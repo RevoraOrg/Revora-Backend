@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'crypto';
+import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 
 interface RequestLog {
   requestId: string;
@@ -31,8 +32,9 @@ const SENSITIVE_ACTIONS = [
 
 /**
  * Middleware for logging API requests and auditing sensitive actions
+ * @param auditRepository Optional repository for persisting audit logs
  */
-export function requestLogMiddleware() {
+export function requestLogMiddleware(auditRepository?: AuditLogRepository) {
   return (req: Request, res: Response, next: NextFunction) => {
     const requestId = randomUUID();
     const startTime = process.hrtime.bigint();
@@ -87,8 +89,18 @@ export function requestLogMiddleware() {
 
         console.log(JSON.stringify({ type: 'audit', ...auditLog }));
 
-        // Note: Persistence to database would be done here if auditRepository was available
-        // For now, just logging to console as per requirements
+        // Persist to database if repository is provided
+        if (auditRepository) {
+          auditRepository.createAuditLog({
+            user_id: auditLog.userId,
+            action: auditLog.action,
+            resource: auditLog.resource,
+            ip_address: auditLog.ipAddress,
+            user_agent: auditLog.userAgent,
+          }).catch((error) => {
+            console.error('Failed to persist audit log:', error);
+          });
+        }
       }
 
       // Call original end

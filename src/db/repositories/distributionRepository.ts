@@ -175,6 +175,29 @@ export class DistributionRepository {
   }
 
   /**
+   * Get aggregate stats for an offering
+   * @param offeringId Offering ID
+   * @returns Aggregate statistics
+   */
+  async getAggregateStats(offeringId: string): Promise<{ totalDistributed: string; lastReportDate: Date | null }> {
+    const query = `
+      SELECT 
+        COALESCE(SUM(total_amount), 0) as total_distributed,
+        MAX(distribution_date) as last_report_date
+      FROM distribution_runs
+      WHERE offering_id = $1 AND status = 'completed'
+    `;
+
+    const result = await this.db.query(query, [offeringId]);
+    const row = result.rows[0];
+
+    return {
+      totalDistributed: row.total_distributed.toString(),
+      lastReportDate: row.last_report_date ? new Date(row.last_report_date) : null,
+    };
+  }
+
+  /**
    * Map database row to DistributionRun entity
    */
   private mapDistributionRun(row: any): DistributionRun {
