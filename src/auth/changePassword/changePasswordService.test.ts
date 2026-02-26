@@ -1,10 +1,7 @@
 import { ChangePasswordService, ChangePasswordUserRepo } from './changePasswordService';
-import { hashPassword } from '../../utils/password';
+import { hashPassword } from '../../utils/password';   // ← was ../../lib/hash
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function makeRepo(
-  overrides: Partial<ChangePasswordUserRepo> = {},
-): ChangePasswordUserRepo {
+function makeRepo(overrides: Partial<ChangePasswordUserRepo> = {}): ChangePasswordUserRepo {
   return {
     findUserById: jest.fn().mockResolvedValue(null),
     updatePasswordHash: jest.fn().mockResolvedValue(undefined),
@@ -12,10 +9,9 @@ function makeRepo(
   };
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
 describe('ChangePasswordService', () => {
   it('returns ok:true and calls updatePasswordHash with a NEW hash on valid credentials', async () => {
-    const oldHash = hashPassword('correct-horse-battery');
+    const oldHash = await hashPassword('correct-horse-battery');   // ← await added
     const updatePasswordHash = jest.fn().mockResolvedValue(undefined);
 
     const repo = makeRepo({
@@ -33,7 +29,6 @@ describe('ChangePasswordService', () => {
     expect(result.ok).toBe(true);
     expect(updatePasswordHash).toHaveBeenCalledWith('u1', expect.any(String));
 
-    // New hash must differ from old hash
     const [, newHash] = (updatePasswordHash.mock.calls[0] as [string, string]);
     expect(newHash).not.toBe(oldHash);
   });
@@ -42,7 +37,7 @@ describe('ChangePasswordService', () => {
     const repo = makeRepo({
       findUserById: jest.fn().mockResolvedValue({
         id: 'u1',
-        password_hash: hashPassword('real-password'),
+        password_hash: await hashPassword('real-password'),   // ← await added
       }),
     });
 
