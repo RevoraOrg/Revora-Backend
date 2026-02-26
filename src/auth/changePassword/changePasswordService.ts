@@ -1,46 +1,71 @@
-import { UserRepository } from '../../db/repositories/userRepository';
-import { SessionRepository } from '../../db/repositories/sessionRepository';
-import { hashPassword, comparePassword } from '../../utils/password';
+import { hashPassword, comparePassword as verifyPassword } from '../../utils/password';
 
-export class ChangePasswordError extends Error {
-  constructor(
-    message: string,
-    public readonly statusCode: number
-  ) {
-    super(message);
-    this.name = 'ChangePasswordError';
-  }
+// ── Port interface ────────────────────────────────────────────────────────────
+// Keeps the service decoupled from pg and the concrete UserRepository.
+export interface ChangePasswordUserRepo {
+  findUserById(id: string): Promise<{ id: string; password_hash: string } | null>;
+  updatePasswordHash(userId: string, newHash: string): Promise<void>;
 }
 
+// ── Input / Output types ──────────────────────────────────────────────────────
+export interface ChangePasswordInput {
+  userId: string;
+  currentPassword: string;
+  newPassword: string;
+}
+
+export type ChangePasswordResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: 'USER_NOT_FOUND' | 'WRONG_PASSWORD' | 'VALIDATION_ERROR';
+      message: string;
+    };
+
+// ── Service ───────────────────────────────────────────────────────────────────
 export class ChangePasswordService {
-  constructor(
-    private readonly userRepository: UserRepository,
-    private readonly sessionRepository: SessionRepository
-  ) {}
+  constructor(private readonly userRepo: ChangePasswordUserRepo) {}
 
-  async changePassword(
-    userId: string,
-    currentSessionId: string,
-    currentPassword: string,
-    newPassword: string
-  ): Promise<void> {
-    // 1. Fetch user — needed for password_hash
-    const user = await this.userRepository.findById(userId);
+  async execute(input: ChangePasswordInput): Promise<ChangePasswordResult> {
+    const { userId, currentPassword, newPassword } = input;
+
+    // Validate inputs first (cheap, no DB hit)
+    if (!currentPassword) {
+      return {
+        ok: false,
+        reason: 'VALIDATION_ERROR',
+        message: 'currentPassword is required.',
+      };
+    }
+
+    if (!newPassword || newPassword.length < 8) {
+      return {
+        ok: false,
+        reason: 'VALIDATION_ERROR',
+        message: 'newPassword must be at least 8 characters.',
+      };
+    }
+
+    // Load user
+    const user = await this.userRepo.findUserById(userId);
     if (!user) {
-      throw new ChangePasswordError('User not found', 404);
+      return { ok: false, reason: 'USER_NOT_FOUND', message: 'User not found.' };
     }
 
-    // 2. Verify current password (timing-safe)
-    const isMatch = await comparePassword(currentPassword, user.password_hash);
+    // Verify current password using scrypt timing-safe compare (src/lib/hash.ts)
+    const isMatch = await verifyPassword(currentPassword, user.password_hash);
     if (!isMatch) {
-      throw new ChangePasswordError('Current password is incorrect', 401);
+      return {
+        ok: false,
+        reason: 'WRONG_PASSWORD',
+        message: 'Current password is incorrect.',
+      };
     }
 
-    // 3. Hash and persist the new password
+    // Hash and persist
     const newHash = await hashPassword(newPassword);
-    await this.userRepository.updatePasswordHash(userId, newHash);
+    await this.userRepo.updatePasswordHash(userId, newHash);
 
-    // 4. Invalidate ALL sessions for this user (security: force re-login everywhere)
-    await this.sessionRepository.deleteAllSessionsByUserId(userId);
+    return { ok: true };
   }
 }

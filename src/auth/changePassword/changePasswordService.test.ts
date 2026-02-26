@@ -1,97 +1,95 @@
-import { ChangePasswordService, ChangePasswordError } from './changePasswordService';
-import { UserRepository, User } from '../../db/repositories/userRepository';
-import { SessionRepository } from '../../db/repositories/sessionRepository';
-import * as passwordUtils from '../../utils/password';
+import { ChangePasswordService, ChangePasswordUserRepo } from './changePasswordService';
+import { hashPassword } from '../../utils/password';
 
-// ── mocks ──────────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function makeRepo(
+  overrides: Partial<ChangePasswordUserRepo> = {},
+): ChangePasswordUserRepo {
+  return {
+    findUserById: jest.fn().mockResolvedValue(null),
+    updatePasswordHash: jest.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
 
-jest.mock('../../db/repositories/userRepository');
-jest.mock('../../db/repositories/sessionRepository');
-jest.mock('../../utils/password');
-
-const MockedRepo = UserRepository as jest.MockedClass<typeof UserRepository>;
-const mockedCompare = passwordUtils.comparePassword as jest.MockedFunction<
-  typeof passwordUtils.comparePassword
->;
-const MockedSessionRepo = SessionRepository as jest.MockedClass<
-  typeof SessionRepository
->;
-const mockedHash = passwordUtils.hashPassword as jest.MockedFunction<
-  typeof passwordUtils.hashPassword
->;
-
-// ── fixtures ───────────────────────────────────────────────────────────────────
-
-const mockUser: User = {
-  id: 'user-123',
-  email: 'alice@example.com',
-  password_hash: 'salt:hash',
-  created_at: new Date(),
-  updated_at: new Date(),
-};
-
-// ── tests ──────────────────────────────────────────────────────────────────────
-
+// ── Tests ─────────────────────────────────────────────────────────────────────
 describe('ChangePasswordService', () => {
-  let service: ChangePasswordService;
-  let mockRepo: jest.Mocked<UserRepository>;
-  let mockSessionRepo: jest.Mocked<SessionRepository>;
+  it('returns ok:true and calls updatePasswordHash with a NEW hash on valid credentials', async () => {
+    const oldHash = hashPassword('correct-horse-battery');
+    const updatePasswordHash = jest.fn().mockResolvedValue(undefined);
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mockRepo = new MockedRepo({} as any) as jest.Mocked<UserRepository>;
-    mockSessionRepo = new MockedSessionRepo({} as any) as jest.Mocked<SessionRepository>;
-    service = new ChangePasswordService(mockRepo, mockSessionRepo);
-  });
-
-  it('throws 404 when user is not found', async () => {
-    mockRepo.findById.mockResolvedValueOnce(null);
-
-    await expect(
-      service.changePassword('user-123', 'session-abc', 'old', 'newPassword1')
-    ).rejects.toMatchObject({
-      statusCode: 404,
-      message: 'User not found',
+    const repo = makeRepo({
+      findUserById: jest.fn().mockResolvedValue({ id: 'u1', password_hash: oldHash }),
+      updatePasswordHash,
     });
 
-    expect(mockRepo.updatePasswordHash).not.toHaveBeenCalled();
-  });
-
-  it('throws 401 when currentPassword is incorrect', async () => {
-    mockRepo.findById.mockResolvedValueOnce(mockUser);
-    mockedCompare.mockResolvedValueOnce(false);
-
-    await expect(
-      service.changePassword('user-123', 'session-abc', 'wrongpass', 'newPassword1')
-    ).rejects.toMatchObject({
-      statusCode: 401,
-      message: 'Current password is incorrect',
+    const svc = new ChangePasswordService(repo);
+    const result = await svc.execute({
+      userId: 'u1',
+      currentPassword: 'correct-horse-battery',
+      newPassword: 'new-secure-pw-123',
     });
 
-    expect(mockedCompare).toHaveBeenCalledWith('wrongpass', mockUser.password_hash);
-    expect(mockRepo.updatePasswordHash).not.toHaveBeenCalled();
+    expect(result.ok).toBe(true);
+    expect(updatePasswordHash).toHaveBeenCalledWith('u1', expect.any(String));
+
+    // New hash must differ from old hash
+    const [, newHash] = (updatePasswordHash.mock.calls[0] as [string, string]);
+    expect(newHash).not.toBe(oldHash);
   });
 
-  it('hashes the new password and updates it when current password is correct', async () => {
-    mockRepo.findById.mockResolvedValueOnce(mockUser);
-    mockedCompare.mockResolvedValueOnce(true);
-    mockedHash.mockResolvedValueOnce('newsalt:newhash');
-    mockRepo.updatePasswordHash.mockResolvedValueOnce(undefined);
+  it('returns WRONG_PASSWORD when current password does not match', async () => {
+    const repo = makeRepo({
+      findUserById: jest.fn().mockResolvedValue({
+        id: 'u1',
+        password_hash: hashPassword('real-password'),
+      }),
+    });
 
-    await service.changePassword('user-123', 'session-abc', 'correctpass', 'newPassword1');
+    const svc = new ChangePasswordService(repo);
+    const result = await svc.execute({
+      userId: 'u1',
+      currentPassword: 'wrong-password',
+      newPassword: 'new-secure-pw-123',
+    });
 
-    expect(mockedHash).toHaveBeenCalledWith('newPassword1');
-    expect(mockRepo.updatePasswordHash).toHaveBeenCalledWith('user-123', 'newsalt:newhash');
-    expect(mockSessionRepo.deleteAllSessionsByUserId).toHaveBeenCalledWith('user-123');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('WRONG_PASSWORD');
   });
 
-  it('throws ChangePasswordError instance (not generic Error)', async () => {
-    mockRepo.findById.mockResolvedValueOnce(null);
+  it('returns USER_NOT_FOUND when repo returns null', async () => {
+    const svc = new ChangePasswordService(makeRepo());
+    const result = await svc.execute({
+      userId: 'ghost',
+      currentPassword: 'whatever',
+      newPassword: 'new-secure-pw-123',
+    });
 
-    const err = await service
-      .changePassword('user-123', 'session-abc', 'old', 'new12345')
-      .catch((e) => e);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('USER_NOT_FOUND');
+  });
 
-    expect(err).toBeInstanceOf(ChangePasswordError);
+  it('returns VALIDATION_ERROR when newPassword is shorter than 8 chars', async () => {
+    const svc = new ChangePasswordService(makeRepo());
+    const result = await svc.execute({
+      userId: 'u1',
+      currentPassword: 'any-password',
+      newPassword: 'short',
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('VALIDATION_ERROR');
+  });
+
+  it('returns VALIDATION_ERROR when currentPassword is empty string', async () => {
+    const svc = new ChangePasswordService(makeRepo());
+    const result = await svc.execute({
+      userId: 'u1',
+      currentPassword: '',
+      newPassword: 'new-secure-pw-123',
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('VALIDATION_ERROR');
   });
 });

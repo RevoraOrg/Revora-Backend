@@ -1,157 +1,96 @@
-import { Request, Response, NextFunction } from 'express';
 import { createChangePasswordHandler } from './changePasswordHandler';
-import { ChangePasswordService, ChangePasswordError } from './changePasswordService';
-import { AuthenticatedRequest } from './types';
+import { ChangePasswordService } from './changePasswordService';
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-const mockRes = () => {
-  const res = {
-    status: jest.fn().mockReturnThis(),
-    json: jest.fn().mockReturnThis(),
-  } as unknown as Response;
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function mockRes() {
+  const res: any = {};
+  res.status = jest.fn().mockReturnValue(res);
+  res.json   = jest.fn().mockReturnValue(res);
   return res;
-};
+}
 
-const mockNext: NextFunction = jest.fn();
-
-const makeReq = (
-  body: unknown,
-  userId?: string
-): AuthenticatedRequest => {
+function mockReq(overrides: object = {}): any {
   return {
-    auth: userId ? { userId, sessionId: 'session-1' } : undefined,
-    body,
-  } as AuthenticatedRequest;
-};
+    user: { sub: 'user-abc' },
+    body: { currentPassword: 'old-pw-12345', newPassword: 'new-pw-67890' },
+    ...overrides,
+  };
+}
 
-// ── mocks ─────────────────────────────────────────────────────────────────────
+function mockService(result: object): ChangePasswordService {
+  return { execute: jest.fn().mockResolvedValue(result) } as unknown as ChangePasswordService;
+}
 
-jest.mock('./changePasswordService');
-
-const MockedService = ChangePasswordService as jest.MockedClass<typeof ChangePasswordService>;
-
-// ── tests ─────────────────────────────────────────────────────────────────────
-
+// ── Tests ─────────────────────────────────────────────────────────────────────
 describe('createChangePasswordHandler', () => {
-  let service: jest.Mocked<ChangePasswordService>;
-  let handler: ReturnType<typeof createChangePasswordHandler>;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-    service = new MockedService({} as any) as jest.Mocked<ChangePasswordService>;
-    handler = createChangePasswordHandler(service);
-  });
-
-  it('returns 401 when req.auth is missing', async () => {
-    const req = makeReq({ currentPassword: 'old', newPassword: 'newPassword1' });
+  it('returns 200 when service resolves ok:true', async () => {
+    const handler = createChangePasswordHandler(mockService({ ok: true }));
     const res = mockRes();
 
-    await handler(req as Request, res, mockNext);
+    await handler(mockReq(), res, jest.fn());
 
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.json).toHaveBeenCalledWith({ error: 'Unauthorized' });
-    expect(service.changePassword).not.toHaveBeenCalled();
-  });
-
-  it('returns 400 when body is missing currentPassword', async () => {
-    const req = makeReq({ newPassword: 'newPassword1' }, 'user-123');
-    const res = mockRes();
-
-    await handler(req as Request, res, mockNext);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('Invalid') })
-    );
-  });
-
-  it('returns 400 when newPassword is shorter than 8 chars', async () => {
-    const req = makeReq({ currentPassword: 'old', newPassword: 'short' }, 'user-123');
-    const res = mockRes();
-
-    await handler(req as Request, res, mockNext);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-  });
-
-  it('returns 400 when body is empty', async () => {
-    const req = makeReq({}, 'user-123');
-    const res = mockRes();
-
-    await handler(req as Request, res, mockNext);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-  });
-
-  it('returns 200 on success', async () => {
-    service.changePassword.mockResolvedValueOnce(undefined);
-
-    const req = makeReq(
-      { currentPassword: 'currentPass1', newPassword: 'newPassword1' },
-      'user-123'
-    );
-    const res = mockRes();
-
-    await handler(req as Request, res, mockNext);
-
-    expect(service.changePassword).toHaveBeenCalledWith(
-      'user-123',
-      'session-1',
-      'currentPass1',
-      'newPassword1'
-    );
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ message: 'Password changed successfully' });
+    expect(res.json).toHaveBeenCalledWith({ message: 'Password updated successfully.' });
   });
 
-  it('returns 401 when service throws ChangePasswordError with status 401', async () => {
-    service.changePassword.mockRejectedValueOnce(
-      new ChangePasswordError('Current password is incorrect', 401)
-    );
-
-    const req = makeReq(
-      { currentPassword: 'wrong', newPassword: 'newPassword1' },
-      'user-123'
-    );
+  it('returns 401 and does NOT call service when req.user is absent', async () => {
+    const svc = mockService({ ok: true });
+    const handler = createChangePasswordHandler(svc);
     const res = mockRes();
 
-    await handler(req as Request, res, mockNext);
+    await handler(mockReq({ user: undefined }), res, jest.fn());
 
     expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.json).toHaveBeenCalledWith({ error: 'Current password is incorrect' });
-    expect(mockNext).not.toHaveBeenCalled();
+    expect((svc.execute as jest.Mock)).not.toHaveBeenCalled();
   });
 
-  it('returns 404 when service throws ChangePasswordError with status 404', async () => {
-    service.changePassword.mockRejectedValueOnce(
-      new ChangePasswordError('User not found', 404)
-    );
-
-    const req = makeReq(
-      { currentPassword: 'pass', newPassword: 'newPassword1' },
-      'user-123'
-    );
+  it('returns 400 and does NOT call service when body fields are missing', async () => {
+    const svc = mockService({ ok: true });
+    const handler = createChangePasswordHandler(svc);
     const res = mockRes();
 
-    await handler(req as Request, res, mockNext);
+    await handler(mockReq({ body: {} }), res, jest.fn());
 
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect((svc.execute as jest.Mock)).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 on VALIDATION_ERROR from service', async () => {
+    const handler = createChangePasswordHandler(
+      mockService({ ok: false, reason: 'VALIDATION_ERROR', message: 'too short' }),
+    );
+    const res = mockRes();
+    await handler(mockReq(), res, jest.fn());
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  it('returns 401 on WRONG_PASSWORD from service', async () => {
+    const handler = createChangePasswordHandler(
+      mockService({ ok: false, reason: 'WRONG_PASSWORD', message: 'wrong' }),
+    );
+    const res = mockRes();
+    await handler(mockReq(), res, jest.fn());
+    expect(res.status).toHaveBeenCalledWith(401);
+  });
+
+  it('returns 404 on USER_NOT_FOUND from service', async () => {
+    const handler = createChangePasswordHandler(
+      mockService({ ok: false, reason: 'USER_NOT_FOUND', message: 'not found' }),
+    );
+    const res = mockRes();
+    await handler(mockReq(), res, jest.fn());
     expect(res.status).toHaveBeenCalledWith(404);
-    expect(res.json).toHaveBeenCalledWith({ error: 'User not found' });
   });
 
-  it('calls next() for unexpected errors', async () => {
-    const unexpectedError = new Error('DB connection lost');
-    service.changePassword.mockRejectedValueOnce(unexpectedError);
-
-    const req = makeReq(
-      { currentPassword: 'pass', newPassword: 'newPassword1' },
-      'user-123'
-    );
+  it('calls next(err) on unexpected exception from service', async () => {
+    const boom = new Error('db exploded');
+    const svc = { execute: jest.fn().mockRejectedValue(boom) } as unknown as ChangePasswordService;
+    const handler = createChangePasswordHandler(svc);
+    const next = jest.fn();
     const res = mockRes();
 
-    await handler(req as Request, res, mockNext);
+    await handler(mockReq(), res, next);
 
-    expect(mockNext).toHaveBeenCalledWith(unexpectedError);
+    expect(next).toHaveBeenCalledWith(boom);
   });
 });

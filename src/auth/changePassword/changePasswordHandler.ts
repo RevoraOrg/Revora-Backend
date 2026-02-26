@@ -1,59 +1,60 @@
-import { NextFunction, RequestHandler, Response } from 'express';
-import { ChangePasswordService, ChangePasswordError } from './changePasswordService';
-import { AuthenticatedRequest, ChangePasswordBody } from './types';
+import { Request, Response, NextFunction } from 'express';
+import { ChangePasswordService } from './changePasswordService';
 
-function isValidBody(body: unknown): body is ChangePasswordBody {
-  if (typeof body !== 'object' || body === null) return false;
-  const { currentPassword, newPassword } = body as Record<string, unknown>;
-  return (
-    typeof currentPassword === 'string' &&
-    currentPassword.length > 0 &&
-    typeof newPassword === 'string' &&
-    newPassword.length >= 8
-  );
+// Re-use the AuthenticatedRequest shape already in the codebase.
+// req.user.sub  → set by the JWT authMiddleware (src/middleware/auth.ts, line 35)
+// req.user.id   → set by the mock requireAuth stub in src/index.ts (line 103)
+interface AuthedReq extends Request {
+  user?: { sub?: string; id?: string; [key: string]: unknown };
 }
 
-export const createChangePasswordHandler = (
-  changePasswordService: ChangePasswordService
-): RequestHandler => {
-  return async (
-    req: AuthenticatedRequest,
+export function createChangePasswordHandler(service: ChangePasswordService) {
+  return async function changePasswordHandler(
+    req: AuthedReq,
     res: Response,
-    next: NextFunction
-  ): Promise<void> => {
+    next: NextFunction,
+  ): Promise<void> {
     try {
-      const userId = req.auth?.userId;
-      const sessionId = req.auth?.sessionId;
+      // Support both middleware conventions present in the codebase
+      const userId = (req.user?.sub ?? req.user?.id) as string | undefined;
 
-      if (!userId || !sessionId) {
-        res.status(401).json({ error: 'Unauthorized' });
+      if (!userId) {
+        res.status(401).json({ error: 'Unauthorized', message: 'No authenticated user.' });
         return;
       }
 
-      if (!isValidBody(req.body)) {
+      const { currentPassword, newPassword } = req.body as Record<string, unknown>;
+
+      if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
         res.status(400).json({
-          error:
-            'Invalid request body. currentPassword and newPassword (min 8 chars) are required.',
+          error: 'Bad Request',
+          message: 'Body must include currentPassword and newPassword as strings.',
         });
         return;
       }
 
-      const { currentPassword, newPassword } = req.body;
+      const result = await service.execute({ userId, currentPassword, newPassword });
 
-      await changePasswordService.changePassword(
-        userId,
-        sessionId,
-        currentPassword,
-        newPassword
-      );
-
-      res.status(200).json({ message: 'Password changed successfully' });
-    } catch (error) {
-      if (error instanceof ChangePasswordError) {
-        res.status(error.statusCode).json({ error: error.message });
+      if (result.ok) {
+        res.status(200).json({ message: 'Password updated successfully.' });
         return;
       }
-      next(error);
+
+      switch (result.reason) {
+        case 'VALIDATION_ERROR':
+          res.status(400).json({ error: 'Validation Error', message: result.message });
+          break;
+        case 'WRONG_PASSWORD':
+          res.status(401).json({ error: 'Unauthorized', message: result.message });
+          break;
+        case 'USER_NOT_FOUND':
+          res.status(404).json({ error: 'Not Found', message: result.message });
+          break;
+        default:
+          res.status(500).json({ error: 'Internal Server Error', message: 'Unexpected error.' });
+      }
+    } catch (err) {
+      next(err);
     }
   };
-};
+}
