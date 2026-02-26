@@ -1,0 +1,802 @@
+openapi: 3.0.0
+info:
+  title: Revora Backend API
+  version: "1.0.0"
+  description: |
+    Backend API for tokenized revenue-sharing on Stellar (offerings, investments,
+    revenue reports, distributions, users, and notifications).
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Authentication and session management
+  - name: Offerings
+    description: Startup offerings and public catalog
+  - name: Investments
+    description: Investor holdings
+  - name: Revenue
+    description: Revenue reporting and history
+  - name: Distributions
+    description: Revenue distribution runs
+  - name: Notifications
+    description: User notifications and preferences
+  - name: Users
+    description: User-specific endpoints
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      tags: [Users]
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: revora-backend
+
+  /api/overview:
+    get:
+      summary: API overview
+      tags: [Users]
+      responses:
+        "200":
+          description: Basic information about the API
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+
+  /api/auth/login:
+    post:
+      summary: Login (email & password)
+      description: |
+        Authenticate an existing user and return a JWT access token plus basic user info.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          description: Invalid credentials
+
+  /api/auth/investor/register:
+    post:
+      summary: Register investor
+      description: Register a new investor account using email and password.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterInvestorRequest"
+      responses:
+        "201":
+          description: Investor registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+        "400":
+          description: Validation error
+        "409":
+          description: User already exists
+
+  /api/auth/logout:
+    post:
+      summary: Logout
+      description: Invalidate the current session token.
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logged out
+        "401":
+          description: Unauthorized
+
+  /api/startup/offerings:
+    get:
+      summary: List offerings for startup
+      description: |
+        Returns offerings created by the authenticated startup user.
+      tags: [Offerings]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+          description: Optional status filter.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 0
+          description: Maximum number of offerings to return.
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+          description: Number of offerings to skip.
+      responses:
+        "200":
+          description: List of offerings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offerings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Offering"
+                  total:
+                    type: integer
+                    description: Total number of matching offerings (if available).
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+
+  /api/offerings:
+    get:
+      summary: Public offerings catalog
+      description: |
+        Public catalog of offerings, accessible without authentication.
+      tags: [Offerings]
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: sort
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of public offerings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  offerings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PublicOffering"
+                  total:
+                    type: integer
+
+  /api/offerings/{id}:
+    get:
+      summary: Get offering by ID
+      tags: [Offerings]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Offering details
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Offering"
+                  - $ref: "#/components/schemas/PublicOffering"
+        "400":
+          description: Invalid ID format
+        "404":
+          description: Offering not found
+
+  /api/investments:
+    get:
+      summary: List investments for investor
+      tags: [Investments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+        - in: query
+          name: offering_id
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: List of investments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Investment"
+        "400":
+          description: Invalid query parameters
+        "401":
+          description: Unauthorized
+
+  /api/offerings/{id}/revenue:
+    post:
+      summary: Submit revenue report for an offering
+      tags: [Revenue]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevenueReportInput"
+      responses:
+        "201":
+          description: Revenue report recorded
+        "400":
+          description: Invalid input
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+
+  /api/revenue-reports:
+    post:
+      summary: Submit revenue report
+      description: Alternative endpoint for submitting a revenue report.
+      tags: [Revenue]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevenueReportInput"
+      responses:
+        "201":
+          description: Revenue report recorded
+        "400":
+          description: Invalid input
+        "401":
+          description: Unauthorized
+
+  /api/offerings/{id}/revenue-reports:
+    get:
+      summary: List revenue reports for an offering
+      tags: [Revenue]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: periodFrom
+          schema:
+            type: string
+            description: Filter by start of period (inclusive).
+        - in: query
+          name: periodTo
+          schema:
+            type: string
+            description: Filter by end of period (inclusive).
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Paginated list of revenue reports
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RevenueReport"
+                  pagination:
+                    type: object
+                    properties:
+                      page:
+                        type: integer
+                      pageSize:
+                        type: integer
+                      total:
+                        type: integer
+                      totalPages:
+                        type: integer
+        "400":
+          description: Invalid query parameters
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+
+  /api/offerings/{id}/distribute:
+    post:
+      summary: Trigger revenue distribution for an offering
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DistributionRequest"
+      responses:
+        "200":
+          description: Distribution run started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DistributionResponse"
+        "400":
+          description: Invalid input
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+        "404":
+          description: Offering not found
+
+  /api/notifications:
+    get:
+      summary: List notifications for authenticated user
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of notifications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Notification"
+        "401":
+          description: Unauthorized
+
+  /api/notifications/{id}/read:
+    patch:
+      summary: Mark notification(s) as read
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            description: Notification ID (for single update) or "bulk" when using body.ids.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Notifications marked as read
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  marked:
+                    type: integer
+        "400":
+          description: Invalid request or bulk mark not supported
+        "401":
+          description: Unauthorized
+        "404":
+          description: Notification not found
+
+  /api/users/me/notification-preferences:
+    get:
+      summary: Get current user's notification preferences
+      tags: [Users, Notifications]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current notification preferences
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationPreferences"
+        "401":
+          description: Unauthorized
+    patch:
+      summary: Update current user's notification preferences
+      tags: [Users, Notifications]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NotificationPreferencesUpdate"
+      responses:
+        "200":
+          description: Updated preferences
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationPreferences"
+        "401":
+          description: Unauthorized
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          description: User role
+          enum: [startup, investor]
+        name:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT access token
+        user:
+          $ref: "#/components/schemas/User"
+
+    RegisterInvestorRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+        name:
+          type: string
+
+    Offering:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        issuer_id:
+          type: string
+          description: Issuer user id
+        contract_address:
+          type: string
+          description: On-chain contract address
+        name:
+          type: string
+        symbol:
+          type: string
+        status:
+          type: string
+          description: Current status on/off chain
+          enum: [draft, open, closed, paused, cancelled, active, completed]
+        total_raised:
+          type: string
+          description: Total amount raised, as a high-precision decimal string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PublicOffering:
+      type: object
+      description: Public view of an offering
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        symbol:
+          type: string
+        status:
+          type: string
+        total_raised:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Investment:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        investor_id:
+          type: string
+        offering_id:
+          type: string
+        amount:
+          type: string
+          description: Investment amount as a decimal string
+        asset:
+          type: string
+          description: Asset code or identifier
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        tx_hash:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RevenueReportInput:
+      type: object
+      properties:
+        offering_id:
+          type: string
+          format: uuid
+        period_id:
+          type: string
+          description: Optional business period identifier
+        period:
+          type: object
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+        total_revenue:
+          type: string
+          description: Revenue amount as a decimal string
+        issuer_id:
+          type: string
+          description: Issuer user id (optional override)
+        amount:
+          type: string
+          description: Optional alternative amount field
+      required:
+        - offering_id
+
+    RevenueReport:
+      type: object
+      properties:
+        id:
+          type: string
+        offering_id:
+          type: string
+        period_id:
+          type: string
+          nullable: true
+        total_revenue:
+          type: string
+          nullable: true
+        issuer_id:
+          type: string
+          nullable: true
+        amount:
+          type: string
+          nullable: true
+        period_start:
+          type: string
+          format: date-time
+          nullable: true
+        period_end:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    DistributionRequest:
+      type: object
+      properties:
+        revenue_amount:
+          type: number
+          minimum: 0
+        period:
+          type: object
+          properties:
+            start:
+              type: string
+              format: date-time
+            end:
+              type: string
+              format: date-time
+      required:
+        - revenue_amount
+        - period
+
+    DistributionResponse:
+      type: object
+      properties:
+        run_id:
+          type: string
+        payouts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+        user_id:
+          type: string
+        type:
+          type: string
+          description: Notification type key
+        message:
+          type: string
+        read:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    NotificationPreferences:
+      type: object
+      properties:
+        user_id:
+          type: string
+        email_notifications:
+          type: boolean
+        push_notifications:
+          type: boolean
+        sms_notifications:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+
+    NotificationPreferencesUpdate:
+      type: object
+      properties:
+        email_notifications:
+          type: boolean
+        push_notifications:
+          type: boolean
+        sms_notifications:
+          type: boolean
+
