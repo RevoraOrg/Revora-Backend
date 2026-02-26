@@ -1,10 +1,6 @@
 import assert from 'assert';
 import { createUserHandler } from './users';
 
-// ---------------------------------------------------------------------------
-// Minimal mock helpers — no supertest, no extra packages needed
-// ---------------------------------------------------------------------------
-
 class MockUserRepo {
   constructor(private row: any | null) { }
   async findUserById(_id: string) {
