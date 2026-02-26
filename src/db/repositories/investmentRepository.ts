@@ -1,15 +1,16 @@
-import {Pool, QueryResult} from "pg";
+import { Pool, QueryResult } from 'pg';
 
 /**
  * Investment entity
  */
 export interface Investment {
   id: string;
-  offering_id: string;
   investor_id: string;
-  amount: string;
-  status: "pending" | "confirmed" | "cancelled";
-  transaction_hash?: string;
+  offering_id: string;
+  amount: string; // Numeric as string to preserve precision
+  asset: string;
+  status: 'pending' | 'completed' | 'failed';
+  tx_hash?: string;
   created_at: Date;
   updated_at: Date;
 }
@@ -18,11 +19,12 @@ export interface Investment {
  * Investment input for creation
  */
 export interface CreateInvestmentInput {
-  offering_id: string;
   investor_id: string;
+  offering_id: string;
   amount: string;
-  status?: "pending" | "confirmed" | "cancelled";
-  transaction_hash?: string;
+  asset: string;
+  status?: 'pending' | 'completed' | 'failed';
+  tx_hash?: string;
 }
 
 /**
@@ -40,51 +42,33 @@ export class InvestmentRepository {
   async create(input: CreateInvestmentInput): Promise<Investment> {
     const query = `
       INSERT INTO investments (
-        offering_id,
         investor_id,
+        offering_id,
         amount,
+        asset,
         status,
-        transaction_hash,
+        tx_hash,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
 
-    const status = input.status || "pending";
+    const status = input.status || 'pending';
     const values = [
-      input.offering_id,
       input.investor_id,
+      input.offering_id,
       input.amount,
+      input.asset,
       status,
-      input.transaction_hash || null,
+      input.tx_hash || null,
     ];
 
     const result: QueryResult<Investment> = await this.db.query(query, values);
 
     if (result.rows.length === 0) {
-      throw new Error("Failed to create investment");
-    }
-
-    return this.mapInvestment(result.rows[0]);
-  }
-
-  /**
-   * Find an investment by ID
-   * @param id Investment ID
-   * @returns Investment if found, undefined otherwise
-   */
-  async findById(id: string): Promise<Investment | undefined> {
-    const query = `
-      SELECT * FROM investments
-      WHERE id = $1
-    `;
-
-    const result: QueryResult<Investment> = await this.db.query(query, [id]);
-
-    if (result.rows.length === 0) {
-      return undefined;
+      throw new Error('Failed to create investment');
     }
 
     return this.mapInvestment(result.rows[0]);
@@ -97,35 +81,38 @@ export class InvestmentRepository {
    */
   async findByOffering(offeringId: string): Promise<Investment[]> {
     const query = `
-      SELECT * FROM investments
+      SELECT *
+      FROM investments
       WHERE offering_id = $1
       ORDER BY created_at DESC
     `;
 
-    const result: QueryResult<Investment> = await this.db.query(query, [
-      offeringId,
-    ]);
+    const result: QueryResult<Investment> = await this.db.query(query, [offeringId]);
 
     return result.rows.map((row) => this.mapInvestment(row));
   }
 
   /**
-   * Find investments by investor
-   * @param investorId Investor ID
-   * @returns Array of investments
+   * Get aggregate stats for an offering
+   * @param offeringId Offering ID
+   * @returns Aggregate statistics
    */
-  async findByInvestor(investorId: string): Promise<Investment[]> {
+  async getAggregateStats(offeringId: string): Promise<{ totalInvested: string; investorCount: number }> {
     const query = `
-      SELECT * FROM investments
-      WHERE investor_id = $1
-      ORDER BY created_at DESC
+      SELECT 
+        COALESCE(SUM(amount), 0) as total_invested,
+        COUNT(DISTINCT investor_id) as investor_count
+      FROM investments
+      WHERE offering_id = $1 AND status = 'completed'
     `;
 
-    const result: QueryResult<Investment> = await this.db.query(query, [
-      investorId,
-    ]);
+    const result = await this.db.query(query, [offeringId]);
+    const row = result.rows[0];
 
-    return result.rows.map((row) => this.mapInvestment(row));
+    return {
+      totalInvested: row.total_invested.toString(),
+      investorCount: parseInt(row.investor_count, 10),
+    };
   }
 
   /**
@@ -134,11 +121,12 @@ export class InvestmentRepository {
   private mapInvestment(row: any): Investment {
     return {
       id: row.id,
-      offering_id: row.offering_id,
       investor_id: row.investor_id,
+      offering_id: row.offering_id,
       amount: row.amount,
+      asset: row.asset,
       status: row.status,
-      transaction_hash: row.transaction_hash || undefined,
+      tx_hash: row.tx_hash || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
