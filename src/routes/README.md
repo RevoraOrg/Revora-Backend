@@ -56,9 +56,10 @@ All fields are optional. Only provided fields will be updated.
 
 ## Usage Example
 
-To integrate this route into your Express app:
+To integrate this route into your Express app (with versioned API prefix):
 
 ```typescript
+import express from 'express';
 import { Pool } from 'pg';
 import { createNotificationPreferencesRouter } from './routes/notificationPreferences';
 import { NotificationPreferencesRepository } from './db/repositories/notificationPreferencesRepository';
@@ -66,12 +67,20 @@ import { NotificationPreferencesRepository } from './db/repositories/notificatio
 const db = new Pool({ /* your config */ });
 const notificationPreferencesRepository = new NotificationPreferencesRepository(db);
 
+const app = express();
+
+// All API routes are mounted under a versioned prefix.
+const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
+const apiRouter = express.Router();
+app.use(API_VERSION_PREFIX, apiRouter);
+
 const router = createNotificationPreferencesRouter({
   requireAuth: yourAuthMiddleware,
   notificationPreferencesRepository,
 });
 
-app.use(router);
+// Mount the feature router under the versioned API router
+apiRouter.use(router);
 ```
 
 ## Database Migration
