@@ -15,6 +15,8 @@ import {
 
 const app = express();
 const port = process.env.PORT ?? 3000;
+const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
+const apiRouter = express.Router();
 
 class InMemoryMilestoneRepository implements MilestoneRepository {
   constructor(private readonly milestones = new Map<string, Milestone>()) {}
@@ -138,6 +140,10 @@ app.use(createCorsMiddleware());
 app.use(express.json());
 app.use(morgan("dev"));
 app.use(
+app.use(morgan('dev'));
+app.use(API_VERSION_PREFIX, apiRouter);
+
+apiRouter.use(
   createMilestoneValidationRouter({
     requireAuth,
     milestoneRepository,
@@ -157,6 +163,7 @@ app.get("/health", async (_req: Request, res: Response) => {
 });
 
 app.get("/api/overview", (_req: Request, res: Response) => {
+apiRouter.get('/overview', (_req: Request, res: Response) => {
   res.json({
     name: "Stellar RevenueShare (Revora) Backend",
     description:
