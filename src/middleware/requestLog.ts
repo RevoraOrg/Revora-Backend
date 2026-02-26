@@ -54,7 +54,12 @@ export function requestLogMiddleware(auditRepository?: AuditLogRepository) {
 
     // Override res.end to log after response
     const originalEnd = res.end;
-    res.end = function (chunk?: any, encoding?: BufferEncoding | (() => void)) {
+    const wrappedEnd: typeof res.end = function (
+      this: Response,
+      chunk?: any,
+      encoding?: any,
+      cb?: any
+    ) {
       const endTime = process.hrtime.bigint();
       const duration = Number(endTime - startTime) / 1000000; // Convert to milliseconds
 
@@ -104,8 +109,9 @@ export function requestLogMiddleware(auditRepository?: AuditLogRepository) {
       }
 
       // Call original end
-      originalEnd.call(this, chunk, encoding);
+      return (originalEnd as any).call(this, chunk, encoding, cb);
     };
+    res.end = wrappedEnd;
 
     next();
   };
