@@ -16,6 +16,16 @@ export interface Investment {
 }
 
 /**
+ * Options for listing investments by investor
+ */
+export interface ListByInvestorOptions {
+  investor_id: string;
+  offering_id?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
  * Investment input for creation
  */
 export interface CreateInvestmentInput {
@@ -33,6 +43,42 @@ export interface CreateInvestmentInput {
  */
 export class InvestmentRepository {
   constructor(private db: Pool) {}
+
+  /**
+   * List investments for a given investor with optional filters and pagination
+   * @param options Query options including investor_id, offering_id, limit, offset
+   * @returns Array of investments
+   */
+  async listByInvestor(options: ListByInvestorOptions): Promise<Investment[]> {
+    const params: unknown[] = [options.investor_id];
+    let paramIndex = 2;
+
+    let query = `
+      SELECT *
+      FROM investments
+      WHERE investor_id = $1
+    `;
+
+    if (options.offering_id !== undefined) {
+      query += ` AND offering_id = $${paramIndex++}`;
+      params.push(options.offering_id);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    if (options.limit !== undefined) {
+      query += ` LIMIT $${paramIndex++}`;
+      params.push(options.limit);
+    }
+
+    if (options.offset !== undefined) {
+      query += ` OFFSET $${paramIndex++}`;
+      params.push(options.offset);
+    }
+
+    const result: QueryResult<Investment> = await this.db.query(query, params);
+    return result.rows.map((row) => this.mapInvestment(row));
+  }
 
   /**
    * Create a new investment
@@ -88,7 +134,6 @@ export class InvestmentRepository {
     `;
 
     const result: QueryResult<Investment> = await this.db.query(query, [offeringId]);
-
     return result.rows.map((row) => this.mapInvestment(row));
   }
 
@@ -99,14 +144,17 @@ export class InvestmentRepository {
    */
   async getAggregateStats(offeringId: string): Promise<{ totalInvested: string; investorCount: number }> {
     const query = `
-      SELECT 
+      SELECT
         COALESCE(SUM(amount), 0) as total_invested,
         COUNT(DISTINCT investor_id) as investor_count
       FROM investments
       WHERE offering_id = $1 AND status = 'completed'
     `;
 
-    const result = await this.db.query(query, [offeringId]);
+    const result = await this.db.query<{ total_invested: string; investor_count: string }>(
+      query,
+      [offeringId]
+    );
     const row = result.rows[0];
 
     return {
@@ -118,6 +166,7 @@ export class InvestmentRepository {
   /**
    * Map database row to Investment entity
    */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private mapInvestment(row: any): Investment {
     return {
       id: row.id,

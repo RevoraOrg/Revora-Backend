@@ -12,9 +12,24 @@ export interface Offering {
 export interface OfferingRepo {
   listByIssuer: (issuerId: string, opts?: { status?: string; limit?: number; offset?: number }) => Promise<Offering[]>;
   countByIssuer?: (issuerId: string, opts?: { status?: string }) => Promise<number>;
+  getById: (id: string) => Promise<Offering | null>;
   // Optional public listing for investors / catalog
   listPublic?: (opts?: { status?: string; limit?: number; offset?: number; sort?: string }) => Promise<Partial<Offering>[]>;
   countPublic?: (opts?: { status?: string }) => Promise<number>;
+}
+
+function isValidUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function toPublicOffering(offering: Offering): Partial<Offering> {
+  return {
+    id: offering.id,
+    title: offering.title,
+    status: offering.status,
+    amount: offering.amount,
+    created_at: offering.created_at,
+  };
 }
 
 export function createOfferingHandlers(offeringRepo: OfferingRepo) {
@@ -67,7 +82,33 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
     }
   }
 
-  return { listCatalog };
+  async function getOfferingById(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      if (!isValidUuid(id)) {
+        return res.status(400).json({ error: 'Invalid offering id format' });
+      }
+
+      const offering = await offeringRepo.getById(id);
+      if (!offering) {
+        return res.status(404).json({ error: 'Offering not found' });
+      }
+
+      const user = (req as any).user;
+      const offeringIssuerId = offering.issuer_id ?? (offering as any).issuer_user_id;
+      const isIssuer =
+        !!user &&
+        typeof user.id === 'string' &&
+        (user.role === 'startup' || user.role === 'issuer') &&
+        user.id === offeringIssuerId;
+
+      return res.json(isIssuer ? offering : toPublicOffering(offering));
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  return { listCatalog, getOfferingById };
 }
 
 export default function createOfferingsRouter(opts: { offeringRepo: OfferingRepo; verifyJWT: express.RequestHandler }) {
@@ -78,6 +119,7 @@ export default function createOfferingsRouter(opts: { offeringRepo: OfferingRepo
   router.get('/api/startup/offerings', opts.verifyJWT, handlers.listOfferings);
   // Public catalog for investors (no auth)
   router.get('/api/offerings', publicHandlers.listCatalog);
+  router.get('/api/offerings/:id', publicHandlers.getOfferingById);
 
   return router;
 }
