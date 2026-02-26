@@ -11,9 +11,11 @@
     "lint": "eslint \"src/**/*.{ts,tsx}\""
   },
   "dependencies": {
+    "@types/pg": "^8.16.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
+    "jest": "^30.2.0",
     "morgan": "^1.10.0",
     "pg": "^8.19.0"
   },
@@ -22,12 +24,9 @@
     "@types/express": "^4.17.21",
     "@types/jest": "^30.0.0",
     "@types/morgan": "^1.9.9",
-    "@types/pg": "^8.16.0",
     "@typescript-eslint/eslint-plugin": "^8.15.0",
     "@typescript-eslint/parser": "^8.15.0",
     "eslint": "^9.14.0",
-    "jest": "^30.2.0",
-    "ts-jest": "^29.4.6",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.7.0"
   }
