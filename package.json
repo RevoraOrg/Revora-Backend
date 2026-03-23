@@ -9,7 +9,11 @@
     "migrate": "node src/db/migrate.js",
     "build": "tsc",
     "start": "node dist/index.js",
-    "lint": "eslint \"src/**/*.{ts,tsx}\""
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "test": "jest",
+    "test:validation": "jest src/lib/validationMatrix.test.ts --verbose --no-coverage",
+    "test:health": "jest src/routes/health.test.ts --verbose --no-coverage",
+    "test:middleware": "jest src/middleware/offeringValidation.test.ts --verbose --no-coverage"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.5.0",
