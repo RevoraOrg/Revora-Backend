@@ -3,6 +3,9 @@ import express, { Request, Response } from "express";
 import morgan from "morgan";
 import { dbHealth, closePool } from "./db/client";
 import { createCorsMiddleware } from "./middleware/cors";
+import { createRateLimitMiddleware } from "./middleware/rateLimit";
+import { requestIdMiddleware } from "./middleware/requestId";
+import { requestLogMiddleware } from "./middleware/requestLog";
 import {
   createMilestoneValidationRouter,
   DomainEventPublisher,
@@ -141,8 +144,19 @@ const milestoneValidationEventRepository =
   new InMemoryMilestoneValidationEventRepository();
 const domainEventPublisher = new ConsoleDomainEventPublisher();
 
+app.disable("x-powered-by");
+
 app.use(createCorsMiddleware());
 app.use(express.json());
+app.use(requestIdMiddleware());
+app.use(requestLogMiddleware());
+
+/**
+ * @dev Global rate limiting for all routes. 
+ * Prevents brute-force and generic resource exhaustion.
+ */
+app.use(createRateLimitMiddleware({ limit: 100, windowMs: 60000 }));
+
 app.use(morgan("dev"));
 /**
  * @dev All API business routes are deliberately scoped under the target version prefix.

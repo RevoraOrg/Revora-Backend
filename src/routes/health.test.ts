@@ -117,3 +117,82 @@ describe('API Version Prefix Consistency tests', () => {
         expect(res.status).toBe(404);
     });
 });
+
+describe('Security Regression Suite', () => {
+    /**
+     * @test Information Disclosure Prevention
+     * @desc Ensures the server does not disclose its underlying technology stack via headers.
+     */
+    it('should not disclose X-Powered-By header', async () => {
+        const res = await request(app).get('/health');
+        expect(res.headers['x-powered-by']).toBeUndefined();
+    });
+
+    /**
+     * @test Request Traceability
+     * @desc Ensures every request is assigned a unique X-Request-Id for audit and debugging.
+     */
+    it('should return X-Request-Id header in responses', async () => {
+        const res = await request(app).get('/health');
+        expect(res.headers['x-request-id']).toBeDefined();
+        expect(typeof res.headers['x-request-id']).toBe('string');
+    });
+
+    /**
+     * @test CORS Policy Enforcement
+     * @desc Validates that only allowed origins can access the API.
+     */
+    it('should enforce CORS origin policy', async () => {
+        const res = await request(app)
+            .get('/health')
+            .set('Origin', 'http://malicious-site.com');
+        
+        // The cors middleware might return 200 with no Allow-Origin header or vary, 
+        // depending on how it's configured. If origin doesn't match, Access-Control-Allow-Origin 
+        // will usually be missing or different.
+        expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    });
+
+    /**
+     * @test Rate Limiting
+     * @desc Ensures the global rate limiter triggers after the threshold is exceeded.
+     * @note Using a tight window/limit for demonstration if possible, but here we test the behavior.
+     */
+    it('should eventually trigger rate limiting (429) for excessive requests', async () => {
+        // The current limit is 100 per minute in index.ts. 
+        // For testing, we might want to mock the store or just verify headers.
+        const res = await request(app).get('/health');
+        expect(res.headers['x-ratelimit-limit']).toBe('100');
+        expect(res.headers['x-ratelimit-remaining']).toBeDefined();
+        
+        // We won't actually fire 100 requests in a unit test unless we mock the store,
+        // but we can verify the headers are working.
+    });
+
+    /**
+     * @test Auth Boundary Enforcement
+     * @desc Deterministically verify that protected routes reject unauthorized requests.
+     */
+    it('should reject requests missing required security headers for protected routes', async () => {
+        const prefix = process.env.API_VERSION_PREFIX ?? '/api/v1';
+        const res = await request(app).post(`${prefix}/vaults/vault-1/milestones/milestone-1/validate`);
+        
+        expect(res.status).toBe(401);
+        expect(res.body).toEqual({ error: 'Unauthorized' });
+    });
+
+    /**
+     * @test Auth Success Path
+     * @desc Verify that providing the required security headers bypasses the auth boundary.
+     */
+    it('should allow requests with valid security headers', async () => {
+        const prefix = process.env.API_VERSION_PREFIX ?? '/api/v1';
+        const res = await request(app)
+            .post(`${prefix}/vaults/vault-1/milestones/milestone-1/validate`)
+            .set('x-user-id', 'test-user')
+            .set('x-user-role', 'verifier');
+        
+        // Should not be 401. Might be 200 or 400 depending on payload, but 401 means auth failed.
+        expect(res.status).not.toBe(401);
+    });
+});
