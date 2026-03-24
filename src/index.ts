@@ -12,6 +12,8 @@ import {
   MilestoneValidationEventRepository,
   VerifierAssignmentRepository,
 } from "./vaults/milestoneValidationRoute";
+import { createSessionRouter } from "./middleware/session";
+import { sessionStore } from "./lib/sessionStore";
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -139,9 +141,12 @@ const domainEventPublisher = new ConsoleDomainEventPublisher();
 app.use(createCorsMiddleware());
 app.use(express.json());
 app.use(morgan("dev"));
-app.use(
+// app.use(
 app.use(morgan('dev'));
 app.use(API_VERSION_PREFIX, apiRouter);
+
+// Session management (login, logout, me)
+apiRouter.use(createSessionRouter(sessionStore));
 
 apiRouter.use(
   createMilestoneValidationRouter({
@@ -155,10 +160,12 @@ apiRouter.use(
 
 app.get("/health", async (_req: Request, res: Response) => {
   const db = await dbHealth();
+  const session = sessionStore.stats();
   res.status(db.healthy ? 200 : 503).json({
     status: db.healthy ? "ok" : "degraded",
     service: "revora-backend",
     db,
+    session
   });
 });
 
@@ -170,6 +177,11 @@ apiRouter.get('/overview', (_req: Request, res: Response) => {
       "Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).",
   });
 });
+
+apiRouter.get("/session/stats", (_req: Request, res: Response) => {
+  res.json(sessionStore.stats());
+}));
+ 
 
 const shutdown = async (signal: string) => {
   console.log(`\n[server] ${signal} DB shutting down…`);
