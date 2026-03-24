@@ -7,8 +7,8 @@ import { InvestmentService, CreateInvestmentRequest, createInvestmentService } f
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeMockPool(): jest.Mocked<Pool> {
-  return { query: jest.fn() } as unknown as jest.Mocked<Pool>;
+function makeMockPool(): any {
+  return { query: jest.fn() } as unknown as any;
 }
 
 function makeInvestmentRow(override: Partial<Investment> = {}): Investment {
@@ -38,7 +38,7 @@ function makeOfferingRow(override: Partial<Offering> = {}): Offering {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function mockQueryResult<T = any>(rows: T[]): QueryResult<T> {
+function mockQueryResult<T extends QueryResultRow = any>(rows: T[]): QueryResult<T> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
@@ -47,7 +47,7 @@ function mockQueryResult<T = any>(rows: T[]): QueryResult<T> {
 // ---------------------------------------------------------------------------
 
 describe('InvestmentService', () => {
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
   let investmentRepo: InvestmentRepository;
   let offeringRepo: OfferingRepository;
   let service: InvestmentService;

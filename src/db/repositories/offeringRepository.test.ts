@@ -7,12 +7,12 @@ import {
 
 describe('OfferingRepository', () => {
   let repository: OfferingRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     mockPool = {
       query: jest.fn(),
-    } as unknown as jest.Mocked<Pool>;
+    } as unknown as any;
 
     repository = new OfferingRepository(mockPool);
   });

@@ -1,13 +1,8 @@
 import { Pool, QueryResult } from 'pg';
 
 /**
- * Offering entity
+ * Offering status type
  */
-export interface Offering {
-  id: string;
-  contract_address: string;
-  status: 'draft' | 'active' | 'closed' | 'completed';
-  total_raised: string; // Decimal as string to preserve precision
 export type OfferingStatus =
   | 'draft'
   | 'open'
@@ -18,13 +13,20 @@ export type OfferingStatus =
   | 'completed'
   | string;
 
+/**
+ * Offering entity
+ */
 export interface Offering {
   id: string;
+  contract_address?: string;
   issuer_user_id?: string;
   issuer_id?: string;
   name?: string;
   symbol?: string;
   status?: OfferingStatus;
+  total_raised?: string; // Decimal as string to preserve precision
+  version?: number; // Optimistic lock version
+  sync_hash?: string; // Hash of blockchain state
   created_at?: Date;
   updated_at?: Date;
   [key: string]: unknown;
@@ -55,15 +57,6 @@ export class OfferingRepository {
   constructor(private db: Pool) {}
 
   /**
-   * Find an offering by ID
-   */
-  async findById(id: string): Promise<Offering | null> {
-    const query = `SELECT * FROM offerings WHERE id = $1 LIMIT 1`;
-    const result: QueryResult<Offering> = await this.db.query(query, [id]);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
-  }
-
-  /**
    * Find an offering by contract address
    */
   async findByContractAddress(
@@ -73,7 +66,7 @@ export class OfferingRepository {
     const result: QueryResult<Offering> = await this.db.query(query, [
       contractAddress,
     ]);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
+    return result.rows.length > 0 ? this.mapOffering(result.rows[0] as Record<string, unknown>) : null;
   }
 
   /**
@@ -82,7 +75,7 @@ export class OfferingRepository {
   async listAll(): Promise<Offering[]> {
     const query = `SELECT * FROM offerings ORDER BY created_at DESC`;
     const result: QueryResult<Offering> = await this.db.query(query);
-    return result.rows.map((row: any) => this.mapOffering(row));
+    return result.rows.map((row: any) => this.mapOffering(row as Record<string, unknown>));
   }
 
   /**
@@ -118,25 +111,8 @@ export class OfferingRepository {
     `;
 
     const result: QueryResult<Offering> = await this.db.query(query, values);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
+    return result.rows.length > 0 ? this.mapOffering(result.rows[0] as unknown as Record<string, unknown>) : null;
   }
-
-  /**
-   * Map database row to Offering entity
-   */
-  private mapOffering(row: any): Offering {
-    return {
-      id: row.id,
-      contract_address: row.contract_address,
-      status: row.status,
-      total_raised: row.total_raised,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-    };
-  }
-}
-export class OfferingRepository {
-  constructor(private db: Pool) {}
 
   async create(offering: CreateOfferingInput): Promise<Offering> {
     const entries = this.getDefinedEntries(offering);

@@ -3,7 +3,7 @@ import { Pool } from 'pg';
 import { createStartupAuthRouter } from './startupAuth';
 
 describe('StartupAuth Route', () => {
-    let mockDb: jest.Mocked<Pool>;
+    let mockDb: any;
     let mockReq: Partial<Request>;
     let mockRes: Partial<Response>;
     let jsonSpy: jest.Mock;

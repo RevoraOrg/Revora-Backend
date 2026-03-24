@@ -79,7 +79,7 @@ export function issueToken(options: TokenOptions): string {
 
   const signOptions: jwt.SignOptions = {
     algorithm,
-    expiresIn: options.expiresIn || TOKEN_EXPIRY,
+    expiresIn: (options.expiresIn || TOKEN_EXPIRY) as any,
     subject: options.subject,
   };
 

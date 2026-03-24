@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
-import { authMiddleware, verifyJwt, requireInvestor, AuthenticatedRequest } from './auth';
-import { requireAuth } from './requireAuth';
+import { authMiddleware, verifyJwt, requireInvestor, requireAuth, AuthenticatedRequest } from './auth';
+
 import { signJwt } from '../utils/jwt';
 import { issueToken } from '../lib/jwt';
 import { AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
@@ -100,7 +100,7 @@ describe('authMiddleware', () => {
 
   describe('valid token', () => {
     it('attaches user to request with valid token', () => {
-      const token = issueToken({ subject: 'user-123', email: 'test@example.com' });
+      const token = issueToken({ subject: 'user-123', additionalPayload: { email: 'test@example.com' } });
       const req = { headers: { authorization: `Bearer ${token}` } } as Request;
       const res = mockRes();
       const next = jest.fn();

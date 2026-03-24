@@ -7,11 +7,12 @@ const mockUser: User = {
   password_hash: 'salt:hash',
   created_at: new Date('2024-01-01'),
   updated_at: new Date('2024-01-01'),
+  role: 'startup'
 };
 
 describe('UserRepository', () => {
   let repository: UserRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     mockPool = { query: jest.fn() } as any;

@@ -96,11 +96,11 @@ function mockQueryResult(rows: Investment[]): QueryResult<Investment> {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/investments route handler', () => {
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     process.env['JWT_SECRET'] = SECRET;
-    mockPool = { query: jest.fn() } as unknown as jest.Mocked<Pool>;
+    mockPool = { query: jest.fn() } as unknown as any;
   });
 
   afterEach(() => {

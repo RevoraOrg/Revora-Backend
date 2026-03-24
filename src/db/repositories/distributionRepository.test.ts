@@ -9,7 +9,7 @@ import {
 
 describe('DistributionRepository', () => {
   let repository: DistributionRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     // Mock Pool
@@ -135,7 +135,7 @@ describe('DistributionRepository', () => {
             investor_id: 'investor-456',
             amount: '500.25',
             status: 'pending',
-            transaction_hash: null,
+            transaction_hash: undefined,
             created_at: new Date(),
             updated_at: new Date(),
           },
@@ -307,7 +307,7 @@ describe('DistributionRepository', () => {
             investor_id: 'investor-456',
             amount: '300.00',
             status: 'pending',
-            transaction_hash: null,
+            transaction_hash: undefined,
             created_at: new Date('2024-01-10'),
             updated_at: new Date('2024-01-10'),
           },

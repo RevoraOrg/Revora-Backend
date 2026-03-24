@@ -73,7 +73,7 @@ export class OfferingSyncService {
       if (r.status === 'fulfilled') return r.value;
       return {
         offeringId: offerings[i].id,
-        contractAddress: offerings[i].contract_address,
+        contractAddress: offerings[i].contract_address ?? '',
         success: false,
         updated: false,
         error: r.reason?.message ?? 'Unknown error',
@@ -86,8 +86,9 @@ export class OfferingSyncService {
    */
   private async syncFromChain(offering: Offering): Promise<SyncResult> {
     try {
+      const contractAddress = offering.contract_address ?? '';
       const onChain = await this.stellarClient.getOfferingState(
-        offering.contract_address
+        contractAddress
       );
 
       const hasChanged =
@@ -97,7 +98,7 @@ export class OfferingSyncService {
       if (!hasChanged) {
         return {
           offeringId: offering.id,
-          contractAddress: offering.contract_address,
+          contractAddress: contractAddress,
           success: true,
           updated: false,
         };
@@ -112,14 +113,14 @@ export class OfferingSyncService {
 
       return {
         offeringId: offering.id,
-        contractAddress: offering.contract_address,
+        contractAddress: contractAddress,
         success: true,
         updated: true,
       };
     } catch (err: any) {
       return {
         offeringId: offering.id,
-        contractAddress: offering.contract_address,
+        contractAddress: offering.contract_address ?? '',
         success: false,
         updated: false,
         error: err.message ?? 'Unknown error',

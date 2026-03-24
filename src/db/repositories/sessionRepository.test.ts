@@ -11,7 +11,7 @@ const mockSession: Session = {
 
 describe('SessionRepository', () => {
   let repository: SessionRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     mockPool = { query: jest.fn() } as any;
