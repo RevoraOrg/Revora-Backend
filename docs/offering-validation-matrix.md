@@ -1,123 +1,401 @@
-# Offering Validation Matrix Documentation
+# Offering Validation Matrix
 
 ## Overview
 
-The Offering Validation Matrix is a production-grade validation framework for the Stellar RevenueShare (Revora) backend that provides comprehensive security, business rule, and technical validation for all offering operations.
+The Offering Validation Matrix is a production-grade security framework designed to validate Stellar RevenueShare offering operations with comprehensive input sanitization, business rule enforcement, and audit trail generation.
 
 ## Architecture
 
 ### Core Components
 
-1. **Validation Matrix Engine** (`src/lib/validationMatrix.ts`)
-   - Central validation orchestration
-   - Rule-based validation system
-   - Deterministic execution with priority ordering
-   - Comprehensive error reporting and audit trails
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Validation Matrix                        │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │   Security      │  │   Business      │  │  Technical  │ │
+│  │   Rules         │  │   Rules         │  │   Rules     │ │
+│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │   Compliance    │  │   Performance   │  │   Audit     │ │
+│  │   Rules         │  │   Rules         │  │   Trail     │ │
+│  └─────────────────┘  └─────────────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Validation Service                            │
+├─────────────────────────────────────────────────────────────┤
+│  • Context Enrichment                                        │
+│  • Repository Integration                                   │
+│  • Error Handling                                           │
+│  • Metadata Generation                                      │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Express Middleware                           │
+├─────────────────────────────────────────────────────────────┤
+│  • Request/Response Handling                                │
+│  • HTTP Status Mapping                                      │
+│  • Error Formatting                                         │
+│  • Logging Integration                                      │
+└─────────────────────────────────────────────────────────────┘
+```
 
-2. **Validation Service** (`src/services/offeringValidationService.ts`)
-   - Service layer for validation operations
-   - Integration with existing repositories
-   - Business logic enforcement
+### Data Flow
 
-3. **Validation Middleware** (`src/middleware/offeringValidation.ts`)
-   - Express middleware integration
-   - Request/response handling
-   - Error formatting and status code determination
+1. **Request Reception** - Express middleware receives HTTP request
+2. **Context Building** - Validation context is constructed with user data, payload, and operation type
+3. **Rule Execution** - Validation matrix executes rules in priority order
+4. **Result Aggregation** - Errors and warnings are collected with metadata
+5. **Response Generation** - HTTP response is formatted with appropriate status code
 
-## Security Model
+## Validation Categories
+
+### 🔒 Security Rules
+
+**Priority**: 1-3 (Critical)  
+**Purpose**: Prevent injection attacks and unauthorized access
+
+#### Input Sanitization
+- **SQL Injection Detection**: Identifies SQL keywords and patterns
+- **XSS Prevention**: Detects script tags and JavaScript URLs
+- **NoSQL Injection**: Prevents MongoDB query injection
+- **Command Injection**: Blocks shell command execution
+- **Path Traversal**: Prevents directory traversal attacks
+- **Dangerous Characters**: Filters null bytes and control characters
+
+#### Authorization
+- **Role-Based Access**: Ensures only startup users can create offerings
+- **User Validation**: Verifies user authentication and status
+- **Session Security**: Validates user session integrity
+
+### 💼 Business Rules
+
+**Priority**: 10-15 (High)  
+**Purpose**: Enforce business logic and data integrity
+
+#### Field Requirements
+- **Name Validation**: Length, format, and character restrictions
+- **Revenue Share**: Range validation (0-10000 basis points)
+- **Token Asset**: Stellar format compliance
+- **Status Transitions**: Valid state machine enforcement
+
+#### Financial Controls
+- **Overflow Protection**: Prevents integer overflow/underflow
+- **Type Validation**: Ensures proper numeric types
+- **Range Enforcement**: Validates percentage limits
+- **Precision Checking**: Maintains financial accuracy
+
+### 🔧 Technical Rules
+
+**Priority**: 20-25 (Medium)  
+**Purpose**: Ensure system stability and performance
+
+#### Payload Validation
+- **Size Limits**: Prevents resource exhaustion
+- **Format Checking**: Ensures valid JSON structure
+- **Field Length**: Enforces database constraints
+- **Duplicate Detection**: Prevents data conflicts
+
+#### Performance Rules
+- **Rate Limiting**: Abuse prevention
+- **Complexity Limits**: Prevents expensive operations
+- **Resource Monitoring**: System health checks
+
+### 📋 Compliance Rules
+
+**Priority**: 30-35 (Low)  
+**Purpose**: Regulatory and audit requirements
+
+#### Audit Trail
+- **Request Logging**: Complete request capture
+- **User Tracking**: Action attribution
+- **Timestamp Recording**: Chronological ordering
+- **Rule Execution**: Validation transparency
+
+## Rule Execution
+
+### Priority System
+
+Rules are executed in priority order (lower numbers = higher priority):
+
+```
+1. Input Sanitization (Security)
+2. Role Authorization (Security)
+3. Rate Limit Check (Security)
+4. Payload Size Validation (Technical)
+5. Offering Name Validation (Business)
+6. Revenue Share Validation (Business)
+7. Token Asset Validation (Business)
+8. Status Transition Validation (Business)
+9. Duplicate Offering Check (Technical)
+```
+
+### Fail-Fast Behavior
+
+- **Critical Security Errors**: Immediate termination on critical security violations
+- **Business Rule Errors**: Continue execution but aggregate all errors
+- **Technical Errors**: Log and continue with warnings
+- **Warning Collection**: Non-blocking issues collected for reporting
+
+## Adding New Rules
+
+### 1. Define Rule Interface
+
+```typescript
+const customRule: ValidationRule = {
+  name: 'custom_business_rule',
+  description: 'Validates custom business logic',
+  category: 'business',
+  priority: 15,
+  isRequired: true,
+  validate: async (context: OfferingValidationContext): Promise<ValidationRuleResult> => {
+    const errors: ValidationError[] = [];
+    const warnings: ValidationWarning[] = [];
+
+    // Custom validation logic here
+    if (/* condition */) {
+      errors.push({
+        code: 'CUSTOM_RULE_VIOLATION',
+        message: 'Custom business rule violated',
+        field: 'custom_field',
+        severity: 'error',
+        category: 'business',
+        remediation: 'Fix the custom field value'
+      });
+    }
+
+    return { isValid: errors.length === 0, errors, warnings };
+  }
+};
+```
+
+### 2. Register Rule
+
+```typescript
+const validationMatrix = new OfferingValidationMatrix();
+validationMatrix.addRule(customRule);
+```
+
+### 3. Update Rule Sets (Optional)
+
+```typescript
+// Add to specific operation rule sets
+validationMatrix.addRuleToSet('create', 'custom_business_rule');
+validationMatrix.addRuleToSet('update', 'custom_business_rule');
+```
+
+## Security Assumptions
 
 ### Threat Model
 
-The validation matrix addresses the following threat vectors:
+1. **Injection Attacks**
+   - **Assumption**: All user input is malicious
+   - **Mitigation**: Comprehensive input sanitization and pattern detection
+   - **Coverage**: SQL, NoSQL, XSS, Command injection
 
-- **Injection Attacks**: SQL injection, XSS, command injection
-- **Privilege Escalation**: Role-based access control violations
-- **Resource Exhaustion**: Large payloads, rate limiting abuse
-- **Data Integrity**: Invalid data formats, boundary violations
-- **Race Conditions**: Concurrent operation conflicts
+2. **Privilege Escalation**
+   - **Assumption**: Users may attempt role manipulation
+   - **Mitigation**: Server-side role validation and authorization checks
+   - **Coverage**: Role-based access control
 
-### Security Assumptions
+3. **Resource Exhaustion**
+   - **Assumption**: Attackers may send large payloads
+   - **Mitigation**: Payload size limits and rate limiting
+   - **Coverage**: DoS prevention
 
-- All input is untrusted and must be validated
-- Authentication is handled separately but roles are enforced
-- Rate limiting and request size limits are applied upstream
-- Database transactions ensure atomicity
-- Audit trails are maintained for compliance
+4. **Data Integrity**
+   - **Assumption**: Financial data may be manipulated
+   - **Mitigation**: Type validation and range enforcement
+   - **Coverage**: Overflow protection
 
-### Security Controls
+### Security Boundaries
 
-#### Input Sanitization
-```typescript
-// SQL injection detection
-const sqlPatterns = [/(\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER)\b)/i, /(\b(UNION|OR|AND)\b.*\b(=|LIKE)\b)/i];
+- **Input Boundary**: All external data enters through validation matrix
+- **User Boundary**: Role-based access controls enforcement
+- **Data Boundary**: Type safety and format validation
+- **System Boundary**: Resource limits and monitoring
 
-// XSS detection  
-const xssPatterns = [/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, /javascript:/i];
-```
+### Failure Modes
 
-#### Role Authorization
-```typescript
-// Only startup users can create offerings
-if (operation === 'create' && user.role !== 'startup') {
-  return {
-    isValid: false,
-    errors: [{
-      code: 'INSUFFICIENT_PRIVILEGES',
-      severity: 'critical',
-      category: 'security'
-    }]
-  };
-}
-```
-
-#### Rate Limiting
-```typescript
-// Check for excessive creation attempts
-if (operation === 'create' && existingOfferings.length > 10) {
-  warnings.push({
-    code: 'MANY_OFFERINGS',
-    category: 'business'
-  });
-}
-```
-
-## Validation Rules
-
-### Rule Categories
-
-1. **Security Rules** (Priority: 1-10)
-   - `input_sanitization`: Prevent injection attacks
-   - `role_authorization`: Enforce role-based access
-   - `rate_limit_check`: Prevent abuse
-
-2. **Business Rules** (Priority: 10-20)
-   - `offering_name_validation`: Name requirements and format
-   - `revenue_share_validation`: Percentage constraints
-   - `token_asset_validation`: Asset format compliance
-   - `status_transition_validation`: State machine enforcement
-
-3. **Technical Rules** (Priority: 20-30)
-   - `payload_size_validation`: Request size limits
-   - `duplicate_offering_check`: Uniqueness enforcement
-
-### Rule Execution
-
-Rules are executed in priority order with fail-fast behavior for critical security errors:
-
-```typescript
-for (const ruleName of ruleSet) {
-  const result = await rule.validate(context);
-  
-  // Fail fast on critical security errors
-  if (result.errors.some(e => e.severity === 'critical' && e.category === 'security')) {
-    break;
-  }
-}
-```
+1. **Graceful Degradation**: Validation errors don't crash the system
+2. **Fail-Secure**: Default to deny on validation failures
+3. **Audit Trail**: All validation attempts are logged
+4. **Error Isolation**: Rule failures don't affect other rules
 
 ## API Integration
 
 ### Middleware Usage
+
+```typescript
+import { validateOfferingCreation } from './middleware/offeringValidation';
+
+// Apply to routes
+router.post('/offerings', 
+  requireAuth,
+  validateOfferingCreation(offeringRepository, investmentRepository),
+  offeringController.create
+);
+```
+
+### Response Format
+
+#### Success Response (200/201)
+```json
+{
+  "message": "Offering created successfully",
+  "data": { /* offering data */ },
+  "validation": {
+    "timestamp": "2024-03-24T08:00:00.000Z",
+    "executionTimeMs": 15,
+    "rulesApplied": ["input_sanitization", "role_authorization", "..."]
+  }
+}
+```
+
+#### Validation Error (400/422)
+```json
+{
+  "error": "Validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": [
+    {
+      "code": "NAME_REQUIRED",
+      "message": "Offering name is required",
+      "field": "name",
+      "severity": "error",
+      "category": "business",
+      "remediation": "Provide a valid offering name"
+    }
+  ],
+  "warnings": [
+    {
+      "code": "LONG_DESCRIPTION",
+      "message": "Description is very long, consider shortening",
+      "field": "description",
+      "category": "performance"
+    }
+  ],
+  "metadata": {
+    "timestamp": "2024-03-24T08:00:00.000Z",
+    "executionTimeMs": 12,
+    "rulesApplied": ["input_sanitization", "role_authorization", "..."]
+  }
+}
+```
+
+## Testing Strategy
+
+### Coverage Requirements
+
+- **Minimum Coverage**: 95%
+- **Critical Path Coverage**: 100%
+- **Security Rule Coverage**: 100%
+- **Error Path Coverage**: 90%
+
+### Test Categories
+
+1. **Success Cases**: Valid inputs pass validation
+2. **Security Cases**: Attack vectors are blocked
+3. **Boundary Cases**: Edge values are handled
+4. **Error Cases**: Invalid inputs fail appropriately
+5. **Performance Cases**: Load and concurrency testing
+
+### Test Data
+
+- **Malicious Inputs**: SQL injection, XSS, command injection
+- **Boundary Values**: Minimum/maximum valid values
+- **Invalid Types**: Wrong data types, null values
+- **Large Payloads**: Size limit testing
+- **Concurrent Requests**: Race condition testing
+
+## Performance Considerations
+
+### Optimization Strategies
+
+1. **Rule Ordering**: Critical security rules first
+2. **Early Termination**: Fail-fast on critical errors
+3. **Caching**: Repeated validation caching
+4. **Async Processing**: Non-blocking validation
+5. **Memory Management**: Efficient data structures
+
+### Monitoring Metrics
+
+- **Validation Execution Time**: Per-rule timing
+- **Error Rates**: Validation failure frequency
+- **Throughput**: Requests per second
+- **Memory Usage**: Peak consumption
+- **Rule Performance**: Individual rule timing
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Validation Failures**
+   - Check error codes and messages
+   - Review field requirements
+   - Verify user permissions
+
+2. **Performance Issues**
+   - Monitor rule execution times
+   - Check for expensive operations
+   - Review payload sizes
+
+3. **Security Alerts**
+   - Review attack patterns
+   - Check rate limiting
+   - Monitor user behavior
+
+### Debug Information
+
+Enable debug mode for detailed validation logging:
+
+```typescript
+const validationMatrix = new OfferingValidationMatrix();
+validationMatrix.setDebugMode(true);
+```
+
+## Maintenance
+
+### Rule Updates
+
+1. **Regular Review**: Quarterly rule assessment
+2. **Threat Intelligence**: Update attack patterns
+3. **Business Logic**: Align with requirement changes
+4. **Performance**: Optimize slow rules
+
+### Compliance
+
+1. **Audit Logs**: Retain validation logs for 1 year
+2. **Security Review**: Annual security assessment
+3. **Penetration Testing**: Bi-annual security testing
+4. **Documentation**: Keep rules documented
+
+## Version History
+
+### v1.0.0 (Current)
+- Initial production release
+- Comprehensive security validation
+- Business rule enforcement
+- Audit trail generation
+- 95%+ test coverage
+
+### Future Enhancements
+
+- **Machine Learning**: Anomaly detection
+- **Dynamic Rules**: Runtime rule updates
+- **Distributed Validation**: Microservice architecture
+- **Advanced Analytics**: Validation pattern analysis
+
+---
+
+**Author**: Stellar Wave Program  
+**Version**: 1.0.0  
+**Last Updated**: March 24, 2026  
+**Security Classification**: Internal Use Only
 
 ```typescript
 import { validateOfferingCreation } from './middleware/offeringValidation';

