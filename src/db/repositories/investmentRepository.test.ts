@@ -8,13 +8,13 @@ import {
 
 describe('InvestmentRepository', () => {
   let repository: InvestmentRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     // Mock Pool
     mockPool = {
       query: jest.fn(),
-    } as unknown as jest.Mocked<Pool>;
+    } as unknown as any;
 
     repository = new InvestmentRepository(mockPool);
   });

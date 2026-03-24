@@ -50,8 +50,8 @@ describe('requestLogMiddleware', () => {
   });
 
   it('should audit sensitive action', () => {
-    mockReq.method = 'POST';
-    mockReq.path = '/auth/login';
+    (mockReq as any).method = 'POST';
+    (mockReq as any).path = '/auth/login';
     (mockReq as any).user = { id: 'user-123' };
 
     const middleware = requestLogMiddleware();
@@ -68,8 +68,8 @@ describe('requestLogMiddleware', () => {
   });
 
   it('should not audit non-sensitive action', () => {
-    mockReq.method = 'GET';
-    mockReq.path = '/health';
+    (mockReq as any).method = 'GET';
+    (mockReq as any).path = '/health';
 
     const middleware = requestLogMiddleware();
     middleware(mockReq as Request, mockRes as Response, mockNext);

@@ -23,15 +23,13 @@ export const createNotificationPreferencesRouter = ({
     }
 
     try {
-      const preferences = await notificationPreferencesRepository.getByUserId(userId);
-      if (!preferences) {
-        return res.json({
-          email_notifications: true,
-          push_notifications: true,
-          sms_notifications: false,
-        });
-      }
-      res.json(preferences);
+      const prefs = await notificationPreferencesRepository.listPreferences({ user_id: userId });
+      
+      return res.json({
+        email_notifications: prefs.find(p => p.channel === 'email')?.enabled ?? true,
+        push_notifications: prefs.find(p => p.channel === 'push')?.enabled ?? true,
+        sms_notifications: false,
+      });
     } catch (error) {
       res.status(500).json({ error: 'Failed to fetch notification preferences' });
     }
@@ -43,15 +41,22 @@ export const createNotificationPreferencesRouter = ({
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { email_notifications, push_notifications, sms_notifications } = req.body;
+    const { email_notifications, push_notifications } = req.body;
 
     try {
-      const updated = await notificationPreferencesRepository.upsert(userId, {
-        email_notifications,
-        push_notifications,
-        sms_notifications,
+      if (email_notifications !== undefined) {
+         await notificationPreferencesRepository.upsertPreference({ user_id: userId, channel: 'email', type: 'global', enabled: email_notifications });
+      }
+      if (push_notifications !== undefined) {
+         await notificationPreferencesRepository.upsertPreference({ user_id: userId, channel: 'push', type: 'global', enabled: push_notifications });
+      }
+      
+      const prefs = await notificationPreferencesRepository.listPreferences({ user_id: userId });
+      res.json({
+        email_notifications: prefs.find(p => p.channel === 'email')?.enabled ?? true,
+        push_notifications: prefs.find(p => p.channel === 'push')?.enabled ?? true,
+        sms_notifications: false,
       });
-      res.json(updated);
     } catch (error) {
       res.status(500).json({ error: 'Failed to update notification preferences' });
     }

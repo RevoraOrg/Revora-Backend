@@ -102,7 +102,7 @@ describe("jwt utilities", () => {
     it("should verify valid token and return payload", () => {
       const token = issueToken({
         subject: "user-123",
-        email: "test@example.com",
+        additionalPayload: { email: "test@example.com" },
       });
 
       const payload = verifyToken(token);

@@ -7,7 +7,7 @@ import {
 
 describe('AuditLogRepository', () => {
   let repository: AuditLogRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: any;
 
   beforeEach(() => {
     // Mock Pool
@@ -84,12 +84,12 @@ describe('AuditLogRepository', () => {
         rows: [
           {
             id: 'audit-124',
-            user_id: null,
+            user_id: undefined,
             action: 'create_offering',
-            resource: null,
-            details: null,
-            ip_address: null,
-            user_agent: null,
+            resource: undefined,
+            details: undefined,
+            ip_address: undefined,
+            user_agent: undefined,
             created_at: new Date(),
           },
         ],
