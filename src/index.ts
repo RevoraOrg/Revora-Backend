@@ -12,6 +12,7 @@ import {
   MilestoneValidationEventRepository,
   VerifierAssignmentRepository,
 } from "./vaults/milestoneValidationRoute";
+import os from 'os';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -195,6 +196,55 @@ if (process.env.NODE_ENV !== "test") {
     // eslint-disable-next-line no-console
     console.log(`revora-backend listening on http://localhost:${port}`);
   });
+}
+
+/**
+ * Webhook Delivery Backoff Queue
+ * Requirements: 95% coverage, SSRF Protection, Exponential Backoff.
+ */
+export class WebhookQueue {
+  private static MAX_RETRIES = 5;
+  private static INITIAL_DELAY = 1000; // 1s
+
+  // SSRF Protection: Block internal/private IP ranges
+  private static isSafeUrl(url: string): boolean {
+    const privateIPs = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
+    try {
+      const { hostname } = new URL(url);
+      return !privateIPs.test(hostname) && hostname !== 'localhost';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Calculates delay: 1s, 2s, 4s, 8s, 16s...
+   */
+  static getBackoffDelay(retryCount: number): number {
+    if (retryCount >= this.MAX_RETRIES) return -1;
+    return this.INITIAL_DELAY * Math.pow(2, retryCount);
+  }
+
+  static async processDelivery(url: string, payload: object, attempt = 0): Promise<boolean> {
+    if (!this.isSafeUrl(url)) {
+      console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
+      return false;
+    }
+
+    try {
+      // Logic for actual fetch call would go here
+      // For now, we simulate a failure to test the backoff
+      throw new Error("Simulated Network Failure");
+    } catch (err) {
+      const nextDelay = this.getBackoffDelay(attempt);
+      if (nextDelay !== -1) {
+        console.log(`Retrying in ${nextDelay}ms (Attempt ${attempt + 1})`);
+        // In production, this would be a job queue like BullMQ
+        return new Promise(res => setTimeout(() => res(this.processDelivery(url, payload, attempt + 1)), nextDelay));
+      }
+      return false; // Max retries exceeded
+    }
+  }
 }
 
 export default app;
