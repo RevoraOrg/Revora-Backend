@@ -176,11 +176,11 @@ apiRouter.get('/overview', (_req: Request, res: Response) => {
     description:
       "Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).",
   });
-});
+})});
 
 apiRouter.get("/session/stats", (_req: Request, res: Response) => {
   res.json(sessionStore.stats());
-}));
+});
  
 
 const shutdown = async (signal: string) => {

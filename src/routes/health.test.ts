@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { Pool } from 'pg';
 import { healthReadyHandler } from './health';
+import { createCorsMiddleware } from "../middleware/cors";
 
 // Mock fetch for Stellar check
 global.fetch = jest.fn();
@@ -71,5 +72,92 @@ describe('Health Router', () => {
 
         expect(statusMock).toHaveBeenCalledWith(503);
         expect(jsonMock).toHaveBeenCalledWith({ status: 'error', message: 'Stellar Horizon is down' });
+    });
+});
+
+
+describe("CORS policy tightening", () => {
+    beforeEach(() => {
+        process.env.ALLOWED_ORIGINS =
+            "http://allowed.com,http://localhost:3000";
+
+        process.env.CORS_ALLOW_NO_ORIGIN = "true";
+    });
+
+    it("allows allowed origin", (done) => {
+        const middleware = createCorsMiddleware();
+
+        const req: any = {
+            headers: { origin: "http://allowed.com" },
+        };
+
+        const res: any = {};
+
+        middleware(req, res, () => {
+            done();
+        });
+    });
+
+    it("blocks disallowed origin", (done) => {
+        const middleware = createCorsMiddleware();
+
+        const req: any = {
+            headers: { origin: "http://evil.com" },
+        };
+
+        const res: any = {};
+
+        middleware(req, res, () => {
+            done();
+        });
+    });
+
+    it("allows no origin when enabled", (done) => {
+        process.env.CORS_ALLOW_NO_ORIGIN = "true";
+
+        const middleware = createCorsMiddleware();
+
+        const req: any = {
+            headers: {},
+        };
+
+        const res: any = {};
+
+        middleware(req, res, () => {
+            done();
+        });
+    });
+
+    it("blocks no origin when disabled", (done) => {
+        process.env.CORS_ALLOW_NO_ORIGIN = "false";
+
+        const middleware = createCorsMiddleware();
+
+        const req: any = {
+            headers: {},
+        };
+
+        const res: any = {};
+
+        middleware(req, res, () => {
+            done();
+        });
+    });
+
+    it("supports multiple origins", (done) => {
+        process.env.ALLOWED_ORIGINS =
+            "http://a.com,http://b.com";
+
+        const middleware = createCorsMiddleware();
+
+        const req: any = {
+            headers: { origin: "http://b.com" },
+        };
+
+        const res: any = {};
+
+        middleware(req, res, () => {
+            done();
+        });
     });
 });
