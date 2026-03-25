@@ -1,4 +1,3 @@
-import assert from 'assert';
 import { createDistributionHandlers } from './distributions';
 
 class MockEngine {
@@ -17,47 +16,121 @@ class MockOfferingRepo {
 function makeReq(user: any, params: any = {}, body: any = {}) { return { user, params, body } as any; }
 function makeRes() { let statusCode = 200; let jsonData: any = null; return { status(code: number) { statusCode = code; return this; }, json(obj: any) { jsonData = obj; return this; }, _get() { return { statusCode, jsonData }; } } as any; }
 
-(async function run() {
-  const engine = new MockEngine();
-  const offeringRows: any = { off1: { id: 'off1', issuer_id: 's1' } };
-  const repo = new MockOfferingRepo(offeringRows);
-  const handlers = createDistributionHandlers(engine as any, repo as any);
+describe('Distribution Trigger Authorization', () => {
+  let engine: MockEngine;
+  let offeringRows: any;
+  let repo: MockOfferingRepo;
+  let handlers: any;
 
-  // Admin success
-  const req1 = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
-  const res1 = makeRes();
-  await handlers.triggerDistribution(req1, res1, (e: any) => { throw e; });
-  const out1 = res1._get();
-  assert(out1.statusCode === 200);
-  assert(out1.jsonData.run_id === 'run-1');
+  beforeEach(() => {
+    engine = new MockEngine();
+    offeringRows = { off1: { id: 'off1', issuer_id: 's1' } };
+    repo = new MockOfferingRepo(offeringRows);
+    handlers = createDistributionHandlers(engine as any, repo as any);
+  });
 
-  // Startup owner success
-  const req2 = makeReq({ id: 's1', role: 'startup' }, { id: 'off1' }, { revenueAmount: 200, start: new Date().toISOString(), end: new Date().toISOString() });
-  const res2 = makeRes();
-  await handlers.triggerDistribution(req2, res2, (e: any) => { throw e; });
-  const out2 = res2._get();
-  assert(out2.statusCode === 200);
+  it('should allow admin to trigger distribution', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+    expect(out.jsonData.run_id).toBe('run-1');
+  });
 
-  // Forbidden startup (not issuer)
-  const req3 = makeReq({ id: 's2', role: 'startup' }, { id: 'off1' }, { revenue_amount: 50, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
-  const res3 = makeRes();
-  await handlers.triggerDistribution(req3, res3, (e: any) => { throw e; });
-  const out3 = res3._get();
-  assert(out3.statusCode === 403);
+  it('should allow startup owner to trigger distribution', async () => {
+    const req = makeReq({ id: 's1', role: 'startup' }, { id: 'off1' }, { revenueAmount: 200, start: new Date().toISOString(), end: new Date().toISOString() });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(200);
+  });
 
-  // Unauthorized
-  const req4 = makeReq(null, { id: 'off1' }, { revenue_amount: 10, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
-  const res4 = makeRes();
-  await handlers.triggerDistribution(req4, res4, (e: any) => { throw e; });
-  const out4 = res4._get();
-  assert(out4.statusCode === 401);
+  it('should forbid startup non-owner from triggering distribution', async () => {
+    const req = makeReq({ id: 's2', role: 'startup' }, { id: 'off1' }, { revenue_amount: 50, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(403);
+  });
 
-  // Bad input
-  const req5 = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { period: { start: new Date().toISOString() } });
-  const res5 = makeRes();
-  await handlers.triggerDistribution(req5, res5, (e: any) => { throw e; });
-  const out5 = res5._get();
-  assert(out5.statusCode === 400);
+  it('should return 401 for unauthorized user', async () => {
+    const req = makeReq(null, { id: 'off1' }, { revenue_amount: 10, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(401);
+  });
 
-  console.log('distributions route tests passed');
-})();
+  it('should return 400 for invalid input', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { period: { start: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should handle missing offering ID', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, {}, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should handle non-existent offering', async () => {
+    const req = makeReq({ id: 's1', role: 'startup' }, { id: 'off2' }, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(404);
+  });
+
+  it('should handle zero revenue amount', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: 0, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should handle negative revenue amount', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: -10, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should handle missing period end date', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: 100, period: { start: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should handle invalid date format', async () => {
+    const req = makeReq({ id: 'admin1', role: 'admin' }, { id: 'off1' }, { revenue_amount: 100, period: { start: 'invalid-date', end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(400);
+  });
+
+  it('should forbid investor role', async () => {
+    const req = makeReq({ id: 'inv1', role: 'investor' }, { id: 'off1' }, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(403);
+  });
+
+  it('should forbid verifier role', async () => {
+    const req = makeReq({ id: 'ver1', role: 'verifier' }, { id: 'off1' }, { revenue_amount: 100, period: { start: new Date().toISOString(), end: new Date().toISOString() } });
+    const res = makeRes();
+    await handlers.triggerDistribution(req, res, (e: any) => { throw e; });
+    const out = res._get();
+    expect(out.statusCode).toBe(403);
+  });
+});

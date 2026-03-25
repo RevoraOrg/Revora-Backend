@@ -1,10 +1,9 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import morgan from "morgan";
-import { dbHealth, closePool } from "./db/client";
+import { dbHealth, closePool, pool } from "./db/client";
 import { createCorsMiddleware } from "./middleware/cors";
-import {
-  createMilestoneValidationRouter,
+import { createMilestoneValidationRouter,
   DomainEventPublisher,
   Milestone,
   MilestoneRepository,
@@ -12,6 +11,9 @@ import {
   MilestoneValidationEventRepository,
   VerifierAssignmentRepository,
 } from "./vaults/milestoneValidationRoute";
+import { OfferingRepository } from './db/repositories/offeringRepository';
+import { DistributionRepository } from './db/repositories/distributionRepository';
+import createDistributionsRouter from './routes/distributions';
 
 const app = express();
 const port = process.env.PORT ?? 3000;
@@ -73,7 +75,7 @@ class InMemoryVerifierAssignmentRepository implements VerifierAssignmentReposito
 }
 
 class InMemoryMilestoneValidationEventRepository implements MilestoneValidationEventRepository {
-  private events: MilestoneValidationEvent[] = [];
+  private readonly events: MilestoneValidationEvent[] = [];
   private counter = 0;
 
   async create(input: {
@@ -122,6 +124,9 @@ const requireAuth = (req: Request, res: Response, next: () => void): void => {
   next();
 };
 
+const offeringRepository = new OfferingRepository(pool);
+const distributionRepository = new DistributionRepository(pool);
+const distributionEngine = new DistributionEngine(offeringRepository, distributionRepository);
 const milestoneRepository = new InMemoryMilestoneRepository(
   new Map<string, Milestone>([
     [
@@ -157,6 +162,14 @@ apiRouter.use(
     verifierAssignmentRepository,
     milestoneValidationEventRepository,
     domainEventPublisher,
+  }),
+);
+
+apiRouter.use(
+  createDistributionsRouter({
+    distributionEngine,
+    offeringRepo: offeringRepository,
+    verifyJWT: requireAuth,
   }),
 );
 
