@@ -66,11 +66,11 @@ export default function createNotificationsRouter(opts: {
   const router = express.Router();
   const handlers = createNotificationHandlers(opts.notificationRepo);
 
-  // GET /api/notifications
-  router.get('/api/notifications', opts.verifyJWT, handlers.getNotifications);
+  // GET /notifications
+  router.get('/notifications', opts.verifyJWT, handlers.getNotifications);
 
   // PATCH single or bulk
-  router.patch('/api/notifications/:id/read', opts.verifyJWT, handlers.markRead);
+  router.patch('/notifications/:id/read', opts.verifyJWT, handlers.markRead);
 
   return router;
 }

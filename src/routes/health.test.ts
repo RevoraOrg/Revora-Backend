@@ -117,3 +117,70 @@ describe('API Version Prefix Consistency tests', () => {
         expect(res.status).toBe(404);
     });
 });
+
+describe('Notification fan-out reliability', () => {
+    const prefix = process.env.API_VERSION_PREFIX ?? '/api/v1';
+
+    it('should forbid non-admin users', async () => {
+        const res = await request(app)
+            .post(`${prefix}/notifications/fanout`)
+            .set('x-user-id', 'u1')
+            .set('x-user-role', 'user')
+            .send({ type: 'announce', title: 'Hello', body: 'world', recipient_ids: ['u1'] });
+
+        expect(res.status).toBe(403);
+        expect(res.body).toHaveProperty('error', 'Forbidden');
+    });
+
+    it('should require idempotency key', async () => {
+        const res = await request(app)
+            .post(`${prefix}/notifications/fanout`)
+            .set('x-user-id', 'admin')
+            .set('x-user-role', 'admin')
+            .send({ type: 'announce', title: 'Hello', body: 'world', recipient_ids: ['u1'] });
+
+        expect(res.status).toBe(400);
+        expect(res.body).toHaveProperty('error', 'Missing x-idempotency-key header');
+    });
+
+    it('should fan out and honor idempotency', async () => {
+        const idempotencyKey = 'fanout-1';
+        const data = { type: 'announce', title: 'Fanout', body: 'Test', recipient_ids: ['u1', 'u2'] };
+
+        const res1 = await request(app)
+            .post(`${prefix}/notifications/fanout`)
+            .set('x-user-id', 'admin')
+            .set('x-user-role', 'admin')
+            .set('x-idempotency-key', idempotencyKey)
+            .send(data);
+
+        expect(res1.status).toBe(200);
+        expect(res1.body).toMatchObject({ requested: 2, delivered: 2, failed: [], idempotent: false });
+
+        const res2 = await request(app)
+            .post(`${prefix}/notifications/fanout`)
+            .set('x-user-id', 'admin')
+            .set('x-user-role', 'admin')
+            .set('x-idempotency-key', idempotencyKey)
+            .send(data);
+
+        expect(res2.status).toBe(200);
+        expect(res2.body).toMatchObject({ requested: 2, delivered: 2, failed: [], idempotent: false, cached: true });
+
+        const user1 = await request(app)
+            .get(`${prefix}/notifications`)
+            .set('x-user-id', 'u1')
+            .set('x-user-role', 'user');
+
+        expect(user1.status).toBe(200);
+        expect(user1.body.notifications).toHaveLength(1);
+
+        const user2 = await request(app)
+            .get(`${prefix}/notifications`)
+            .set('x-user-id', 'u2')
+            .set('x-user-role', 'user');
+
+        expect(user2.status).toBe(200);
+        expect(user2.body.notifications).toHaveLength(1);
+    });
+});
