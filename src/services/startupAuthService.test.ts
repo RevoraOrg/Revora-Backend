@@ -28,7 +28,7 @@ describe('StartupAuthService', () => {
                 email: input.email,
                 password_hash: 'hashed_password',
                 name: input.name,
-                role: 'startup_admin',
+                role: 'startup',
                 created_at: new Date(),
                 updated_at: new Date(),
             });

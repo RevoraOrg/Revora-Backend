@@ -25,7 +25,8 @@ class MockBalanceProvider {
   }
 }
 
-(async function run() {
+describe('DistributionEngine', () => {
+  it('prorates payouts, preserves totals across rounding, and errors on zero balance', async () => {
   // Test 1: simple proration
   const distRepo1 = new MockDistributionRepo();
   const balances1 = [
@@ -59,6 +60,5 @@ class MockBalanceProvider {
     threw = true;
   }
   assert(threw, 'expected error when total balance is zero');
-
-  console.log('distributionEngine tests passed');
-})();
+  });
+});

@@ -8,15 +8,13 @@ import {
 
 describe('InvestmentRepository', () => {
   let repository: InvestmentRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
     // Mock Pool
-    mockPool = {
-      query: jest.fn(),
-    } as unknown as jest.Mocked<Pool>;
+    mockPool = { query: jest.fn() };
 
-    repository = new InvestmentRepository(mockPool);
+    repository = new InvestmentRepository(mockPool as unknown as Pool);
   });
 
   describe('listByInvestor', () => {

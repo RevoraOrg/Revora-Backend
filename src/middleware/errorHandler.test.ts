@@ -1,277 +1,160 @@
 import { NextFunction, Request, Response } from 'express';
-import { AppError, errorHandler } from './errorHandler';
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+import {
+  AppError,
+  ErrorCode,
+  Errors,
+  createError,
+  sendAppError,
+  throwError,
+} from '../lib/errors';
+import {
+  createStructuredErrorLogEntry,
+  errorHandler,
+  mapUnknownErrorToAppError,
+} from './errorHandler';
 
 function makeReq(requestId?: string): Request {
-  return { requestId } as any;
+  return { requestId } as Request;
 }
 
-function makeRes(): jest.Mocked<Pick<Response, 'status' | 'json'>> & { status: jest.Mock; json: jest.Mock } {
-  const res = {
+function makeRes(): jest.Mocked<Pick<Response, 'status' | 'json'>> {
+  return {
     status: jest.fn().mockReturnThis(),
     json: jest.fn().mockReturnThis(),
-  };
-  return res as any;
+  } as unknown as jest.Mocked<Pick<Response, 'status' | 'json'>>;
 }
 
-const noopNext = jest.fn() as unknown as NextFunction;
-
-// ─── AppError class ───────────────────────────────────────────────────────────
-
-describe('AppError', () => {
-  it('carries statusCode and message', () => {
-    const err = new AppError(422, 'Unprocessable entity');
-    expect(err.statusCode).toBe(422);
-    expect(err.message).toBe('Unprocessable entity');
-    expect(err.name).toBe('AppError');
+describe('lib/errors', () => {
+  it('creates structured AppError responses with request ids', () => {
+    const err = createError(ErrorCode.BAD_REQUEST, 'bad input', 400, { field: 'email' });
+    expect(err.toResponse('rid-1')).toEqual({
+      code: ErrorCode.BAD_REQUEST,
+      message: 'bad input',
+      details: { field: 'email' },
+      requestId: 'rid-1',
+    });
   });
 
-  it('is an instance of Error', () => {
-    const err = new AppError(400, 'Bad');
-    expect(err).toBeInstanceOf(Error);
-    expect(err).toBeInstanceOf(AppError);
+  it('exposes convenience factories with the expected codes', () => {
+    expect(Errors.badRequest('bad').code).toBe(ErrorCode.BAD_REQUEST);
+    expect(Errors.unauthorized().code).toBe(ErrorCode.UNAUTHORIZED);
+    expect(Errors.forbidden().code).toBe(ErrorCode.FORBIDDEN);
+    expect(Errors.notFound().code).toBe(ErrorCode.NOT_FOUND);
+    expect(Errors.conflict('dup').code).toBe(ErrorCode.CONFLICT);
+    expect(Errors.serviceUnavailable().code).toBe(ErrorCode.SERVICE_UNAVAILABLE);
+    expect(Errors.internal().code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(Errors.internal().expose).toBe(false);
   });
 
-  it('has a stack trace', () => {
-    const err = new AppError(500, 'oops');
-    expect(err.stack).toBeDefined();
+  it('throws AppError via throwError helper', () => {
+    expect(() => {
+      throwError(ErrorCode.CONFLICT, 'duplicate', 409, { id: 'x' });
+    }).toThrow(AppError);
+  });
+
+  it('forwards AppError via sendAppError helper', () => {
+    const next = jest.fn();
+    const err = Errors.validationError('bad', { field: 'amount' });
+    sendAppError(next, err);
+    expect(next).toHaveBeenCalledWith(err);
   });
 });
 
-// ─── errorHandler middleware ──────────────────────────────────────────────────
+describe('mapUnknownErrorToAppError', () => {
+  it('returns AppError instances unchanged', () => {
+    const err = Errors.forbidden('Nope');
+    expect(mapUnknownErrorToAppError(err)).toBe(err);
+  });
+
+  it('sanitizes unknown errors into INTERNAL_ERROR', () => {
+    const mapped = mapUnknownErrorToAppError(new Error('secret db password'));
+    expect(mapped.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(mapped.statusCode).toBe(500);
+    expect(mapped.message).toBe('Internal server error');
+    expect(mapped.expose).toBe(false);
+  });
+
+  it('sanitizes non-Error thrown values', () => {
+    const mapped = mapUnknownErrorToAppError('boom');
+    expect(mapped.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(mapped.message).toBe('Internal server error');
+  });
+});
+
+describe('createStructuredErrorLogEntry', () => {
+  const originalEnv = process.env.NODE_ENV;
+
+  afterEach(() => {
+    process.env.NODE_ENV = originalEnv;
+  });
+
+  it('logs structured AppError fields including details', () => {
+    process.env.NODE_ENV = 'production';
+    const entry = createStructuredErrorLogEntry(
+      new AppError(ErrorCode.CONFLICT, 'already exists', 409, { id: 'abc' }),
+      'req-1',
+    );
+
+    expect(entry).toEqual({
+      type: 'error',
+      requestId: 'req-1',
+      code: ErrorCode.CONFLICT,
+      statusCode: 409,
+      message: 'already exists',
+      expose: true,
+      details: { id: 'abc' },
+    });
+  });
+
+  it('includes stack traces for unknown errors outside production', () => {
+    process.env.NODE_ENV = 'test';
+    const entry = createStructuredErrorLogEntry(new Error('boom'));
+    expect(entry.code).toBe(ErrorCode.INTERNAL_ERROR);
+    expect(entry.stack).toContain('Error: boom');
+  });
+
+  it('omits stack traces in production', () => {
+    process.env.NODE_ENV = 'production';
+    const entry = createStructuredErrorLogEntry(new Error('boom'));
+    expect(entry.stack).toBeUndefined();
+  });
+});
 
 describe('errorHandler', () => {
   let consoleErrorSpy: jest.SpyInstance;
-  let originalNodeEnv: string | undefined;
+  const next = jest.fn() as unknown as NextFunction;
 
   beforeEach(() => {
     consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    originalNodeEnv = process.env.NODE_ENV;
+    jest.clearAllMocks();
   });
 
   afterEach(() => {
     consoleErrorSpy.mockRestore();
-    process.env.NODE_ENV = originalNodeEnv;
   });
 
-  // ── AppError handling ─────────────────────────────────────────────────────
-
-  it('responds with AppError statusCode and message', () => {
-    const err = new AppError(404, 'Offering not found');
+  it('responds with structured AppError bodies', () => {
     const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(404);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: 'Offering not found' }),
+    errorHandler(
+      Errors.validationError('bad input', { field: 'amount' }),
+      makeReq('rid-1'),
+      res as unknown as Response,
+      next,
     );
-  });
-
-  it('handles 400 AppError', () => {
-    const err = new AppError(400, 'Invalid input');
-    const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
 
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: 'Invalid input' }));
-  });
-
-  it('handles 403 AppError', () => {
-    const err = new AppError(403, 'Forbidden');
-    const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(403);
-  });
-
-  // ── requestId forwarding ──────────────────────────────────────────────────
-
-  it('includes requestId in response when set on req', () => {
-    const err = new AppError(400, 'Bad');
-    const res = makeRes();
-    errorHandler(err, makeReq('req-abc-123'), res as unknown as Response, noopNext);
-
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ requestId: 'req-abc-123' }),
-    );
-  });
-
-  it('omits requestId from response when not set on req', () => {
-    const err = new AppError(400, 'Bad');
-    const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
-
-    const body = (res.json as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
-    expect(body.requestId).toBeUndefined();
-  });
-
-  // ── Unknown errors ────────────────────────────────────────────────────────
-
-  it('returns 500 for plain Error in production and hides message', () => {
-    process.env.NODE_ENV = 'production';
-    const err = new Error('pg: password authentication failed for user "admin"');
-    const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-    const body = (res.json as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
-    expect(body.error).toBe('Internal Server Error');
-    expect(body.error).not.toContain('authentication failed');
-  });
-
-  it('exposes plain Error message in non-production to aid debugging', () => {
-    process.env.NODE_ENV = 'development';
-    const err = new Error('connection refused');
-    const res = makeRes();
-    errorHandler(err, makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-    const body = (res.json as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
-    expect(body.error).toBe('connection refused');
-  });
-
-  it('returns 500 "Internal Server Error" for non-Error thrown values', () => {
-    const res = makeRes();
-    errorHandler('something broke', makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-    const body = (res.json as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
-    expect(body.error).toBe('Internal Server Error');
-  });
-
-  it('returns 500 for null thrown value', () => {
-    const res = makeRes();
-    errorHandler(null, makeReq(), res as unknown as Response, noopNext);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-  });
-
-  // ── Logging ───────────────────────────────────────────────────────────────
-
-  it('logs a structured JSON entry to console.error', () => {
-    process.env.NODE_ENV = 'development';
-    const err = new AppError(503, 'Service unavailable');
-    errorHandler(err, makeReq('rid-1'), makeRes() as unknown as Response, noopNext);
-
-    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
-    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
-    expect(logged.type).toBe('error');
-    expect(logged.statusCode).toBe(503);
-    expect(logged.message).toBe('Service unavailable');
-    expect(logged.requestId).toBe('rid-1');
-  });
-
-  it('includes stack trace in log in non-production', () => {
-    process.env.NODE_ENV = 'development';
-    const err = new Error('boom');
-    errorHandler(err, makeReq(), makeRes() as unknown as Response, noopNext);
-
-    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
-    expect(logged.stack).toContain('Error: boom');
-  });
-
-  it('omits stack trace from log in production', () => {
-    process.env.NODE_ENV = 'production';
-    const err = new Error('boom');
-    errorHandler(err, makeReq(), makeRes() as unknown as Response, noopNext);
-
-    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
-    expect(logged.stack).toBeUndefined();
-  });
-
-  it('omits stack trace from log for AppError (stack is never leaked)', () => {
-    process.env.NODE_ENV = 'production';
-    const err = new AppError(400, 'bad input');
-    errorHandler(err, makeReq(), makeRes() as unknown as Response, noopNext);
-
-    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
-    expect(logged.stack).toBeUndefined();
-  });
-
-  // ── next() not called ─────────────────────────────────────────────────────
-
-  it('does not call next()', () => {
-    const next = jest.fn() as unknown as NextFunction;
-    errorHandler(new AppError(400, 'bad'), makeReq(), makeRes() as unknown as Response, next);
-    expect(next).not.toHaveBeenCalled();
-import { Request, Response, NextFunction } from 'express';
-import { errorHandler } from './errorHandler';
-import { AppError, ErrorCode, Errors } from '../lib/errors';
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function makeMockRes(): jest.Mocked<Response> {
-  return {
-    status: jest.fn().mockReturnThis(),
-    json: jest.fn().mockReturnThis(),
-  } as unknown as jest.Mocked<Response>;
-}
-
-const req = {} as Request;
-const next = jest.fn() as unknown as NextFunction;
-
-// ─── errorHandler ─────────────────────────────────────────────────────────────
-
-describe('errorHandler', () => {
-  beforeEach(() => jest.clearAllMocks());
-
-  // ── AppError handling ──────────────────────────────────────────────────────
-
-  it('sends the AppError status code', () => {
-    const res = makeMockRes();
-    errorHandler(Errors.notFound('Offering 99 not found'), req, res, next);
-    expect(res.status).toHaveBeenCalledWith(404);
-  });
-
-  it('sends the structured error body for AppError', () => {
-    const res = makeMockRes();
-    errorHandler(Errors.unauthorized('Token expired'), req, res, next);
-    expect(res.json).toHaveBeenCalledWith({
-      code: ErrorCode.UNAUTHORIZED,
-      message: 'Token expired',
-    });
-  });
-
-  it('includes details in the body when AppError has them', () => {
-    const res = makeMockRes();
-    const err = Errors.validationError('bad input', { field: 'amount' });
-    errorHandler(err, req, res, next);
     expect(res.json).toHaveBeenCalledWith({
       code: ErrorCode.VALIDATION_ERROR,
       message: 'bad input',
       details: { field: 'amount' },
+      requestId: 'rid-1',
     });
   });
 
-  it('handles all AppError status codes correctly', () => {
-    const cases: [AppError, number][] = [
-      [Errors.badRequest('x'), 400],
-      [Errors.unauthorized(), 401],
-      [Errors.forbidden(), 403],
-      [Errors.notFound('x'), 404],
-      [Errors.conflict('x'), 409],
-      [Errors.internal(), 500],
-    ];
+  it('sanitizes unexpected errors for clients', () => {
+    const res = makeRes();
+    errorHandler(new Error('secret internal failure'), makeReq(), res as unknown as Response, next);
 
-    for (const [err, expectedStatus] of cases) {
-      const res = makeMockRes();
-      errorHandler(err, req, res, next);
-      expect(res.status).toHaveBeenCalledWith(expectedStatus);
-    }
-  });
-
-  it('does not call next() for AppError', () => {
-    const res = makeMockRes();
-    errorHandler(Errors.forbidden(), req, res, next);
-    expect(next).not.toHaveBeenCalled();
-  });
-
-  // ── Unknown error handling ─────────────────────────────────────────────────
-
-  it('returns 500 for a plain Error', () => {
-    const res = makeMockRes();
-    errorHandler(new Error('something exploded'), req, res, next);
     expect(res.status).toHaveBeenCalledWith(500);
     expect(res.json).toHaveBeenCalledWith({
       code: ErrorCode.INTERNAL_ERROR,
@@ -279,47 +162,30 @@ describe('errorHandler', () => {
     });
   });
 
-  it('returns 500 for a thrown string', () => {
-    const res = makeMockRes();
-    errorHandler('oops', req, res, next);
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(res.json).toHaveBeenCalledWith({
-      code: ErrorCode.INTERNAL_ERROR,
-      message: 'Internal server error',
-    });
-  });
-
-  it('returns 500 for null', () => {
-    const res = makeMockRes();
-    errorHandler(null, req, res, next);
-    expect(res.status).toHaveBeenCalledWith(500);
-  });
-
-  it('does not leak error internals for unknown errors', () => {
-    const res = makeMockRes();
-    errorHandler(new Error('secret db password in stack'), req, res, next);
-    const body = (res.json as jest.Mock).mock.calls[0][0];
-    expect(body.message).toBe('Internal server error');
-    expect(body.details).toBeUndefined();
-  });
-
-  it('does not call next() for unknown errors', () => {
-    const res = makeMockRes();
-    errorHandler(new Error('random'), req, res, next);
+  it('does not call next after responding', () => {
+    const res = makeRes();
+    errorHandler(Errors.unauthorized(), makeReq(), res as unknown as Response, next);
     expect(next).not.toHaveBeenCalled();
   });
 
-  // ── AppError created via createError ──────────────────────────────────────
+  it('writes a structured JSON log entry', () => {
+    const res = makeRes();
+    errorHandler(
+      Errors.serviceUnavailable('Dependency unavailable', { dependency: 'db' }),
+      makeReq('rid-2'),
+      res as unknown as Response,
+      next,
+    );
 
-  it('handles AppError created via createError factory', () => {
-    const res = makeMockRes();
-    const err = new AppError(ErrorCode.CONFLICT, 'already exists', 409, { id: 'abc' });
-    errorHandler(err, req, res, next);
-    expect(res.status).toHaveBeenCalledWith(409);
-    expect(res.json).toHaveBeenCalledWith({
-      code: 'CONFLICT',
-      message: 'already exists',
-      details: { id: 'abc' },
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
+    expect(logged).toMatchObject({
+      type: 'error',
+      requestId: 'rid-2',
+      code: ErrorCode.SERVICE_UNAVAILABLE,
+      statusCode: 503,
+      message: 'Dependency unavailable',
+      details: { dependency: 'db' },
     });
   });
 });

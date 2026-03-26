@@ -1,21 +1,20 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 import {
     JwtIssuer,
     LoginSuccessResponse,
     SessionRepository,
     UserRepository,
 } from './types';
+import { hashSessionToken, SESSION_TTL_MS } from '../auth/session';
 
 /**
  * Domain service that orchestrates the login flow:
  *
  *  1. Look up the user by email.
  *  2. Compare the provided password against the stored hash.
- *  3. Create a new session.
- *  4. Issue a JWT that embeds the session.
- *
- * All I/O is pushed to injected collaborators so this class can be
- * unit-tested with in-memory fakes.
+ *  3. Generate a new session ID.
+ *  4. Issue tokens embedding the session ID.
+ *  5. Persist the session with the refresh token hash.
  */
 export class LoginService {
     constructor(
@@ -27,7 +26,7 @@ export class LoginService {
     /**
      * Attempt to log a user in.
      *
-     * @returns The signed JWT and a subset of user data on success,
+     * @returns The signed JWTs and a subset of user data on success,
      *          or `null` when the credentials are invalid.
      */
     async login(
@@ -46,18 +45,33 @@ export class LoginService {
             return null;
         }
 
-        // 3. Create session
-        const sessionId = await this.sessionRepository.createSession(user.id);
+        // 3. Generate session ID
+        const sessionId = randomUUID();
 
-        // 4. Issue JWT
-        const token = this.jwtIssuer.sign({
+        // 4. Issue tokens
+        const tokens = this.jwtIssuer.sign({
             userId: user.id,
             sessionId,
             role: user.role,
         });
 
+        // 5. Persist session
+        const tokenHash = createHash('sha256')
+            .update(tokens.refreshToken)
+            .digest('hex');
+        
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+
+        await this.sessionRepository.createSession({
+            id: sessionId,
+            userId: user.id,
+            tokenHash,
+            expiresAt,
+        });
+
         return {
-            token,
+            ...tokens,
             user: {
                 id: user.id,
                 email: user.email,

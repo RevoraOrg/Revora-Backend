@@ -1,7 +1,7 @@
 import crypto from 'crypto';
-import { Request, Response, NextFunction } from 'express';
-import { authMiddleware, verifyJwt, requireInvestor, AuthenticatedRequest } from './auth';
-import { requireAuth } from './requireAuth';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
+import { authMiddleware, verifyJwt, requireInvestor, AuthenticatedRequest, createRequireAuth } from './auth';
+import { hashSessionToken } from '../auth/session';
 import { signJwt } from '../utils/jwt';
 import { issueToken } from '../lib/jwt';
 import { AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
@@ -38,13 +38,34 @@ describe('requireAuth middleware', () => {
   const makeReq = (authHeader?: string): LogoutAuthenticatedRequest =>
     ({ headers: authHeader ? { authorization: authHeader } : {} }) as LogoutAuthenticatedRequest;
 
-  beforeEach(() => jest.clearAllMocks());
+  let requireAuth: RequestHandler;
+  let sessionRepo: { findById: jest.Mock };
 
-  it('calls next() and sets req.auth for a valid token', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    sessionRepo = {
+      findById: jest.fn().mockResolvedValue(null),
+    };
+
+    requireAuth = createRequireAuth(sessionRepo as any);
+  });
+
+  it('calls next() and sets req.auth for a valid token', async () => {
     const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
-    const req = makeReq(`Bearer ${token}`);
+    const tokenHash = hashSessionToken(token);
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: tokenHash,
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+    });
 
-    requireAuth(req as Request, mockRes(), mockNext);
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
 
     expect(mockNext).toHaveBeenCalled();
     expect(req.auth?.userId).toBe('user-123');
@@ -52,42 +73,42 @@ describe('requireAuth middleware', () => {
     expect(req.auth?.tokenId).toBe(token);
   });
 
-  it('returns 401 when Authorization header is missing', () => {
+  it('returns 401 when Authorization header is missing', async () => {
     const req = makeReq();
     const res = mockRes();
 
-    requireAuth(req as Request, res, mockNext);
+    await requireAuth(req as Request, res, mockNext);
 
     expect(res.status).toHaveBeenCalledWith(401);
     expect(mockNext).not.toHaveBeenCalled();
   });
 
-  it('returns 401 when the header is not Bearer scheme', () => {
+  it('returns 401 when the header is not Bearer scheme', async () => {
     const req = makeReq('Basic dXNlcjpwYXNz');
     const res = mockRes();
 
-    requireAuth(req as Request, res, mockNext);
+    await requireAuth(req as Request, res, mockNext);
 
     expect(res.status).toHaveBeenCalledWith(401);
     expect(mockNext).not.toHaveBeenCalled();
   });
 
-  it('returns 401 for an invalid/tampered token', () => {
+  it('returns 401 for an invalid/tampered token', async () => {
     const req = makeReq('Bearer invalid.token.here');
     const res = mockRes();
 
-    requireAuth(req as Request, res, mockNext);
+    await requireAuth(req as Request, res, mockNext);
 
     expect(res.status).toHaveBeenCalledWith(401);
     expect(mockNext).not.toHaveBeenCalled();
   });
 
-  it('returns 401 for an expired token', () => {
-    const token = signJwt({ sub: 'user-123', sid: 'session-abc' }, -1);
+  it('returns 401 for an expired token', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' }, '-1s');
     const req = makeReq(`Bearer ${token}`);
     const res = mockRes();
 
-    requireAuth(req as Request, res, mockNext);
+    await requireAuth(req as Request, res, mockNext);
 
     expect(res.status).toHaveBeenCalledWith(401);
     expect(mockNext).not.toHaveBeenCalled();

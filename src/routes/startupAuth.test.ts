@@ -3,7 +3,7 @@ import { Pool } from 'pg';
 import { createStartupAuthRouter } from './startupAuth';
 
 describe('StartupAuth Route', () => {
-    let mockDb: jest.Mocked<Pool>;
+    let mockDb: { query: jest.Mock };
     let mockReq: Partial<Request>;
     let mockRes: Partial<Response>;
     let jsonSpy: jest.Mock;
@@ -25,7 +25,7 @@ describe('StartupAuth Route', () => {
 
     it('should return 400 if email is missing', async () => {
         mockReq = { body: { password: 'password123' } };
-        const router = createStartupAuthRouter(mockDb);
+        const router = createStartupAuthRouter(mockDb as unknown as Pool);
         const handler = (router.stack[0].route as any).stack[0].handle;
 
         await handler(mockReq as Request, mockRes as Response);
@@ -38,7 +38,7 @@ describe('StartupAuth Route', () => {
 
     it('should return 400 if email format is invalid', async () => {
         mockReq = { body: { email: 'invalid-email', password: 'password123' } };
-        const router = createStartupAuthRouter(mockDb);
+        const router = createStartupAuthRouter(mockDb as unknown as Pool);
         const handler = (router.stack[0].route as any).stack[0].handle;
 
         await handler(mockReq as Request, mockRes as Response);
@@ -51,7 +51,7 @@ describe('StartupAuth Route', () => {
 
     it('should return 400 if password is too short', async () => {
         mockReq = { body: { email: 'test@example.com', password: 'short' } };
-        const router = createStartupAuthRouter(mockDb);
+        const router = createStartupAuthRouter(mockDb as unknown as Pool);
         const handler = (router.stack[0].route as any).stack[0].handle;
 
         await handler(mockReq as Request, mockRes as Response);

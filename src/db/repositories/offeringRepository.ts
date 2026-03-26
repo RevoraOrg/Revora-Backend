@@ -1,13 +1,5 @@
 import { Pool, QueryResult } from 'pg';
 
-/**
- * Offering entity
- */
-export interface Offering {
-  id: string;
-  contract_address: string;
-  status: 'draft' | 'active' | 'closed' | 'completed';
-  total_raised: string; // Decimal as string to preserve precision
 export type OfferingStatus =
   | 'draft'
   | 'open'
@@ -18,13 +10,23 @@ export type OfferingStatus =
   | 'completed'
   | string;
 
+/**
+ * Offering row shape returned from repositories.
+ *
+ * Many call sites treat some fields as optional because offerings can be partially hydrated
+ * depending on which columns are selected / mocked in tests.
+ */
 export interface Offering {
   id: string;
   issuer_user_id?: string;
   issuer_id?: string;
   name?: string;
   symbol?: string;
+  title?: string;
+  contract_address?: string;
   status?: OfferingStatus;
+  total_raised?: string;
+  target_amount?: string;
   created_at?: Date;
   updated_at?: Date;
   [key: string]: unknown;
@@ -40,101 +42,13 @@ export interface ListOfferingsFilters {
 }
 
 /**
- * Input for updating offering state from chain
+ * Input for updating offering state from chain sync flows.
  */
 export interface UpdateOfferingStateInput {
   status?: 'draft' | 'active' | 'closed' | 'completed';
   total_raised?: string;
 }
 
-/**
- * Offering Repository
- * Handles database operations for offerings
- */
-export class OfferingRepository {
-  constructor(private db: Pool) {}
-
-  /**
-   * Find an offering by ID
-   */
-  async findById(id: string): Promise<Offering | null> {
-    const query = `SELECT * FROM offerings WHERE id = $1 LIMIT 1`;
-    const result: QueryResult<Offering> = await this.db.query(query, [id]);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
-  }
-
-  /**
-   * Find an offering by contract address
-   */
-  async findByContractAddress(
-    contractAddress: string
-  ): Promise<Offering | null> {
-    const query = `SELECT * FROM offerings WHERE contract_address = $1 LIMIT 1`;
-    const result: QueryResult<Offering> = await this.db.query(query, [
-      contractAddress,
-    ]);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
-  }
-
-  /**
-   * List all offerings
-   */
-  async listAll(): Promise<Offering[]> {
-    const query = `SELECT * FROM offerings ORDER BY created_at DESC`;
-    const result: QueryResult<Offering> = await this.db.query(query);
-    return result.rows.map((row: any) => this.mapOffering(row));
-  }
-
-  /**
-   * Update offering state (status and/or total_raised)
-   */
-  async updateState(
-    id: string,
-    input: UpdateOfferingStateInput
-  ): Promise<Offering | null> {
-    const fields: string[] = [];
-    const values: any[] = [];
-    let idx = 1;
-
-    if (input.status !== undefined) {
-      fields.push(`status = $${idx++}`);
-      values.push(input.status);
-    }
-    if (input.total_raised !== undefined) {
-      fields.push(`total_raised = $${idx++}`);
-      values.push(input.total_raised);
-    }
-
-    if (fields.length === 0) return this.findById(id);
-
-    fields.push(`updated_at = NOW()`);
-    values.push(id);
-
-    const query = `
-      UPDATE offerings
-      SET ${fields.join(', ')}
-      WHERE id = $${idx}
-      RETURNING *
-    `;
-
-    const result: QueryResult<Offering> = await this.db.query(query, values);
-    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
-  }
-
-  /**
-   * Map database row to Offering entity
-   */
-  private mapOffering(row: any): Offering {
-    return {
-      id: row.id,
-      contract_address: row.contract_address,
-      status: row.status,
-      total_raised: row.total_raised,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-    };
-  }
-}
 export class OfferingRepository {
   constructor(private db: Pool) {}
 
@@ -182,12 +96,30 @@ export class OfferingRepository {
     return this.getById(id);
   }
 
+  async findByContractAddress(
+    contractAddress: string
+  ): Promise<Offering | null> {
+    const query = `SELECT * FROM offerings WHERE contract_address = $1 LIMIT 1`;
+    const result: QueryResult<Offering> = await this.db.query(query, [
+      contractAddress,
+    ]);
+    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
+  }
+
+  async listAll(): Promise<Offering[]> {
+    const query = `SELECT * FROM offerings ORDER BY created_at DESC`;
+    const result: QueryResult<Offering> = await this.db.query(query);
+    return result.rows.map((row) => this.mapOffering(row));
+  }
+
   async listByIssuer(
     issuerUserId: string,
     filters: ListOfferingsFilters = {}
   ): Promise<Offering[]> {
     const values: unknown[] = [issuerUserId];
-    const whereClauses: string[] = ['(issuer_user_id = $1 OR issuer_id = $1)'];
+    const whereClauses: string[] = [
+      '(issuer_user_id = $1 OR issuer_id = $1)',
+    ];
 
     if (filters.status !== undefined) {
       values.push(filters.status);
@@ -243,7 +175,53 @@ export class OfferingRepository {
   }
 
   async updateStatus(id: string, status: OfferingStatus): Promise<Offering | null> {
-    return this.update(id, { status });
+    const query = `
+      UPDATE offerings
+      SET status = $1, updated_at = NOW()
+      WHERE id = $2
+      RETURNING *
+    `;
+    const result: QueryResult<Offering> = await this.db.query(query, [
+      status,
+      id,
+    ]);
+    if (result.rows.length === 0) {
+      return null;
+    }
+    return this.mapOffering(result.rows[0]);
+  }
+
+  async updateState(
+    id: string,
+    input: UpdateOfferingStateInput
+  ): Promise<Offering | null> {
+    const fields: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    if (input.status !== undefined) {
+      fields.push(`status = $${idx++}`);
+      values.push(input.status);
+    }
+    if (input.total_raised !== undefined) {
+      fields.push(`total_raised = $${idx++}`);
+      values.push(input.total_raised);
+    }
+
+    if (fields.length === 0) return this.findById(id);
+
+    fields.push(`updated_at = NOW()`);
+    values.push(id);
+
+    const query = `
+      UPDATE offerings
+      SET ${fields.join(', ')}
+      WHERE id = $${idx}
+      RETURNING *
+    `;
+
+    const result: QueryResult<Offering> = await this.db.query(query, values);
+    return result.rows.length > 0 ? this.mapOffering(result.rows[0]) : null;
   }
 
   async isOwner(offeringId: string, issuerId: string): Promise<boolean> {

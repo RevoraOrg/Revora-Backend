@@ -17,7 +17,8 @@ class MockOfferingRepo {
 function makeReq(user: any, params: any = {}, body: any = {}) { return { user, params, body } as any; }
 function makeRes() { let statusCode = 200; let jsonData: any = null; return { status(code: number) { statusCode = code; return this; }, json(obj: any) { jsonData = obj; return this; }, _get() { return { statusCode, jsonData }; } } as any; }
 
-(async function run() {
+describe('distributions routes', () => {
+  it('covers admin/startup authorization and validation for triggerDistribution', async () => {
   const engine = new MockEngine();
   const offeringRows: any = { off1: { id: 'off1', issuer_id: 's1' } };
   const repo = new MockOfferingRepo(offeringRows);
@@ -58,6 +59,5 @@ function makeRes() { let statusCode = 200; let jsonData: any = null; return { st
   await handlers.triggerDistribution(req5, res5, (e: any) => { throw e; });
   const out5 = res5._get();
   assert(out5.statusCode === 400);
-
-  console.log('distributions route tests passed');
-})();
+  });
+});

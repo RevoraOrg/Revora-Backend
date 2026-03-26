@@ -7,14 +7,12 @@ import {
 
 describe('OfferingRepository', () => {
   let repository: OfferingRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
-    mockPool = {
-      query: jest.fn(),
-    } as unknown as jest.Mocked<Pool>;
+    mockPool = { query: jest.fn() };
 
-    repository = new OfferingRepository(mockPool);
+    repository = new OfferingRepository(mockPool as unknown as Pool);
   });
 
   it('creates an offering with provided fields', async () => {
@@ -65,6 +63,7 @@ describe('OfferingRepository', () => {
     expect(result).toEqual({
       id: 'off-2',
       issuer_user_id: 'issuer-999',
+      issuer_id: 'issuer-999',
       status: 'open',
     });
   });
@@ -105,7 +104,9 @@ describe('OfferingRepository', () => {
     });
 
     expect(mockPool.query).toHaveBeenCalledWith(
-      expect.stringContaining('WHERE issuer_user_id = $1 AND status = $2'),
+      expect.stringContaining(
+        'WHERE (issuer_user_id = $1 OR issuer_id = $1) AND status = $2'
+      ),
       ['issuer-1', 'open', 10, 5]
     );
     expect(result).toHaveLength(2);

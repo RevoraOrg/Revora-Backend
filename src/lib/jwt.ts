@@ -31,6 +31,7 @@ export interface JwtPayload {
 export interface TokenOptions {
   expiresIn?: string;
   subject: string;
+  email?: string;
   additionalPayload?: Record<string, unknown>;
 }
 
@@ -72,15 +73,18 @@ export function issueToken(options: TokenOptions): string {
   const secret = getJwtSecret();
   const algorithm = getJwtAlgorithm();
 
+  // Apply additional payload first, but always force `sub` (and `email` when provided)
+  // to match TokenOptions. This avoids duplicate-field ambiguity and prevents
+  // jsonwebtoken from erroring when `subject` is also provided in SignOptions.
   const payload: JwtPayload = {
+    ...(options.additionalPayload ?? {}),
+    ...(options.email ? { email: options.email } : {}),
     sub: options.subject,
-    ...options.additionalPayload,
   };
 
   const signOptions: jwt.SignOptions = {
     algorithm,
-    expiresIn: options.expiresIn || TOKEN_EXPIRY,
-    subject: options.subject,
+    expiresIn: (options.expiresIn || TOKEN_EXPIRY) as jwt.SignOptions["expiresIn"],
   };
 
   return jwt.sign(payload, secret, signOptions);

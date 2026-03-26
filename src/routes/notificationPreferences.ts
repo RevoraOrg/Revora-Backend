@@ -52,23 +52,18 @@ export function validateNotificationPreferencesInput(
   return errors;
 }
 
-/**
- * Creates handler functions for notification preferences routes.
- * Separated from router creation for easier unit testing.
- */
-export function createNotificationPreferencesHandlers(
-  notificationRepo: NotificationPreferencesRepository
-) {
-  /**
-   * GET /api/users/me/notification-preferences
-   * Returns the authenticated user's notification preferences.
-   * Falls back to sensible defaults if no preferences have been saved.
-   */
-  async function getPreferences(
-    req: AuthenticatedRequest,
-    res: Response
-  ): Promise<void> {
-    const userId = req.user?.id;
+  const toWireShape = (prefs: {
+    email_notifications: boolean;
+    push_notifications: boolean;
+    sms_notifications: boolean;
+  }) => ({
+    email_notifications: prefs.email_notifications,
+    push_notifications: prefs.push_notifications,
+    sms_notifications: prefs.sms_notifications,
+  });
+
+  router.get('/api/users/me/notification-preferences', requireAuth, async (req, res) => {
+    const userId = (req as any).user?.id;
     if (!userId) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
@@ -84,8 +79,8 @@ export function createNotificationPreferencesHandlers(
         });
         return;
       }
-      res.json(preferences);
-    } catch {
+      res.json(toWireShape(preferences));
+    } catch (error) {
       res.status(500).json({ error: 'Failed to fetch notification preferences' });
     }
   }
@@ -121,9 +116,13 @@ export function createNotificationPreferencesHandlers(
     };
 
     try {
-      const updated = await notificationRepo.upsert(userId, input);
-      res.json(updated);
-    } catch {
+      const updated = await notificationPreferencesRepository.upsert(userId, {
+        email_notifications,
+        push_notifications,
+        sms_notifications,
+      });
+      res.json(toWireShape(updated));
+    } catch (error) {
       res.status(500).json({ error: 'Failed to update notification preferences' });
     }
   }

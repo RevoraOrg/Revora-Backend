@@ -336,21 +336,40 @@ describe('HorizonClient', () => {
 
   describe('timeout handling', () => {
     it('should timeout after specified duration', async () => {
-      const timeoutClient = new HorizonClient({ timeout: 5000 });
+      // This suite uses fake timers by default; timeout behavior is easier to
+      // validate with real timers + a short client timeout.
+      jest.useRealTimers();
+
+      const timeoutClient = new HorizonClient({ timeout: 50 });
       const abortError = new Error('Aborted');
       abortError.name = 'AbortError';
 
-      mockFetch.mockImplementation(
-        () =>
-          new Promise((_resolve, reject) => {
-            setTimeout(() => reject(abortError), 10000);
-          })
-      );
+      mockFetch.mockImplementation((_url, init) => {
+        return new Promise((_resolve, reject) => {
+          let settled = false;
+          const fail = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            reject(err);
+          };
 
-      const promise = timeoutClient.getAccount('GABC1234567890');
-      jest.advanceTimersByTime(5000);
+          const signal = init?.signal;
+          if (!signal) {
+            setTimeout(() => fail(abortError), 10_000);
+            return;
+          }
 
-      await expect(promise).rejects.toThrow();
+          const onAbort = () => fail(abortError);
+          if (signal.aborted) {
+            queueMicrotask(onAbort);
+            return;
+          }
+
+          signal.addEventListener('abort', onAbort, { once: true });
+        });
+      });
+
+      await expect(timeoutClient.getAccount('GABC1234567890')).rejects.toThrow();
     });
   });
 });

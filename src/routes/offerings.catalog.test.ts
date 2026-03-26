@@ -26,7 +26,8 @@ class MockOfferingRepo {
 function makeReq(query: any = {}, params: any = {}, user: any = undefined) { return { query, params, user } as any; }
 function makeRes() { let statusCode=200; let jsonData:any=null; return { status(code:number){statusCode=code;return this}, json(obj:any){jsonData=obj;return this}, _get(){return {statusCode,jsonData}} } as any; }
 
-(async function run(){
+describe('offerings catalog routes', () => {
+  it('covers public catalog + detail visibility rules', async () => {
   const rows = [
     { id:'11111111-1111-4111-8111-111111111111', title:'A', issuer_id:'s1', status:'active', amount:'100.00', created_at:new Date(), revenue_share_bps:500, private_note: 'issuer-only' },
     { id:'22222222-2222-4222-8222-222222222222', title:'B', issuer_id:'s2', status:'draft', amount:'200.00', created_at:new Date(Date.now()-10000), revenue_share_bps:300 },
@@ -86,5 +87,5 @@ function makeRes() { let statusCode=200; let jsonData:any=null; return { status(
   const out6 = res6._get();
   assert(out6.statusCode === 400);
 
-  console.log('offerings catalog tests passed');
-})();
+  });
+});
