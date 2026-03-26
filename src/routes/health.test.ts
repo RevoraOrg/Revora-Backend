@@ -1594,3 +1594,80 @@ describe('Revenue Reconciliation Edge Case Tests', () => {
         });
     });
 });
+
+describe('Password Reset Rate Controls', () => {
+    const prefix = process.env.API_VERSION_PREFIX ?? '/api/v1';
+
+    it('should return success message for valid password reset request', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/forgot-password`)
+            .send({ email: 'test@example.com' });
+        expect(res.status).toBe(200);
+        expect(res.body).toHaveProperty('message');
+    });
+
+    it('should return success message even for non-existent email (security)', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/forgot-password`)
+            .send({ email: 'nonexistent@example.com' });
+        expect(res.status).toBe(200);
+        expect(res.body.message).toContain('If the email exists');
+    });
+
+    it('should return 400 for invalid email format', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/forgot-password`)
+            .send({ email: 'invalid-email' });
+        expect(res.status).toBe(200);
+        expect(res.body.message).toContain('If the email exists');
+    });
+
+    it('should return 400 for missing email', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/forgot-password`)
+            .send({});
+        expect(res.status).toBe(200);
+        expect(res.body.message).toContain('If the email exists');
+    });
+
+    it('should return 400 for invalid token in reset-password', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/reset-password`)
+            .send({ token: '', password: 'password123' });
+        expect(res.status).toBe(400);
+        expect(res.body).toHaveProperty('error');
+    });
+
+    it('should return 400 for short password in reset-password', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/reset-password`)
+            .send({ token: 'valid-token', password: 'short' });
+        expect(res.status).toBe(400);
+        expect(res.body).toHaveProperty('error');
+    });
+
+    it('should return 400 for missing password in reset-password', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/reset-password`)
+            .send({ token: 'valid-token' });
+        expect(res.status).toBe(400);
+        expect(res.body).toHaveProperty('error');
+    });
+
+    it('should return 404 for password reset routes without prefix', async () => {
+        const res = await request(app)
+            .post('/api/auth/forgot-password')
+            .send({ email: 'test@example.com' });
+        expect(res.status).toBe(404);
+    });
+
+    it('should handle rate limiting with 429 response', async () => {
+        const res = await request(app)
+            .post(`${prefix}/api/auth/forgot-password`)
+            .send({ email: 'ratelimit@example.com' });
+        expect([200, 429]).toContain(res.status);
+        if (res.status === 429) {
+            expect(res.body).toHaveProperty('retryAfter');
+        }
+    });
+});

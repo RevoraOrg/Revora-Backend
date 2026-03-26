@@ -1,5 +1,6 @@
 import { Pool, PoolClient } from 'pg';
 import { randomBytes, createHash } from 'node:crypto';
+import { PasswordResetRateLimiter, RateLimitResult } from './passwordResetRateLimiter';
 
 export type EmailSender = (to: string, subject: string, body: string) => Promise<void>;
 
@@ -7,21 +8,51 @@ export interface PasswordResetServiceOptions {
   emailSender?: EmailSender;
   tokenTtlMinutes?: number;
   appUrl?: string;
+  rateLimiter?: PasswordResetRateLimiter;
+}
+
+export class PasswordResetRateLimitedError extends Error {
+  constructor(
+    message: string,
+    public readonly retryAfter: number,
+    public readonly rateLimitResult: RateLimitResult
+  ) {
+    super(message);
+    this.name = 'PasswordResetRateLimitedError';
+  }
 }
 
 export class PasswordResetService {
   private emailSender: EmailSender;
   private tokenTtlMinutes: number;
   private appUrl: string;
+  private rateLimiter?: PasswordResetRateLimiter;
 
   constructor(private readonly db: Pool, opts?: PasswordResetServiceOptions) {
     this.emailSender = opts?.emailSender ?? (async (_to, _subject, _body) => {});
     this.tokenTtlMinutes = opts?.tokenTtlMinutes ?? 60;
     this.appUrl = opts?.appUrl ?? process.env.APP_URL ?? 'http://localhost:3000';
+    this.rateLimiter = opts?.rateLimiter;
   }
 
   async requestPasswordReset(emailRaw: string): Promise<void> {
     const email = emailRaw.trim().toLowerCase();
+
+    if (this.rateLimiter) {
+      try {
+        const rateLimitResult = await this.rateLimiter.checkRateLimit(email);
+        if (!rateLimitResult.allowed) {
+          throw new PasswordResetRateLimitedError(
+            'Too many password reset requests. Please try again later.',
+            rateLimitResult.retryAfter ?? this.rateLimiter['blockMinutes'] * 60,
+            rateLimitResult
+          );
+        }
+      } catch (err) {
+        console.error('[password-reset] Rate limiter error, failing open:', err);
+      }
+    }
+
     const user = await this.findUserByEmail(email);
     if (!user) {
       return;

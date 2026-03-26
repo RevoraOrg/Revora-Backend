@@ -149,6 +149,8 @@ apiRouter.use(
   }),
 );
 
+apiRouter.use(createPasswordResetRouter(pool));
+
 /**
  * Main Express application entrypoint.
  *
