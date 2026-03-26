@@ -173,6 +173,83 @@ app.get("/health", async (_req: Request, res: Response) => {
   });
 });
 
+interface IdempotencyRecord {
+  status: "processing" | "completed";
+  response?: any;
+  expiresAt: number;
+}
+
+const idempotencyStore = new Map<string, IdempotencyRecord>();
+
+export const clearIdempotencyStore = () => idempotencyStore.clear();
+
+/**
+ * @dev Investment Double-Submit Protection Middleware
+ * Security Assumptions:
+ * 1. An idempotency key is required (`x-idempotency-key`).
+ * 2. The key is namespaced by the user ID to prevent cross-account collisions.
+ * 3. Concurrent identical requests will receive a 409 Conflict.
+ * 4. Completed identical requests will receive the cached response (200 OK).
+ */
+export const investmentDoubleSubmitProtection = (req: Request, res: Response, next: () => void): void => {
+  const idempotencyKey = req.header("x-idempotency-key");
+
+  if (!idempotencyKey) {
+    res.status(400).json({ error: "Missing x-idempotency-key header" });
+    return;
+  }
+
+  const userId = (req as any).user?.id;
+  
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  const namespacedKey = `${userId}:${idempotencyKey}`;
+  const now = Date.now();
+  const existingRecord = idempotencyStore.get(namespacedKey);
+
+  if (existingRecord) {
+    if (existingRecord.expiresAt < now) {
+      idempotencyStore.delete(namespacedKey);
+    } else if (existingRecord.status === "processing") {
+      res.status(409).json({ error: "Concurrent request detected" });
+      return;
+    } else if (existingRecord.status === "completed") {
+      res.status(200).json(existingRecord.response);
+      return;
+    }
+  }
+
+  idempotencyStore.set(namespacedKey, {
+    status: "processing",
+    expiresAt: now + 24 * 60 * 60 * 1000,
+  });
+
+  const originalJson = res.json.bind(res);
+  (res as any).json = (body: any) => {
+    // Only cache 2xx responses
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      idempotencyStore.set(namespacedKey, {
+        status: "completed",
+        response: body,
+        expiresAt: now + 24 * 60 * 60 * 1000,
+      });
+    } else {
+      // In case of error, delete the processing state so the user can retry
+      idempotencyStore.delete(namespacedKey);
+    }
+    return originalJson(body);
+  };
+
+  next();
+};
+
+apiRouter.post('/invest', requireAuth, investmentDoubleSubmitProtection, (req: Request, res: Response) => {
+  res.status(200).json({ status: "success", message: "Investment processed" });
+});
+
 apiRouter.get('/overview', (_req: Request, res: Response) => {
   res.json({
     name: "Stellar RevenueShare (Revora) Backend",
