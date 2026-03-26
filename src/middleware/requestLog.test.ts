@@ -50,9 +50,13 @@ describe('requestLogMiddleware', () => {
   });
 
   it('should audit sensitive action', () => {
-    mockReq.method = 'POST';
-    mockReq.path = '/auth/login';
-    (mockReq as any).user = { id: 'user-123' };
+    mockReq = {
+      method: 'POST',
+      path: '/auth/login',
+      ip: '127.0.0.1',
+      get: jest.fn().mockReturnValue('TestAgent/1.0'),
+      user: { id: 'user-123' },
+    } as any;
 
     const middleware = requestLogMiddleware();
     middleware(mockReq as Request, mockRes as Response, mockNext);
@@ -68,8 +72,12 @@ describe('requestLogMiddleware', () => {
   });
 
   it('should not audit non-sensitive action', () => {
-    mockReq.method = 'GET';
-    mockReq.path = '/health';
+    mockReq = {
+      method: 'GET',
+      path: '/health',
+      ip: '127.0.0.1',
+      get: jest.fn().mockReturnValue('TestAgent/1.0'),
+    };
 
     const middleware = requestLogMiddleware();
     middleware(mockReq as Request, mockRes as Response, mockNext);

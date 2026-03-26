@@ -42,7 +42,8 @@ function makeRes() {
   } as any;
 }
 
-(async function run() {
+describe('notifications routes', () => {
+  it('covers listing, mark read, bulk mark, and auth failures', async () => {
   const rows = [
     { id: 'n1', user_id: 'u1', message: 'm1', read: false, type: 'info', created_at: new Date() },
     { id: 'n2', user_id: 'u1', message: 'm2', read: false, type: 'alert', created_at: new Date() },
@@ -83,6 +84,5 @@ function makeRes() {
   await handlers.getNotifications(req4, res4, (e: any) => { throw e; });
   const out4 = res4._get();
   assert(out4.statusCode === 401);
-
-  console.log('notifications route tests passed');
-})();
+  });
+});

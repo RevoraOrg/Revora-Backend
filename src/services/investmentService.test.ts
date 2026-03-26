@@ -1,4 +1,4 @@
-import { Pool, QueryResult, QueryResultRow } from 'pg';
+import { Pool, QueryResult } from 'pg';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository, Offering } from '../db/repositories/offeringRepository';
 import { InvestmentService, CreateInvestmentRequest, createInvestmentService } from './investmentService';
@@ -7,8 +7,8 @@ import { InvestmentService, CreateInvestmentRequest, createInvestmentService } f
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeMockPool(): jest.Mocked<Pool> {
-  return { query: jest.fn() } as unknown as jest.Mocked<Pool>;
+function makeMockPool(): { query: jest.Mock } {
+  return { query: jest.fn() };
 }
 
 function makeInvestmentRow(override: Partial<Investment> = {}): Investment {
@@ -37,8 +37,7 @@ function makeOfferingRow(override: Partial<Offering> = {}): Offering {
   };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function mockQueryResult<T = any>(rows: T[]): QueryResult<T> {
+function mockQueryResult(rows: unknown[]): QueryResult<any> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
@@ -47,15 +46,15 @@ function mockQueryResult<T = any>(rows: T[]): QueryResult<T> {
 // ---------------------------------------------------------------------------
 
 describe('InvestmentService', () => {
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
   let investmentRepo: InvestmentRepository;
   let offeringRepo: OfferingRepository;
   let service: InvestmentService;
 
   beforeEach(() => {
     mockPool = makeMockPool();
-    investmentRepo = new InvestmentRepository(mockPool);
-    offeringRepo = new OfferingRepository(mockPool);
+    investmentRepo = new InvestmentRepository(mockPool as unknown as Pool);
+    offeringRepo = new OfferingRepository(mockPool as unknown as Pool);
     service = new InvestmentService(investmentRepo, offeringRepo);
   });
 
@@ -125,9 +124,17 @@ describe('InvestmentService', () => {
       mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
 
       // Act & Assert
-      await expect(service.createInvestment({ ...baseInput, amount: '-100' })).rejects.toThrow('Invalid amount');
-      await expect(service.createInvestment({ ...baseInput, amount: '0' })).rejects.toThrow('Invalid amount');
-      await expect(service.createInvestment({ ...baseInput, amount: 'abc' })).rejects.toThrow('Invalid amount');
+      await expect(service.createInvestment({ ...baseInput, amount: '-100' })).rejects.toThrow(
+        'Invalid amount: must be a positive number',
+      );
+      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+      await expect(service.createInvestment({ ...baseInput, amount: '0' })).rejects.toThrow(
+        'Invalid amount: must be a positive number',
+      );
+      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+      await expect(service.createInvestment({ ...baseInput, amount: 'abc' })).rejects.toThrow(
+        'Invalid amount: must be a positive number',
+      );
     });
 
     it('throws VALIDATION_ERROR when asset is empty', async () => {
@@ -163,7 +170,7 @@ describe('createInvestmentService', () => {
     const mockPool = makeMockPool();
     
     // Act
-    const service = createInvestmentService(mockPool);
+    const service = createInvestmentService(mockPool as unknown as Pool);
     
     // Assert
     expect(service).toBeInstanceOf(InvestmentService);

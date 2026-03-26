@@ -62,6 +62,9 @@ paths:
                     type: string
                   description:
                     type: string
+                  version:
+                    type: string
+                    example: "0.1.0"
 
   /api/auth/login:
     post:

@@ -57,7 +57,7 @@ describe('AppError', () => {
       const err = new AppError(ErrorCode.UNAUTHORIZED, 'not logged in', 401);
       const response: ErrorResponse = err.toResponse();
       expect(response).toEqual({ code: 'UNAUTHORIZED', message: 'not logged in' });
-      expect(Object.hasOwn(response, 'details')).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(response, 'details')).toBe(false);
     });
 
     it('includes details when present', () => {

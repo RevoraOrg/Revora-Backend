@@ -11,7 +11,7 @@ function makeRepo(overrides: Partial<ChangePasswordUserRepo> = {}): ChangePasswo
 
 describe('ChangePasswordService', () => {
   it('returns ok:true and calls updatePasswordHash with a NEW hash on valid credentials', async () => {
-    const oldHash = await hashPassword('correct-horse-battery');   // ← await added
+    const oldHash = await hashPassword('CorrectHorse159!');   // Strong password - no sequential digits
     const updatePasswordHash = jest.fn().mockResolvedValue(undefined);
 
     const repo = makeRepo({
@@ -22,8 +22,8 @@ describe('ChangePasswordService', () => {
     const svc = new ChangePasswordService(repo);
     const result = await svc.execute({
       userId: 'u1',
-      currentPassword: 'correct-horse-battery',
-      newPassword: 'new-secure-pw-123',
+      currentPassword: 'CorrectHorse159!',
+      newPassword: 'NewSecurePw481!',
     });
 
     expect(result.ok).toBe(true);
@@ -37,15 +37,15 @@ describe('ChangePasswordService', () => {
     const repo = makeRepo({
       findUserById: jest.fn().mockResolvedValue({
         id: 'u1',
-        password_hash: await hashPassword('real-password'),   // ← await added
+        password_hash: await hashPassword('RealPassword159!'),   // Strong password
       }),
     });
 
     const svc = new ChangePasswordService(repo);
     const result = await svc.execute({
       userId: 'u1',
-      currentPassword: 'wrong-password',
-      newPassword: 'new-secure-pw-123',
+      currentPassword: 'WrongPassword159!',
+      newPassword: 'NewSecurePw481!',
     });
 
     expect(result.ok).toBe(false);
@@ -56,19 +56,25 @@ describe('ChangePasswordService', () => {
     const svc = new ChangePasswordService(makeRepo());
     const result = await svc.execute({
       userId: 'ghost',
-      currentPassword: 'whatever',
-      newPassword: 'new-secure-pw-123',
+      currentPassword: 'SomePass159!',
+      newPassword: 'NewSecurePw481!',
     });
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe('USER_NOT_FOUND');
   });
 
-  it('returns VALIDATION_ERROR when newPassword is shorter than 8 chars', async () => {
-    const svc = new ChangePasswordService(makeRepo());
+  it('returns VALIDATION_ERROR when newPassword is shorter than 12 chars', async () => {
+    const repo = makeRepo({
+      findUserById: jest.fn().mockResolvedValue({
+        id: 'u1',
+        password_hash: await hashPassword('CurrentPass159!'),
+      }),
+    });
+    const svc = new ChangePasswordService(repo);
     const result = await svc.execute({
       userId: 'u1',
-      currentPassword: 'any-password',
+      currentPassword: 'CurrentPass159!',
       newPassword: 'short',
     });
 
@@ -76,15 +82,24 @@ describe('ChangePasswordService', () => {
     if (!result.ok) expect(result.reason).toBe('VALIDATION_ERROR');
   });
 
-  it('returns VALIDATION_ERROR when currentPassword is empty string', async () => {
-    const svc = new ChangePasswordService(makeRepo());
+  it('returns VALIDATION_ERROR when newPassword does not meet strength requirements', async () => {
+    const repo = makeRepo({
+      findUserById: jest.fn().mockResolvedValue({
+        id: 'u1',
+        password_hash: await hashPassword('CurrentPass159!'),
+      }),
+    });
+    const svc = new ChangePasswordService(repo);
     const result = await svc.execute({
       userId: 'u1',
-      currentPassword: '',
-      newPassword: 'new-secure-pw-123',
+      currentPassword: 'CurrentPass159!',
+      newPassword: 'weakpassword',
     });
 
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe('VALIDATION_ERROR');
+    if (!result.ok) {
+      expect(result.reason).toBe('VALIDATION_ERROR');
+      expect(result.message).toContain('does not meet strength requirements');
+    }
   });
 });
