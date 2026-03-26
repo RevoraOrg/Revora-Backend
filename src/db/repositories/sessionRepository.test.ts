@@ -75,4 +75,22 @@ describe('SessionRepository', () => {
       );
     });
   });
+
+  describe('createSessionForUser / setSessionMetadata', () => {
+    it('creates a session and updates metadata', async () => {
+      mockPool.query
+        .mockResolvedValueOnce({ rows: [{ id: 'session-123', user_id: 'user-456', token_hash: '', expires_at: new Date(0), created_at: new Date() }], rowCount: 1 } as any)
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+
+      const sessionId = await repository.createSessionForUser('user-456');
+      expect(sessionId).toBe('session-123');
+
+      await repository.setSessionMetadata('session-123', 'hash-x', new Date('2099-01-01'));
+
+      expect(mockPool.query).toHaveBeenLastCalledWith(
+        expect.stringContaining('UPDATE sessions SET token_hash'),
+        ['hash-x', new Date('2099-01-01'), 'session-123'],
+      );
+    });
+  });
 });

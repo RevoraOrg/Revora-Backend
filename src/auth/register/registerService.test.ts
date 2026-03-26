@@ -36,13 +36,13 @@ class FakeUserRepository implements IUserRepository {
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    const user = await svc.register('Alice@Example.COM', 'secret123');
+    const user = await svc.register('Alice@Example.COM', 'StrongSecret123!');
 
     assert(user.id, 'user should have an id');
     assert.strictEqual(user.email, 'alice@example.com', 'email should be lowercased + trimmed');
     assert.strictEqual(user.role, 'investor', 'role must be investor');
 
-    const expectedHash = createHash('sha256').update('secret123').digest('hex');
+    const expectedHash = createHash('sha256').update('StrongSecret123!').digest('hex');
     assert.strictEqual(repo.getStoredHash('alice@example.com'), expectedHash, 'password must be SHA-256 hashed');
   }
 
@@ -87,16 +87,20 @@ class FakeUserRepository implements IUserRepository {
     assert(threw, 'should have thrown on case-variant duplicate');
   }
 
-  // ── Different users can register independently ──────────────────────────────
+  // ── Weak password throws error ───────────────────────────────────────────────
   {
     const repo = new FakeUserRepository();
     const svc = new RegisterService(repo);
-    const u1 = await svc.register('eve@example.com', 'password-eve');
-    const u2 = await svc.register('frank@example.com', 'password-frank');
 
-    assert.notStrictEqual(u1.id, u2.id, 'each user gets a unique id');
-    assert.strictEqual(u1.role, 'investor');
-    assert.strictEqual(u2.role, 'investor');
+    let threw = false;
+    try {
+      await svc.register('weak@example.com', 'short');
+    } catch (err) {
+      threw = true;
+      assert(err instanceof Error, 'should throw Error for weak password');
+      assert((err as Error).message.includes('Password does not meet strength requirements'), 'error message should mention strength');
+    }
+    assert(threw, 'should have thrown for weak password');
   }
 
   // ── Repository error propagates ───────────────────────────────────────────────

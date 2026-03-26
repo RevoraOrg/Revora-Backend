@@ -38,7 +38,12 @@ export class RevenueHandler {
                 data: report,
             });
         } catch (error: any) {
-            const statusCode = error.message.includes('Unauthorized') ? 403 : 400;
+            let statusCode = 400;
+            if (error.message.includes('Unauthorized')) {
+                statusCode = 403;
+            } else if (error.message.includes('overlaps')) {
+                statusCode = 409;
+            }
             return res.status(statusCode).json({ error: error.message });
         }
     };

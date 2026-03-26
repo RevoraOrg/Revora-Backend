@@ -32,16 +32,22 @@ class InMemoryUserRepository implements UserRepository {
 }
 
 class InMemorySessionRepository implements SessionRepository {
-    private sessions = new Map<string, string>();
+    private sessions = new Map<string, { userId: string; tokenHash: string; expiresAt: Date }>();
     private counter = 0;
 
     async createSession(userId: string): Promise<string> {
         const id = `session-${++this.counter}`;
-        this.sessions.set(id, userId);
+        this.sessions.set(id, { userId, tokenHash: '', expiresAt: new Date(0) });
         return id;
     }
 
-    getSession(sessionId: string): string | undefined {
+    async setSessionMetadata(sessionId: string, tokenHash: string, expiresAt: Date): Promise<void> {
+        const existing = this.sessions.get(sessionId);
+        if (!existing) throw new Error('Session not found');
+        this.sessions.set(sessionId, { ...existing, tokenHash, expiresAt });
+    }
+
+    getSession(sessionId: string): { userId: string; tokenHash: string; expiresAt: Date } | undefined {
         return this.sessions.get(sessionId);
     }
 }

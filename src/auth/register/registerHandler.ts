@@ -4,7 +4,7 @@ import { RegisterRequestBody } from './types';
 
 /** Minimal RFC-5322-ish email pattern – same rigour used across the auth module. */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MIN_PASSWORD_LENGTH = 8;
+const MIN_PASSWORD_LENGTH = 12; // Must align with passwordStrength validator
 
 /**
  * Express handler factory for `POST /api/auth/investor/register`.

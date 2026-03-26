@@ -5,24 +5,27 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
+    "test": "jest",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "migrate": "node src/db/migrate.js",
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
-    "test": "jest"
+    "test": "jest",
+    "test:coverage": "jest --coverage --runInBand"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.5.0",
     "@types/pg": "^8.16.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.2",
+    "express": "^4.22.1",
     "jest": "^30.2.0",
     "morgan": "^1.10.0",
     "pg": "^8.19.0",
     "stellar-sdk": "^13.3.0",
-    "ts-jest": "^29.4.6"
+    "ts-jest": "^29.4.6",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
