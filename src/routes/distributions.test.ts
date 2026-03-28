@@ -1,4 +1,3 @@
-import assert from 'assert';
 import { createDistributionHandlers } from './distributions';
 
 class MockEngine {

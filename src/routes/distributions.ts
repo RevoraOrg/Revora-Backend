@@ -1,7 +1,12 @@
 import express, { Request, Response, NextFunction } from 'express';
 
 export interface OfferingRepo {
-  getById: (id: string) => Promise<{ id: string; issuer_id: string } | null>;
+  getById: (id: string) => Promise<Offering | null>;
+}
+
+export interface Offering {
+  id: string;
+  issuer_id?: string;
 }
 
 export function createDistributionHandlers(distributionEngine: any, offeringRepo?: OfferingRepo) {
@@ -49,7 +54,7 @@ export default function createDistributionsRouter(opts: { distributionEngine: an
   const router = express.Router();
   const handlers = createDistributionHandlers(opts.distributionEngine, opts.offeringRepo);
 
-  router.post('/api/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
+  router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
 
   return router;
 }
