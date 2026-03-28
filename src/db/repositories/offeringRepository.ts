@@ -134,6 +134,39 @@ export class OfferingRepository {
     return result.rows.map((row) => this.mapOffering(row));
   }
 
+  /**
+   * List catalog items with pagination and status filtering.
+   * Performs field projection to ensure internal fields (e.g. issuer info)
+   * aren't leaked in public catalog summaries.
+   */
+  async listCatalog(
+    filters: { limit?: number; offset?: number; statuses?: string[] } = {}
+  ): Promise<Offering[]> {
+    const limit = filters.limit ?? 10;
+    const offset = filters.offset ?? 0;
+    const statuses = filters.statuses ?? ['active', 'completed'];
+
+    if (statuses.length === 0) {
+      return [];
+    }
+
+    const statusPlaceholders = statuses.map((_, i) => `$${i + 1}`).join(', ');
+    
+    // Explicit projection of secure fields
+    const query = `
+      SELECT id, name, symbol, title, contract_address, status, total_raised, target_amount, created_at, updated_at
+      FROM offerings
+      WHERE status IN (${statusPlaceholders})
+      ORDER BY created_at DESC
+      LIMIT $${statuses.length + 1} OFFSET $${statuses.length + 2}
+    `;
+
+    const values = [...statuses, limit, offset];
+
+    const result: QueryResult<Offering> = await this.db.query(query, values);
+    return result.rows.map((row) => this.mapOffering(row));
+  }
+
   async listByIssuer(
     issuerUserId: string,
     filters: ListOfferingsFilters = {}

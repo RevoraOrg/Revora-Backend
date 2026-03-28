@@ -7,6 +7,7 @@ import { createCorsMiddleware } from './middleware/cors';
 import { errorHandler } from './middleware/errorHandler';
 import { Errors } from './lib/errors';
 import { createHealthRouter } from './routes/health';
+import { createOfferingRouter } from './offerings/offeringRoute';
 import {
   createMilestoneValidationRouter,
   DomainEventPublisher,
@@ -141,6 +142,8 @@ function createMilestoneDependencies() {
 
 apiRouter.use(createLoginRouter({ loginService }));
 apiRouter.use(createRefreshRouter({ refreshService }));
+
+apiRouter.use('/offerings', createOfferingRouter(pool));
 
 const offeringRepository = new OfferingRepository(pool);
 apiRouter.use(
