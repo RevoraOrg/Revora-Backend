@@ -29,7 +29,8 @@ function makeRes() {
   } as any;
 }
 
-(async function run() {
+describe('offerings routes', () => {
+  it('covers startup listing behavior', async () => {
   const offers = [
     { id: 'o1', issuer_id: 's1', title: 'A', status: 'draft', amount: '100.00', created_at: new Date() },
     { id: 'o2', issuer_id: 's1', title: 'B', status: 'live', amount: '200.00', created_at: new Date() },
@@ -75,5 +76,5 @@ function makeRes() {
   const out5 = res5._get();
   assert(out5.statusCode === 403);
 
-  console.log('offerings route tests passed');
-})();
+  });
+});

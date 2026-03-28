@@ -1,31 +1,39 @@
-import assert from 'assert';
 import DistributionEngine from './distributionEngine';
 
-// Mock distributionRepo that records created runs and payouts
-class MockDistributionRepo {
-  runs: any[] = [];
-  payouts: any[] = [];
-  async createDistributionRun(input: any) {
-    const run = { id: `run-${this.runs.length + 1}`, ...input };
-    this.runs.push(run);
-    return run;
-  }
-  async createPayout(input: any) {
-    const p = { id: `p-${this.payouts.length + 1}`, ...input };
-    this.payouts.push(p);
-    return p;
+describe('DistributionEngine', () => {
+  // Mock distributionRepo that records created runs and payouts
+  class MockDistributionRepo {
+    runs: any[] = [];
+    payouts: any[] = [];
+    failNext = 0;
+    failCount = 0;
+
+    async createDistributionRun(input: any) {
+      if (this.failNext > 0) {
+        this.failNext--;
+        this.failCount++;
+        throw new Error('Database error (run)');
+      }
+      const run = { id: `run-${this.runs.length + 1}`, ...input };
+      this.runs.push(run);
+      return run;
+    }
+
+    async createPayout(input: any) {
+      if (this.failNext > 0) {
+        this.failNext--;
+        this.failCount++;
+        throw new Error('Database error (payout)');
+      }
+      const p = { id: `p-${this.payouts.length + 1}`, ...input };
+      this.payouts.push(p);
+      return p;
+    }
   }
 }
 
-// Mock balance provider
-class MockBalanceProvider {
-  constructor(private rows: any[]) {}
-  async getBalances(_offeringId: string, _period: any) {
-    return this.rows;
-  }
-}
-
-(async function run() {
+describe('DistributionEngine', () => {
+  it('prorates payouts, preserves totals across rounding, and errors on zero balance', async () => {
   // Test 1: simple proration
   const distRepo1 = new MockDistributionRepo();
   const balances1 = [
@@ -59,6 +67,5 @@ class MockBalanceProvider {
     threw = true;
   }
   assert(threw, 'expected error when total balance is zero');
-
-  console.log('distributionEngine tests passed');
-})();
+  });
+});

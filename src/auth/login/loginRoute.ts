@@ -1,42 +1,19 @@
 import { Router } from 'express';
-import { createLoginHandler } from './loginHandler';
 import { LoginService } from './loginService';
-import { JwtIssuer, SessionRepository, UserRepository } from './types';
+import { createLoginHandler } from './loginHandler';
 
-/**
- * Dependencies required to wire the login route.
- *
- * These are satisfied by concrete implementations at composition-root
- * level (e.g. inside `src/index.ts`), keeping this module decoupled
- * from database drivers, JWT libraries, etc.
- */
-export interface CreateLoginRouterDeps {
-    userRepository: UserRepository;
-    sessionRepository: SessionRepository;
-    jwtIssuer: JwtIssuer;
+export interface LoginRouterDependencies {
+  loginService: LoginService;
 }
 
 /**
- * Create an Express router that exposes:
- *
- *   POST /api/auth/login   { email, password }
- *
- * Returns 200 with `{ token, user: { id, email, role } }` on success,
- * or 401 for invalid credentials.
+ * Express router factory for `POST /api/auth/login`.
  */
-export const createLoginRouter = ({
-    userRepository,
-    sessionRepository,
-    jwtIssuer,
-}: CreateLoginRouterDeps): Router => {
-    const router = Router();
-    const loginService = new LoginService(
-        userRepository,
-        sessionRepository,
-        jwtIssuer,
-    );
+export function createLoginRouter(deps: LoginRouterDependencies): Router {
+  const router = Router();
+  const handler = createLoginHandler(deps.loginService);
 
-    router.post('/api/auth/login', createLoginHandler(loginService));
+  router.post('/api/auth/login', handler);
 
-    return router;
-};
+  return router;
+}

@@ -1,36 +1,67 @@
-import { Router, Request, Response } from 'express';
+import { NextFunction, Request, Response, Router } from 'express';
 import { Pool } from 'pg';
+import { AppError, Errors } from '../lib/errors';
 
-export const healthReadyHandler = (db: Pool) => async (_req: Request, res: Response): Promise<void> => {
-    try {
-        // 1. Check Database connectivity
-        await db.query('SELECT 1');
+export type HealthDependency = 'database' | 'stellar-horizon';
 
-        // 2. Check Stellar Horizon connectivity
-        try {
-            const horizonUrl = process.env.STELLAR_HORIZON_URL || 'https://horizon.stellar.org';
-            const response = await fetch(horizonUrl);
-            if (!response.ok) {
-                throw new Error('Stellar Horizon returned non-ok status');
-            }
-        } catch (stellarError) {
-            console.error('Stellar Horizon check failed:', stellarError);
-            res.status(503).json({ status: 'error', message: 'Stellar Horizon is down' });
-            return;
-        }
+interface QueryableDb {
+  query(sql: string, params?: unknown[]): Promise<unknown>;
+}
 
-        // If both checks pass
-        res.status(200).json({ status: 'ok', db: 'up', stellar: 'up' });
-    } catch (dbError) {
-        console.error('Database check failed:', dbError);
-        res.status(503).json({ status: 'error', message: 'Database is down' });
+/**
+ * Maps dependency failures into a stable, reviewable API error shape.
+ * Raw upstream error messages are intentionally not exposed to clients.
+ */
+export function mapHealthDependencyFailure(
+  dependency: HealthDependency,
+  cause: unknown,
+): AppError {
+  const details: Record<string, unknown> = { dependency };
+
+  if (dependency === 'stellar-horizon' && typeof cause === 'object' && cause !== null) {
+    const status = (cause as { status?: unknown }).status;
+    if (typeof status === 'number') {
+      details.upstreamStatus = status;
     }
-};
+  }
 
-export const createHealthRouter = (db: Pool): Router => {
-    const router = Router();
-    router.get('/ready', healthReadyHandler(db));
-    return router;
+  return Errors.serviceUnavailable('Dependency unavailable', details);
+}
+
+export const healthReadyHandler =
+  (db: QueryableDb) =>
+  async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      await db.query('SELECT 1');
+    } catch (dbError) {
+      next(mapHealthDependencyFailure('database', dbError));
+      return;
+    }
+
+    try {
+      const horizonUrl = process.env.STELLAR_HORIZON_URL || 'https://horizon.stellar.org';
+      const response = await fetch(horizonUrl);
+
+      if (!response.ok) {
+        next(mapHealthDependencyFailure('stellar-horizon', { status: response.status }));
+        return;
+      }
+    } catch (stellarError) {
+      next(mapHealthDependencyFailure('stellar-horizon', stellarError));
+      return;
+    }
+
+    res.status(200).json({
+      status: 'ok',
+      db: 'up',
+      stellar: 'up',
+    });
+  };
+
+export const createHealthRouter = (db: QueryableDb): Router => {
+  const router = Router();
+  router.get('/ready', healthReadyHandler(db));
+  return router;
 };
 
 export default createHealthRouter;

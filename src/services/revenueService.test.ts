@@ -15,7 +15,7 @@ describe('RevenueService', () => {
 
         mockRevenueReportRepo = {
             create: jest.fn(),
-            findByOfferingAndPeriod: jest.fn(),
+            findOverlappingReport: jest.fn(),
         } as any;
 
         service = new RevenueService(mockOfferingRepo, mockRevenueReportRepo);
@@ -40,7 +40,7 @@ describe('RevenueService', () => {
             updated_at: new Date(),
         });
 
-        mockRevenueReportRepo.findByOfferingAndPeriod.mockResolvedValue(null);
+        mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
         mockRevenueReportRepo.create.mockResolvedValue({
             id: 'report-1',
             ...input,
@@ -94,13 +94,13 @@ describe('RevenueService', () => {
         await expect(service.submitReport(input)).rejects.toThrow('Unauthorized');
     });
 
-    it('should throw error if report already exists for period', async () => {
+    it('should throw error if report overlaps with existing period', async () => {
         const input: SubmitRevenueReportInput = {
             offeringId: 'offering-1',
             issuerId: 'issuer-1',
             amount: '1000.00',
-            periodStart: new Date('2024-01-01'),
-            periodEnd: new Date('2024-01-31'),
+            periodStart: new Date('2024-01-15'),
+            periodEnd: new Date('2024-02-15'),
         };
 
         mockOfferingRepo.findById.mockResolvedValue({
@@ -113,8 +113,59 @@ describe('RevenueService', () => {
             updated_at: new Date(),
         });
 
-        mockRevenueReportRepo.findByOfferingAndPeriod.mockResolvedValue({ id: 'existing' } as any);
+        mockRevenueReportRepo.findOverlappingReport.mockResolvedValue({ id: 'existing' } as any);
 
-        await expect(service.submitReport(input)).rejects.toThrow('Revenue report already exists');
+        await expect(service.submitReport(input)).rejects.toThrow('overlaps');
+    });
+
+    it('should throw error for invalid amount format', async () => {
+        const input: SubmitRevenueReportInput = {
+            offeringId: 'offering-1',
+            issuerId: 'issuer-1',
+            amount: 'invalid-amount',
+            periodStart: new Date('2024-01-01'),
+            periodEnd: new Date('2024-01-31'),
+        };
+
+        mockOfferingRepo.findById.mockResolvedValue({
+            id: 'offering-1',
+            issuer_id: 'issuer-1',
+        } as any);
+
+        await expect(service.submitReport(input)).rejects.toThrow('Invalid revenue amount format');
+    });
+
+    it('should throw error for non-positive amount', async () => {
+        const input: SubmitRevenueReportInput = {
+            offeringId: 'offering-1',
+            issuerId: 'issuer-1',
+            amount: '0.00',
+            periodStart: new Date('2024-01-01'),
+            periodEnd: new Date('2024-01-31'),
+        };
+
+        mockOfferingRepo.findById.mockResolvedValue({
+            id: 'offering-1',
+            issuer_id: 'issuer-1',
+        } as any);
+
+        await expect(service.submitReport(input)).rejects.toThrow('must be greater than zero');
+    });
+
+    it('should throw error if period end is not after start', async () => {
+        const input: SubmitRevenueReportInput = {
+            offeringId: 'offering-1',
+            issuerId: 'issuer-1',
+            amount: '100.00',
+            periodStart: new Date('2024-01-31'),
+            periodEnd: new Date('2024-01-01'),
+        };
+
+        mockOfferingRepo.findById.mockResolvedValue({
+            id: 'offering-1',
+            issuer_id: 'issuer-1',
+        } as any);
+
+        await expect(service.submitReport(input)).rejects.toThrow('end date must be strictly after start date');
     });
 });

@@ -40,7 +40,7 @@ export class StartupAuthService {
                 email: input.email,
                 password_hash: passwordHash,
                 name: input.name,
-                role: 'startup_admin',
+                role: 'startup',
             };
 
             const newUser = await this.userRepository.createUser(createInput);

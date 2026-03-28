@@ -22,6 +22,9 @@ export interface JwtPayload {
   email?: string;
   iat?: number;
   exp?: number;
+  nbf?: number;            // Not Before
+  iss?: string;            // Issuer
+  aud?: string | string[]; // Audience
   [key: string]: unknown;
 }
 
@@ -31,7 +34,74 @@ export interface JwtPayload {
 export interface TokenOptions {
   expiresIn?: string;
   subject: string;
+  email?: string;
   additionalPayload?: Record<string, unknown>;
+}
+
+/**
+ * @notice Options controlling which optional JWT claims are validated.
+ * @dev All fields are optional. When omitted, the corresponding check is skipped.
+ */
+export interface ClaimValidationOptions {
+  /** @param issuer Expected value of the `iss` claim. Validated only when provided. */
+  issuer?: string;
+  /** @param audience Expected value of the `aud` claim. Validated only when provided. */
+  audience?: string;
+  /**
+   * @param clockToleranceSeconds Seconds of clock skew to tolerate for time-based claims.
+   * Defaults to 30 seconds when not specified.
+   */
+  clockToleranceSeconds?: number;
+}
+
+/**
+ * @notice Validates standard JWT claims beyond signature verification.
+ * @dev Enforces sub presence, exp, iat, nbf, iss, and aud claims explicitly.
+ *      Called by verifyToken after jsonwebtoken signature verification.
+ *      Can also be called independently on a decoded payload.
+ * @param payload The decoded JWT payload to validate.
+ * @param options Optional configuration for issuer, audience, and clock skew.
+ * @throws {Error} Descriptive error for each specific claim violation.
+ */
+export function validateClaims(
+  payload: JwtPayload,
+  options?: ClaimValidationOptions,
+): void {
+  const tolerance = options?.clockToleranceSeconds ?? 30;
+  const now = Math.floor(Date.now() / 1000);
+
+  // sub: must be present and a non-empty string
+  if (!payload.sub || typeof payload.sub !== 'string' || payload.sub.trim() === '') {
+    throw new Error('Token is missing required subject (sub) claim');
+  }
+
+  // exp: explicit check (jsonwebtoken already checks this; here for standalone use)
+  if (payload.exp !== undefined && payload.exp < now - tolerance) {
+    throw new Error('Token has expired');
+  }
+
+  // iat: issued-at must not be in the future (beyond tolerance)
+  if (payload.iat !== undefined && payload.iat > now + tolerance) {
+    throw new Error('Token iat claim is in the future');
+  }
+
+  // nbf: not-before — token must be valid by now (beyond tolerance)
+  if (payload.nbf !== undefined && payload.nbf > now + tolerance) {
+    throw new Error('Token is not yet valid (nbf claim)');
+  }
+
+  // iss: issuer — validated only when an expected issuer is configured
+  if (options?.issuer !== undefined && payload.iss !== options.issuer) {
+    throw new Error(`Token issuer mismatch: expected "${options.issuer}"`);
+  }
+
+  // aud: audience — validated only when an expected audience is configured
+  if (options?.audience !== undefined) {
+    const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (!audiences.includes(options.audience)) {
+      throw new Error(`Token audience mismatch: expected "${options.audience}"`);
+    }
+  }
 }
 
 /**
@@ -72,15 +142,18 @@ export function issueToken(options: TokenOptions): string {
   const secret = getJwtSecret();
   const algorithm = getJwtAlgorithm();
 
+  // Apply additional payload first, but always force `sub` (and `email` when provided)
+  // to match TokenOptions. This avoids duplicate-field ambiguity and prevents
+  // jsonwebtoken from erroring when `subject` is also provided in SignOptions.
   const payload: JwtPayload = {
+    ...(options.additionalPayload ?? {}),
+    ...(options.email ? { email: options.email } : {}),
     sub: options.subject,
-    ...options.additionalPayload,
   };
 
   const signOptions: jwt.SignOptions = {
     algorithm,
-    expiresIn: options.expiresIn || TOKEN_EXPIRY,
-    subject: options.subject,
+    expiresIn: (options.expiresIn || TOKEN_EXPIRY) as jwt.SignOptions["expiresIn"],
   };
 
   return jwt.sign(payload, secret, signOptions);
@@ -116,19 +189,34 @@ export function decodePayload(token: string): JwtPayload | null {
 }
 
 /**
- * Verify and decode a JWT token
- *
- * @param token - JWT token string
- * @returns Decoded payload if valid
- * @throws Error if token is invalid or expired
+ * @notice Verify and decode a JWT token, then validate its standard claims.
+ * @dev Uses jsonwebtoken for HMAC-HS256 signature verification, then calls
+ *      validateClaims for explicit per-claim enforcement.
+ * @param token JWT token string to verify.
+ * @param options Optional claim validation configuration.
+ * @returns Decoded and validated JwtPayload.
+ * @throws {Error} If the token is invalid, expired, or any claim fails validation.
  */
-export function verifyToken(token: string): JwtPayload {
+export function verifyToken(
+  token: string,
+  options?: ClaimValidationOptions,
+): JwtPayload {
   const secret = getJwtSecret();
   const algorithm = getJwtAlgorithm();
 
-  const payload = jwt.verify(token, secret, {
-    algorithms: [algorithm],
-  }) as JwtPayload;
+  let payload: JwtPayload;
+  try {
+    payload = jwt.verify(token, secret, {
+      algorithms: [algorithm],
+    }) as JwtPayload;
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === 'TokenExpiredError') {
+      throw new Error('Token has expired');
+    }
+    throw err;
+  }
+
+  validateClaims(payload, options);
 
   return payload;
 }

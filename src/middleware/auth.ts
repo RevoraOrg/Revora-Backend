@@ -2,6 +2,8 @@ import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { verifyToken, JwtPayload } from '../lib/jwt';
 import crypto from 'crypto';
 import { AuthContext, AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
+import { SessionRepository as DbSessionRepository } from '../db/repositories/sessionRepository';
+import { hashSessionToken, isSessionExpired } from '../auth/session';
 
 // ── AuthenticatedRequest (JWT / sub-based) ────────────────────────────────────
 export interface AuthenticatedRequest extends Request {
@@ -38,9 +40,9 @@ export function authMiddleware(): RequestHandler {
     try {
       const payload = verifyToken(token);
       (req as AuthenticatedRequest).user = {
+        ...payload,
         sub: payload.sub,
         email: payload.email,
-        ...payload,
       };
       next();
     } catch (error) {
@@ -74,7 +76,11 @@ export function optionalAuthMiddleware(): RequestHandler {
 
     try {
       const payload = verifyToken(parts[1]);
-      (req as AuthenticatedRequest).user = { sub: payload.sub, email: payload.email, ...payload };
+      (req as AuthenticatedRequest).user = {
+        ...payload,
+        sub: payload.sub,
+        email: payload.email,
+      };
     } catch {
       (req as AuthenticatedRequest).user = undefined;
     }
@@ -162,39 +168,63 @@ export const requireIssuerAuth = (
   next();
 };
 
-// ── requireAuth (feature/change-password-api) ─────────────────────────────────
-// Verifies HS256 Bearer JWT, populates req.auth with { userId, sessionId, tokenId }.
-// Consumed by logoutRoute and changePasswordRoute via src/middleware/auth.ts.
-export const requireAuth: RequestHandler = (
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void => {
-  const authHeader = req.headers.authorization;
+// ── createRequireAuth (session-hardened)
+export function createRequireAuth(sessionRepository: DbSessionRepository): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header' });
+      return;
+    }
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized' });
-    return;
-  }
+    const token = authHeader.slice(7);
+    let payload: JwtPayload;
 
-  const token = authHeader.slice(7);
-  const secret = process.env.JWT_SECRET;
+    try {
+      payload = verifyToken(token);
+    } catch (err) {
+      res.status(401).json({ error: 'Unauthorized: invalid or expired token' });
+      return;
+    }
 
-  if (!secret) {
-    res.status(500).json({ error: 'Server configuration error' });
-    return;
-  }
+    if (!payload.sub || !payload.sid) {
+      res.status(401).json({ error: 'Unauthorized: token missing subject or session' });
+      return;
+    }
 
-  try {
-    const payload = verifyJwt(token, secret);
-    const authContext: AuthContext = {
+    const session = await sessionRepository.findById(payload.sid);
+
+    if (!session || session.user_id !== payload.sub) {
+      res.status(401).json({ error: 'Unauthorized: session not found or user mismatch' });
+      return;
+    }
+
+    if (isSessionExpired(session.expires_at)) {
+      res.status(401).json({ error: 'Unauthorized: session expired' });
+      return;
+    }
+
+    if (hashSessionToken(token) !== session.token_hash) {
+      res.status(401).json({ error: 'Unauthorized: token mismatch' });
+      return;
+    }
+
+    (req as any).auth = {
       userId: payload.sub,
-      sessionId: payload.sid ?? '',
+      sessionId: payload.sid,
       tokenId: token,
+    } as AuthContext;
+
+    (req as AuthenticatedRequest).user = {
+      sub: payload.sub,
+      id: payload.sub,
+      role: payload.role as string,
     };
-    (req as LogoutAuthenticatedRequest).auth = authContext;
+
     next();
-  } catch {
-    res.status(401).json({ error: 'Unauthorized' });
-  }
-};
+  };
+}
+
+export function requireAuth(sessionRepository: DbSessionRepository): RequestHandler {
+  return createRequireAuth(sessionRepository);
+}

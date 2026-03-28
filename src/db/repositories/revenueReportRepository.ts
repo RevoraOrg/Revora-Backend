@@ -9,6 +9,7 @@ export interface RevenueReport {
   amount?: string;
   period_start?: Date;
   period_end?: Date;
+  reported_by: string;
   created_at: Date;
   updated_at: Date;
   [key: string]: unknown;
@@ -22,6 +23,7 @@ export interface CreateRevenueReportInput {
   amount?: string;
   period_start?: Date;
   period_end?: Date;
+  reported_by: string;
   [key: string]: string | number | boolean | Date | null | undefined;
 }
 
@@ -122,6 +124,38 @@ export class RevenueReportRepository {
   }
 
   /**
+   * Find any existing report that overlaps with the given period for an offering.
+   * This ensures no two reports cover the same time window.
+   */
+  async findOverlappingReport(
+    offeringId: string,
+    periodStart: Date,
+    periodEnd: Date
+  ): Promise<RevenueReport | null> {
+    const query = `
+      SELECT *
+      FROM revenue_reports
+      WHERE offering_id = $1
+        AND (
+          (period_start < $3 AND period_end > $2)
+        )
+      LIMIT 1
+    `;
+
+    const result: QueryResult<RevenueReportRow> = await this.db.query(query, [
+      offeringId,
+      periodStart,
+      periodEnd,
+    ]);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.mapRevenueReport(result.rows[0]);
+  }
+
+  /**
    * List all revenue reports for an offering.
    */
   async listByOffering(offeringId: string): Promise<RevenueReport[]> {
@@ -155,6 +189,7 @@ export class RevenueReportRepository {
           ? String(row.issuer_id)
           : undefined,
       amount: row.amount !== undefined && row.amount !== null ? String(row.amount) : undefined,
+      reported_by: String(row.reported_by),
       period_start: (row.period_start as Date | undefined) ?? undefined,
       period_end: (row.period_end as Date | undefined) ?? undefined,
       created_at: row.created_at as Date,
