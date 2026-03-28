@@ -7,6 +7,23 @@ import { createCorsMiddleware } from './middleware/cors';
 import { errorHandler } from './middleware/errorHandler';
 import { Errors } from './lib/errors';
 import { createHealthRouter } from './routes/health';
+import { createRateLimitMiddleware } from './middleware/rateLimit';
+import { createStartupAuthRouter } from './routes/startupAuth';
+import { createLoginRouter } from './auth/login/loginRoute';
+import { LoginService } from './auth/login/loginService';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { RefreshService } from './auth/refresh/refreshService';
+import { JwtIssuerAdapter } from './auth/login/jwtIssuerAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { UserRepository } from './db/repositories/userRepository';
+import { SessionRepository } from './db/repositories/sessionRepository';
+import { UserRepositoryAdapter } from './auth/login/userRepositoryAdapter';
+import { SessionRepositoryAdapter } from './auth/login/sessionRepositoryAdapter';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { OfferingRepository } from './db/repositories/offeringRepository';
+import { createPasswordResetRouter } from './routes/passwordReset';
+import { createReconciliationRouter } from './routes/reconciliationRoutes';
+import { pool } from './db/pool';
 import {
   createMilestoneValidationRouter,
   DomainEventPublisher,
@@ -101,9 +118,10 @@ const requireAuth: RequestHandler = (
     return;
   }
 
-  (req as Request & { user?: { id: string; role: string } }).user = {
+  (req as Request & { user?: { id: string; role: string; sessionToken: string } }).user = {
     id: userId,
     role,
+    sessionToken: 'stub-token',
   };
 
   next();
@@ -139,21 +157,6 @@ function createMilestoneDependencies() {
   };
 }
 
-apiRouter.use(createLoginRouter({ loginService }));
-apiRouter.use(createRefreshRouter({ refreshService }));
-
-const offeringRepository = new OfferingRepository(pool);
-apiRouter.use(
-  "/reconciliation",
-  createReconciliationRouter({
-    db: pool,
-    offeringRepo: offeringRepository,
-    requireAuth,
-  }),
-);
-
-apiRouter.use(createPasswordResetRouter(pool));
-
 /**
  * Main Express application entrypoint.
  *
@@ -170,6 +173,40 @@ export function createApp(): express.Express {
   const app = express();
   const apiRouter = express.Router();
   const milestoneDeps = createMilestoneDependencies();
+
+  // Initialize core repositories
+  const dbUserRepository = new UserRepository(pool);
+  const dbSessionRepository = new SessionRepository(pool);
+
+  // Adapters for domain services
+  const userRepoAdapter = new UserRepositoryAdapter(dbUserRepository);
+  const sessionRepoAdapter = new SessionRepositoryAdapter(dbSessionRepository);
+  const refreshRepoAdapter = new RefreshTokenRepositoryAdapter(dbSessionRepository);
+
+  // Domain services
+  const jwtIssuer = new JwtIssuerAdapter();
+  const tokenService = new JwtTokenServiceAdapter();
+
+  const loginService = new LoginService(
+    userRepoAdapter,
+    sessionRepoAdapter,
+    jwtIssuer
+  );
+
+  const refreshService = new RefreshService(
+    refreshRepoAdapter,
+    tokenService
+  );
+
+  /**
+   * Startup Auth Brute-Force Mitigation
+   * Limits registration attempts per IP to prevent automated abuse.
+   */
+  const startupAuthLimiter = createRateLimitMiddleware({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    limit: 5,
+    message: 'Too many registration attempts, please try again after 15 minutes.',
+  });
 
   app.use((req, _res, next) => {
     (req as Request & { requestId?: string }).requestId =
@@ -200,6 +237,23 @@ export function createApp(): express.Express {
     });
   });
 
+  // Mount business logic routes
+  apiRouter.use('/startup', startupAuthLimiter, createStartupAuthRouter(pool));
+  apiRouter.use(createLoginRouter({ loginService }));
+  apiRouter.use(createRefreshRouter({ refreshService }));
+
+  const offeringRepository = new OfferingRepository(pool);
+  apiRouter.use(
+    "/reconciliation",
+    createReconciliationRouter({
+      db: pool,
+      offeringRepo: offeringRepository,
+      requireAuth,
+    }),
+  );
+
+  apiRouter.use(createPasswordResetRouter(pool));
+
   apiRouter.use(
     createMilestoneValidationRouter({
       requireAuth,
@@ -214,14 +268,17 @@ export function createApp(): express.Express {
   return app;
 }
 
-const app = createApp();
+export const app = createApp();
 
-async function shutdown(signal: string): Promise<void> {
+export async function shutdown(signal: string): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`\n[server] ${signal} shutting down`);
   await closePool();
   process.exit(0);
 }
+
+let server: any;
+export const setServer = (s: any) => { server = s; };
 
 if (require.main === module) {
   process.on('SIGTERM', () => {
@@ -232,7 +289,7 @@ if (require.main === module) {
   });
 
   if (process.env.NODE_ENV !== 'test') {
-    app.listen(port, () => {
+    server = app.listen(port, () => {
       // eslint-disable-next-line no-console
       console.log(`revora-backend listening on http://localhost:${port}`);
     });

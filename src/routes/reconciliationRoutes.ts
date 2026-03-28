@@ -14,6 +14,7 @@ export interface ReconciliationRequest extends Request {
   user?: {
     id: string;
     role: string;
+    sessionToken: string;
   };
 }
 
