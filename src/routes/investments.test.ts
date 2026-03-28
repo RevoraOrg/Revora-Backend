@@ -8,7 +8,8 @@ import { createInvestmentsRouter } from './investments';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const SECRET = 'test-secret';
+const SECRET =
+  'test-secret-key-that-is-at-least-32-characters-long-for-route-tests!';
 
 /** Build a valid HS256 JWT without any external dependency. */
 function makeToken(payload: Record<string, unknown>): string {
@@ -33,9 +34,13 @@ function makeMockRes(): jest.Mocked<Response> {
 
 function makeReq(
   authHeader?: string,
-  query: Record<string, string> = {}
+  query: Record<string, string> = {},
+  method: string = 'GET'
 ): Request {
   return {
+    method,
+    url: '/',
+    originalUrl: '/',
     headers: authHeader ? { authorization: authHeader } : {},
     query,
   } as unknown as Request;
@@ -65,7 +70,15 @@ function dispatch(
   res: Response
 ): void {
   const outerNext = jest.fn(); // called only if every middleware passes through
-  const layer = router.stack[0];
+  const method = (req.method || 'GET').toLowerCase();
+  const layer = router.stack.find((l: any) => {
+    const route = l.route;
+    if (!route || !route.methods) return false;
+    return Boolean(route.methods[method]);
+  });
+  if (!layer) {
+    throw new Error(`No router layer found for method ${req.method}`);
+  }
   layer.handle(req, res, outerNext);
 }
 
@@ -96,11 +109,11 @@ function mockQueryResult(rows: Investment[]): QueryResult<Investment> {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/investments route handler', () => {
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
     process.env['JWT_SECRET'] = SECRET;
-    mockPool = { query: jest.fn() } as unknown as jest.Mocked<Pool>;
+    mockPool = { query: jest.fn() };
   });
 
   afterEach(() => {
@@ -112,7 +125,7 @@ describe('GET /api/investments route handler', () => {
   // -------------------------------------------------------------------------
 
   it('returns 401 when the Authorization header is absent', () => {
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(), res);
     expect(res.status).toHaveBeenCalledWith(401);
@@ -126,7 +139,7 @@ describe('GET /api/investments route handler', () => {
       const s = crypto.createHmac('sha256', 'wrong').update(`${h}.${b}`).digest('base64url');
       return `${h}.${b}.${s}`;
     })();
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${badToken}`), res);
     expect(res.status).toHaveBeenCalledWith(401);
@@ -134,7 +147,7 @@ describe('GET /api/investments route handler', () => {
 
   it('returns 403 for a token whose role is not investor', () => {
     const token = makeToken({ sub: 'admin-1', role: 'admin' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`), res);
     expect(res.status).toHaveBeenCalledWith(403);
@@ -149,7 +162,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult(rows));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`), res);
 
@@ -162,7 +175,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
 
     const token = makeToken({ sub: 'investor-456', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     dispatch(router, makeReq(`Bearer ${token}`), makeMockRes());
 
     await flushPromises();
@@ -181,7 +194,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     dispatch(router, makeReq(`Bearer ${token}`, { offering_id: 'offering-abc' }), makeMockRes());
 
     await flushPromises();
@@ -196,7 +209,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     dispatch(router, makeReq(`Bearer ${token}`, { limit: '10' }), makeMockRes());
 
     await flushPromises();
@@ -211,7 +224,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     dispatch(router, makeReq(`Bearer ${token}`, { offset: '20' }), makeMockRes());
 
     await flushPromises();
@@ -226,7 +239,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     dispatch(
       router,
       makeReq(`Bearer ${token}`, { offering_id: 'offering-abc', limit: '5', offset: '10' }),
@@ -247,7 +260,7 @@ describe('GET /api/investments route handler', () => {
 
   it('returns 400 for a non-numeric limit', async () => {
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`, { limit: 'abc' }), res);
 
@@ -260,7 +273,7 @@ describe('GET /api/investments route handler', () => {
 
   it('returns 400 for a negative limit', async () => {
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`, { limit: '-1' }), res);
 
@@ -272,7 +285,7 @@ describe('GET /api/investments route handler', () => {
 
   it('returns 400 for a non-numeric offset', async () => {
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`, { offset: 'bad' }), res);
 
@@ -284,7 +297,7 @@ describe('GET /api/investments route handler', () => {
 
   it('returns 400 for a negative offset', async () => {
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`, { offset: '-5' }), res);
 
@@ -302,7 +315,7 @@ describe('GET /api/investments route handler', () => {
     mockPool.query.mockRejectedValueOnce(new Error('db connection lost'));
 
     const token = makeToken({ sub: 'investor-123', role: 'investor' });
-    const router = createInvestmentsRouter(mockPool);
+    const router = createInvestmentsRouter(mockPool as unknown as Pool);
     const res = makeMockRes();
     dispatch(router, makeReq(`Bearer ${token}`), res);
 

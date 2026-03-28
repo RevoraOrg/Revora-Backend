@@ -5,17 +5,18 @@ const mockUser: User = {
   id: 'user-123',
   email: 'alice@example.com',
   password_hash: 'salt:hash',
+  role: 'investor',
   created_at: new Date('2024-01-01'),
   updated_at: new Date('2024-01-01'),
 };
 
 describe('UserRepository', () => {
   let repository: UserRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
     mockPool = { query: jest.fn() } as any;
-    repository = new UserRepository(mockPool);
+    repository = new UserRepository(mockPool as unknown as Pool);
   });
 
   describe('findById', () => {

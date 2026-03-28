@@ -1,4 +1,5 @@
 import { hashPassword, comparePassword as verifyPassword } from '../../utils/password';
+import { validatePasswordStrength } from '../../lib/passwordStrength';
 
 // ── Port interface ────────────────────────────────────────────────────────────
 // Keeps the service decoupled from pg and the concrete UserRepository.
@@ -38,11 +39,13 @@ export class ChangePasswordService {
       };
     }
 
-    if (!newPassword || newPassword.length < 8) {
+    // Validate new password strength
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.isValid) {
       return {
         ok: false,
         reason: 'VALIDATION_ERROR',
-        message: 'newPassword must be at least 8 characters.',
+        message: `New password does not meet strength requirements: ${strength.errors.join(', ')}`,
       };
     }
 

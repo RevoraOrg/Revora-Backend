@@ -22,7 +22,7 @@ export interface Payout {
   investor_id: string;
   amount: string; // Decimal as string to preserve precision
   status: 'pending' | 'processed' | 'failed';
-  transaction_hash?: string;
+  transaction_hash?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -45,7 +45,7 @@ export interface CreatePayoutInput {
   investor_id: string;
   amount: string;
   status?: 'pending' | 'processed' | 'failed';
-  transaction_hash?: string;
+  transaction_hash?: string | null;
 }
 
 /**

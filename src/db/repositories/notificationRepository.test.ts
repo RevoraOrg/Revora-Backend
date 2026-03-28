@@ -8,7 +8,8 @@ class MockPool {
   }
 }
 
-(async function run() {
+describe('NotificationRepository', () => {
+  it('create/listByUser/markRead behave as expected with mocked pool', async () => {
   const sampleNotification = {
     id: 'n1',
     user_id: 'u1',
@@ -42,6 +43,5 @@ class MockPool {
   const marked = await markReadRepo.markRead('n1');
   assert(marked.read_at !== null);
   assert(marked.id === 'n1');
-
-  console.log('notificationRepository tests passed');
-})();
+  });
+});

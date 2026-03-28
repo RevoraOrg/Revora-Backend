@@ -7,7 +7,7 @@ import {
 
 describe('AuditLogRepository', () => {
   let repository: AuditLogRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
     // Mock Pool
@@ -15,7 +15,7 @@ describe('AuditLogRepository', () => {
       query: jest.fn(),
     } as any;
 
-    repository = new AuditLogRepository(mockPool);
+    repository = new AuditLogRepository(mockPool as unknown as Pool);
   });
 
   describe('createAuditLog', () => {
@@ -138,7 +138,7 @@ describe('AuditLogRepository', () => {
       const result = await repository.getAuditLogsByUser(userId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM audit_logs WHERE user_id = $1'),
+        expect.stringMatching(/SELECT\s*\*\s*FROM\s+audit_logs[\s\S]*WHERE\s+user_id\s*=\s*\$1[\s\S]*ORDER\s+BY\s+created_at\s+DESC[\s\S]*LIMIT\s+\$2/),
         [userId, 50]
       );
       expect(result).toHaveLength(1);
@@ -173,7 +173,7 @@ describe('AuditLogRepository', () => {
       const result = await repository.getAuditLogsByAction(action);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM audit_logs WHERE action = $1'),
+        expect.stringMatching(/SELECT\s*\*\s*FROM\s+audit_logs[\s\S]*WHERE\s+action\s*=\s*\$1[\s\S]*ORDER\s+BY\s+created_at\s+DESC[\s\S]*LIMIT\s+\$2/),
         [action, 50]
       );
       expect(result).toHaveLength(1);

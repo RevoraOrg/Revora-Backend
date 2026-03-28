@@ -43,8 +43,13 @@ export function sanitizeString(input: unknown, opts?: SanitizeOptions): string {
   if (o.trim) s = s.trim();
   if (o.collapseWhitespace) {
     if (o.allowNewlines) {
-      s = s.replace(/[ \t\f\v\r]+/g, ' ');
-      s = s.replace(/ *\n+ */g, '\n');
+      // Normalize per-line whitespace while preserving newline structure.
+      // (A naïve `/ *\n+ */g` merge collapses intentional blank lines.)
+      s = s
+        .split('\n')
+        .map((line) => line.replace(/[ \t\f\v\r]+/g, ' ').trim())
+        .join('\n');
+      // Collapse/extremely long paragraph breaks down to a single blank line.
       s = s.replace(/\n{3,}/g, '\n\n');
     } else {
       s = s.replace(/\s+/g, ' ');

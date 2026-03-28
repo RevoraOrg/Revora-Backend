@@ -1,6 +1,4 @@
 import { NextFunction, Response } from 'express';
-import assert from 'node:assert/strict';
-import test from 'node:test';
 import { createLogoutHandler } from './logoutHandler';
 import { LogoutService } from './logoutService';
 import { AuthenticatedRequest, SessionRepository } from './types';
@@ -52,7 +50,7 @@ const createProtectedAuthMiddleware = (sessions: InMemorySessionRepository) => {
   return (
     req: AuthenticatedRequest,
     res: Response,
-    next: NextFunction
+    next: NextFunction,
   ): void => {
     const bearer = req.headers.authorization;
     const token = bearer?.startsWith('Bearer ') ? bearer.slice(7) : undefined;
@@ -85,55 +83,57 @@ const login = (sessions: InMemorySessionRepository): string => {
   return token;
 };
 
-test('logout invalidates current session and token can no longer be used', async () => {
-  const sessions = new InMemorySessionRepository();
-  const requireAuth = createProtectedAuthMiddleware(sessions);
-  const logoutHandler = createLogoutHandler(new LogoutService(sessions));
+describe('logout route', () => {
+  it('invalidates current session and token can no longer be used', async () => {
+    const sessions = new InMemorySessionRepository();
+    const requireAuth = createProtectedAuthMiddleware(sessions);
+    const logoutHandler = createLogoutHandler(new LogoutService(sessions));
 
-  const token = login(sessions);
+    const token = login(sessions);
 
-  const authorizedRequestBeforeLogout = {
-    headers: { authorization: createBearerHeader(token) },
-  } as AuthenticatedRequest;
+    const authorizedRequestBeforeLogout = {
+      headers: { authorization: createBearerHeader(token) },
+    } as AuthenticatedRequest;
 
-  const authorizedResponseBeforeLogout = new MockResponse() as unknown as Response;
+    const authorizedResponseBeforeLogout = new MockResponse() as unknown as Response;
 
-  let nextCalledBeforeLogout = false;
-  requireAuth(
-    authorizedRequestBeforeLogout,
-    authorizedResponseBeforeLogout,
-    () => {
-      nextCalledBeforeLogout = true;
-    }
-  );
+    let nextCalledBeforeLogout = false;
+    requireAuth(
+      authorizedRequestBeforeLogout,
+      authorizedResponseBeforeLogout,
+      () => {
+        nextCalledBeforeLogout = true;
+      },
+    );
 
-  assert.equal(nextCalledBeforeLogout, true);
-  assert.equal(authorizedRequestBeforeLogout.auth?.sessionId, 'session-1');
+    expect(nextCalledBeforeLogout).toBe(true);
+    expect(authorizedRequestBeforeLogout.auth?.sessionId).toBe('session-1');
 
-  const logoutResponse = new MockResponse();
-  await logoutHandler(
-    authorizedRequestBeforeLogout,
-    logoutResponse as unknown as Response,
-    () => undefined
-  );
+    const logoutResponse = new MockResponse();
+    await logoutHandler(
+      authorizedRequestBeforeLogout,
+      logoutResponse as unknown as Response,
+      () => undefined,
+    );
 
-  assert.equal(logoutResponse.statusCode, 204);
+    expect(logoutResponse.statusCode).toBe(204);
 
-  const authorizedRequestAfterLogout = {
-    headers: { authorization: createBearerHeader(token) },
-  } as AuthenticatedRequest;
+    const authorizedRequestAfterLogout = {
+      headers: { authorization: createBearerHeader(token) },
+    } as AuthenticatedRequest;
 
-  const unauthorizedResponseAfterLogout = new MockResponse();
+    const unauthorizedResponseAfterLogout = new MockResponse();
 
-  let nextCalledAfterLogout = false;
-  requireAuth(
-    authorizedRequestAfterLogout,
-    unauthorizedResponseAfterLogout as unknown as Response,
-    () => {
-      nextCalledAfterLogout = true;
-    }
-  );
+    let nextCalledAfterLogout = false;
+    requireAuth(
+      authorizedRequestAfterLogout,
+      unauthorizedResponseAfterLogout as unknown as Response,
+      () => {
+        nextCalledAfterLogout = true;
+      },
+    );
 
-  assert.equal(nextCalledAfterLogout, false);
-  assert.equal(unauthorizedResponseAfterLogout.statusCode, 401);
+    expect(nextCalledAfterLogout).toBe(false);
+    expect(unauthorizedResponseAfterLogout.statusCode).toBe(401);
+  });
 });

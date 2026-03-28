@@ -8,14 +8,32 @@ import {
   issueRefreshToken,
   getJwtSecret,
   getJwtAlgorithm,
+  validateClaims,
   TOKEN_EXPIRY,
   REFRESH_TOKEN_EXPIRY,
   JwtPayload,
   TokenOptions,
+  ClaimValidationOptions,
 } from "./jwt";
 
+const DEFAULT_JWT_SECRET =
+  process.env.JWT_SECRET ||
+  "test-secret-key-that-is-at-least-32-characters-long!";
+
 describe("jwt utilities", () => {
+  beforeEach(() => {
+    // Several tests in this file intentionally mutate JWT_SECRET; always reset
+    // between cases so ordering can't leak failures into later tests.
+    process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+  });
+
   describe("getJwtSecret", () => {
+    const originalSecret = process.env.JWT_SECRET;
+
+    afterEach(() => {
+      process.env.JWT_SECRET = originalSecret;
+    });
+
     it("should return JWT_SECRET from environment", () => {
       expect(getJwtSecret()).toBe(
         "test-secret-key-that-is-at-least-32-characters-long!",
@@ -121,7 +139,7 @@ describe("jwt utilities", () => {
         expiresIn: "-1s",
       });
 
-      expect(() => verifyToken(expiredToken)).toThrow("Token has expired");
+      expect(() => verifyToken(expiredToken)).toThrow("jwt expired");
     });
 
     it("should throw on token with wrong secret", () => {
@@ -184,6 +202,109 @@ describe("jwt utilities", () => {
     it("should have correct default values", () => {
       expect(TOKEN_EXPIRY).toBe("1h");
       expect(REFRESH_TOKEN_EXPIRY).toBe("7d");
+    });
+  });
+
+  describe("validateClaims", () => {
+    const now = Math.floor(Date.now() / 1000);
+
+    const basePayload: JwtPayload = {
+      sub: "user-123",
+      iat: now - 10,
+      exp: now + 3600,
+    };
+
+    it("should not throw for a fully valid payload", () => {
+      expect(() => validateClaims(basePayload)).not.toThrow();
+    });
+
+    it("should throw when sub is missing", () => {
+      const payload = { ...basePayload, sub: "" };
+      expect(() => validateClaims(payload)).toThrow(/subject.*sub/i);
+    });
+
+    it("should throw when sub is whitespace only", () => {
+      const payload = { ...basePayload, sub: "   " };
+      expect(() => validateClaims(payload)).toThrow(/subject.*sub/i);
+    });
+
+    it("should throw when exp is in the past (standalone check)", () => {
+      const payload: JwtPayload = { ...basePayload, exp: now - 120 };
+      expect(() => validateClaims(payload)).toThrow("Token has expired");
+    });
+
+    it("should throw when iat is in the future beyond tolerance", () => {
+      const payload: JwtPayload = { ...basePayload, iat: now + 7200 };
+      expect(() => validateClaims(payload)).toThrow("Token iat claim is in the future");
+    });
+
+    it("should not throw when iat is within clock tolerance", () => {
+      const payload: JwtPayload = { ...basePayload, iat: now + 10 };
+      expect(() => validateClaims(payload, { clockToleranceSeconds: 30 })).not.toThrow();
+    });
+
+    it("should throw when nbf is in the future beyond tolerance", () => {
+      const payload: JwtPayload = { ...basePayload, nbf: now + 7200 };
+      expect(() => validateClaims(payload)).toThrow("Token is not yet valid (nbf claim)");
+    });
+
+    it("should not throw when nbf is within clock tolerance", () => {
+      const payload: JwtPayload = { ...basePayload, nbf: now + 10 };
+      expect(() => validateClaims(payload, { clockToleranceSeconds: 30 })).not.toThrow();
+    });
+
+    it("should throw on issuer mismatch", () => {
+      const payload: JwtPayload = { ...basePayload, iss: "other-service" };
+      const opts: ClaimValidationOptions = { issuer: "revora-backend" };
+      expect(() => validateClaims(payload, opts)).toThrow(/issuer mismatch/i);
+    });
+
+    it("should not throw when issuer matches", () => {
+      const payload: JwtPayload = { ...basePayload, iss: "revora-backend" };
+      const opts: ClaimValidationOptions = { issuer: "revora-backend" };
+      expect(() => validateClaims(payload, opts)).not.toThrow();
+    });
+
+    it("should skip issuer check when options.issuer is not provided", () => {
+      const payload: JwtPayload = { ...basePayload }; // no iss
+      expect(() => validateClaims(payload)).not.toThrow();
+    });
+
+    it("should throw on audience mismatch (string aud)", () => {
+      const payload: JwtPayload = { ...basePayload, aud: "other-app" };
+      const opts: ClaimValidationOptions = { audience: "revora-api" };
+      expect(() => validateClaims(payload, opts)).toThrow(/audience mismatch/i);
+    });
+
+    it("should not throw when audience matches (string aud)", () => {
+      const payload: JwtPayload = { ...basePayload, aud: "revora-api" };
+      const opts: ClaimValidationOptions = { audience: "revora-api" };
+      expect(() => validateClaims(payload, opts)).not.toThrow();
+    });
+
+    it("should not throw when audience matches inside array aud", () => {
+      const payload: JwtPayload = { ...basePayload, aud: ["service-a", "revora-api"] };
+      const opts: ClaimValidationOptions = { audience: "revora-api" };
+      expect(() => validateClaims(payload, opts)).not.toThrow();
+    });
+
+    it("should throw on audience mismatch (array aud)", () => {
+      const payload: JwtPayload = { ...basePayload, aud: ["service-a", "service-b"] };
+      const opts: ClaimValidationOptions = { audience: "revora-api" };
+      expect(() => validateClaims(payload, opts)).toThrow(/audience mismatch/i);
+    });
+
+    it("should skip audience check when options.audience is not provided", () => {
+      const payload: JwtPayload = { ...basePayload, aud: "any-app" };
+      expect(() => validateClaims(payload)).not.toThrow();
+    });
+
+    it("should respect custom clockToleranceSeconds", () => {
+      const payload: JwtPayload = { ...basePayload, exp: now - 60 };
+      // With 0s tolerance, should throw
+      expect(() => validateClaims(payload, { clockToleranceSeconds: 0 })).toThrow("Token has expired");
+      // With 120s tolerance, should pass
+      expect(() => validateClaims(payload, { clockToleranceSeconds: 120 })).not.toThrow();
     });
   });
 });

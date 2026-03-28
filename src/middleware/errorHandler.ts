@@ -1,45 +1,81 @@
-import { Request, Response, NextFunction } from 'express';
-import { AppError, ErrorCode, ErrorResponse } from '../lib/errors';
+import { ErrorRequestHandler, NextFunction, Request, Response } from 'express';
+import { AppError, ErrorCode, ErrorResponse, Errors } from '../lib/errors';
+
+interface StructuredErrorLogEntry {
+  type: 'error';
+  requestId?: string;
+  code: ErrorCode;
+  statusCode: number;
+  message: string;
+  expose: boolean;
+  details?: unknown;
+  stack?: string;
+}
+
+const isProduction = (): boolean => process.env.NODE_ENV === 'production';
+
+function getRequestId(req: Request): string | undefined {
+  return (req as Request & { requestId?: string }).requestId;
+}
 
 /**
- * @notice Global Express error-handling middleware.
- * @dev Mount this AFTER all routes so unhandled errors bubble up here:
- *   app.use(errorHandler);
+ * Maps arbitrary thrown values to a structured application error.
  *
- * Behaviour:
- * - AppError instances are serialised via AppError.toResponse()
- *   and the correct HTTP status code is used.
- * - Any other thrown value is treated as an unexpected server error (500),
- *   logged, and returned as { code: 'INTERNAL_ERROR', message: 'Internal server error' }.
- * - Stack traces are never leaked to the client.
- * - If requestIdMiddleware is mounted earlier, req.requestId is forwarded
- *   in the JSON response body for traceability.
+ * Security boundary:
+ * - AppError instances are trusted to carry client-visible messages/details.
+ * - Unknown values are always downgraded to a generic INTERNAL_ERROR.
  */
-export function errorHandler(
+export function mapUnknownErrorToAppError(err: unknown): AppError {
+  if (err instanceof AppError) {
+    return err;
+  }
+
+  return Errors.internal();
+}
+
+export function createStructuredErrorLogEntry(
+  err: unknown,
+  requestId?: string,
+): StructuredErrorLogEntry {
+  const mapped = mapUnknownErrorToAppError(err);
+  const isMappedAppError = err instanceof AppError;
+  const entry: StructuredErrorLogEntry = {
+    type: 'error',
+    requestId,
+    code: mapped.code,
+    statusCode: mapped.statusCode,
+    message: mapped.message,
+    expose: mapped.expose,
+  };
+
+  if (mapped.details !== undefined && isMappedAppError) {
+    entry.details = mapped.details;
+  }
+
+  if (!isProduction() && err instanceof Error && err.stack) {
+    entry.stack = err.stack;
+  }
+
+  return entry;
+}
+
+/** Express 4-argument global error handler. Mount after all routes. */
+export const errorHandler: ErrorRequestHandler = (
   err: unknown,
   req: Request,
   res: Response,
-  // Express requires the fourth argument for the function to be recognised
-  // as an error handler, even when it is unused.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _next: NextFunction,
-): void {
-  const requestId: string | undefined = (req as any).requestId;
+): void => {
+  const requestId = getRequestId(req);
+  const mapped = mapUnknownErrorToAppError(err);
+  const logEntry = createStructuredErrorLogEntry(err, requestId);
 
-  if (err instanceof AppError) {
-    const body = err.toResponse() as ErrorResponse & { requestId?: string };
-    if (requestId !== undefined) body.requestId = requestId;
-    res.status(err.statusCode).json(body);
-    return;
-  }
+  console.error(JSON.stringify(logEntry));
 
-  // Unknown / unexpected error — log and return an opaque 500.
-  console.error('[errorHandler] Unhandled error:', err);
+  const body: ErrorResponse = mapped.expose
+    ? mapped.toResponse(requestId)
+    : Errors.internal().toResponse(requestId);
 
-  const body: ErrorResponse & { requestId?: string } = {
-    code: ErrorCode.INTERNAL_ERROR,
-    message: 'Internal server error',
-  };
-  if (requestId !== undefined) body.requestId = requestId;
-  res.status(500).json(body);
-}
+  res.status(mapped.statusCode).json(body);
+};

@@ -9,7 +9,7 @@ import {
 
 describe('DistributionRepository', () => {
   let repository: DistributionRepository;
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: { query: jest.Mock };
 
   beforeEach(() => {
     // Mock Pool
@@ -17,7 +17,7 @@ describe('DistributionRepository', () => {
       query: jest.fn(),
     } as any;
 
-    repository = new DistributionRepository(mockPool);
+    repository = new DistributionRepository(mockPool as unknown as Pool);
   });
 
   describe('createDistributionRun', () => {
@@ -258,7 +258,9 @@ describe('DistributionRepository', () => {
       const result = await repository.listByOffering(offeringId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM distribution_runs'),
+        expect.stringMatching(
+          /SELECT\s*\*[\s\S]*FROM\s+distribution_runs[\s\S]*WHERE\s+offering_id\s*=\s*\$1[\s\S]*ORDER\s+BY\s+distribution_date\s+DESC,\s+created_at\s+DESC/,
+        ),
         [offeringId]
       );
       expect(result).toHaveLength(2);
@@ -323,7 +325,9 @@ describe('DistributionRepository', () => {
       const result = await repository.listPayoutsByInvestor(investorId);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT * FROM payouts'),
+        expect.stringMatching(
+          /SELECT\s*\*[\s\S]*FROM\s+payouts[\s\S]*WHERE\s+investor_id\s*=\s*\$1[\s\S]*ORDER\s+BY\s+created_at\s+DESC/,
+        ),
         [investorId]
       );
       expect(result).toHaveLength(2);

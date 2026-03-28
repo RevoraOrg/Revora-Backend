@@ -40,7 +40,8 @@ function makePayout(overrides: Partial<Payout> = {}): Payout {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-(async function run() {
+describe('payouts routes', () => {
+  it('covers listPayouts behavior', async () => {
   const payouts: Payout[] = [
     makePayout({ id: 'pay-1', investor_id: 'inv-1', status: 'processed', amount: '100.00', created_at: new Date('2024-01-01') }),
     makePayout({ id: 'pay-2', investor_id: 'inv-1', status: 'processed', amount: '200.00', created_at: new Date('2024-01-02') }),
@@ -188,6 +189,5 @@ function makePayout(overrides: Partial<Payout> = {}): Payout {
     await failHandlers.listPayouts(makeReq({ id: 'inv-1', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr instanceof Error && capturedErr.message === 'DB error');
   }
-
-  console.log('payouts route tests passed');
-})();
+  });
+});

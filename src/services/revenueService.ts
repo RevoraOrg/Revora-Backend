@@ -20,7 +20,21 @@ export class RevenueService {
     ) { }
 
     /**
-     * Submit a revenue report for an offering
+     * @notice Submits and validates a revenue report for a specific offering.
+     * @dev Hardened with production-grade validation for amounts and reporting periods.
+     * 
+     * Security Assumptions:
+     * 1. The `issuerId` has been authenticated via JWT middleware.
+     * 2. The `issuerId` is the primary owner of the `offeringId`.
+     * 
+     * Validation Rules:
+     * - Amount must be a valid positive decimal string (max 10 decimal places).
+     * - Period end date must be strictly after the start date.
+     * - New reports cannot overlap with any existing reports for the same offering.
+     * 
+     * @param input - The revenue report data containing offering, amount, and period.
+     * @returns The persisted RevenueReport object.
+     * @throws Error if validation fails or unauthorized access is detected.
      */
     async submitReport(input: SubmitRevenueReportInput): Promise<RevenueReport> {
         // 1. Validate offering existence and ownership
@@ -33,27 +47,32 @@ export class RevenueService {
             throw new Error(`Unauthorized: Issuer does not own offering ${input.offeringId}`);
         }
 
-        // 2. Validate amount
+        // 2. Validate amount format and value
+        const amountRegex = /^\d+(\.\d{1,10})?$/;
+        if (!amountRegex.test(input.amount)) {
+            throw new Error('Invalid revenue amount format: must be a positive decimal string (max 10 decimal places)');
+        }
+
         const amountNum = parseFloat(input.amount);
-        if (isNaN(amountNum) || amountNum <= 0) {
-            throw new Error('Invalid revenue amount: must be a positive number');
+        if (amountNum <= 0) {
+            throw new Error('Invalid revenue amount: must be greater than zero');
         }
 
-        // 3. Validate period
+        // 3. Validate period logic
         if (input.periodEnd <= input.periodStart) {
-            throw new Error('Invalid period: end date must be after start date');
+            throw new Error('Invalid period: end date must be strictly after start date');
         }
 
-        // 4. Enforce idempotency per offering + period
-        const existing = await this.revenueReportRepo.findByOfferingAndPeriod(
+        // 4. Enforce non-overlapping periods per offering
+        const overlapping = await this.revenueReportRepo.findOverlappingReport(
             input.offeringId,
             input.periodStart,
             input.periodEnd
         );
 
-        if (existing) {
+        if (overlapping) {
             throw new Error(
-                `Revenue report already exists for offering ${input.offeringId} and specified period`
+                `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
             );
         }
 
@@ -64,6 +83,7 @@ export class RevenueService {
             amount: input.amount,
             period_start: input.periodStart,
             period_end: input.periodEnd,
+            reported_by: input.issuerId, // Assuming reporter is the issuer for now
         });
 
         // 6. Optionally emit event for distribution engine

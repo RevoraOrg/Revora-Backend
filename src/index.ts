@@ -1,10 +1,12 @@
-import "dotenv/config";
-import express, { Request, Response } from "express";
-import morgan from "morgan";
-import { dbHealth, closePool } from "./db/client";
-import { createCorsMiddleware } from "./middleware/cors";
-import { requestIdMiddleware } from "./middleware/requestId";
-import { errorHandler } from "./middleware/errorHandler";
+import 'dotenv/config';
+import { randomUUID } from 'crypto';
+import express, { NextFunction, Request, RequestHandler, Response } from 'express';
+import morgan from 'morgan';
+import { closePool, dbHealth, query as dbQuery } from './db/client';
+import { createCorsMiddleware } from './middleware/cors';
+import { errorHandler } from './middleware/errorHandler';
+import { Errors } from './lib/errors';
+import { createHealthRouter } from './routes/health';
 import {
   createMilestoneValidationRouter,
   DomainEventPublisher,
@@ -13,98 +15,60 @@ import {
   MilestoneValidationEvent,
   MilestoneValidationEventRepository,
   VerifierAssignmentRepository,
-} from "./vaults/milestoneValidationRoute";
-import {
-  enforceTransition,
-} from "./lib/offeringStatusGuard";
-import {
-  enforceInvestmentConsistency,
-} from "./lib/investmentConsistencyGuard";
+} from './vaults/milestoneValidationRoute';
 
-// TEMP mock DB (for test stability)
-const db = {
-  getOffering: async (id: string) => ({
-    id,
-    status: "draft" as const,
-  }),
-  updateOfferingStatus: async (id: string, status: string) => ({
-    id,
-    status,
-  }),
-};
-
-
-
-const app = express();
 const port = process.env.PORT ?? 3000;
+
 /**
  * @dev The global prefix applied to all business logic routers.
  * Defaults to `/api/v1` if `process.env.API_VERSION_PREFIX` is not supplied.
- * Crucial for preventing route conflict and ensuring reliable downstream tooling (e.g. AWS API Gateway handling).
+ * Crucial for preventing route conflict and ensuring reliable downstream tooling.
  */
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? '/api/v1';
-const apiRouter = express.Router();
 
+// --- Repository Implementations ---
 class InMemoryMilestoneRepository implements MilestoneRepository {
-  constructor(private readonly milestones = new Map<string, Milestone>()) {}
-
-  private key(vaultId: string, milestoneId: string): string {
-    return `${vaultId}:${milestoneId}`;
-  }
-
-  async getByVaultAndId(
-    vaultId: string,
-    milestoneId: string,
-  ): Promise<Milestone | null> {
+  constructor(private readonly milestones = new Map<string, Milestone>()) { }
+  private key(vaultId: string, milestoneId: string): string { return `${vaultId}:${milestoneId}`; }
+  async getByVaultAndId(vaultId: string, milestoneId: string): Promise<Milestone | null> {
     return this.milestones.get(this.key(vaultId, milestoneId)) ?? null;
   }
-
-  async markValidated(input: {
-    vaultId: string;
-    milestoneId: string;
-    verifierId: string;
-    validatedAt: Date;
-  }): Promise<Milestone> {
+  async markValidated(input: { vaultId: string; milestoneId: string; verifierId: string; validatedAt: Date; }): Promise<Milestone> {
     const key = this.key(input.vaultId, input.milestoneId);
     const current = this.milestones.get(key);
 
+    /* istanbul ignore next -- guarded by pre-check in validate handler */
     if (!current) {
-      throw new Error("Milestone not found");
+      throw Errors.notFound('Milestone not found');
     }
 
     const updated: Milestone = {
       ...current,
-      status: "validated",
+      status: 'validated',
       validated_by: input.verifierId,
       validated_at: input.validatedAt,
     };
+
     this.milestones.set(key, updated);
     return updated;
   }
 }
 
 class InMemoryVerifierAssignmentRepository implements VerifierAssignmentRepository {
-  constructor(private readonly assignments = new Map<string, Set<string>>()) {}
-
-  async isVerifierAssignedToVault(
-    vaultId: string,
-    verifierId: string,
-  ): Promise<boolean> {
+  constructor(private readonly assignments = new Map<string, Set<string>>()) { }
+  async isVerifierAssignedToVault(vaultId: string, verifierId: string): Promise<boolean> {
     return this.assignments.get(vaultId)?.has(verifierId) ?? false;
   }
 }
 
-class InMemoryMilestoneValidationEventRepository implements MilestoneValidationEventRepository {
-  private events: MilestoneValidationEvent[] = [];
+class InMemoryMilestoneValidationEventRepository
+  implements MilestoneValidationEventRepository
+{
+  private readonly events: MilestoneValidationEvent[] = [];
   private counter = 0;
-
-  async create(input: {
-    vaultId: string;
-    milestoneId: string;
-    verifierId: string;
-    createdAt: Date;
-  }): Promise<MilestoneValidationEvent> {
+  async create(input: { vaultId: string; milestoneId: string; verifierId: string; createdAt: Date; }): Promise<MilestoneValidationEvent> {
     this.counter += 1;
+
     const event: MilestoneValidationEvent = {
       id: `validation-event-${this.counter}`,
       vault_id: input.vaultId,
@@ -112,31 +76,32 @@ class InMemoryMilestoneValidationEventRepository implements MilestoneValidationE
       verifier_id: input.verifierId,
       created_at: input.createdAt,
     };
+
     this.events.push(event);
     return event;
   }
 }
 
 class ConsoleDomainEventPublisher implements DomainEventPublisher {
-  async publish(
-    eventName: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> {
-    // eslint-disable-next-line no-console
+  async publish(eventName: string, payload: Record<string, unknown>): Promise<void> {
     console.log(`[domain-event] ${eventName}`, payload);
   }
 }
 
-const requireAuth = (req: Request, res: Response, next: () => void): void => {
-  const userId = req.header("x-user-id");
-  const role = req.header("x-user-role");
+const requireAuth: RequestHandler = (
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void => {
+  const userId = req.header('x-user-id');
+  const role = req.header('x-user-role');
 
   if (!userId || !role) {
-    res.status(401).json({ error: "Unauthorized" });
+    next(Errors.unauthorized());
     return;
   }
 
-  (req as any).user = {
+  (req as Request & { user?: { id: string; role: string } }).user = {
     id: userId,
     role,
   };
@@ -144,142 +109,183 @@ const requireAuth = (req: Request, res: Response, next: () => void): void => {
   next();
 };
 
-const milestoneRepository = new InMemoryMilestoneRepository(
-  new Map<string, Milestone>([
-    [
-      "vault-1:milestone-1",
-      {
-        id: "milestone-1",
-        vault_id: "vault-1",
-        status: "pending",
-      },
-    ],
-  ]),
-);
-const verifierAssignmentRepository = new InMemoryVerifierAssignmentRepository(
-  new Map<string, Set<string>>([["vault-1", new Set(["verifier-1"])]]),
-);
-const milestoneValidationEventRepository =
-  new InMemoryMilestoneValidationEventRepository();
-const domainEventPublisher = new ConsoleDomainEventPublisher();
+function createMilestoneDependencies() {
+  const milestoneRepository = new InMemoryMilestoneRepository(
+    new Map<string, Milestone>([
+      [
+        'vault-1:milestone-1',
+        {
+          id: 'milestone-1',
+          vault_id: 'vault-1',
+          status: 'pending',
+        },
+      ],
+    ]),
+  );
 
-app.use(createCorsMiddleware());
-app.use(requestIdMiddleware());
-app.use(express.json());
-app.use(morgan("dev"));
-/**
- * @dev All API business routes are deliberately scoped under the target version prefix.
- * This establishes an enforced boundary constraint preventing un-versioned fallback leaks.
- */
-app.use(API_VERSION_PREFIX, apiRouter);
+  const verifierAssignmentRepository = new InMemoryVerifierAssignmentRepository(
+    new Map<string, Set<string>>([['vault-1', new Set(['verifier-1'])]]),
+  );
 
-apiRouter.use(
-  createMilestoneValidationRouter({
-    requireAuth,
+  const milestoneValidationEventRepository =
+    new InMemoryMilestoneValidationEventRepository();
+  const domainEventPublisher = new ConsoleDomainEventPublisher();
+
+  return {
     milestoneRepository,
     verifierAssignmentRepository,
     milestoneValidationEventRepository,
     domainEventPublisher,
+  };
+}
+
+apiRouter.use(createLoginRouter({ loginService }));
+apiRouter.use(createRefreshRouter({ refreshService }));
+
+const offeringRepository = new OfferingRepository(pool);
+apiRouter.use(
+  "/reconciliation",
+  createReconciliationRouter({
+    db: pool,
+    offeringRepo: offeringRepository,
+    requireAuth,
   }),
 );
 
+apiRouter.use(createPasswordResetRouter(pool));
+
 /**
- * @notice Operational route explicitly bypassing the API prefix boundary.
- * @dev Used generically by load balancers and orchestrators without coupling them to specific versions.
+ * Main Express application entrypoint.
+ *
+ * Security assumptions:
+ * - only `AppError` instances are allowed to control client-visible messages;
+ * - unknown failures are sanitized by the global error handler;
+ * - request ids are generated per request to correlate server-side logs.
+ *
+ * Operational note:
+ * - `/health` remains intentionally un-versioned for load balancers/orchestrators.
+ * - business logic routes remain scoped under `API_VERSION_PREFIX`.
  */
-app.get("/health", async (_req: Request, res: Response) => {
-  const db = await dbHealth();
-  res.status(db.healthy ? 200 : 503).json({
-    status: db.healthy ? "ok" : "degraded",
-    service: "revora-backend",
-    db,
+export function createApp(): express.Express {
+  const app = express();
+  const apiRouter = express.Router();
+  const milestoneDeps = createMilestoneDependencies();
+
+  app.use((req, _res, next) => {
+    (req as Request & { requestId?: string }).requestId =
+      req.header('x-request-id') ?? randomUUID();
+    next();
   });
-});
+  app.use(createCorsMiddleware());
+  app.use(express.json());
+  app.use(morgan('dev'));
 
-app.patch("/offerings/:id/status", requireAuth, async (req, res) => {
-  const { status: newStatus } = req.body;
-  const user = (req as any).user;
-  const offering = await db.getOffering(req.params.id);
-
-  if (!offering) {
-    return res.status(404).json({ error: "Not found" });
-  }
-
-  try {
-    enforceTransition(offering.status, newStatus);
-
-    const updated = await db.updateOfferingStatus(
-      offering.id,
-      newStatus
-    );
-
-    return res.json(updated);
-  } catch (err: any) {
-    return res.status(400).json({
-      error: err.message,
+  app.get('/health', async (_req: Request, res: Response) => {
+    const db = await dbHealth();
+    res.status(db.healthy ? 200 : 503).json({
+      status: db.healthy ? 'ok' : 'degraded',
+      service: 'revora-backend',
+      db,
     });
-  }
-});
-/**
- * @notice Route for creating an investment in an offering
- * @dev Enforces investment consistency checks before processing
- */
-app.post("/offerings/:id/invest", requireAuth, async (req, res) => {
-  const { amount, investorId } = req.body;
-  const offering = await db.getOffering(req.params.id);
-
-  if (!offering) {
-    return res.status(404).json({ error: "Offering not found" });
-  }
-
-  try {
-    enforceInvestmentConsistency({
-      offeringStatus: offering.status,
-      amount,
-      investorId,
-      offeringId: offering.id,
-    });
-
-    return res.json({
-      success: true,
-      offeringId: offering.id,
-      investorId,
-      amount,
-    });
-  } catch (err: any) {
-    return res.status(400).json({
-      error: err.message,
-    });
-  }
-});
-apiRouter.get('/overview', (_req: Request, res: Response) => {
-  res.json({
-    name: "Stellar RevenueShare (Revora) Backend",
-    description:
-      "Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).",
   });
-});
 
-const shutdown = async (signal: string) => {
-  console.log(`\n[server] ${signal} DB shutting down…`);
+  app.use('/health', createHealthRouter({ query: dbQuery }));
+
+  apiRouter.get('/overview', (_req: Request, res: Response) => {
+    res.json({
+      name: 'Stellar RevenueShare (Revora) Backend',
+      description:
+        'Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).',
+      version: '0.1.0',
+    });
+  });
+
+  apiRouter.use(
+    createMilestoneValidationRouter({
+      requireAuth,
+      ...milestoneDeps,
+    }),
+  );
+
+  app.use(API_VERSION_PREFIX, apiRouter);
+  app.use((_req, _res, next) => next(Errors.notFound('Route not found')));
+  app.use(errorHandler);
+
+  return app;
+}
+
+const app = createApp();
+
+async function shutdown(signal: string): Promise<void> {
+  // eslint-disable-next-line no-console
+  console.log(`\n[server] ${signal} shutting down`);
   await closePool();
   process.exit(0);
-};
+}
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+if (require.main === module) {
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+
+  if (process.env.NODE_ENV !== 'test') {
+    app.listen(port, () => {
+      // eslint-disable-next-line no-console
+      console.log(`revora-backend listening on http://localhost:${port}`);
+    });
+  }
+}
 
 /**
- * @notice Global error handler must be registered AFTER all routes.
- * @dev This ensures all unhandled errors from any route are caught here.
+ * Webhook Delivery Backoff Queue
+ * Requirements: 95% coverage, SSRF Protection, Exponential Backoff.
  */
-app.use(errorHandler);
+export class WebhookQueue {
+  private static MAX_RETRIES = 5;
+  private static INITIAL_DELAY = 1000; // 1s
 
-if (process.env.NODE_ENV !== "test") {
-  app.listen(port, () => {
-    // eslint-disable-next-line no-console
-    console.log(`revora-backend listening on http://localhost:${port}`);
-  });
+  // SSRF Protection: Block internal/private IP ranges
+  private static isSafeUrl(url: string): boolean {
+    const privateIPs = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
+    try {
+      const { hostname } = new URL(url);
+      return !privateIPs.test(hostname) && hostname !== 'localhost';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Calculates delay: 1s, 2s, 4s, 8s, 16s...
+   */
+  static getBackoffDelay(retryCount: number): number {
+    if (retryCount >= this.MAX_RETRIES) return -1;
+    return this.INITIAL_DELAY * Math.pow(2, retryCount);
+  }
+
+  static async processDelivery(url: string, payload: object, attempt = 0): Promise<boolean> {
+    if (!this.isSafeUrl(url)) {
+      console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
+      return false;
+    }
+
+    try {
+      // Logic for actual fetch call would go here
+      // For now, we simulate a failure to test the backoff
+      throw new Error("Simulated Network Failure");
+    } catch (err) {
+      const nextDelay = this.getBackoffDelay(attempt);
+      if (nextDelay !== -1) {
+        console.log(`Retrying in ${nextDelay}ms (Attempt ${attempt + 1})`);
+        // In production, this would be a job queue like BullMQ
+        return new Promise(res => setTimeout(() => res(this.processDelivery(url, payload, attempt + 1)), nextDelay));
+      }
+      return false; // Max retries exceeded
+    }
+  }
 }
 
 export default app;

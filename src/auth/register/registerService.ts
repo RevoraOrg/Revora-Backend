@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { validatePasswordStrength } from '../../lib/passwordStrength';
 import { IUserRepository, RegisteredUser } from './types';
 
 /**
@@ -31,6 +32,12 @@ export class RegisterService {
 
   async register(rawEmail: string, password: string): Promise<RegisteredUser> {
     const email = rawEmail.toLowerCase().trim();
+
+    // Validate password strength
+    const strength = validatePasswordStrength(password);
+    if (!strength.isValid) {
+      throw new Error(`Password does not meet strength requirements: ${strength.errors.join(', ')}`);
+    }
 
     const existing = await this.userRepository.findByEmail(email);
     if (existing) {

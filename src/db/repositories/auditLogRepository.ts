@@ -5,12 +5,12 @@ import { Pool, QueryResult } from 'pg';
  */
 export interface AuditLog {
   id: string;
-  user_id?: string;
+  user_id?: string | null;
   action: string;
-  resource?: string;
-  details?: string;
-  ip_address?: string;
-  user_agent?: string;
+  resource?: string | null;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
   created_at: Date;
 }
 
@@ -18,12 +18,12 @@ export interface AuditLog {
  * Audit Log input for creation
  */
 export interface CreateAuditLogInput {
-  user_id?: string;
+  user_id?: string | null;
   action: string;
-  resource?: string;
-  details?: string;
-  ip_address?: string;
-  user_agent?: string;
+  resource?: string | null;
+  details?: string | null;
+  ip_address?: string | null;
+  user_agent?: string | null;
 }
 
 /**
