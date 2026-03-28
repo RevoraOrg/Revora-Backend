@@ -2328,3 +2328,41 @@ describe("Investment Consistency Checks", () => {
     ).not.toThrow();
   });
 });
+
+
+describe("Request ID Propagation", () => {
+  it("returns X-Request-Id header in response", async () => {
+    const res = await request(app).get("/health");
+    expect(res.headers["x-request-id"]).toBeDefined();
+  });
+
+  it("echoes back the X-Request-Id header when provided", async () => {
+    const res = await request(app)
+      .get("/health")
+      .set("x-request-id", "test-id-123");
+    expect(res.headers["x-request-id"]).toBe("test-id-123");
+  });
+
+  it("generates a UUID when no X-Request-Id is provided", async () => {
+    const res = await request(app).get("/health");
+    expect(res.headers["x-request-id"]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+  });
+
+  it("propagates X-Request-Id on API routes", async () => {
+    const prefix = process.env.API_VERSION_PREFIX ?? "/api/v1";
+    const res = await request(app)
+      .get(`${prefix}/overview`)
+      .set("x-request-id", "propagation-test");
+    expect(res.headers["x-request-id"]).toBe("propagation-test");
+  });
+
+  it("generates different IDs for different requests", async () => {
+    const res1 = await request(app).get("/health");
+    const res2 = await request(app).get("/health");
+    expect(res1.headers["x-request-id"]).not.toBe(
+      res2.headers["x-request-id"]
+    );
+  });
+});
