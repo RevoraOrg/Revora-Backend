@@ -25,16 +25,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { Router }                               from "express";
 import type { SessionStore }                    from "../lib/sessionStore";
-
-// ─── Augment Express Request ──────────────────────────────────────────────────
-
-declare global {
-  namespace Express {
-    interface Request {
-      user?: { id: string; role: string; sessionToken: string };
-    }
-  }
-}
+import { AuthenticatedRequest }                from "./auth";
 
 // ─── Middleware factory ───────────────────────────────────────────────────────
 
@@ -48,7 +39,7 @@ declare global {
  */
 export function createSessionAuth(store: SessionStore) {
   return async function sessionAuth(
-    req:  Request,
+    req:  AuthenticatedRequest,
     res:  Response,
     next: NextFunction
   ): Promise<void> {
@@ -108,7 +99,7 @@ export function createSessionRouter(store: SessionStore): Router {
    *
    * @security Credentials should be verified against a real store in production.
    */
-  router.post("/session/login", async (req: Request, res: Response) => {
+  router.post("/session/login", async (req: AuthenticatedRequest, res: Response) => {
     const userId = req.header("x-user-id");
     const role   = req.header("x-user-role");
 
@@ -130,8 +121,8 @@ export function createSessionRouter(store: SessionStore): Router {
    * Requires: Authorization: Bearer <token>
    * Response: 204 No Content
    */
-  router.post("/session/logout", auth, async (req: Request, res: Response) => {
-    await store.delete(req.user!.sessionToken);
+  router.post("/session/logout", auth, async (req: AuthenticatedRequest, res: Response) => {
+    await store.delete(req.user!.sessionToken!);
     res.status(204).send();
   });
 
@@ -140,7 +131,7 @@ export function createSessionRouter(store: SessionStore): Router {
    * Requires: Authorization: Bearer <token>
    * Response: { userId, role }
    */
-  router.get("/session/me", auth, (req: Request, res: Response) => {
+  router.get("/session/me", auth, (req: AuthenticatedRequest, res: Response) => {
     res.json({ userId: req.user!.id, role: req.user!.role });
   });
 

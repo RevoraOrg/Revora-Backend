@@ -19,6 +19,7 @@ export const REFRESH_TOKEN_EXPIRY = "7d";
  */
 export interface JwtPayload {
   sub: string; // Subject (user ID)
+  sid?: string; // Session ID
   email?: string;
   iat?: number;
   exp?: number;

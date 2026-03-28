@@ -62,15 +62,6 @@ export class SessionRepository {
     return this.mapSession(result.rows[0]);
   }
 
-  async createSessionForUser(userId: string): Promise<string> {
-    const placeholder = await this.createSession({
-      user_id: userId,
-      token_hash: '',
-      expires_at: new Date(0),
-    });
-    return placeholder.id;
-  }
-
   async setSessionMetadata(sessionId: string, tokenHash: string, expiresAt: Date): Promise<void> {
     await this.db.query(
       `UPDATE sessions SET token_hash = $1, expires_at = $2 WHERE id = $3`,

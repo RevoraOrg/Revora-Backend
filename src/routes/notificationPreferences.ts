@@ -3,11 +3,7 @@ import {
   NotificationPreferencesRepository,
   UpdateNotificationPreferencesInput,
 } from '../db/repositories/notificationPreferencesRepository';
-
-/** JWT-authenticated request with user context injected by auth middleware. */
-interface AuthenticatedRequest extends Request {
-  user?: { id: string };
-}
+import { requireAuth, AuthenticatedRequest } from '../middleware/auth';
 
 /** Valid notification channel field names. */
 type NotificationField = 'email_notifications' | 'push_notifications' | 'sms_notifications';
@@ -62,15 +58,23 @@ export function validateNotificationPreferencesInput(
     sms_notifications: prefs.sms_notifications,
   });
 
-  router.get('/api/users/me/notification-preferences', requireAuth, async (req, res) => {
-    const userId = (req as any).user?.id;
+/**
+ * Create handlers for notification preferences endpoints.
+ */
+export function createNotificationPreferencesHandlers(
+  notificationPreferencesRepository: NotificationPreferencesRepository
+) {
+  const router = Router();
+
+  async function getPreferences(req: AuthenticatedRequest, res: Response): Promise<void> {
+    const userId = req.user?.id;
     if (!userId) {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
 
     try {
-      const preferences = await notificationRepo.getByUserId(userId);
+      const preferences = await notificationPreferencesRepository.getByUserId(userId);
       if (!preferences) {
         res.json({
           email_notifications: true,
@@ -116,11 +120,7 @@ export function validateNotificationPreferencesInput(
     };
 
     try {
-      const updated = await notificationPreferencesRepository.upsert(userId, {
-        email_notifications,
-        push_notifications,
-        sms_notifications,
-      });
+      const updated = await notificationPreferencesRepository.upsert(userId, input);
       res.json(toWireShape(updated));
     } catch (error) {
       res.status(500).json({ error: 'Failed to update notification preferences' });
