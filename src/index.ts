@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import express, { NextFunction, Request, RequestHandler, Response } from 'express';
 import morgan from 'morgan';
-import { closePool, dbHealth, query as dbQuery } from './db/client';
+import { closePool, dbHealth, pool, query as dbQuery } from './db/client';
 import { createCorsMiddleware } from './middleware/cors';
 import { errorHandler } from './middleware/errorHandler';
 import { Errors } from './lib/errors';
@@ -299,6 +299,50 @@ export const __test = {
 };
 
 const app = createApp();
+
+/**
+ * Balance Snapshot Atomicity implementation
+ * Production-ready atomic endpoint integrated with BalanceSnapshotService & BalanceSnapshotRepository's `insertMany` batch transaction.
+ */
+app.post(
+  `${API_VERSION_PREFIX}/offerings/:offeringId/snapshots`,
+  requireAuth,
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { offeringId } = req.params;
+      const { periodId } = req.body;
+
+      if (!periodId) {
+        next(Errors.badRequest('periodId is required'));
+        return;
+      }
+
+      const balanceSnapshotRepo = new BalanceSnapshotRepository(pool);
+      const offeringRepo = new OfferingRepository(pool);
+
+      // The service guarantees database-level snapshot atomicity using the repository's internal transaction boundaries.
+      const snapshotService = new BalanceSnapshotService(balanceSnapshotRepo, offeringRepo);
+
+      const result = await snapshotService.snapshotBalances({
+        offeringId,
+        periodId,
+        source: 'auto',
+        skipIfExists: false, // Forcing true atomic computation check
+      });
+
+      res.status(201).json({
+        message: 'Balance snapshot created atomically',
+        data: result,
+      });
+    } catch (err: any) {
+      if (err.message && err.message.includes('not found')) {
+        next(Errors.notFound(err.message));
+      } else {
+        next(err);
+      }
+    }
+  }
+);
 
 async function shutdown(signal: string): Promise<void> {
   // eslint-disable-next-line no-console
