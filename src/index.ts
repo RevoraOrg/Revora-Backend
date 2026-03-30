@@ -10,6 +10,7 @@ import { createRateLimitMiddleware } from './middleware/rateLimit';
 import { Errors } from './lib/errors';
 import { createHealthRouter } from './routes/health';
 import { StellarSubmissionService } from './services/stellarSubmissionService';
+import { createSanitizationMiddleware } from './middleware/sanitization';
 
 /**
  * @dev Classifies failures from Stellar RPC providers into stable categories.
@@ -62,7 +63,6 @@ import {
 } from './vaults/milestoneValidationRoute';
 import { createRegisterRouter } from './auth/register/registerRoute';
 import {
-  createIdempotencyMiddleware,
   InMemoryIdempotencyStore,
 } from './middleware/idempotency';
 import { createLoginRouter } from './auth/login/loginRoute';
@@ -126,16 +126,25 @@ function isValidStellarAmount(value: unknown): value is string {
   return Number(value) > 0;
 }
 
+/**
+ * @dev Creates a router for startup-specific registration.
+ * Explicitly sanitizes and validates registration inputs.
+ */
 function createStartupRegisterRouter(): express.Router {
   const router = express.Router();
 
+  /**
+   * @dev POST /register
+   * Boundary assumption: email and password must be non-empty strings.
+   * Security note: Sanitization middleware cleans the inputs before this handler.
+   */
   router.post('/register', (req: Request, res: Response) => {
     const { email, password } = req.body as {
       email?: unknown;
       password?: unknown;
     };
 
-    if (typeof email !== 'string' || typeof password !== 'string') {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       res.status(400).json({ error: 'Email and password are required' });
       return;
     }
@@ -217,6 +226,13 @@ export function createApp(): express.Express {
   app.use(requestIdMiddleware());
   app.use(createCorsMiddleware() as RequestHandler);
   app.use(express.json());
+  
+  /** 
+   * @dev Harden all inputs (body, query, params) against null bytes, control chars, 
+   * and common injection vectors by scrubbing them at the boundary.
+   */
+  app.use(createSanitizationMiddleware());
+  
   app.use(morgan('dev'));
 
   app.get('/health', async (_req: Request, res: Response) => {
