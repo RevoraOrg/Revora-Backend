@@ -23,6 +23,7 @@ import {
   healthReadyHandler,
   mapHealthDependencyFailure,
 } from './health';
+import { sanitizeValue } from '../middleware/sanitization';
 
 // Mock helpers that are missing
 const waitForEventHealth = async (predicate: (state: any) => boolean, options: any) => {
@@ -1965,6 +1966,96 @@ describe('Investor Registration Idempotency', () => {
     const bodyStr = JSON.stringify(res.body);
     expect(bodyStr).not.toMatch(/password/i);
     expect(bodyStr).not.toMatch(/hash/i);
+  });
+});
+
+describe('Input Sanitization Coverage', () => {
+  describe('sanitizeValue unit tests', () => {
+    it('trims whitespace from strings', () => {
+      expect(sanitizeValue('  hello  ')).toBe('hello');
+    });
+
+    it('removes null bytes', () => {
+      expect(sanitizeValue('hello\0world')).toBe('helloworld');
+    });
+
+    it('removes control characters', () => {
+      // \x01 and \x1F are control characters
+      expect(sanitizeValue('hello\x01world\x1F')).toBe('helloworld');
+    });
+
+    it('strips script tags', () => {
+      const input = '<script>alert("xss")</script>hello';
+      expect(sanitizeValue(input)).toBe('hello');
+    });
+
+    it('strips all HTML tags and cleans result', () => {
+      const input = '<div><b>Hello</b>  <p>World</p></div>';
+      // Note: we remove tags and then trim.
+      expect(sanitizeValue(input)).toBe('Hello  World');
+    });
+
+    it('sanitizes nested objects', () => {
+      const input = {
+        name: '  John  ',
+        meta: {
+          bio: '<b>Developer</b>',
+          tags: [' tag1 ', ' <script></script>tag2 ']
+        }
+      };
+      const expected = {
+        name: 'John',
+        meta: {
+          bio: 'Developer',
+          tags: ['tag1', 'tag2']
+        }
+      };
+      expect(sanitizeValue(input)).toEqual(expected);
+    });
+
+    it('handles mixed types safely', () => {
+      const input = {
+        count: 42,
+        active: true,
+        data: null,
+        text: '  test  '
+      };
+      const expected = {
+        count: 42,
+        active: true,
+        data: null,
+        text: 'test'
+      };
+      expect(sanitizeValue(input)).toEqual(expected);
+    });
+  });
+
+  describe('Sanitization Middleware integration in index.ts', () => {
+    const prefix = process.env.API_VERSION_PREFIX ?? '/api/v1';
+
+    it('sanitizes startup registration input', async () => {
+      const res = await request(app)
+        .post(`${prefix}/startup/register`)
+        .send({
+          email: '  startup@example.com  ',
+          password: 'password123\0'
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.message).toContain('registered successfully');
+    });
+
+    it('rejects empty inputs after sanitization', async () => {
+      const res = await request(app)
+        .post(`${prefix}/startup/register`)
+        .send({
+          email: '   ', 
+          password: '  \0  '
+        });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('Email and password are required');
+    });
   });
 });
 
