@@ -1,68 +1,68 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
-import { PasswordResetService, PasswordResetRateLimitedError } from '../services/passwordResetService';
-import { PasswordResetRateLimiter } from '../services/passwordResetRateLimiter';
+import { z } from 'zod';
+import { PasswordResetService, EmailSender } from '../services/passwordResetService';
+import { createPasswordResetRateLimiter } from '../middleware/passwordResetRateLimiter';
+import { Errors } from '../lib/errors';
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MIN_PASSWORD_LENGTH = 8;
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+});
 
-export function createPasswordResetRouter(db: Pool): Router {
+const resetPasswordSchema = z.object({
+  token: z.string().length(64).regex(/^[0-9a-fA-F]{64}$/),
+  password: z.string().min(12),
+});
+
+const NEUTRAL_FORGOT_RESPONSE = {
+  message: 'If the email exists, a password reset link has been sent',
+};
+
+export interface PasswordResetRouterOptions {
+  emailSender?: EmailSender;
+  appUrl?: string;
+}
+
+export function createPasswordResetRouter(db: Pool, opts?: PasswordResetRouterOptions): Router {
   const router = Router();
-  const rateLimiter = new PasswordResetRateLimiter(db, {
-    maxRequests: 3,
-    windowMinutes: 60,
-    blockMinutes: 15,
-  });
   const service = new PasswordResetService(db, {
-    emailSender: async (to, subject, body) => {
-      console.log(`[email] to=${to} subject="${subject}" body="${body}"`);
+    emailSender: opts?.emailSender,
+    appUrl: opts?.appUrl,
+  });
+
+  router.post(
+    '/api/auth/forgot-password',
+    createPasswordResetRateLimiter(),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { email } = forgotPasswordSchema.parse(req.body);
+        await service.requestPasswordReset(email);
+        return res.status(200).json(NEUTRAL_FORGOT_RESPONSE);
+      } catch (error) {
+        if (error instanceof z.ZodError) {
+          return res.status(200).json(NEUTRAL_FORGOT_RESPONSE);
+        }
+        return next(error);
+      }
     },
-    rateLimiter,
-  });
+  );
 
-  router.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
-    const { email } = req.body ?? {};
-    if (typeof email !== 'string' || !EMAIL_RE.test(email)) {
-      res.status(200).json({
-        message: 'If the email exists, a password reset link has been sent',
-      });
-      return;
-    }
-    try {
-      await service.requestPasswordReset(email);
-    } catch (err) {
-      if (err instanceof PasswordResetRateLimitedError) {
-        res.status(429).json({
-          error: err.message,
-          retryAfter: err.retryAfter,
-        });
-        return;
+  router.post(
+    '/api/auth/reset-password',
+    createPasswordResetRateLimiter(),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { token, password } = resetPasswordSchema.parse(req.body);
+        await service.resetPassword(token, password);
+        return res.status(200).json({ message: 'Password has been reset' });
+      } catch (error) {
+        if (error instanceof z.ZodError) {
+          return next(Errors.validationError('Invalid password reset payload', error.issues));
+        }
+        return next(error);
       }
-      console.error('[password-reset] Error processing request:', err);
-    }
-    res.status(200).json({
-      message: 'If the email exists, a password reset link has been sent',
-    });
-  });
-
-  router.post('/api/auth/reset-password', async (req: Request, res: Response) => {
-    const { token, password } = req.body ?? {};
-    if (typeof token !== 'string' || typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
-      res.status(400).json({ error: 'Invalid token or password' });
-      return;
-    }
-    try {
-      const ok = await service.resetPassword(token, password);
-      if (!ok) {
-        res.status(400).json({ error: 'Invalid or expired token' });
-        return;
-      }
-      res.status(200).json({ message: 'Password updated' });
-    } catch (err) {
-      console.error('[password-reset] Reset password error:', err);
-      res.status(400).json({ error: 'Invalid or expired token' });
-    }
-  });
+    },
+  );
 
   return router;
 }

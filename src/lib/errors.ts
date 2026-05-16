@@ -157,3 +157,17 @@ export class BadRequestError extends AppError {
     this.name = 'BadRequestError';
   }
 }
+
+export class PasswordResetTokenInvalidError extends AppError {
+  constructor(message: string = 'Invalid or expired password reset token') {
+    super(ErrorCode.BAD_REQUEST, 400, message);
+    this.name = 'PasswordResetTokenInvalidError';
+  }
+}
+
+export class PasswordResetRateLimitError extends AppError {
+  constructor(message: string = 'Too many password reset requests') {
+    super(ErrorCode.TOO_MANY_REQUESTS, 429, message);
+    this.name = 'PasswordResetRateLimitError';
+  }
+}

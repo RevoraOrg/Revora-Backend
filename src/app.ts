@@ -9,6 +9,8 @@ import { SessionRepository } from './db/repositories/sessionRepository';
 import { createLogoutRouter } from './auth/logout/logoutRoute';
 import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
 import { createLoginRouter } from './auth/login/loginRoute';
+import { createPasswordResetRouter } from './routes/passwordReset';
+import { emailService } from './services/emailService';
 import { createHealthRouter } from './routes/health';
 import { dbHealth } from './db/client';
 import { createOfferingSyncRouter } from './routes/offeringSync';
@@ -16,7 +18,13 @@ import { UserRepository } from './db/repositories/userRepository';
 import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
 import { LoginService } from './auth/login/loginService';
 import { issueToken } from './lib/jwt';
+import { Logger } from './lib/logger';
 import { MetricsCollector } from './lib/metrics';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { RefreshService } from './auth/refresh/refreshService';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { errorHandler } from './middleware/errorHandler';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -117,6 +125,7 @@ export function createApp() {
   app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
+  app.use(createPasswordResetRouter(pool, { emailSender: emailService.sendMail.bind(emailService), appUrl: process.env.APP_URL }));
   app.use('/api/v1/health', createHealthRouter(pool, dbHealth, metrics));
 
   // Offering sync routes
