@@ -30,4 +30,8 @@ export class RefreshTokenRepositoryAdapter implements RefreshTokenRepository {
     async findSessionByIdForUpdate(sessionId: string, client: PoolClient): Promise<any> {
         return this.sessionRepository.findByIdForUpdate(sessionId, client);
     }
+
+    async setSessionConsumed(sessionId: string, client?: PoolClient): Promise<void> {
+        return this.sessionRepository.setSessionConsumed(sessionId, client);
+    }
 }

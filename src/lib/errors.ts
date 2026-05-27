@@ -131,16 +131,6 @@ export const Errors = {
     createError(ErrorCode.TOO_MANY_REQUESTS, message, 429, details),
 };
 
-export function createError(
-  code: ErrorCode,
-  message: string,
-  statusCode: number,
-  details?: unknown,
-  options?: { expose?: boolean },
-): AppError {
-  return new AppError(code, statusCode, message, details, options);
-}
-
 export function throwError(
   code: ErrorCode,
   message: string,

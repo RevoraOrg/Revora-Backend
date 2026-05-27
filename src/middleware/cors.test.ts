@@ -57,6 +57,10 @@ describe('CORS Middleware', () => {
       expect(() => createTestApp({ nodeEnv: 'production', allowedOrigins: [] })).toThrow('ALLOWED_ORIGINS must be configured in production environment');
     });
 
+    it('should throw error if wildcard "*" is in ALLOWED_ORIGINS', () => {
+      expect(() => createTestApp({ allowedOrigins: ['*'] })).toThrow("CORS configuration error: Wildcard origin '*' is not allowed when credentials are true");
+    });
+
     it('should not throw in development without ALLOWED_ORIGINS', () => {
       expect(() => createTestApp({ nodeEnv: 'development', allowedOrigins: [] })).not.toThrow();
     });
@@ -129,7 +133,19 @@ describe('CORS Middleware', () => {
       expect(response.headers['access-control-allow-methods']).toContain('POST');
       expect(response.headers['access-control-allow-headers']).toContain('Content-Type');
       expect(response.headers['access-control-allow-headers']).toContain('Authorization');
-      expect(response.headers['access-control-allow-headers']).toContain('x-request-id');
+      expect(response.headers['access-control-allow-headers']).toContain('X-Request-Id');
+      expect(response.headers['access-control-max-age']).toBe('86400');
+    });
+
+    it('should include exposed headers in actual response', async () => {
+      const app = createTestApp({ allowedOrigins: ['https://app.example.com'] });
+
+      const response = await request(app)
+        .get('/test')
+        .set('Origin', 'https://app.example.com');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['access-control-expose-headers']).toBe('X-Request-Id');
     });
 
     it('should handle actual requests with allowed origin', async () => {
