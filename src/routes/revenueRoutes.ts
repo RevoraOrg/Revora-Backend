@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { validateBody, validateParams, FieldSchema, ObjectSchema } from '../middleware/validate';
+import { validateZodBody, validateZodParams } from '../middleware/validate';
+import { z } from 'zod';
 import { RevenueService, RevenueReportInput } from '../services/revenueService';
 import { AppError } from '../lib/errors';
 import { Logger } from '../lib/logger'; // Assuming a logger exists
@@ -28,28 +29,35 @@ const POSITIVE_DECIMAL_REGEX = /^\d+(\.\d{1,18})?$/;
 // Regex for ISO 8601 date or datetime strings.
 const ISO_8601_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})?)?$/;
 
-// Schema for offering ID parameter
-const offeringIdParamsSchema: ObjectSchema = {
-  id: { type: 'string', required: true, pattern: UUID_V4_REGEX },
+const amountRefinement = (val: string) => {
+  if (!POSITIVE_DECIMAL_REGEX.test(val)) return false;
+  const num = Number(val);
+  return !isNaN(num) && num > 0;
 };
 
-// Base schema for revenue report body
-const baseRevenueReportBodySchema: ObjectSchema = {
-  amount: { type: 'string', required: true, pattern: POSITIVE_DECIMAL_REGEX },
-  periodStart: { type: 'string', required: true, pattern: ISO_8601_DATE_REGEX },
-  periodEnd: { type: 'string', required: true, pattern: ISO_8601_DATE_REGEX },
+const baseFields = {
+  amount: z.string().refine(amountRefinement, { message: "Invalid positive amount" }),
+  periodStart: z.string().regex(ISO_8601_DATE_REGEX, { message: "Invalid date format" }),
+  periodEnd: z.string().regex(ISO_8601_DATE_REGEX, { message: "Invalid date format" })
 };
+
+// Schema for offering ID parameter
+const offeringIdParamsZodSchema = z.object({
+  id: z.string().regex(UUID_V4_REGEX, "Invalid UUID")
+});
 
 // Schema for POST /offerings/:id/revenue
-const offeringRevenueBodySchema: ObjectSchema = {
-  ...baseRevenueReportBodySchema,
-};
+const offeringRevenueBodyZodSchema = z.object(baseFields).strict().refine((data) => {
+  return new Date(data.periodEnd) > new Date(data.periodStart);
+}, { message: "periodEnd must be after periodStart", path: ["periodEnd"] });
 
 // Schema for POST /revenue-reports (includes offeringId in body)
-const revenueReportBodySchema: ObjectSchema = {
-  offeringId: { type: 'string', required: true, pattern: UUID_V4_REGEX },
-  ...baseRevenueReportBodySchema,
-};
+const revenueReportBodyZodSchema = z.object({
+  offeringId: z.string().regex(UUID_V4_REGEX, "Invalid UUID"),
+  ...baseFields
+}).strict().refine((data) => {
+  return new Date(data.periodEnd) > new Date(data.periodStart);
+}, { message: "periodEnd must be after periodStart", path: ["periodEnd"] });
 
 export function createRevenueRoutes(revenueService: RevenueService, logger: Logger): Router {
   const router = Router();
@@ -61,8 +69,8 @@ export function createRevenueRoutes(revenueService: RevenueService, logger: Logg
    */
   router.post(
     '/offerings/:id/revenue',
-    validateParams(offeringIdParamsSchema),
-    validateBody(offeringRevenueBodySchema),
+    validateZodParams(offeringIdParamsZodSchema),
+    validateZodBody(offeringRevenueBodyZodSchema),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
         const { id: offeringId } = req.params;
@@ -91,7 +99,7 @@ export function createRevenueRoutes(revenueService: RevenueService, logger: Logg
    */
   router.post(
     '/revenue-reports',
-    validateBody(revenueReportBodySchema),
+    validateZodBody(revenueReportBodyZodSchema),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
         const { offeringId, amount, periodStart, periodEnd } = req.body;

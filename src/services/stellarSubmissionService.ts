@@ -36,7 +36,7 @@ export class StellarSubmissionService {
 
     this.server = new StellarSdk.rpc.Server(horizonUrl);
 
-    const secret = process.env.STELLAR_SERVER_SECRET;
+    const secret = env.STELLAR_SERVER_SECRET;
     if (!secret) {
       throw Errors.internal('STELLAR_SERVER_SECRET is not defined in environment variables');
     }

@@ -103,6 +103,17 @@ export class RefreshService {
                 return null;
             }
 
+            // 2b.5 Check if token has already been consumed (rotation already occurred)
+            if (session.token_consumed_at) {
+                this.logger.warn('Refresh token already consumed', {
+                    userId,
+                    sessionId,
+                    consumedAt: session.token_consumed_at,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
             // 2c. Check if session is already revoked
             if (session.revoked_at) {
                 this.logger.warn('Attempted refresh on revoked session', {
@@ -134,7 +145,10 @@ export class RefreshService {
                 role,
             });
 
-            // 2e. Create new session for the new refresh token
+            // 2e. Mark the parent session's token as consumed to prevent reuse
+            await this.repository.setSessionConsumed(sessionId, client);
+
+            // 2f. Create new session for the new refresh token
             const newTokenHash = this.tokenService.hashToken(tokens.refreshToken);
             const expiresAt = new Date();
             expiresAt.setDate(expiresAt.getDate() + 7); // 7 days

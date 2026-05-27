@@ -10,18 +10,20 @@ This document describes the CORS (Cross-Origin Resource Sharing) middleware impl
 - **Explicit Allowlist**: Only origins explicitly listed in `ALLOWED_ORIGINS` are permitted
 - **Default Deny**: Any origin not in the allowlist is denied
 - **Production Enforcement**: `ALLOWED_ORIGINS` must be configured in production environments
+- **No Wildcards with Credentials**: Wildcard origin `*` is strictly forbidden when `credentials: true` is enabled (which is our default)
 - **No Origin Handling**: Requests without Origin header (e.g., curl, health checks) can be optionally allowed via `CORS_ALLOW_NO_ORIGIN`
 
 ### Threat Mitigation
 - **Origin Spoofing**: CORS does not prevent origin header spoofing; this is a client-side enforcement mechanism
 - **CSRF Protection**: CORS is not a substitute for CSRF tokens; it complements other security measures
 - **Information Disclosure**: Denied origins are logged for security monitoring but not exposed to clients
+- **Preflight Hardening**: Preflight responses are capped with a bounded `max-age` and restricted methods/headers to minimize attack surface
 
 ### Abuse and Failure Paths
-- **Configuration Errors**: Missing `ALLOWED_ORIGINS` in production throws startup error
-- **Malformed Origins**: Invalid origin headers are safely rejected
-- **Logging Overhead**: Security events are logged at appropriate levels (WARN for denials, ERROR for config issues)
-- **Performance**: Origin validation is O(n) where n is allowlist size; keep allowlist small
+- **Configuration Errors**: Missing `ALLOWED_ORIGINS` in production, or including `*` in the allowlist while credentials are enabled, throws a startup error.
+- **Malformed Origins**: Invalid origin headers are safely rejected.
+- **Allowlist Integrity**: Mixing `*` with explicit origins in `ALLOWED_ORIGINS` is rejected during environment parsing.
+- **Logging Overhead**: Security events are logged at appropriate levels (WARN for denials, ERROR for config issues).
 
 ## Configuration
 
@@ -48,11 +50,12 @@ CORS_ALLOW_NO_ORIGIN="true"
 4. **Header Injection**: Sets appropriate CORS headers for allowed requests
 
 ### CORS Headers Configured
-- `Access-Control-Allow-Origin`: Mirrors request origin if allowed
+- `Access-Control-Allow-Origin`: Mirrors request origin if allowed (never `*` with credentials)
 - `Access-Control-Allow-Credentials`: `true`
 - `Access-Control-Allow-Methods`: `GET, POST, PUT, PATCH, DELETE, OPTIONS`
-- `Access-Control-Allow-Headers`: `Content-Type, Authorization, x-user-id, x-user-role, x-request-id`
-- `Access-Control-Max-Age`: Default (browsers handle preflight caching)
+- `Access-Control-Allow-Headers`: `Content-Type, Authorization, X-Request-Id, X-User-Id, X-User-Role`
+- `Access-Control-Expose-Headers`: `X-Request-Id`
+- `Access-Control-Max-Age`: `86400` (24 hours - bounded preflight cache)
 
 ### Error Handling
 - **Configuration Errors**: Throws `Error` on startup if production config invalid

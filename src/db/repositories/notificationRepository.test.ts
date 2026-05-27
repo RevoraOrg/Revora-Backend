@@ -38,10 +38,13 @@ describe('NotificationRepository', () => {
   assert(notifications[0].user_id === 'u1');
 
   // Test markRead
-  const readNotification = { ...sampleNotification, read_at: new Date() };
-  const markReadRepo = new NotificationRepository(new MockPool([readNotification]) as any);
-  const marked = await markReadRepo.markRead('n1');
-  assert(marked.read_at !== null);
-  assert(marked.id === 'n1');
+  const markReadRepo = new NotificationRepository(new MockPool([], 1) as any);
+  const marked = await markReadRepo.markRead('n1', 'u1');
+  assert(marked === true);
+
+  // Test markReadBulk
+  const markReadBulkRepo = new NotificationRepository(new MockPool([], 2) as any);
+  const markedCount = await markReadBulkRepo.markReadBulk(['n1', 'n2', 'n2'], 'u1');
+  assert(markedCount === 2);
   });
 });

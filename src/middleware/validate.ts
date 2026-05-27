@@ -1,9 +1,7 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { Errors } from '../lib/errors';
-
+import { z, AnyZodObject, ZodEffects } from 'zod';
 type PrimitiveType = 'string' | 'number' | 'boolean';
-import { Request, Response, NextFunction } from 'express';
-
 export type FieldSchema = {
   type: PrimitiveType;
   required?: boolean;
@@ -164,3 +162,27 @@ export function validate(arg: ObjectSchema | ValidateOptions): RequestHandler[] 
  * @description Defines a validation rule for a single field.
  * @property {boolean} required - True if the field is mandatory.
  * @property
+ */
+
+export function validateZodBody(schema: AnyZodObject | ZodEffects<any>): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      return next(Errors.validationError('Invalid request parameters', result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`)));
+    }
+    req.body = result.data;
+    next();
+  };
+}
+
+export function validateZodParams(schema: AnyZodObject | ZodEffects<any>): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.params);
+    if (!result.success) {
+      return next(Errors.validationError('Invalid request parameters', result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`)));
+    }
+    req.params = result.data;
+    next();
+  };
+}
+
