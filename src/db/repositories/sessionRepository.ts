@@ -9,6 +9,7 @@ export interface Session {
   created_at: Date;
   parent_id?: string;
   revoked_at?: Date;
+  token_consumed_at?: Date | null;
 }
 
 export interface CreateSessionInput {
@@ -69,6 +70,11 @@ export class SessionRepository {
       `UPDATE sessions SET token_hash = $1, expires_at = $2 WHERE id = $3`,
       [tokenHash, expiresAt, sessionId],
     );
+  }
+
+  async setSessionConsumed(sessionId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(`UPDATE sessions SET token_consumed_at = NOW() WHERE id = $1`, [sessionId]);
   }
 
   /**
@@ -165,6 +171,7 @@ export class SessionRepository {
       created_at: row.created_at,
       parent_id: row.parent_id,
       revoked_at: row.revoked_at,
+      token_consumed_at: row.token_consumed_at,
     };
   }
 }

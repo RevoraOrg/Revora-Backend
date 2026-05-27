@@ -29,6 +29,8 @@ export interface RefreshTokenRepository {
     findSessionByParentId(parentId: string, client?: PoolClient): Promise<any>;
     /** Find session by ID with exclusive lock for update (for concurrent refresh protection). */
     findSessionByIdForUpdate(sessionId: string, client: PoolClient): Promise<any>;
+    /** Mark a session's refresh token as consumed (rotation has occurred). */
+    setSessionConsumed(sessionId: string, client?: PoolClient): Promise<void>;
 }
 
 export interface TokenService {
