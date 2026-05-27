@@ -11,7 +11,7 @@ import { RevenueReportRepository, RevenueReport } from '../db/repositories/reven
 import { DistributionRepository, DistributionRun, Payout } from '../db/repositories/distributionRepository';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
-import { logger } from '../lib/logger';
+import { logger, Logger, LogLevel } from '../lib/logger';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailureClass,
@@ -48,7 +48,11 @@ export type DiscrepancyType =
   | 'UNDERPAMENT'
   | 'DISTRIBUTION_STATUS_INVALID'
   | 'CHAIN_DRIFT_DETECTED'
-  | 'RPC_ERROR';
+  | 'RPC_ERROR'
+  | 'STELLAR_TX_NOT_FOUND'
+  | 'STELLAR_TX_FAILED'
+  | 'CHAIN_EVENT_MISMATCH'
+  | 'CHAIN_EVENT_VALIDATION_FAILED';
 
 export interface ReconciliationResult {
   offeringId: string;
@@ -85,7 +89,11 @@ export interface ReconciliationOptions {
 const DEFAULT_TOLERANCE = 0.01;
 
 export class RevenueReconciliationService {
+  private readonly revenueReportRepo: RevenueReportRepository;
+  private readonly distributionRepo: DistributionRepository;
+  private readonly investmentRepo: InvestmentRepository;
   private readonly offeringRepo: OfferingRepository;
+  private readonly logger: Logger;
 
   constructor(
     private readonly db: Pool,
@@ -95,6 +103,7 @@ export class RevenueReconciliationService {
     this.distributionRepo = new DistributionRepository(db);
     this.investmentRepo = new InvestmentRepository(db);
     this.offeringRepo = new OfferingRepository(db);
+    this.logger = logger.child({ service: 'RevenueReconciliationService' });
   }
 
   /**
@@ -113,7 +122,7 @@ export class RevenueReconciliationService {
     const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
-    this.logger?.info(
+    this.logger.info(
       'Starting reconciliation process',
       {
         offeringId,
@@ -121,8 +130,7 @@ export class RevenueReconciliationService {
         periodEnd,
         tolerance,
         options,
-      },
-      LogLevel.INFO
+      }
     );
 
     try {
@@ -138,7 +146,7 @@ export class RevenueReconciliationService {
           r.distribution_date >= periodStart && r.distribution_date <= periodEnd
       );
 
-      this.logger?.debug(
+      this.logger.debug(
         'Fetched data for reconciliation',
         {
           offeringId,
@@ -146,61 +154,61 @@ export class RevenueReconciliationService {
           relevantReportsCount: relevantReports.length,
           distributionRunsCount: distributionRuns.length,
           relevantRunsCount: relevantRuns.length,
-        },
-        LogLevel.DEBUG
+        }
       );
 
-    // Drift Detection
-    if (this.stellarClient) {
-      try {
-        const driftResult = await this.detectChainDrift(offeringId);
-        if (driftResult.hasDrift) {
-          discrepancies.push({
-            type: 'CHAIN_DRIFT_DETECTED',
-            severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
-            message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
-            details: driftResult,
-            offeringId,
-          });
+      // Compute aggregated totals
+      const totalRevenueReported = this.sumRevenueAmounts(relevantReports);
+      const totalPayouts = this.sumDistributionAmounts(relevantRuns);
 
-          logger.error('Revenue reconciliation drift detected', {
-            offeringId,
-            ...driftResult,
-          });
-        }
-      } catch (error) {
-        const failure = classifyStellarRPCFailure(error, {
-          operation: 'detectChainDrift',
-          offeringId,
-        });
-        discrepancies.push({
-          type: 'RPC_ERROR',
-          severity: 'warning',
-          message: `Failed to fetch on-chain state: ${failure.class}`,
-          details: { error: String(error), failureClass: failure.class },
-          offeringId,
-        });
-
-        logger.warn('Failed to fetch on-chain state during reconciliation', {
-          offeringId,
-          failureClass: failure.class,
-          error: String(error),
-        });
-      }
-    }
-
-    for (const run of relevantRuns) {
-      const payoutCheck = await this.checkDistributionRunIntegrity(run, tolerance);
-      discrepancies.push(...payoutCheck);
-    }
-
+      // Check revenue mismatch
       const revenueMismatch = this.checkRevenueMismatch(
         totalRevenueReported,
         totalPayouts,
         tolerance
       );
       if (revenueMismatch) {
+        revenueMismatch.offeringId = offeringId;
         discrepancies.push(revenueMismatch);
+      }
+
+      // Drift Detection
+      if (this.stellarClient) {
+        try {
+          const driftResult = await this.detectChainDrift(offeringId);
+          if (driftResult.hasDrift) {
+            discrepancies.push({
+              type: 'CHAIN_DRIFT_DETECTED',
+              severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
+              message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
+              details: driftResult,
+              offeringId,
+            });
+
+            this.logger.error('Revenue reconciliation drift detected', {
+              offeringId,
+              ...driftResult,
+            });
+          }
+        } catch (error) {
+          const failure = classifyStellarRPCFailure(error, {
+            operation: 'detectChainDrift',
+            offeringId,
+          });
+          discrepancies.push({
+            type: 'RPC_ERROR',
+            severity: 'warning',
+            message: `Failed to fetch on-chain state: ${failure.class}`,
+            details: { error: String(error), failureClass: failure.class },
+            offeringId,
+          });
+
+          this.logger.warn('Failed to fetch on-chain state during reconciliation', {
+            offeringId,
+            failureClass: failure.class,
+            error: String(error),
+          });
+        }
       }
 
       for (const run of relevantRuns) {
@@ -208,14 +216,13 @@ export class RevenueReconciliationService {
           const payoutCheck = await this.checkDistributionRunIntegrity(run, tolerance);
           discrepancies.push(...payoutCheck);
         } catch (error) {
-          this.logger?.error(
+          this.logger.error(
             'Failed to check distribution run integrity',
             {
               offeringId,
               runId: run.id,
               error: error instanceof Error ? error.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
           
           // Add a discrepancy for the failed check
@@ -243,13 +250,12 @@ export class RevenueReconciliationService {
           );
           discrepancies.push(...allocationChecks);
         } catch (error) {
-          this.logger?.error(
+          this.logger.error(
             'Failed to check investor allocations',
             {
               offeringId,
               error: error instanceof Error ? error.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -259,13 +265,12 @@ export class RevenueReconciliationService {
           const roundingChecks = this.checkRoundingAdjustments(relevantRuns);
           discrepancies.push(...roundingChecks);
         } catch (error) {
-          this.logger?.error(
+          this.logger.error(
             'Failed to check rounding adjustments',
             {
               offeringId,
               error: error instanceof Error ? error.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -284,14 +289,13 @@ export class RevenueReconciliationService {
             operation: 'validateChainEventConsistency',
             offeringId,
           });
-          this.logger?.warn(
+          this.logger.warn(
             'Failed to validate chain event consistency',
             {
               offeringId,
               failureClass: failure.class,
               error: error instanceof Error ? error.message : 'Unknown error',
-            },
-            LogLevel.WARN
+            }
           );
           
           if (failure.class !== StellarRPCFailureClass.UNKNOWN) {
@@ -323,14 +327,13 @@ export class RevenueReconciliationService {
           );
           discrepancies.push(...payoutDiscrepancies);
         } catch (error) {
-          this.logger?.error(
+          this.logger.error(
             'Failed to check payout completeness',
             {
               offeringId,
               runId: run.id,
               error: error instanceof Error ? error.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -343,6 +346,8 @@ export class RevenueReconciliationService {
         totalFailedPayouts += await this.countFailedPayouts(run.id);
       }
 
+      const discrepancyAmount = this.calculateDiscrepancyAmount(totalRevenueReported, totalPayouts);
+
       const result: ReconciliationResult = {
         offeringId,
         periodStart,
@@ -351,15 +356,26 @@ export class RevenueReconciliationService {
         discrepancies,
         summary: {
           totalRevenueReported,
-          totalPayouts
-        ),
-        investorCount: investorIds.size,
-        payoutsProcessed: this.countProcessedPayouts(relevantRuns),
-        payoutsFailed: totalFailedPayouts,
-        chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
-      },
-      checkedAt: new Date(),
-    };
+          totalPayouts,
+          discrepancyAmount,
+          investorCount: investorIds.size,
+          payoutsProcessed: this.countProcessedPayouts(relevantRuns),
+          payoutsFailed: totalFailedPayouts,
+          chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
+        },
+        checkedAt: new Date(),
+      };
+
+      return result;
+    } catch (error) {
+      this.logger.error('Reconciliation process failed', {
+        offeringId,
+        periodStart,
+        periodEnd,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+      throw error;
+    }
   }
 
   /**
@@ -687,15 +703,14 @@ export class RevenueReconciliationService {
   ): Promise<ReconciliationDiscrepancy[]> {
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
-    this.logger?.debug(
+    this.logger.debug(
       'Starting chain event consistency validation',
       {
         offeringId,
         runsCount: runs.length,
         periodStart,
         periodEnd,
-      },
-      LogLevel.DEBUG
+      }
     );
 
     for (const run of runs) {
@@ -764,7 +779,7 @@ export class RevenueReconciliationService {
         }
       } catch (error) {
         const failureClass = classifyStellarRPCFailure(error);
-        this.logger?.warn(
+        this.logger.warn(
           'Failed to validate Stellar transaction',
           {
             offeringId,
@@ -772,8 +787,7 @@ export class RevenueReconciliationService {
             txHash: run.stellar_transaction_hash,
             failureClass,
             error: error instanceof Error ? error.message : 'Unknown error',
-          },
-          LogLevel.WARN
+          }
         );
         
         if (failureClass !== StellarRPCFailureClass.UNKNOWN) {
@@ -795,13 +809,12 @@ export class RevenueReconciliationService {
       }
     }
 
-    this.logger?.debug(
+    this.logger.debug(
       'Chain event consistency validation completed',
       {
         offeringId,
         discrepanciesFound: discrepancies.length,
-      },
-      LogLevel.DEBUG
+      }
     );
 
     return discrepancies;
