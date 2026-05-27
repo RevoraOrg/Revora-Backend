@@ -20,7 +20,7 @@ class MockDistributionRepo {
   }
 
   async getPayoutsForRun(runId: string): Promise<any[]> {
-    return this.payouts.filter(p => p.distribution_run_id === runId);
+    return this.payouts.filter(p => p.distribution_id === runId);
   }
 
   public failNextUpdateStatusCount = 0;
@@ -50,7 +50,7 @@ class MockDistributionRepo {
     return run;
   }
 
-  async createPayout(input: any): Promise<any> {
+  async createPayout(input: any, client?: any): Promise<any> {
     // Check if this specific payout should fail
     const payoutIndex = this.payouts.length;
     if (this.failNextPayoutCount > 0) {
