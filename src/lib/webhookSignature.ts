@@ -1,5 +1,9 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 
+export const WEBHOOK_SIGNATURE_HEADER = 'x-revora-signature';
+export const WEBHOOK_TIMESTAMP_HEADER = 'x-revora-timestamp';
+export const WEBHOOK_EVENT_HEADER = 'x-revora-event';
+
 /**
  * @title Webhook Signature Verification
  * @notice Production-grade HMAC-SHA256 signature verification for incoming webhooks.
@@ -49,6 +53,17 @@ export function signWebhookPayload(secret: string, payload: string | Buffer): st
   const hmac = createHmac('sha256', secret);
   hmac.update(payload);
   return `sha256=${hmac.digest('hex')}`;
+}
+
+/**
+ * @notice Generates a versioned signature for a webhook payload including a timestamp.
+ * @param secret The shared secret key
+ * @param body The raw request body string
+ * @param timestamp The timestamp string
+ * @returns A signature string
+ */
+export function signPayload(secret: string, body: string, timestamp: string): string {
+  return signWebhookPayload(secret, `${timestamp}.${body}`);
 }
 
 /**
