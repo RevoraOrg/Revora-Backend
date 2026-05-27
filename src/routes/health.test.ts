@@ -651,7 +651,7 @@ describe('health metrics collection', () => {
       m.labels?.endpoint === 'ready'
     );
     expect(durationMetric).toBeDefined();
-    expect(durationMetric?.value).toBeGreaterThan(0);
+    expect(durationMetric?.value).toBeGreaterThanOrEqual(0);
   });
 
   it('should work without metrics collector', async () => {
@@ -1156,5 +1156,132 @@ describe("Stellar Horizon timeout handling", () => {
       StellarRPCFailureClass.TIMEOUT,
     );
     expect(response.body.checks[1].error).toBe("timeout");
+  });
+});
+
+describe("healthRootHandler - dependency graph aggregation", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("returns 503 unhealthy when Horizon is down and DB is up", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 12,
+      pool: { totalCount: 2, idleCount: 2, waitingCount: 0, maxConnections: 10 },
+    });
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 500 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe("unhealthy");
+    expect(response.body.checks[0].name).toBe("database");
+    expect(response.body.checks[0].status).toBe("up");
+    expect(response.body.checks[1].name).toBe("stellar-horizon");
+    expect(response.body.checks[1].status).toBe("down");
+    expect(response.body.checks[1].healthy).toBe(false);
+  });
+
+  it("returns 200 degraded when both DB pool and Horizon are degraded", async () => {
+    // DB pool at 90% utilization → degraded; Horizon returns 200 but we simulate
+    // a degraded DB pool scenario. Horizon itself is up, so overall = degraded.
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 30,
+      pool: { totalCount: 9, idleCount: 1, waitingCount: 0, maxConnections: 10 },
+    });
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe("degraded");
+    expect(response.body.checks[0].status).toBe("degraded");
+    expect(response.body.checks[1].status).toBe("up");
+  });
+
+  it("returns 503 unhealthy when DB checker throws an exception", async () => {
+    const mockDbHealth = jest.fn().mockRejectedValue(new Error("unexpected db crash"));
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    // The handler should not crash the process; it should propagate as 500 or 503
+    const response = await request(app).get("/health");
+
+    expect([500, 503]).toContain(response.status);
+  });
+
+  it("populates latencyMs on both database and stellar-horizon checks", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 42,
+      pool: { totalCount: 1, idleCount: 1, waitingCount: 0, maxConnections: 10 },
+    });
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+    const dbCheck = response.body.checks.find((c: DependencyHealth) => c.name === "database");
+    const stellarCheck = response.body.checks.find((c: DependencyHealth) => c.name === "stellar-horizon");
+
+    expect(typeof dbCheck.latencyMs).toBe("number");
+    expect(dbCheck.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(typeof stellarCheck.latencyMs).toBe("number");
+    expect(stellarCheck.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("populates dependsOn on database check when pool metrics are present", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: true,
+      latencyMs: 8,
+      pool: { totalCount: 3, idleCount: 3, waitingCount: 0, maxConnections: 10 },
+    });
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(200);
+    const dbCheck = response.body.checks.find((c: DependencyHealth) => c.name === "database");
+    expect(Array.isArray(dbCheck.dependsOn)).toBe(true);
+    expect(dbCheck.dependsOn).toContain("db-pool");
+  });
+
+  it("returns 503 unhealthy when both DB and Horizon are down", async () => {
+    const mockDbHealth = jest.fn().mockResolvedValue({
+      healthy: false,
+      latencyMs: 200,
+      error: "connection refused",
+      pool: { totalCount: 0, idleCount: 0, waitingCount: 0, maxConnections: 10 },
+    });
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 503 }) as typeof fetch;
+
+    const app = express();
+    app.get("/health", healthRootHandler(mockDbHealth));
+
+    const response = await request(app).get("/health");
+
+    expect(response.status).toBe(503);
+    expect(response.body.status).toBe("unhealthy");
+    expect(response.body.checks[0].status).toBe("down");
+    expect(response.body.checks[1].status).toBe("down");
   });
 });

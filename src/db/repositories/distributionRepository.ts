@@ -1,4 +1,10 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
+
+/**
+ * Type representing any queryable database object (Pool or PoolClient)
+ * Both have the same query interface for transactional support
+ */
+type Queryable = Pool | PoolClient;
 
 /**
  * Distribution entity (matches 'distributions' table)
@@ -61,10 +67,12 @@ export class DistributionRepository {
   /**
    * Create a new distribution run
    * @param input Distribution run data
+   * @param client Optional transaction client; if provided, query is executed within that transaction
    * @returns Created distribution run
    */
   async createDistributionRun(
-    input: CreateDistributionRunInput
+    input: CreateDistributionRunInput,
+    client?: Queryable
   ): Promise<DistributionRun> {
     const query = `
       INSERT INTO distributions (
@@ -90,7 +98,8 @@ export class DistributionRepository {
       status,
     ];
 
-    const result: QueryResult<DistributionRun> = await this.db.query(
+    const queryable = client || this.db;
+    const result: QueryResult<DistributionRun> = await queryable.query(
       query,
       values
     );
@@ -105,9 +114,10 @@ export class DistributionRepository {
   /**
    * Create a new payout
    * @param input Payout data
+   * @param client Optional transaction client; if provided, query is executed within that transaction
    * @returns Created payout
    */
-  async createPayout(input: CreatePayoutInput): Promise<Payout> {
+  async createPayout(input: CreatePayoutInput, client?: Queryable): Promise<Payout> {
     const query = `
       INSERT INTO distribution_payouts (
         distribution_id,
@@ -131,7 +141,8 @@ export class DistributionRepository {
       input.tx_hash || null,
     ];
 
-    const result: QueryResult<Payout> = await this.db.query(query, values);
+    const queryable = client || this.db;
+    const result: QueryResult<Payout> = await queryable.query(query, values);
 
     if (result.rows.length === 0) {
       throw new Error('Failed to create payout');
@@ -187,10 +198,14 @@ export class DistributionRepository {
 
   /**
    * Update distribution run status
+   * @param id Run ID
+   * @param status New status
+   * @param client Optional transaction client; if provided, query is executed within that transaction
    */
   async updateRunStatus(
     id: string,
-    status: 'pending' | 'processing' | 'completed' | 'failed'
+    status: 'pending' | 'processing' | 'completed' | 'failed',
+    client?: Queryable
   ): Promise<void> {
     const query = `
       UPDATE distributions
@@ -198,7 +213,8 @@ export class DistributionRepository {
       WHERE id = $2
     `;
 
-    await this.db.query(query, [status, id]);
+    const queryable = client || this.db;
+    await queryable.query(query, [status, id]);
   }
 
   /**
