@@ -11,6 +11,9 @@ import { createHealthRouter } from './routes/health';
 import vestingRouter from './routes/vesting';
 import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
 import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
+import { WebhookEndpointRepository, WebhookDelivery } from './db/repositories/webhookEndpointRepository';
+import { WebhookService, WebhookPayload, WebhookEventType } from './services/webhookService';
+import { pool } from './db/client';
 
 const port = process.env.PORT ?? 3000;
 const API_VERSION_PREFIX = process.env.API_VERSION_PREFIX ?? "/api/v1";
@@ -675,8 +678,15 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
  * Webhook delivery queue with exponential backoff and SSRF-aware URL blocking.
  */
 export class WebhookQueue {
+  private static repo: WebhookEndpointRepository;
+  private static service: WebhookService;
   private static MAX_RETRIES = 5;
   private static INITIAL_DELAY = 1000;
+
+  static init(repo: WebhookEndpointRepository, service: WebhookService) {
+    this.repo = repo;
+    this.service = service;
+  }
 
   private static isSafeUrl(url: string): boolean {
     const privateIPs = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
@@ -699,29 +709,100 @@ export class WebhookQueue {
 
   static async processDelivery(
     url: string,
-    payload: object,
-    attempt = 0,
+    payload: any,
+    deliveryId?: string,
   ): Promise<boolean> {
-    void payload;
+    if (!this.repo || !this.service) {
+      console.error("[WebhookQueue] Not initialized");
+      return false;
+    }
 
     if (!this.isSafeUrl(url)) {
       console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
       return false;
     }
 
-    try {
-      throw new Error("Simulated Network Failure");
-    } catch {
-      const nextDelay = this.getBackoffDelay(attempt);
-      if (nextDelay !== -1) {
-        return new Promise((resolve) => {
-          setTimeout(() => {
-            void this.processDelivery(url, payload, attempt + 1).then(resolve);
-          }, nextDelay);
-        });
-      }
-
+    const endpoint = await this.repo.findByUrl(url);
+    if (!endpoint) {
+      console.error(`[WebhookQueue] No active endpoint found for URL: ${url}`);
       return false;
+    }
+
+    let delivery: WebhookDelivery | null = null;
+    if (deliveryId) {
+      delivery = await this.repo.findDeliveryById(deliveryId);
+    }
+
+    if (!delivery) {
+      delivery = await this.repo.createDelivery({
+        endpoint_id: endpoint.id,
+        payload,
+        status: 'pending',
+        attempts: 0
+      });
+    }
+
+    const currentAttempt = delivery.attempts + 1;
+    
+    // Construct WebhookPayload for real delivery
+    const webhookPayload: WebhookPayload = {
+      id: delivery.id,
+      event: (payload as any).event || WebhookEventType.OFFERING_UPDATED,
+      payload: (payload as any).payload || payload,
+      timestamp: new Date().toISOString(),
+    };
+
+    const result = await this.service.sendAttempt({
+      id: endpoint.id,
+      url: endpoint.url,
+      secret: endpoint.secret
+    }, webhookPayload);
+
+    if (result.success) {
+      await this.repo.updateDelivery(delivery.id, {
+        status: 'completed',
+        attempts: currentAttempt,
+        last_error: null,
+        next_retry_at: null
+      });
+      return true;
+    }
+
+    const isRetryable = !result.statusCode || (result.statusCode >= 500) || (result.statusCode === 429);
+    const nextDelay = this.getBackoffDelay(currentAttempt);
+
+    if (isRetryable && nextDelay !== -1) {
+      const nextRetryAt = new Date(Date.now() + nextDelay);
+      await this.repo.updateDelivery(delivery.id, {
+        attempts: currentAttempt,
+        last_error: result.error,
+        next_retry_at: nextRetryAt
+      });
+      
+      setTimeout(() => {
+        void this.processDelivery(url, payload, delivery!.id);
+      }, nextDelay);
+      
+      return false;
+    } else {
+      await this.repo.updateDelivery(delivery.id, {
+        status: nextDelay === -1 ? 'dead_letter' : 'failed',
+        attempts: currentAttempt,
+        last_error: result.error,
+        next_retry_at: null
+      });
+      return false;
+    }
+  }
+
+  static async resumePending(): Promise<void> {
+    if (!this.repo) return;
+    const pending = await this.repo.getPendingDeliveries();
+    for (const delivery of pending) {
+      const endpoint = await this.repo.findById(delivery.endpoint_id);
+      if (endpoint) {
+        void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
+      }
     }
   }
 }
@@ -734,6 +815,11 @@ if (require.main === module && process.env.NODE_ENV !== "test") {
   process.on("SIGINT", () => {
     void shutdown("SIGINT");
   });
+
+  const repo = new WebhookEndpointRepository(pool);
+  const service = new WebhookService(repo);
+  WebhookQueue.init(repo, service);
+  void WebhookQueue.resumePending();
 
   server = app.listen(port, () => {
     console.log(`revora-backend listening on http://localhost:${port}`);

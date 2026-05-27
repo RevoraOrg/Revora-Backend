@@ -40,17 +40,25 @@ function normalizeStellarNetwork(value?: string): "testnet" | "public" {
 function parseAllowedOrigins(value?: string): string[] {
   if (!value) {
     // In production, require explicit configuration
-    if (process.env.NODE_ENV === 'production') {
+    if (process.env.NODE_ENV === "production") {
       return [];
     }
     // Default to localhost in development
     return ["http://localhost:3000"];
   }
+
   // Split by comma and trim whitespace from each origin
-  return value
+  const origins = value
     .split(",")
     .map((origin) => origin.trim())
     .filter((origin) => origin.length > 0);
+
+  // Security: Fail fast if wildcard is found in a list that should be explicit
+  if (origins.includes("*") && origins.length > 1) {
+    throw new Error("CORS configuration error: ALLOWED_ORIGINS cannot contain both '*' and explicit origins");
+  }
+
+  return origins;
 }
 
 function parseStellarTimeout(value?: string): number {
