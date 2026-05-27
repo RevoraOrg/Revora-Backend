@@ -12,6 +12,12 @@ import vestingRouter from './routes/vesting';
 import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
 import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
 import { env } from './config/env';
+import { validateWebhookUrl, SsrfValidationError } from './lib/ssrfProtection';
+import { WebhookEndpointRepository, WebhookDelivery } from './db/repositories/webhookEndpointRepository';
+import { WebhookService, WebhookPayload, WebhookEventType } from './services/webhookService';
+import { pool } from './db/pool';
+import { createPasswordResetRouter } from './routes/passwordReset';
+import { emailService } from './services/emailService';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -638,6 +644,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   apiRouter.use('/vesting', vestingRouter);
 
+  // Mount password reset router
+  app.use(createPasswordResetRouter({ db: pool, emailService }));
+
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);
@@ -674,6 +683,7 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
 
 /**
  * Webhook delivery queue with exponential backoff and SSRF-aware URL blocking.
+ * @notice Uses comprehensive SSRF protection including IPv6, link-local, and DNS rebinding prevention.
  */
 export class WebhookQueue {
   private static repo: WebhookEndpointRepository;
@@ -686,13 +696,20 @@ export class WebhookQueue {
     this.service = service;
   }
 
-  private static isSafeUrl(url: string): boolean {
-    const privateIPs = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
-
+  /**
+   * @notice Validates a webhook URL using comprehensive SSRF protection.
+   * @dev Enforces HTTPS, rejects private/reserved addresses (IPv4 and IPv6),
+   * resolves DNS to prevent rebinding attacks, and rejects embedded credentials.
+   */
+  private static async isSafeUrl(url: string): Promise<boolean> {
     try {
-      const { hostname } = new URL(url);
-      return !privateIPs.test(hostname) && hostname !== "localhost";
-    } catch {
+      const result = await validateWebhookUrl(url, true);
+      if (!result.valid) {
+        console.error(`[Security] SSRF validation failed for ${url}: ${result.error?.message}`);
+      }
+      return result.valid;
+    } catch (error) {
+      console.error(`[Security] Error validating webhook URL ${url}:`, error);
       return false;
     }
   }
@@ -715,7 +732,7 @@ export class WebhookQueue {
       return false;
     }
 
-    if (!this.isSafeUrl(url)) {
+    if (!(await this.isSafeUrl(url))) {
       console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
       return false;
     }

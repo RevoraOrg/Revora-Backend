@@ -315,6 +315,200 @@ describe('webhookAuth middleware', () => {
 
       expect(mockRes.status).toHaveBeenCalledWith(403);
     });
+
+    // Clock skew boundary tests
+    describe('clock skew boundary tests', () => {
+      const clockSkewMs = 30_000; // 30 seconds default
+
+      it('should accept timestamp exactly at clock skew boundary (future)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        // Exactly at the clock skew boundary
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() + clockSkewMs);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      it('should reject timestamp 1ms beyond clock skew boundary (future)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        // 1ms beyond the clock skew boundary
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() + clockSkewMs + 1);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('should accept timestamp 1ms inside clock skew boundary (future)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        // 1ms inside the clock skew boundary
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() + clockSkewMs - 1);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      it('should accept timestamp exactly at max age boundary (past)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        const maxAgeMs = 5 * 60 * 1000; // 5 minutes
+        // Use a timestamp 100ms inside the boundary to avoid timing flakiness
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() - maxAgeMs + 100);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          maxAgeMs,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      it('should reject timestamp 1ms beyond max age boundary (past)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        const maxAgeMs = 5 * 60 * 1000; // 5 minutes
+        // 1ms beyond the max age boundary
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() - maxAgeMs - 1);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          maxAgeMs,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('should accept timestamp 1ms inside max age boundary (past)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        const maxAgeMs = 5 * 60 * 1000; // 5 minutes
+        // 1ms inside the max age boundary
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() - maxAgeMs + 1);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          maxAgeMs,
+          clockSkewMs,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+    });
+
+    // Replay window edge cases
+    describe('replay window edge cases', () => {
+      it('should reject very old timestamp (replay attack prevention)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        // 1 hour old - well beyond replay window
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() - 60 * 60 * 1000);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          maxAgeMs: 5 * 60 * 1000, // 5 minutes
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('should reject very far future timestamp (replay attack prevention)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        // 1 hour in future - well beyond clock skew
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 60 * 60 * 1000);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('should accept timestamp at current time (no drift)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        mockReq.headers['x-webhook-timestamp'] = String(Date.now());
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      it('should reject timestamp with negative value (invalid)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        mockReq.headers['x-webhook-timestamp'] = String(-1000);
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('should reject timestamp with zero value (very old)', () => {
+        const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+        mockReq.headers['x-revora-signature'] = signature;
+        mockReq.headers['x-webhook-timestamp'] = '0';
+
+        const middleware = webhookAuth({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+        });
+        middleware(mockReq, mockRes, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(403);
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('custom error handler', () => {
@@ -519,6 +713,278 @@ describe('webhookAuthWithProvider middleware', () => {
     expect(mockNext).toHaveBeenCalled();
     const authReq = mockReq as WebhookAuthenticatedRequest;
     expect(authReq.webhook?.timestamp).toBeInstanceOf(Date);
+  });
+});
+
+// ─── Security: Constant-Time Comparison & Signature Tampering ──────────────
+
+describe('Webhook Auth Security: Constant-Time Comparison', () => {
+  let mockReq: jest.Mocked<Request>;
+  let mockRes: jest.Mocked<Response>;
+  let mockNext: jest.MockedFunction<NextFunction>;
+
+  beforeEach(() => {
+    mockReq = createMockRequest();
+    mockRes = createMockResponse();
+    mockNext = createMockNext();
+    jest.clearAllMocks();
+  });
+
+  it('should reject signature with wrong length (prevents timing attack)', () => {
+    // Create a signature that's too short
+    mockReq.headers['x-revora-signature'] = 'sha256=abc123';
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject signature with extra characters (wrong length)', () => {
+    const validSignature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    // Append extra characters to change length
+    mockReq.headers['x-revora-signature'] = validSignature + 'extra';
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject signature with missing prefix (wrong format)', () => {
+    mockReq.headers['x-revora-signature'] = 'a1b2c3d4e5f6'; // Missing 'sha256=' prefix
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject tampered signature (single bit flip)', () => {
+    const validSignature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    // Flip one character in the signature
+    const tamperedSignature = validSignature.slice(0, -1) + 
+      (validSignature.slice(-1) === 'a' ? 'b' : 'a');
+    
+    mockReq.headers['x-revora-signature'] = tamperedSignature;
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject signature for tampered payload', () => {
+    const originalPayload = TEST_PAYLOAD_STRING;
+    const tamperedPayload = JSON.stringify({ event: 'test', data: { id: '999' } });
+    
+    // Signature is for original payload, but we send tampered payload
+    const signature = signWebhookPayload(TEST_SECRET, originalPayload);
+    mockReq.body = JSON.parse(tamperedPayload);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject signature with invalid hex characters', () => {
+    mockReq.headers['x-revora-signature'] = 'sha256=ghijklmnopqrstuvwxyz'; // Invalid hex
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject empty signature', () => {
+    mockReq.headers['x-revora-signature'] = '';
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(401);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject signature with only prefix', () => {
+    mockReq.headers['x-revora-signature'] = 'sha256=';
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should accept valid signature (constant-time comparison path)', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+    expect(mockRes.status).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Security: Missing Headers ───────────────────────────────────────────────
+
+describe('Webhook Auth Security: Missing Headers', () => {
+  let mockReq: jest.Mocked<Request>;
+  let mockRes: jest.Mocked<Response>;
+  let mockNext: jest.MockedFunction<NextFunction>;
+
+  beforeEach(() => {
+    mockReq = createMockRequest();
+    mockRes = createMockResponse();
+    mockNext = createMockNext();
+    jest.clearAllMocks();
+  });
+
+  it('should return 401 for missing signature header', () => {
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(401);
+    expect(mockRes.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'UNAUTHORIZED',
+      })
+    );
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 401 for missing signature header when timestamp required', () => {
+    mockReq.headers['x-webhook-timestamp'] = String(Date.now());
+    // No signature header
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(401);
+    expect(mockRes.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'UNAUTHORIZED',
+      })
+    );
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for missing timestamp header when required', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    // No timestamp header
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockRes.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'FORBIDDEN',
+      })
+    );
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for missing timestamp header with custom header name', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    // No x-revora-timestamp header
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for undefined timestamp header value', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = undefined;
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for empty timestamp header value', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = '';
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 401 for undefined signature header value', () => {
+    mockReq.headers['x-revora-signature'] = undefined;
+
+    const middleware = webhookAuth({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(401);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for non-numeric timestamp when required', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = 'not-a-number';
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for timestamp with decimal when required', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = '12345.678';
+
+    const middleware = webhookAuth({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
   });
 });
 

@@ -2,11 +2,18 @@ import { Router, Request, Response } from 'express';
 import { Pool } from 'pg';
 import { PasswordResetService, PasswordResetRateLimitedError } from '../services/passwordResetService';
 import { PasswordResetRateLimiter } from '../services/passwordResetRateLimiter';
+import { EmailService } from '../services/emailService';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MIN_PASSWORD_LENGTH = 8;
 
-export function createPasswordResetRouter(db: Pool): Router {
+export interface CreatePasswordResetRouterOptions {
+  db: Pool;
+  emailService: EmailService;
+}
+
+export function createPasswordResetRouter(options: CreatePasswordResetRouterOptions): Router {
+  const { db, emailService } = options;
   const router = Router();
   const rateLimiter = new PasswordResetRateLimiter(db, {
     maxRequests: 3,
@@ -15,7 +22,8 @@ export function createPasswordResetRouter(db: Pool): Router {
   });
   const service = new PasswordResetService(db, {
     emailSender: async (to, subject, body) => {
-      console.log(`[email] to=${to} subject="${subject}" body="${body}"`);
+      // Use EmailService to send the reset email
+      await emailService.sendMail(to, subject, body);
     },
     rateLimiter,
   });
@@ -59,7 +67,8 @@ export function createPasswordResetRouter(db: Pool): Router {
       }
       res.status(200).json({ message: 'Password updated' });
     } catch (err) {
-      console.error('[password-reset] Reset password error:', err);
+      // Log error without exposing token
+      console.error('[password-reset] Reset password error');
       res.status(400).json({ error: 'Invalid or expired token' });
     }
   });
