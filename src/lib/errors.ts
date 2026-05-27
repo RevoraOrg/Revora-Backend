@@ -138,7 +138,7 @@ export function createError(
   details?: unknown,
   options?: { expose?: boolean },
 ): AppError {
-  return new AppError(code, statusCode, message, options?.expose !== false);
+  return new AppError(code, statusCode, message, details, options);
 }
 
 export function throwError(
