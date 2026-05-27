@@ -1,5 +1,7 @@
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
+import { Pool } from 'pg';
+import { withTransaction } from '../db/transaction';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailureClass,
@@ -65,7 +67,8 @@ export class DistributionEngine {
     private offeringRepo: any,
     private distributionRepo: any,
     private balanceProvider?: { getBalances: (offeringId: string, period: any) => Promise<BalanceRow[]> },
-    options: DistributionEngineOptions = {}
+    options: DistributionEngineOptions = {},
+    private pool?: Pool
   ) {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
@@ -269,7 +272,7 @@ export class DistributionEngine {
       batchSize: this.batchSize,
     });
 
-    // 6. Process payouts in batches with partial failure tracking
+    // 6. Process payouts in batches with atomic transaction support
     const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
     const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
 
@@ -285,47 +288,82 @@ export class DistributionEngine {
       const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
       try {
-        for (const r of batch) {
-          if (existingInvestorIds.has(r.investor_id)) {
-            continue;
-          }
+        // Process batch with transaction support if pool is available
+        if (this.pool) {
+          await withTransaction(this.pool, async (client) => {
+            for (const r of batch) {
+              if (existingInvestorIds.has(r.investor_id)) {
+                continue;
+              }
 
-          const amtStr = r.amount.toFixed(2);
-          try {
-            await this.withRetry(() =>
-              this.distributionRepo.createPayout({
-                distribution_run_id: run.id,
+              const amtStr = r.amount.toFixed(2);
+              await this.withRetry(() =>
+                this.distributionRepo.createPayout(
+                  {
+                    distribution_id: run.id,
+                    investor_id: r.investor_id,
+                    amount: amtStr,
+                    status: 'pending',
+                  },
+                  client
+                )
+              );
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            }
+          });
+        } else {
+          // Fallback to non-transactional processing for backward compatibility
+          for (const r of batch) {
+            if (existingInvestorIds.has(r.investor_id)) {
+              continue;
+            }
+
+            const amtStr = r.amount.toFixed(2);
+            try {
+              await this.withRetry(() =>
+                this.distributionRepo.createPayout({
+                  distribution_id: run.id,
+                  investor_id: r.investor_id,
+                  amount: amtStr,
+                  status: 'pending',
+                })
+              );
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            } catch (err) {
+              const failure = classifyStellarRPCFailure(err, {
+                operation: 'createPayout',
+                offeringId,
+                periodId: period.id,
+              });
+              
+              this.logger.error('Payout creation failed', {
+                offeringId,
+                runId: run.id,
+                investorId: r.investor_id,
+                errorClass: failure.class,
+                batchNumber,
+                rawError: err instanceof Error ? err.message : String(err),
+              });
+
+              failedPayouts.push({
                 investor_id: r.investor_id,
                 amount: amtStr,
-                status: 'pending',
-              })
-            );
-            successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
-          } catch (err) {
-            const failure = classifyStellarRPCFailure(err, {
-              operation: 'createPayout',
-              offeringId,
-              periodId: period.id,
-            });
-            
-            this.logger.error('Payout creation failed', {
-              offeringId,
-              runId: run.id,
-              investorId: r.investor_id,
-              errorClass: failure.class,
-              batchNumber,
-              // Log raw error internally but don't expose it in the result
-              rawError: err instanceof Error ? err.message : String(err),
-            });
-
-            failedPayouts.push({
-              investor_id: r.investor_id,
-              amount: amtStr,
-              error: `Action failed with ${failure.class}`,
-              errorClass: failure.class,
-            });
+                error: `Action failed with ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
           }
         }
+
+        this.logger.info('Distribution batch processed successfully', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          payoutsInBatch: batch.length,
+          transactional: !!this.pool,
+        });
       } catch (err) {
         hasBatchFailure = true;
         const failure = classifyStellarRPCFailure(err, {
@@ -333,13 +371,33 @@ export class DistributionEngine {
           offeringId,
           periodId: period.id,
         });
+
         this.logger.error('Payout batch failed', {
           offeringId,
           runId: run.id,
           batchNumber,
           errorClass: failure.class,
           investorCount: batch.length,
+          transactional: !!this.pool,
+          rawError: err instanceof Error ? err.message : String(err),
         });
+
+        // When a transactional batch fails, don't add individual failures 
+        // because the entire batch rolled back
+        if (!this.pool) {
+          // In non-transactional mode, any payout that wasn't already added to successfulPayouts failed
+          for (const r of batch) {
+            if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
+              const amtStr = r.amount.toFixed(2);
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
       }
     }
 

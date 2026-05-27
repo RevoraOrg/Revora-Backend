@@ -4,6 +4,39 @@ import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
 import { InvestmentService, createInvestmentService } from '../services/investmentService';
 import { AppError } from '../lib/errors';
+import { createIdempotencyMiddleware } from '../middleware/idempotency';
+import crypto from 'crypto';
+
+/**
+ * Fingerprint function for investment requests.
+ * Creates a deterministic hash of the request body to detect payload changes.
+ */
+function fingerprintInvestmentRequest(req: Request): string {
+  const body = req.body as Record<string, unknown>;
+  // Normalize by extracting only relevant fields in a consistent order
+  const normalized = JSON.stringify({
+    amount: body.amount,
+    asset: body.asset,
+    offering_id: body.offering_id,
+  });
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+/**
+ * Middleware to require Idempotency-Key header on POST requests.
+ */
+function requireIdempotencyKey(req: Request, res: Response, next: NextFunction): void {
+  if (req.method === 'POST') {
+    const key = req.header('idempotency-key');
+    if (!key || key.trim() === '') {
+      res.status(400).json({
+        error: 'Idempotency-Key header is required for investment submissions',
+      });
+      return;
+    }
+  }
+  next();
+}
 
 /**
  * Factory that creates an Express Router for investment endpoints.
@@ -14,16 +47,29 @@ export function createInvestmentsRouter(db: Pool): Router {
   const investmentRepo = new InvestmentRepository(db);
   const investmentService: InvestmentService = createInvestmentService(db);
 
+  // Create idempotency middleware with request body fingerprinting
+  const idempotencyMiddleware = createIdempotencyMiddleware({
+    fingerprint: fingerprintInvestmentRequest,
+  });
+
   /**
    * POST /api/investments
    * Create a new investment for an offering.
    * 
-   * Request   offering_id - body:
-   * UUID of the offering to invest in (required)
+   * Request body:
+   *   offering_id - UUID of the offering to invest in (required)
    *   amount - Amount to invest as a string (required, positive number)
    *   asset - Asset code (e.g., 'USDC') (required)
+   * 
+   * Headers:
+   *   Idempotency-Key - Required for POST requests to prevent duplicate submissions
    */
-  router.post('/', requireInvestor, async (req: Request, res: Response, next: NextFunction) => {
+  router.post(
+    '/',
+    requireInvestor,
+    requireIdempotencyKey,
+    idempotencyMiddleware,
+    async (req: Request, res: Response, next: NextFunction) => {
     const authenticatedReq = req as AuthenticatedRequest;
     
     // Type guard to ensure user is defined

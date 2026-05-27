@@ -56,6 +56,7 @@ describe('RefreshService', () => {
             findSessionByIdForUpdate: jest.fn(),
             createSession: jest.fn(),
             revokeSessionAndDescendants: jest.fn().mockResolvedValue(undefined),
+            setSessionConsumed: jest.fn().mockResolvedValue(undefined),
             findSessionByParentId: jest.fn(),
         };
         mockTokenService = {
@@ -82,7 +83,8 @@ describe('RefreshService', () => {
         mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
             id: 'session-123', 
             revoked_at: null,
-            token_hash: 'hashed-token'
+            token_hash: 'hashed-token',
+            token_consumed_at: null,
         });
         mockTokenService.hashToken.mockReturnValueOnce('hashed-token').mockReturnValueOnce('new-hash');
         mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
@@ -94,6 +96,7 @@ describe('RefreshService', () => {
         expect(mockRepo.findSessionByIdForUpdate).toHaveBeenCalledWith('session-123', mockClient);
         expect(mockTokenService.hashToken).toHaveBeenCalledWith('old-token');
         expect(mockRepo.createSession).toHaveBeenCalled();
+        expect(mockRepo.setSessionConsumed).toHaveBeenCalledWith('session-123', mockClient);
         expect(mockRepo.revokeSessionAndDescendants).not.toHaveBeenCalled();
     });
 
@@ -107,7 +110,8 @@ describe('RefreshService', () => {
         mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
             id: 'session-123', 
             revoked_at: null,
-            token_hash: 'hashed-token'
+            token_hash: 'hashed-token',
+            token_consumed_at: null,
         });
         mockTokenService.hashToken.mockReturnValue('hashed-token');
         mockRepo.findSessionByParentId.mockResolvedValue({ id: 'child-session-id' });
@@ -128,7 +132,8 @@ describe('RefreshService', () => {
         mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
             id: 'session-123', 
             revoked_at: new Date(),
-            token_hash: 'hashed-token'
+            token_hash: 'hashed-token',
+            token_consumed_at: null,
         });
         mockTokenService.hashToken.mockReturnValue('hashed-token');
 
@@ -174,7 +179,8 @@ describe('RefreshService', () => {
         mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
             id: 'session-123', 
             revoked_at: null,
-            token_hash: 'stored-hash'
+            token_hash: 'stored-hash',
+            token_consumed_at: null,
         });
         mockTokenService.hashToken.mockReturnValue('different-hash');
 
@@ -209,7 +215,7 @@ describe('RefreshService', () => {
             // First call blocks at findSessionById until we release it.
             mockRepo.findSessionById
                 .mockImplementationOnce(() => barrier.then(() => ({ id: 'session-123', revoked_at: null })))
-                .mockResolvedValue({ id: 'session-123', revoked_at: null });
+                .mockResolvedValue({ id: 'session-123', revoked_at: null, token_consumed_at: null });
 
             mockRepo.findSessionByParentId.mockResolvedValue(null);
             mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
@@ -248,6 +254,7 @@ describe('RefreshService', () => {
             mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
             mockTokenService.hashToken.mockReturnValue('new-hash');
             mockRepo.findSessionById.mockResolvedValue({ id: 'session-123', revoked_at: null });
+            mockRepo.findSessionById.mockResolvedValue({ id: 'session-123', revoked_at: null, token_consumed_at: null });
             mockRepo.findSessionByParentId
                 .mockResolvedValueOnce(null)                         // first call: no child yet
                 .mockResolvedValue({ id: 'child-session-id' });      // second call: child exists
@@ -274,7 +281,7 @@ describe('RefreshService', () => {
             // Second call sees revoked_at set (simulates another process revoking between calls).
             mockRepo.findSessionById
                 .mockResolvedValueOnce({ id: 'session-123', revoked_at: null })
-                .mockResolvedValue({ id: 'session-123', revoked_at: new Date() });
+                .mockResolvedValue({ id: 'session-123', revoked_at: new Date(), token_consumed_at: null });
 
             mockRepo.findSessionByParentId.mockResolvedValue(null);
             mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
@@ -299,7 +306,7 @@ describe('RefreshService', () => {
 
             // Block the first call so the second enters the in-flight guard.
             mockRepo.findSessionById.mockImplementation(
-                () => barrier.then(() => ({ id: 'session-123', revoked_at: null }))
+                () => barrier.then(() => ({ id: 'session-123', revoked_at: null, token_consumed_at: null }))
             );
             mockRepo.findSessionByParentId.mockResolvedValue(null);
             mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
@@ -334,7 +341,7 @@ describe('RefreshService', () => {
             mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
             mockTokenService.hashToken.mockReturnValue('hash');
             mockRepo.findSessionById.mockImplementation(
-                () => barrier.then(() => ({ id: 'session-123', revoked_at: null }))
+                () => barrier.then(() => ({ id: 'session-123', revoked_at: null, token_consumed_at: null }))
             );
             mockRepo.findSessionByParentId.mockResolvedValue(null);
             mockRepo.createSession.mockResolvedValue({ id: 'new-id' });

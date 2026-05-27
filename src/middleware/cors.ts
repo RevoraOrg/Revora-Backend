@@ -24,7 +24,6 @@ import { globalLogger } from "../lib/logger";
  */
 export function createCorsMiddleware() {
   const allowedOrigins: string[] = env.ALLOWED_ORIGINS;
-
   const allowNoOrigin = process.env.CORS_ALLOW_NO_ORIGIN === "true";
 
   // Security validation: require explicit origins in production
@@ -40,6 +39,15 @@ export function createCorsMiddleware() {
       );
       throw new Error("ALLOWED_ORIGINS must be configured in production environment");
     }
+  }
+
+  // Security: Reject wildcard when credentials are enabled
+  if (allowedOrigins.includes("*")) {
+    globalLogger.error("CORS security violation: Wildcard origin '*' is not allowed when credentials are true", {
+      securityEvent: "cors_config_error",
+      allowedOrigins,
+    });
+    throw new Error("CORS configuration error: Wildcard origin '*' is not allowed when credentials are true");
   }
 
   // Log configuration on startup
@@ -87,7 +95,15 @@ export function createCorsMiddleware() {
 
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "x-user-role", "x-request-id"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Request-Id",
+      "X-User-Id",
+      "X-User-Role"
+    ],
+    exposedHeaders: ["X-Request-Id"],
+    maxAge: 86400, // 24 hours - bounded preflight cache
     optionsSuccessStatus: 200, // Some legacy browsers choke on 204
   });
 }
