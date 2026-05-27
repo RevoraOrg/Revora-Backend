@@ -26,13 +26,6 @@ export enum StellarRPCFailureClass {
   TX_RESULT_CODE = "TX_RESULT_CODE",
   /** Operation-level result code from Horizon (e.g. op_no_destination, op_underfunded). */
   OP_RESULT_CODE = "OP_RESULT_CODE",
-  NETWORK_ERROR = "NETWORK_ERROR",
-  CONTRACT_ERROR = "CONTRACT_ERROR",
-  TRANSACTION_FAILED = "TRANSACTION_FAILED",
-  INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS",
-  BAD_SEQUENCE = "BAD_SEQUENCE",
-  SIGNING_ERROR = "SIGNING_ERROR",
-  VALIDATION_ERROR = "VALIDATION_ERROR",
   UNKNOWN = "UNKNOWN",
 }
 
@@ -44,30 +37,10 @@ export interface StellarRPCFailureContext {
   attemptCount?: number;
   accountId?: string;
   transactionId?: string;
-  [key: string]: unknown;
-}
-
-/**
- * @dev Structured failure information for Stellar RPC errors.
- */
-export interface StellarRPCFailure {
-  class: StellarRPCFailureClass;
-  context: StellarRPCFailureContext;
-  originalError: unknown;
-  timestamp: string;
-  shouldRetry: boolean;
-  suggestedRetryDelayMs?: number;
-}
-
-/**
- * @dev Context for Stellar RPC failures to assist in retry logic and logging.
- */
-export interface StellarRPCFailureContext {
-  operation: string;
   offeringId?: string;
   periodId?: string;
   requestId?: string;
-  attemptCount?: number;
+  [key: string]: unknown;
 }
 
 /**
@@ -76,7 +49,7 @@ export interface StellarRPCFailureContext {
 export interface StellarRPCFailure {
   class: StellarRPCFailureClass;
   context: StellarRPCFailureContext;
-  originalError: any;
+  originalError: unknown;
   timestamp: string;
   shouldRetry: boolean;
   suggestedRetryDelayMs?: number;
@@ -387,34 +360,39 @@ export function classifyStellarRPCFailure(
  * @dev Sanitizes error objects to prevent sensitive data leakage.
  */
 function sanitizeError(error: unknown): unknown {
+  const redactedMessage = "UPSTREAM_MESSAGE_REDACTED";
+
   if (error instanceof Error) {
     return {
       name: error.name,
-      message: error.message,
-      stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+      message: redactedMessage,
     };
   }
 
   if (typeof error === "object" && error !== null) {
-    const sanitized: any = {};
+    const sanitized: Record<string, unknown> = {};
     const allowedKeys = [
       "status",
       "statusText",
       "code",
-      "message",
       "result_xdr",
     ];
 
     for (const key of allowedKeys) {
       if (key in error) {
-        sanitized[key] = (error as any)[key];
+        sanitized[key] = (error as Record<string, unknown>)[key];
       }
+    }
+
+    if ("message" in error) {
+      // Preserve shape for diagnostics without disclosing upstream text.
+      sanitized.message = redactedMessage;
     }
 
     return sanitized;
   }
 
-  return { message: String(error) };
+  return { message: redactedMessage };
 }
 
 /**

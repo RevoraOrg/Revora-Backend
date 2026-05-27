@@ -51,6 +51,7 @@ jest.mock('@stellar/stellar-sdk', () => {
 
 jest.mock('../lib/logger', () => ({
   globalLogger: {
+    child: jest.fn().mockReturnThis(),
     warn: jest.fn(),
     info: jest.fn(),
     error: jest.fn(),
@@ -514,9 +515,10 @@ describe('Stellar RPC Failure Integration Tests', () => {
       // Verify error message is sanitized but not the long message itself
       expect(result.message).toBe('Stellar network temporarily unavailable');
       
-      // Verify long message is handled in logs without causing issues
+      // Verify logs keep a stable shape without exposing the upstream string
       const logCall = (logger.warn as jest.Mock).mock.calls[0];
-      expect(logCall[1].originalError.message).toBe(longMessage);
+      expect(logCall[1].originalError.message).toBe('UPSTREAM_MESSAGE_REDACTED');
+      expect(JSON.stringify(logCall[1].originalError)).not.toContain(longMessage);
     });
   });
 });

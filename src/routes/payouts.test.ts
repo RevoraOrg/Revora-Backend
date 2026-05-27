@@ -538,28 +538,28 @@ describe('classifyStellarRPCFailure – result codes', () => {
 
     it.each(txCodes)('classifies tx code "%s" as TX_RESULT_CODE', (code) => {
       const err = { status: 400, extras: { result_codes: { transaction: code, operations: [] } } };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
 
     it('classifies tx_bad_seq as TX_RESULT_CODE (explicit)', () => {
       const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_seq' } } };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
 
     it('classifies tx_insufficient_fee as TX_RESULT_CODE (explicit)', () => {
       const err = { status: 400, extras: { result_codes: { transaction: 'tx_insufficient_fee' } } };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
 
     it('classifies tx_bad_auth as TX_RESULT_CODE', () => {
       const err = { status: 400, extras: { result_codes: { transaction: 'tx_bad_auth' } } };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
 
     it('does not classify unknown tx code as TX_RESULT_CODE', () => {
       const err = { status: 400, extras: { result_codes: { transaction: 'tx_unknown_future_code' } } };
       // Falls through to UNKNOWN since status 400 has no other handler
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.UNKNOWN);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.UNKNOWN);
     });
   });
 
@@ -573,7 +573,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
         status: 400,
         extras: { result_codes: { transaction: 'tx_failed', operations: [code] } },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.OP_RESULT_CODE);
     });
 
     it('classifies op_no_destination as OP_RESULT_CODE (explicit)', () => {
@@ -581,7 +581,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
         status: 400,
         extras: { result_codes: { transaction: 'tx_failed', operations: ['op_no_destination'] } },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.OP_RESULT_CODE);
     });
 
     it('classifies op_underfunded as OP_RESULT_CODE (explicit)', () => {
@@ -589,7 +589,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
         status: 400,
         extras: { result_codes: { transaction: 'tx_failed', operations: ['op_underfunded'] } },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.OP_RESULT_CODE);
     });
 
     it('op codes take precedence over tx codes', () => {
@@ -599,7 +599,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
           result_codes: { transaction: 'tx_failed', operations: ['op_no_trust', 'op_success'] },
         },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.OP_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.OP_RESULT_CODE);
     });
 
     it('falls back to TX_RESULT_CODE when ops array has no known codes', () => {
@@ -609,7 +609,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
           result_codes: { transaction: 'tx_bad_seq', operations: ['op_success'] },
         },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
 
     it('handles missing operations array gracefully', () => {
@@ -617,7 +617,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
         status: 400,
         extras: { result_codes: { transaction: 'tx_bad_seq' } },
       };
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TX_RESULT_CODE);
     });
   });
 
@@ -625,23 +625,23 @@ describe('classifyStellarRPCFailure – result codes', () => {
 
   describe('http status codes', () => {
     it('classifies 429 as RATE_LIMIT', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ status: 429 }), StellarRPCFailureClass.RATE_LIMIT);
+      assert.strictEqual(classifyStellarRPCFailure({ status: 429 }).class, StellarRPCFailureClass.RATE_LIMIT);
     });
 
     it('classifies 401 as UNAUTHORIZED', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ status: 401 }), StellarRPCFailureClass.UNAUTHORIZED);
+      assert.strictEqual(classifyStellarRPCFailure({ status: 401 }).class, StellarRPCFailureClass.UNAUTHORIZED);
     });
 
     it('classifies 403 as UNAUTHORIZED', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ status: 403 }), StellarRPCFailureClass.UNAUTHORIZED);
+      assert.strictEqual(classifyStellarRPCFailure({ status: 403 }).class, StellarRPCFailureClass.UNAUTHORIZED);
     });
 
     it('classifies 500 as UPSTREAM_ERROR', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ status: 500 }), StellarRPCFailureClass.UPSTREAM_ERROR);
+      assert.strictEqual(classifyStellarRPCFailure({ status: 500 }).class, StellarRPCFailureClass.UPSTREAM_ERROR);
     });
 
     it('classifies 503 as UPSTREAM_ERROR', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ status: 503 }), StellarRPCFailureClass.UPSTREAM_ERROR);
+      assert.strictEqual(classifyStellarRPCFailure({ status: 503 }).class, StellarRPCFailureClass.UPSTREAM_ERROR);
     });
   });
 
@@ -651,12 +651,12 @@ describe('classifyStellarRPCFailure – result codes', () => {
     it('classifies AbortError as TIMEOUT', () => {
       const err = new Error('aborted');
       err.name = 'AbortError';
-      assert.strictEqual(classifyStellarRPCFailure(err), StellarRPCFailureClass.TIMEOUT);
+      assert.strictEqual(classifyStellarRPCFailure(err).class, StellarRPCFailureClass.TIMEOUT);
     });
 
     it('classifies message containing "timeout" as TIMEOUT', () => {
       assert.strictEqual(
-        classifyStellarRPCFailure(new Error('Request timeout after 30s')),
+        classifyStellarRPCFailure(new Error('Request timeout after 30s')).class,
         StellarRPCFailureClass.TIMEOUT,
       );
     });
@@ -667,7 +667,7 @@ describe('classifyStellarRPCFailure – result codes', () => {
   describe('malformed response', () => {
     it('classifies SyntaxError as MALFORMED_RESPONSE', () => {
       assert.strictEqual(
-        classifyStellarRPCFailure(new SyntaxError('Unexpected token')),
+        classifyStellarRPCFailure(new SyntaxError('Unexpected token')).class,
         StellarRPCFailureClass.MALFORMED_RESPONSE,
       );
     });
@@ -677,39 +677,40 @@ describe('classifyStellarRPCFailure – result codes', () => {
 
   describe('unknown fallback', () => {
     it('classifies null as UNKNOWN', () => {
-      assert.strictEqual(classifyStellarRPCFailure(null), StellarRPCFailureClass.UNKNOWN);
+      assert.strictEqual(classifyStellarRPCFailure(null).class, StellarRPCFailureClass.UNKNOWN);
     });
 
     it('classifies plain string as UNKNOWN', () => {
-      assert.strictEqual(classifyStellarRPCFailure('some error'), StellarRPCFailureClass.UNKNOWN);
+      assert.strictEqual(classifyStellarRPCFailure('some error').class, StellarRPCFailureClass.UNKNOWN);
     });
 
     it('classifies generic Error as UNKNOWN', () => {
-      assert.strictEqual(classifyStellarRPCFailure(new Error('something')), StellarRPCFailureClass.UNKNOWN);
+      assert.strictEqual(classifyStellarRPCFailure(new Error('something')).class, StellarRPCFailureClass.UNKNOWN);
     });
 
     it('classifies object with no status as UNKNOWN', () => {
-      assert.strictEqual(classifyStellarRPCFailure({ message: 'oops' }), StellarRPCFailureClass.UNKNOWN);
+      assert.strictEqual(classifyStellarRPCFailure({ message: 'oops' }).class, StellarRPCFailureClass.UNKNOWN);
     });
   });
 
   // ── Security: no raw upstream strings leak ────────────────────────────────
 
   describe('security: raw upstream strings do not leak', () => {
-    it('returns only a StellarRPCFailureClass enum value, never the raw error', () => {
+    it('returns a classified object without leaking the raw upstream message', () => {
       const sensitiveErr = {
         status: 400,
+        message: 'secret horizon message',
         extras: {
           result_codes: { transaction: 'tx_bad_seq' },
           envelope_xdr: 'AAAA...sensitive...XDR',
           result_xdr: 'AAAA...sensitive...result',
         },
       };
-      const cls = classifyStellarRPCFailure(sensitiveErr);
-      // Result must be one of the known enum values
-      assert(Object.values(StellarRPCFailureClass).includes(cls));
-      // Must not be the raw error object
-      assert.notStrictEqual(cls as any, sensitiveErr);
+      const failure = classifyStellarRPCFailure(sensitiveErr);
+      assert.strictEqual(failure.class, StellarRPCFailureClass.TX_RESULT_CODE);
+      assert.notStrictEqual(failure.originalError as any, sensitiveErr);
+      assert.strictEqual((failure.originalError as any).message, 'UPSTREAM_MESSAGE_REDACTED');
+      assert(!JSON.stringify(failure.originalError).includes('secret horizon message'));
     });
   });
 });
@@ -809,7 +810,7 @@ describe('payout repo retry storm', () => {
     assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1, 'no retry on protocol error');
     // Verify the error is classified as non-retryable
     assert.strictEqual(
-      isStellarRPCRetryable(classifyStellarRPCFailure(txErr)),
+      isStellarRPCRetryable(classifyStellarRPCFailure(txErr).class),
       false,
     );
   });
@@ -823,7 +824,7 @@ describe('payout repo retry storm', () => {
     await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr !== null);
     assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
-    assert.strictEqual(classifyStellarRPCFailure(rateLimitErr), StellarRPCFailureClass.RATE_LIMIT);
+    assert.strictEqual(classifyStellarRPCFailure(rateLimitErr).class, StellarRPCFailureClass.RATE_LIMIT);
     assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.RATE_LIMIT), false);
   });
 
@@ -838,7 +839,7 @@ describe('payout repo retry storm', () => {
     await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr !== null);
     assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
-    assert.strictEqual(classifyStellarRPCFailure(timeoutErr), StellarRPCFailureClass.TIMEOUT);
+    assert.strictEqual(classifyStellarRPCFailure(timeoutErr).class, StellarRPCFailureClass.TIMEOUT);
     assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TIMEOUT), true);
   });
 });

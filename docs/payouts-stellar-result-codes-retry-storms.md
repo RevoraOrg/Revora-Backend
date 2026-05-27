@@ -16,6 +16,7 @@ Extended the existing `classifyStellarRPCFailure` classifier with:
 - `STELLAR_TX_RESULT_CODES` — allowlist of all Horizon transaction-level result codes (`tx_bad_seq`, `tx_insufficient_fee`, `tx_bad_auth`, etc.)
 - `STELLAR_OP_RESULT_CODES` — allowlist of all Horizon operation-level result codes (`op_no_destination`, `op_underfunded`, `op_no_trust`, etc.)
 - Horizon `extras.result_codes` envelope parsing — op-level codes take precedence over tx-level for actionability
+- Sanitized `originalError` payloads — raw Horizon/upstream `message` strings are replaced with `UPSTREAM_MESSAGE_REDACTED`
 - `isStellarRPCRetryable(cls)` — returns `true` only for `TIMEOUT` and `UPSTREAM_ERROR`; all protocol errors (`TX_RESULT_CODE`, `OP_RESULT_CODE`) and auth/rate errors are non-retryable
 
 ### `src/routes/payouts.test.ts`
@@ -94,10 +95,12 @@ anything else                                    → UNKNOWN
 
 1. **No raw upstream strings in client JSON.** `classifyStellarRPCFailure` returns only an enum value. The `extras.envelope_xdr`, `result_xdr`, and raw error messages are never forwarded to callers.
 
-2. **Investor data isolation.** `listPayouts` enforces `role === 'investor'` and scopes the repo query to `req.user.id`. Other roles receive 403 before any DB call is made.
+2. **Sanitized classified failures stay safe in logs.** `failure.originalError` preserves only a narrow diagnostic shape (`status`, `code`, `result_xdr`, redacted `message`) so downstream logging does not accidentally leak Horizon text.
 
-3. **No retry amplification.** The `listPayouts` handler makes exactly one repo call per request. Retry policy is the responsibility of the caller (job queue, middleware), not the HTTP handler. This prevents a single slow request from multiplying load on Horizon during an outage.
+3. **Investor data isolation.** `listPayouts` enforces `role === 'investor'` and scopes the repo query to `req.user.id`. Other roles receive 403 before any DB call is made.
 
-4. **Retry budget is bounded.** `DistributionEngine.withRetry` loops at most `maxRetries` times. Tests assert `callCount === maxRetries` to confirm no infinite loop is possible.
+4. **No retry amplification.** The `listPayouts` handler makes exactly one repo call per request. Retry policy is the responsibility of the caller (job queue, middleware), not the HTTP handler. This prevents a single slow request from multiplying load on Horizon during an outage.
 
-5. **Protocol errors are not retried.** `TX_RESULT_CODE` and `OP_RESULT_CODE` failures (e.g. `tx_bad_seq`, `op_underfunded`) indicate the transaction itself is malformed. Retrying without fixing the transaction wastes Horizon quota and can trigger rate limiting.
+5. **Retry budget is bounded.** `DistributionEngine.withRetry` loops at most `maxRetries` times. Tests assert `callCount === maxRetries` to confirm no infinite loop is possible.
+
+6. **Protocol errors are not retried.** `TX_RESULT_CODE` and `OP_RESULT_CODE` failures (e.g. `tx_bad_seq`, `op_underfunded`) indicate the transaction itself is malformed. Retrying without fixing the transaction wastes Horizon quota and can trigger rate limiting.
