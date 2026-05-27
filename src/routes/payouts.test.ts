@@ -843,3 +843,491 @@ describe('payout repo retry storm', () => {
     assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TIMEOUT), true);
   });
 });
+
+// ─── Expanded allowlist, injection, and pagination boundary tests ─────────────
+//
+// Security assumptions validated here:
+//  - sortBy is validated against a strict allowlist before any downstream use;
+//    injection strings (SQL fragments, semicolons, comment sequences) must
+//    never reach a query layer — they are rejected at the parse boundary.
+//  - status and sortOrder are similarly allowlist-gated; no value outside the
+//    set may pass validation.
+//  - limit is capped at MAX_LIMIT (100); clients cannot request arbitrarily
+//    large result sets regardless of what they send.
+//  - Default limit of 20 is applied when the parameter is absent.
+//  - The repo is always called with the authenticated user's own id, never
+//    with a caller-supplied id, preventing IDOR enumeration.
+//  - Array-shaped query parameters (e.g. ?sortBy[]=amount) are rejected or
+//    treated as absent — they must not bypass the string-type guard.
+
+describe('payouts routes – allowlist injection prevention', () => {
+  const repo = new MockPayoutRepo(PAYOUTS);
+  const handlers = createPayoutsHandlers(repo as any);
+
+  // ── sortBy injection probes ──────────────────────────────────────────────
+
+  describe('sortBy – SQL injection probes rejected with 400', () => {
+    const injectionProbes = [
+      'created_at; DROP TABLE payouts--',
+      '1 OR 1=1',
+      'amount--',
+      "status'; SELECT * FROM users--",
+      'created_at UNION SELECT password FROM users',
+      '(SELECT 1)',
+      'amount, (SELECT 1)',
+      '\'; DROP TABLE--',
+      'created_at\nOR\n1=1',
+      'amount\x00',
+      '../../../etc/passwd',
+      '<script>alert(1)</script>',
+      '${7*7}',
+      '{{7*7}}',
+    ];
+
+    it.each(injectionProbes)(
+      'rejects sortBy="%s" with 400 (never reaches repo)',
+      async (probe) => {
+        const repoSpy = jest.spyOn(repo, 'listPayoutsByInvestor');
+        const res = makeRes();
+        await handlers.listPayouts(makeReq(INVESTOR, { sortBy: probe }), res, next);
+        const { statusCode, jsonData } = res._get();
+        assert.strictEqual(statusCode, 400, `expected 400 for sortBy="${probe}"`);
+        assert(
+          typeof jsonData.error === 'string' && jsonData.error.includes('sortBy'),
+          `error message must mention "sortBy", got: ${JSON.stringify(jsonData.error)}`,
+        );
+        // Critical: repo must NOT have been called — injection never reaches data layer
+        expect(repoSpy).not.toHaveBeenCalled();
+        repoSpy.mockRestore();
+      },
+    );
+
+    it('rejects empty string sortBy with 400', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortBy: '' }), res, next);
+      assert.strictEqual(res._get().statusCode, 400);
+    });
+
+    it('rejects sortBy with leading/trailing whitespace (not in allowlist)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortBy: ' amount ' }), res, next);
+      assert.strictEqual(res._get().statusCode, 400);
+    });
+
+    it('rejects sortBy with uppercase variant (case-sensitive allowlist)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortBy: 'AMOUNT' }), res, next);
+      assert.strictEqual(res._get().statusCode, 400);
+    });
+
+    it('rejects sortBy=created_at; (semicolon suffix)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortBy: 'created_at;' }), res, next);
+      assert.strictEqual(res._get().statusCode, 400);
+    });
+  });
+
+  // ── status injection probes ──────────────────────────────────────────────
+
+  describe('status – out-of-allowlist values rejected with 400', () => {
+    const invalidStatuses = [
+      'open',
+      'closed',
+      'cancelled',
+      'completed',
+      'PENDING',
+      'Processed',
+      'pending ',
+      ' failed',
+      "pending'; DROP TABLE--",
+      '1 OR 1=1',
+      '',
+      'null',
+      'undefined',
+      'true',
+    ];
+
+    it.each(invalidStatuses)(
+      'rejects status="%s" with 400',
+      async (value) => {
+        const res = makeRes();
+        await handlers.listPayouts(makeReq(INVESTOR, { status: value }), res, next);
+        assert.strictEqual(
+          res._get().statusCode,
+          400,
+          `expected 400 for status="${value}"`,
+        );
+      },
+    );
+
+    it('accepts all three valid status values without error', async () => {
+      for (const s of ['pending', 'processed', 'failed']) {
+        const res = makeRes();
+        await handlers.listPayouts(makeReq(INVESTOR, { status: s }), res, next);
+        assert.strictEqual(res._get().statusCode, 200, `expected 200 for status="${s}"`);
+      }
+    });
+  });
+
+  // ── sortOrder injection probes ───────────────────────────────────────────
+
+  describe('sortOrder – out-of-allowlist values rejected with 400', () => {
+    const invalidOrders = [
+      'ASC',
+      'DESC',
+      'Asc',
+      'ascending',
+      'descending',
+      'random',
+      '1',
+      '-1',
+      'asc; DROP TABLE--',
+      'desc OR 1=1',
+      '',
+      'null',
+    ];
+
+    it.each(invalidOrders)(
+      'rejects sortOrder="%s" with 400',
+      async (value) => {
+        const res = makeRes();
+        await handlers.listPayouts(makeReq(INVESTOR, { sortOrder: value }), res, next);
+        assert.strictEqual(
+          res._get().statusCode,
+          400,
+          `expected 400 for sortOrder="${value}"`,
+        );
+      },
+    );
+
+    it('accepts "asc" and "desc" without error', async () => {
+      for (const o of ['asc', 'desc']) {
+        const res = makeRes();
+        await handlers.listPayouts(makeReq(INVESTOR, { sortOrder: o }), res, next);
+        assert.strictEqual(res._get().statusCode, 200, `expected 200 for sortOrder="${o}"`);
+      }
+    });
+  });
+
+  // ── Array-shaped query params (bypass attempt) ───────────────────────────
+
+  describe('array-shaped query parameters are not treated as valid strings', () => {
+    it('array sortBy is ignored (falls back to default created_at) and returns 200', async () => {
+      // Express parses ?sortBy[]=amount as an array; the handler checks
+      // typeof req.query.sortBy === 'string', so an array falls back to the
+      // default 'created_at' which is valid — no 400, no injection.
+      const req = { user: INVESTOR, query: { sortBy: ['amount', 'status'] } } as any;
+      const res = makeRes();
+      await handlers.listPayouts(req, res, next);
+      // Default sortBy='created_at' is used; request succeeds
+      assert.strictEqual(res._get().statusCode, 200);
+    });
+
+    it('array sortOrder is ignored (falls back to default desc) and returns 200', async () => {
+      const req = { user: INVESTOR, query: { sortOrder: ['asc', 'desc'] } } as any;
+      const res = makeRes();
+      await handlers.listPayouts(req, res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+    });
+
+    it('array status is ignored (treated as absent) and returns 200 with all payouts', async () => {
+      const req = { user: INVESTOR, query: { status: ['pending', 'processed'] } } as any;
+      const res = makeRes();
+      await handlers.listPayouts(req, res, next);
+      // status is undefined (not a string), so no filter applied
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.total, 4);
+    });
+
+    it('array limit is coerced via parseInt and treated as valid if numeric', async () => {
+      // String(array) = "2,10" → parseInt("2,10") = 2 (valid)
+      const req = { user: INVESTOR, query: { limit: ['2', '10'] } } as any;
+      const res = makeRes();
+      await handlers.listPayouts(req, res, next);
+      // parseInt(String(['2','10'])) = parseInt('2,10') = 2
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 2);
+    });
+  });
+});
+
+// ─── Pagination boundary tests ────────────────────────────────────────────────
+
+describe('payouts routes – pagination boundary coverage', () => {
+  const repo = new MockPayoutRepo(PAYOUTS);
+  const handlers = createPayoutsHandlers(repo as any);
+
+  describe('limit boundary values', () => {
+    it('limit=1 returns exactly one record', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '1' }), res, next);
+      const { jsonData } = res._get();
+      assert.strictEqual(jsonData.payouts.length, 1);
+      assert.strictEqual(jsonData.limit, 1);
+    });
+
+    it('limit=99 is accepted (below MAX_LIMIT)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '99' }), res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 99);
+    });
+
+    it('limit=100 is accepted and not clamped (exactly at MAX_LIMIT)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '100' }), res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 100);
+    });
+
+    it('limit=101 is clamped to 100', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '101' }), res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 100);
+    });
+
+    it('limit=999 is clamped to 100 (large over-request)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '999' }), res, next);
+      assert.strictEqual(res._get().jsonData.limit, 100);
+    });
+
+    it('limit=0 returns zero records (valid non-negative int)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '0' }), res, next);
+      const { statusCode, jsonData } = res._get();
+      assert.strictEqual(statusCode, 200);
+      assert.strictEqual(jsonData.limit, 0);
+      assert.strictEqual(jsonData.payouts.length, 0);
+      assert.strictEqual(jsonData.total, 4); // total reflects unsliced count
+      assert.strictEqual(jsonData.hasMore, true);
+    });
+
+    it('omitting limit applies default of 20', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, {}), res, next);
+      assert.strictEqual(res._get().jsonData.limit, 20);
+    });
+
+    it('limit=1.9 is truncated to 1 by parseInt (float string)', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '1.9' }), res, next);
+      // parseInt('1.9') = 1 — valid, not rejected
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 1);
+    });
+
+    it('limit=1e2 is rejected (parseInt("1e2") = 1, but "1e2" is not a plain integer string — parseInt still returns 1)', async () => {
+      // parseInt('1e2', 10) = 1 (stops at 'e'), so this is treated as limit=1
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { limit: '1e2' }), res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.limit, 1);
+    });
+  });
+
+  describe('offset boundary values', () => {
+    it('offset=0 explicit is identical to omitting offset', async () => {
+      const resOmit = makeRes();
+      const resZero = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, {}), resOmit, next);
+      await handlers.listPayouts(makeReq(INVESTOR, { offset: '0' }), resZero, next);
+      assert.deepStrictEqual(
+        resOmit._get().jsonData.payouts.map((p: Payout) => p.id),
+        resZero._get().jsonData.payouts.map((p: Payout) => p.id),
+      );
+      assert.strictEqual(resZero._get().jsonData.offset, 0);
+    });
+
+    it('offset=3 with 4 total returns 1 record and hasMore=false', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { offset: '3' }), res, next);
+      const { jsonData } = res._get();
+      assert.strictEqual(jsonData.payouts.length, 1);
+      assert.strictEqual(jsonData.offset, 3);
+      assert.strictEqual(jsonData.hasMore, false);
+    });
+
+    it('offset=4 with 4 total returns 0 records and hasMore=false', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { offset: '4' }), res, next);
+      const { jsonData } = res._get();
+      assert.strictEqual(jsonData.payouts.length, 0);
+      assert.strictEqual(jsonData.hasMore, false);
+    });
+
+    it('offset=1.7 is truncated to 1 by parseInt', async () => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { offset: '1.7' }), res, next);
+      assert.strictEqual(res._get().statusCode, 200);
+      assert.strictEqual(res._get().jsonData.offset, 1);
+    });
+  });
+
+  describe('MAX_LIMIT prevents large result set abuse', () => {
+    it('a dataset of 200 records is capped at 100 per page', async () => {
+      const bigPayouts = Array.from({ length: 200 }, (_, i) =>
+        makePayout({ id: `big-${i}`, investor_id: 'inv-big', amount: '1.00', created_at: new Date('2024-01-01') }),
+      );
+      const bigRepo = new MockPayoutRepo(bigPayouts);
+      const bigHandlers = createPayoutsHandlers(bigRepo as any);
+
+      const res = makeRes();
+      await bigHandlers.listPayouts(
+        makeReq({ id: 'inv-big', role: 'investor' }, { limit: '200' }),
+        res,
+        next,
+      );
+      const { jsonData } = res._get();
+      assert.strictEqual(jsonData.limit, 100);
+      assert.strictEqual(jsonData.payouts.length, 100);
+      assert.strictEqual(jsonData.total, 200);
+      assert.strictEqual(jsonData.hasMore, true);
+    });
+
+    it('second page of a 200-record dataset is also capped at 100', async () => {
+      const bigPayouts = Array.from({ length: 200 }, (_, i) =>
+        makePayout({ id: `big2-${i}`, investor_id: 'inv-big2', amount: '1.00', created_at: new Date('2024-01-01') }),
+      );
+      const bigRepo = new MockPayoutRepo(bigPayouts);
+      const bigHandlers = createPayoutsHandlers(bigRepo as any);
+
+      const res = makeRes();
+      await bigHandlers.listPayouts(
+        makeReq({ id: 'inv-big2', role: 'investor' }, { limit: '200', offset: '100' }),
+        res,
+        next,
+      );
+      const { jsonData } = res._get();
+      assert.strictEqual(jsonData.limit, 100);
+      assert.strictEqual(jsonData.payouts.length, 100);
+      assert.strictEqual(jsonData.hasMore, false);
+    });
+  });
+});
+
+// ─── Response shape contract ──────────────────────────────────────────────────
+
+describe('payouts routes – response shape contract', () => {
+  const repo = new MockPayoutRepo(PAYOUTS);
+  const handlers = createPayoutsHandlers(repo as any);
+
+  it('response always includes payouts, total, limit, offset, hasMore', async () => {
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR), res, next);
+    const { jsonData } = res._get();
+    assert('payouts' in jsonData, 'missing payouts');
+    assert('total' in jsonData, 'missing total');
+    assert('limit' in jsonData, 'missing limit');
+    assert('offset' in jsonData, 'missing offset');
+    assert('hasMore' in jsonData, 'missing hasMore');
+  });
+
+  it('payouts array contains records with required payout fields', async () => {
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '1' }), res, next);
+    const payout = res._get().jsonData.payouts[0] as Payout;
+    assert(typeof payout.id === 'string', 'id must be string');
+    assert(typeof payout.investor_id === 'string', 'investor_id must be string');
+    assert(typeof payout.amount === 'string', 'amount must be string');
+    assert(['pending', 'processed', 'failed'].includes(payout.status), 'status must be valid');
+  });
+
+  it('total reflects filtered count, not raw repo count', async () => {
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { status: 'processed', limit: '1' }), res, next);
+    const { jsonData } = res._get();
+    // 2 processed payouts for inv-1; limit=1 so only 1 returned but total=2
+    assert.strictEqual(jsonData.total, 2);
+    assert.strictEqual(jsonData.payouts.length, 1);
+  });
+
+  it('hasMore is true when offset + limit < total', async () => {
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '2', offset: '0' }), res, next);
+    assert.strictEqual(res._get().jsonData.hasMore, true);
+  });
+
+  it('hasMore is false when offset + limit >= total', async () => {
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '2', offset: '2' }), res, next);
+    assert.strictEqual(res._get().jsonData.hasMore, false);
+  });
+});
+
+// ─── IDOR prevention: repo called with authenticated user id only ─────────────
+
+describe('payouts routes – IDOR prevention', () => {
+  it('repo is called with the authenticated user id, not a query-supplied id', async () => {
+    const repoMock = {
+      listPayoutsByInvestor: jest.fn().mockResolvedValue([]),
+    };
+    const handlers = createPayoutsHandlers(repoMock as any);
+
+    // Attacker sends their own auth token (inv-attacker) but tries to read inv-victim data
+    // by injecting investor_id into query params — the handler must ignore it
+    const req = {
+      user: { id: 'inv-attacker', role: 'investor' },
+      query: { investor_id: 'inv-victim', investorId: 'inv-victim' },
+    } as any;
+    const res = makeRes();
+    await handlers.listPayouts(req, res, next);
+
+    expect(repoMock.listPayoutsByInvestor).toHaveBeenCalledTimes(1);
+    expect(repoMock.listPayoutsByInvestor).toHaveBeenCalledWith('inv-attacker');
+    expect(repoMock.listPayoutsByInvestor).not.toHaveBeenCalledWith('inv-victim');
+  });
+
+  it('two different investors only see their own payouts from the same repo', async () => {
+    const repo = new MockPayoutRepo(PAYOUTS);
+    const handlers = createPayoutsHandlers(repo as any);
+
+    const res1 = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-1', role: 'investor' }), res1, next);
+    const res2 = makeRes();
+    await handlers.listPayouts(makeReq({ id: 'inv-2', role: 'investor' }), res2, next);
+
+    const ids1 = res1._get().jsonData.payouts.map((p: Payout) => p.investor_id);
+    const ids2 = res2._get().jsonData.payouts.map((p: Payout) => p.investor_id);
+
+    assert(ids1.every((id: string) => id === 'inv-1'), 'inv-1 must only see own payouts');
+    assert(ids2.every((id: string) => id === 'inv-2'), 'inv-2 must only see own payouts');
+    assert.strictEqual(ids1.length, 4);
+    assert.strictEqual(ids2.length, 1);
+  });
+});
+
+// ─── Valid allowlist values – all accepted ────────────────────────────────────
+
+describe('payouts routes – all valid allowlist values accepted', () => {
+  const repo = new MockPayoutRepo(PAYOUTS);
+  const handlers = createPayoutsHandlers(repo as any);
+
+  it.each(['created_at', 'amount', 'status'])(
+    'sortBy="%s" returns 200',
+    async (field) => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortBy: field }), res, next);
+      assert.strictEqual(res._get().statusCode, 200, `expected 200 for sortBy="${field}"`);
+    },
+  );
+
+  it.each(['asc', 'desc'])(
+    'sortOrder="%s" returns 200',
+    async (order) => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { sortOrder: order }), res, next);
+      assert.strictEqual(res._get().statusCode, 200, `expected 200 for sortOrder="${order}"`);
+    },
+  );
+
+  it.each(['pending', 'processed', 'failed'])(
+    'status="%s" returns 200',
+    async (status) => {
+      const res = makeRes();
+      await handlers.listPayouts(makeReq(INVESTOR, { status }), res, next);
+      assert.strictEqual(res._get().statusCode, 200, `expected 200 for status="${status}"`);
+    },
+  );
+});

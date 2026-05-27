@@ -23,7 +23,7 @@ import { globalLogger } from "../lib/logger";
  * CORS_ALLOW_NO_ORIGIN = "true" (optional, defaults to false)
  */
 export function createCorsMiddleware() {
-  const allowedOrigins: string[] = env.ALLOWED_ORIGINS;
+  const allowedOrigins: string[] = env.ALLOWED_ORIGINS_ARRAY;
   const allowNoOrigin = process.env.CORS_ALLOW_NO_ORIGIN === "true";
 
   // Security validation: require explicit origins in production
