@@ -5,6 +5,7 @@ import {
   WEBHOOK_TIMESTAMP_HEADER,
   WEBHOOK_EVENT_HEADER,
 } from '../lib/webhookSignature';
+import { Logger } from '../lib/logger';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -121,6 +122,48 @@ export class WebhookService {
           error: err,
         });
       });
+    }
+  }
+
+  /**
+   * Performs a single delivery attempt without retries.
+   * Returns the status code and any error message.
+   */
+  async sendAttempt<T>(
+    endpoint: WebhookEndpointRecord,
+    payload: WebhookPayload<T>
+  ): Promise<{ statusCode?: number; error?: string; success: boolean }> {
+    const body = JSON.stringify(payload);
+    const timestamp = Date.now().toString();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const response = await fetch(endpoint.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [WEBHOOK_SIGNATURE_HEADER]: signPayload(endpoint.secret, body, timestamp),
+          [WEBHOOK_TIMESTAMP_HEADER]: timestamp,
+          [WEBHOOK_EVENT_HEADER]: payload.event,
+        },
+        body,
+        signal: controller.signal,
+      });
+
+      return {
+        statusCode: response.status,
+        success: response.ok,
+        error: response.ok ? undefined : `HTTP ${response.status}`,
+      };
+    } catch (err) {
+      console.error(`[WebhookService] sendAttempt error: ${err}`);
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 

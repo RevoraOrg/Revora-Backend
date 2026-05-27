@@ -450,26 +450,41 @@ export const healthRootHandler =
   async (req: Request, res: Response): Promise<void> => {
     const requestId = req.headers["x-request-id"] as string | undefined;
 
-    const [dbCheck, stellarCheck] = await Promise.all([
-      checkDatabase(dbHealth),
-      checkStellarHorizon(),
-    ]);
+    try {
+      const [dbCheck, stellarCheck] = await Promise.all([
+        checkDatabase(dbHealth),
+        checkStellarHorizon(),
+      ]);
 
-    const checks = [dbCheck, stellarCheck];
-    const status = evaluateOverallStatus(checks);
+      const checks = [dbCheck, stellarCheck];
+      const status = evaluateOverallStatus(checks);
 
-    const response: HealthDependencyGraph = {
-      status,
-      service: "revora-backend",
-      version: getServiceVersion(),
-      timestamp: new Date().toISOString(),
-      uptime: getUptimeSeconds(),
-      checks,
-      requestId,
-    };
+      const response: HealthDependencyGraph = {
+        status,
+        service: "revora-backend",
+        version: getServiceVersion(),
+        timestamp: new Date().toISOString(),
+        uptime: getUptimeSeconds(),
+        checks,
+        requestId,
+      };
 
-    const statusCode = status === "unhealthy" ? 503 : 200;
-    res.status(statusCode).json(response);
+      const statusCode = status === "unhealthy" ? 503 : 200;
+      res.status(statusCode).json(response);
+    } catch (err) {
+      logHealthCheck("error", "Health check failed unexpectedly", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      res.status(503).json({
+        status: "unhealthy",
+        service: "revora-backend",
+        version: getServiceVersion(),
+        timestamp: new Date().toISOString(),
+        uptime: getUptimeSeconds(),
+        checks: [],
+        requestId,
+      });
+    }
   };
 
 export const healthLiveHandler =
