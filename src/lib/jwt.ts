@@ -6,6 +6,7 @@ import { globalLogger } from "./logger";
  *
  * Secret: Must be set via JWT_SECRET environment variable
  * Key Rotation: Set JWT_SECRET_PREVIOUS for seamless secret rotation
+ * Key IDs: Set JWT_KEY_ID and JWT_PREVIOUS_KEY_ID for kid-based key rotation
  * Algorithm: HS256 (HMAC SHA256)
  * Clock Skew: Configurable via JWT_CLOCK_TOLERANCE_SECONDS (default 30s)
  * Issuer: Optional, set via JWT_ISSUER
@@ -14,6 +15,8 @@ import { globalLogger } from "./logger";
  * Example .env entries:
  * JWT_SECRET=your-secure-secret-key-min-32-chars
  * JWT_SECRET_PREVIOUS=your-previous-secret-key-min-32-chars
+ * JWT_KEY_ID=key-2024-01
+ * JWT_PREVIOUS_KEY_ID=key-2023-12
  * JWT_ISSUER=revora-backend
  * JWT_AUDIENCE=revora-api
  * JWT_CLOCK_TOLERANCE_SECONDS=30
@@ -50,6 +53,66 @@ export interface TokenOptions {
   /** @param audience Value for the `aud` claim. When set, included in the signed token. */
   audience?: string;
   additionalPayload?: Record<string, unknown>;
+}
+
+/**
+ * Interface for a JWT key in the keyset
+ */
+export interface JwtKey {
+  kid: string; // Key ID
+  secret: string; // Secret key
+}
+
+/**
+ * Get the current key ID for signing
+ * Defaults to "current" if JWT_KEY_ID is not set
+ */
+export function getCurrentKeyId(): string {
+  return process.env.JWT_KEY_ID || "current";
+}
+
+/**
+ * Get the previous key ID for rotation
+ * Returns undefined if JWT_PREVIOUS_KEY_ID is not set
+ */
+export function getPreviousKeyId(): string | undefined {
+  return process.env.JWT_PREVIOUS_KEY_ID;
+}
+
+/**
+ * @notice Returns the active keyset for JWT signing and verification.
+ * @dev The keyset includes the current key and optionally the previous key.
+ *      Each key has a kid (key ID) that is included in the JWT header.
+ *      Verification uses the kid to select the correct key, enabling
+ *      zero-downtime key rotation.
+ * @returns Array of JwtKey objects ordered by priority (current first).
+ * @throws {Error} If the current JWT_SECRET is missing or too short.
+ */
+export function getJwtKeyset(): JwtKey[] {
+  const currentSecret = getJwtSecret();
+  const currentKid = getCurrentKeyId();
+  const keyset: JwtKey[] = [{ kid: currentKid, secret: currentSecret }];
+
+  const previousSecret = process.env.JWT_SECRET_PREVIOUS;
+  const previousKid = getPreviousKeyId();
+
+  if (previousSecret && previousSecret.length >= 32 && previousKid) {
+    keyset.push({ kid: previousKid, secret: previousSecret });
+  }
+
+  return keyset;
+}
+
+/**
+ * @notice Get a secret from the keyset by key ID.
+ * @dev Used during verification to select the correct secret based on the token's kid header.
+ * @param kid The key ID to look up.
+ * @returns The secret key for the given kid, or undefined if not found.
+ */
+export function getSecretByKid(kid: string): string | undefined {
+  const keyset = getJwtKeyset();
+  const key = keyset.find((k) => k.kid === kid);
+  return key?.secret;
 }
 
 /**
@@ -196,7 +259,8 @@ export function getDefaultClaimValidationOptions(): ClaimValidationOptions {
  * });
  */
 export function issueToken(options: TokenOptions): string {
-  const secret = getJwtSecret();
+  const keyset = getJwtKeyset();
+  const currentKey = keyset[0];
   const algorithm = getJwtAlgorithm();
 
   // Apply additional payload first, but always force `sub` (and `email` when provided)
@@ -213,9 +277,10 @@ export function issueToken(options: TokenOptions): string {
     expiresIn: (options.expiresIn || TOKEN_EXPIRY) as jwt.SignOptions["expiresIn"],
     ...(options.issuer && { issuer: options.issuer }),
     ...(options.audience && { audience: options.audience }),
+    header: { kid: currentKey.kid, alg: algorithm },
   };
 
-  return jwt.sign(payload, secret, signOptions);
+  return jwt.sign(payload, currentKey.secret, signOptions);
 }
 
 /**
@@ -249,69 +314,81 @@ export function decodePayload(token: string): JwtPayload | null {
 
 /**
  * @notice Verify and decode a JWT token, then validate its standard claims.
- * @dev Uses jsonwebtoken for HMAC-HS256 signature verification across all
- *      configured secrets (current + previous for key rotation), then calls
- *      validateClaims for explicit per-claim enforcement including clock skew.
+ * @dev Uses jsonwebtoken for HMAC-HS256 signature verification with kid-based
+ *      key selection, then calls validateClaims for explicit per-claim enforcement
+ *      including clock skew.
  *
  *      Clock skew handling: jsonwebtoken's built-in time checks (exp, nbf) are
  *      disabled so that validateClaims can enforce them with the configurable
  *      clock-skew tolerance window. This ensures tokens that are slightly expired
  *      due to clock drift between servers are not incorrectly rejected.
  *
- *      Key rotation: When JWT_SECRET_PREVIOUS is configured, tokens signed with
- *      the old secret remain valid. The first secret that successfully verifies
- *      the signature wins. Structured logging records which secret was used.
+ *      Key rotation with kid: The token header must contain a kid (key ID) that
+ *      matches a key in the active keyset. Verification uses the secret associated
+ *      with that kid. Tokens with missing or unknown kid are rejected. This enables
+ *      zero-downtime key rotation where old keys remain valid until they expire.
  *
  * @param token JWT token string to verify.
  * @param options Optional claim validation configuration.
  * @returns Decoded and validated JwtPayload.
- * @throws {Error} If the token is invalid, expired, or any claim fails validation.
+ * @throws {Error} If the token is invalid, expired, has missing/unknown kid, or any claim fails validation.
  */
 export function verifyToken(
   token: string,
   options?: ClaimValidationOptions,
 ): JwtPayload {
-  const secrets = getJwtSecretsForVerification();
   const algorithm = getJwtAlgorithm();
 
-  let payload: JwtPayload | null = null;
-  let lastError: Error | null = null;
-  let usedSecretIndex = -1;
-
-  for (let i = 0; i < secrets.length; i++) {
-    try {
-      // Disable jsonwebtoken's built-in time-based checks; validateClaims
-      // handles exp, nbf, and iat with configurable clock-skew tolerance.
-      payload = jwt.verify(token, secrets[i], {
-        algorithms: [algorithm],
-        ignoreExpiration: true,
-        ignoreNotBefore: true,
-      }) as JwtPayload;
-      usedSecretIndex = i;
-      break;
-    } catch (err: unknown) {
-      if (err instanceof Error) {
-        lastError = err;
-      } else {
-        lastError = new Error(String(err));
-      }
-      // Signature mismatch — try next secret for key rotation.
-      continue;
-    }
+  // Decode the token header to extract kid
+  let decodedHeader: jwt.JwtHeader | null = null;
+  try {
+    decodedHeader = jwt.decode(token, { complete: true })?.header ?? null;
+  } catch (err: unknown) {
+    throw new Error('Token decoding failed');
   }
 
-  if (!payload) {
-    globalLogger.warn('JWT signature verification failed against all configured secrets', {
-      error: lastError?.message,
-      secretCount: secrets.length,
+  if (!decodedHeader) {
+    throw new Error('Token header is missing');
+  }
+
+  const kid = decodedHeader.kid;
+  if (!kid || typeof kid !== 'string') {
+    globalLogger.warn('JWT verification failed: missing or invalid kid header');
+    throw new Error('Token is missing required kid (key ID) header');
+  }
+
+  // Look up the secret by kid
+  const secret = getSecretByKid(kid);
+  if (!secret) {
+    globalLogger.warn('JWT verification failed: unknown kid', { kid });
+    throw new Error(`Token signed with unknown key ID: ${kid}`);
+  }
+
+  let payload: JwtPayload | null = null;
+
+  try {
+    // Disable jsonwebtoken's built-in time-based checks; validateClaims
+    // handles exp, nbf, and iat with configurable clock-skew tolerance.
+    payload = jwt.verify(token, secret, {
+      algorithms: [algorithm],
+      ignoreExpiration: true,
+      ignoreNotBefore: true,
+    }) as JwtPayload;
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    globalLogger.warn('JWT signature verification failed', {
+      kid,
+      error: error.message,
     });
-    throw lastError ?? new Error('Token verification failed');
+    throw error;
   }
 
   // Log key rotation usage for operational visibility
-  if (secrets.length > 1 && usedSecretIndex > 0) {
-    globalLogger.info('JWT verified with previous secret (key rotation in progress)', {
-      secretIndex: usedSecretIndex,
+  const currentKid = getCurrentKeyId();
+  if (kid !== currentKid) {
+    globalLogger.info('JWT verified with previous key (key rotation in progress)', {
+      kid,
+      currentKid,
     });
   }
 

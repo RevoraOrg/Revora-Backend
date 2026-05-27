@@ -15,6 +15,7 @@ function makeReq(ip = '1.2.3.4'): Request {
 function makeRes() {
   let statusCode = 200;
   let body: unknown = null;
+  const headers: Record<string, string> = {};
   const res = {
     status(code: number) {
       statusCode = code;
@@ -24,10 +25,15 @@ function makeRes() {
       body = obj;
       return res;
     },
+    setHeader(name: string, value: string) {
+      headers[name] = value;
+      return res;
+    },
     _status: () => statusCode,
     _body: () => body,
+    _headers: () => headers,
   };
-  return res as unknown as Response & { _status(): number; _body(): unknown };
+  return res as unknown as Response & { _status(): number; _body(): unknown; _headers(): Record<string, string> };
 }
 
 const noop: NextFunction = jest.fn();
@@ -282,5 +288,61 @@ describe('createStartupRegisterRateLimit', () => {
     mw(req, makeRes(), next); // second — should be blocked
 
     expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  // ── rate limit headers ────────────────────────────────────────────────────────
+
+  it('sets X-RateLimit-Limit header on every request', () => {
+    const next = jest.fn() as NextFunction;
+    const mw = createStartupRegisterRateLimit({ maxRequests: 5, windowMs: 60_000, store });
+
+    const res = makeRes();
+    mw(makeReq(), res, next);
+
+    expect(res._headers()['X-RateLimit-Limit']).toBe('5');
+  });
+
+  it('sets X-RateLimit-Remaining header correctly', () => {
+    const next = jest.fn() as NextFunction;
+    const mw = createStartupRegisterRateLimit({ maxRequests: 3, windowMs: 60_000, store });
+
+    const res1 = makeRes();
+    mw(makeReq(), res1, next);
+    expect(res1._headers()['X-RateLimit-Remaining']).toBe('3');
+
+    const res2 = makeRes();
+    mw(makeReq(), res2, next);
+    expect(res2._headers()['X-RateLimit-Remaining']).toBe('2');
+
+    const res3 = makeRes();
+    mw(makeReq(), res3, next);
+    expect(res3._headers()['X-RateLimit-Remaining']).toBe('1');
+  });
+
+  it('sets X-RateLimit-Reset header on every request', () => {
+    const next = jest.fn() as NextFunction;
+    const mw = createStartupRegisterRateLimit({ maxRequests: 5, windowMs: 60_000, store });
+
+    const res = makeRes();
+    mw(makeReq(), res, next);
+
+    const resetHeader = res._headers()['X-RateLimit-Reset'];
+    expect(resetHeader).toBeDefined();
+    const resetTime = parseInt(resetHeader, 10);
+    expect(resetTime).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it('sets Retry-After header when rate limited', () => {
+    const next = jest.fn() as NextFunction;
+    const mw = createStartupRegisterRateLimit({ maxRequests: 1, windowMs: 60_000, store });
+
+    mw(makeReq(), makeRes(), next); // allowed
+    const res = makeRes();
+    mw(makeReq(), res, next); // blocked
+
+    const retryAfter = res._headers()['Retry-After'];
+    expect(retryAfter).toBeDefined();
+    const retryAfterSeconds = parseInt(retryAfter, 10);
+    expect(retryAfterSeconds).toBeGreaterThan(0);
   });
 });

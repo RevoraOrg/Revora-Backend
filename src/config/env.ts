@@ -12,6 +12,8 @@ import { z } from "zod";
  * | DATABASE_URL                | Yes/Prod | (empty)                 | Connection string for the PostgreSQL database    |
  * | JWT_SECRET                  | Yes/Prod | (empty)                 | Secret key for signing JSON Web Tokens           |
  * | JWT_SECRET_PREVIOUS         | No       | (empty)                 | Previous secret key for graceful token rotation  |
+ * | JWT_KEY_ID                  | No       | (empty)                 | Key ID for current JWT secret (kid header)      |
+ * | JWT_PREVIOUS_KEY_ID         | No       | (empty)                 | Key ID for previous JWT secret (kid header)     |
  * | JWT_ISSUER                  | No       | (empty)                 | Issuer claim (iss) to set in issued tokens       |
  * | JWT_AUDIENCE                | No       | (empty)                 | Audience claim (aud) to set in issued tokens     |
  * | JWT_CLOCK_TOLERANCE_SECONDS | No       | (empty)                 | Clock tolerance in seconds for JWT verification  |
@@ -31,6 +33,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().optional(),
   JWT_SECRET: z.string().min(16).optional(),
   JWT_SECRET_PREVIOUS: z.string().optional(),
+  JWT_KEY_ID: z.string().optional(),
+  JWT_PREVIOUS_KEY_ID: z.string().optional(),
   JWT_ISSUER: z.string().optional(),
   JWT_AUDIENCE: z.string().optional(),
   JWT_CLOCK_TOLERANCE_SECONDS: z.coerce.number().int().nonnegative().optional(),
@@ -58,9 +62,9 @@ export type Config = z.infer<typeof envSchema> & { ALLOWED_ORIGINS_ARRAY: string
 
 export function buildConfig(): Config {
   const result = envSchema.safeParse(process.env);
-  
+
   if (!result.success) {
-    const errorMessages = result.error.errors.map(e => `${e.path.join('.')}: [REDACTED/INVALID]`).join(', ');
+    const errorMessages = result.error.issues.map((e: any) => `${e.path.join('.')}: [REDACTED/INVALID]`).join(', ');
     console.error(`[FATAL] Configuration validation failed: Missing or invalid required environment variables: ${errorMessages}`);
     process.exit(1);
   }

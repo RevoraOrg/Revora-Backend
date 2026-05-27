@@ -10,7 +10,7 @@ import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellar
 import { createHealthRouter } from './routes/health';
 import vestingRouter from './routes/vesting';
 import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
-import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
+import { createStartupRegisterRateLimit } from './middleware/startupRegisterRateLimit';
 import { env } from './config/env';
 
 const port = env.PORT;
@@ -41,8 +41,6 @@ const OFFERING_SECURITY_ASSUMPTIONS = [
   "Startup actors may only manage offerings they issued unless a privileged admin or compliance actor performs the action.",
   "Validation output is safe for clients and never includes raw database, token, or upstream provider error messages.",
 ] as const;
-const STARTUP_REGISTER_LIMIT = 5;
-const STARTUP_REGISTER_WINDOW_MS = 15 * 60 * 1000;
 
 type OfferingActorRole = (typeof OFFERING_ROLES)[number];
 type OfferingValidationAction = (typeof OFFERING_ACTIONS)[number];
@@ -61,11 +59,6 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
-}
-
-interface StartupRegistrationAttemptState {
-  count: number;
-  resetAt: number;
 }
 
 interface OfferingValidationPayload {
@@ -184,53 +177,6 @@ function parseIsoDate(value: unknown): Date | null {
   }
 
   return parsed;
-}
-
-function createStartupRegisterLimiter(): RequestHandler {
-  const attempts = new Map<string, StartupRegistrationAttemptState>();
-
-  return (req: Request, res: Response, next: NextFunction): void => {
-    const now = Date.now();
-    const key = req.ip || req.socket.remoteAddress || "unknown";
-    const current = attempts.get(key);
-
-    if (!current || current.resetAt <= now) {
-      attempts.set(key, {
-        count: 1,
-        resetAt: now + STARTUP_REGISTER_WINDOW_MS,
-      });
-      res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-      res.setHeader(
-        "X-RateLimit-Remaining",
-        String(STARTUP_REGISTER_LIMIT - 1),
-      );
-      next();
-      return;
-    }
-
-    if (current.count >= STARTUP_REGISTER_LIMIT) {
-      const retryAfterSeconds = Math.max(
-        1,
-        Math.ceil((current.resetAt - now) / 1000),
-      );
-      res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-      res.setHeader("X-RateLimit-Remaining", "0");
-      res.setHeader("Retry-After", String(retryAfterSeconds));
-      res.status(429).json({
-        error: "TooManyRequests",
-        message: "Too many registration attempts",
-      });
-      return;
-    }
-
-    current.count += 1;
-    res.setHeader("X-RateLimit-Limit", String(STARTUP_REGISTER_LIMIT));
-    res.setHeader(
-      "X-RateLimit-Remaining",
-      String(Math.max(0, STARTUP_REGISTER_LIMIT - current.count)),
-    );
-    next();
-  };
 }
 
 function createStartupRegisterHandler(): RequestHandler {
@@ -625,7 +571,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   apiRouter.post(
     "/startup/register",
-    createStartupAuthTierLimiter().middleware,
+    createStartupRegisterRateLimit(),
     createStartupRegisterHandler(),
   );
 

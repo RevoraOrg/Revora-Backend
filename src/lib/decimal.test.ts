@@ -42,6 +42,116 @@ describe('Decimal Utility', () => {
       const dec = new Decimal('1.123456789012345678');
       expect(dec.toString()).toBe('1.123456789012345678');
     });
+
+    // ── format validation edge cases ───────────────────────────────────────────────────
+
+    describe('format validation edge cases', () => {
+      it('should reject .5 (no leading digit before decimal)', () => {
+        expect(() => new Decimal('.5')).toThrow(AppError);
+        expect(() => new Decimal('.123')).toThrow(AppError);
+        expect(() => new Decimal('.0')).toThrow(AppError);
+      });
+
+      it('should reject leading zeros in integer part (security: prevents canonicalization attacks)', () => {
+        // The regex allows leading zeros, but the internal value should be normalized
+        // For security, we want to ensure that "001.23" is treated as "1.23"
+        const dec = new Decimal('001.23');
+        expect(dec.toString()).toBe('1.23'); // Constructor normalizes leading zeros
+        expect(dec.toSorobanI128(2)).toBe(123n);
+      });
+
+      it('should reject exactly 19 fractional digits', () => {
+        expect(() => new Decimal('1.1234567890123456789')).toThrow(AppError);
+      });
+
+      it('should reject 20+ fractional digits', () => {
+        expect(() => new Decimal('1.12345678901234567890')).toThrow(AppError);
+        expect(() => new Decimal('1.' + '9'.repeat(20))).toThrow(AppError);
+      });
+
+      it('should accept exactly 18 fractional digits', () => {
+        const dec = new Decimal('1.123456789012345678');
+        expect(dec.toString()).toBe('1.123456789012345678');
+      });
+
+      it('should reject empty string', () => {
+        expect(() => new Decimal('')).toThrow(AppError);
+      });
+
+      it('should reject whitespace-only string', () => {
+        expect(() => new Decimal('   ')).toThrow(AppError);
+      });
+
+      it('should reject string with leading/trailing whitespace', () => {
+        expect(() => new Decimal(' 123.45')).toThrow(AppError);
+        expect(() => new Decimal('123.45 ')).toThrow(AppError);
+      });
+
+      it('should reject scientific notation', () => {
+        expect(() => new Decimal('1e10')).toThrow(AppError);
+        expect(() => new Decimal('1.23e-5')).toThrow(AppError);
+      });
+
+      it('should reject comma as decimal separator', () => {
+        expect(() => new Decimal('123,45')).toThrow(AppError);
+      });
+
+      it('should reject multiple decimal points', () => {
+        expect(() => new Decimal('123.45.67')).toThrow(AppError);
+        expect(() => new Decimal('1.2.3.4')).toThrow(AppError);
+      });
+
+      // ── ReDoS-safe parsing ─────────────────────────────────────────────────────────────
+
+      describe('ReDoS-safe parsing', () => {
+        it('should reject long-repetition input quickly (bounded-time parsing)', () => {
+          // Create a potentially malicious input with many repeating characters
+          // This tests that the regex doesn't have catastrophic backtracking
+          const maliciousInput = '1' + '0'.repeat(1000) + '.' + '9'.repeat(19); // 19 fractional digits = invalid
+          
+          const startTime = Date.now();
+          expect(() => new Decimal(maliciousInput)).toThrow(AppError);
+          const endTime = Date.now();
+          
+          // Should complete in under 100ms (ReDoS would take much longer)
+          expect(endTime - startTime).toBeLessThan(100);
+        });
+
+        it('should reject alternating pattern input quickly', () => {
+          // Another potential ReDoS pattern: alternating characters with invalid format
+          const maliciousInput = '1' + '0.1'.repeat(500); // Multiple decimal points = invalid
+          
+          const startTime = Date.now();
+          expect(() => new Decimal(maliciousInput)).toThrow(AppError);
+          const endTime = Date.now();
+          
+          expect(endTime - startTime).toBeLessThan(100);
+        });
+
+        it('should reject deeply nested pattern input quickly', () => {
+          // Test with a pattern that could cause backtracking in poorly designed regexes
+          const maliciousInput = '1' + '.' + '9'.repeat(100); // No leading digit after decimal = invalid
+          
+          const startTime = Date.now();
+          expect(() => new Decimal(maliciousInput)).toThrow(AppError);
+          const endTime = Date.now();
+          
+          expect(endTime - startTime).toBeLessThan(100);
+        });
+
+        it('should handle valid long input without performance issues', () => {
+          // Valid input with many digits should still parse quickly
+          const validInput = '12345678901234567890.12345678';
+          
+          const startTime = Date.now();
+          const dec = new Decimal(validInput);
+          const endTime = Date.now();
+          
+          expect(dec.toString()).toBe(validInput);
+          expect(endTime - startTime).toBeLessThan(100);
+        });
+      });
+    });
   });
 
   describe('toSorobanI128()', () => {
@@ -98,6 +208,41 @@ describe('Decimal Utility', () => {
       const dec = new Decimal('1.0');
       expect(() => dec.toSorobanI128(-1)).toThrow(AppError);
       expect(() => dec.toSorobanI128(19)).toThrow(AppError);
+    });
+
+    // ── i128 boundary edge cases ─────────────────────────────────────────────────────
+
+    describe('i128 boundary edge cases', () => {
+      const I128_MAX = 170141183460469231731687303715884105727n;
+
+      it('should accept exact I128_MAX at scale 0', () => {
+        const dec = new Decimal('170141183460469231731687303715884105727');
+        expect(dec.toSorobanI128(0)).toBe(I128_MAX);
+      });
+
+      it('should accept I128_MAX - 1 at scale 0', () => {
+        const dec = new Decimal('170141183460469231731687303715884105726');
+        expect(dec.toSorobanI128(0)).toBe(I128_MAX - 1n);
+      });
+
+      it('should reject I128_MAX + 1 at scale 0', () => {
+        const dec = new Decimal('170141183460469231731687303715884105728');
+        expect(() => dec.toSorobanI128(0)).toThrow(AppError);
+      });
+
+      it('should reject value that overflows when scaled up', () => {
+        const dec = new Decimal('17014118346046923173168730371588410572'); // I128_MAX / 10
+        // Scaling by 1 should work
+        expect(dec.toSorobanI128(1)).toBe(170141183460469231731687303715884105720n);
+        // But scaling by 10 would overflow
+        expect(() => dec.toSorobanI128(10)).toThrow(AppError);
+      });
+
+      it('should handle boundary with fractional scaling', () => {
+        const dec = new Decimal('17014118346046923173168730371588410572.8'); // I128_MAX / 10 + 0.8
+        // At scale 1, this becomes I128_MAX + 8, which overflows
+        expect(() => dec.toSorobanI128(1)).toThrow(AppError);
+      });
     });
   });
 

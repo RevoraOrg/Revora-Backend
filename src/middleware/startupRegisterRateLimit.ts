@@ -109,6 +109,15 @@ export function createStartupRegisterRateLimit(
     const entry = store.get(key) ?? { timestamps: [] };
     entry.timestamps = entry.timestamps.filter((t) => t > windowStart);
 
+    const remaining = Math.max(0, maxRequests - entry.timestamps.length);
+    const windowEnd = now + windowMs;
+    const retryAfterSeconds = Math.max(1, Math.ceil(windowEnd / 1000) - Math.ceil(now / 1000));
+
+    // Set rate limit headers on every request
+    res.setHeader('X-RateLimit-Limit', String(maxRequests));
+    res.setHeader('X-RateLimit-Remaining', String(remaining));
+    res.setHeader('X-RateLimit-Reset', String(Math.ceil(windowEnd / 1000)));
+
     if (entry.timestamps.length >= maxRequests) {
       // Structured log — never expose internal details to the client
       console.warn(
@@ -123,6 +132,7 @@ export function createStartupRegisterRateLimit(
         }),
       );
 
+      res.setHeader('Retry-After', String(retryAfterSeconds));
       res.status(429).json({
         code: ErrorCode.FORBIDDEN,
         message: 'Too many registration attempts. Please try again later.',
