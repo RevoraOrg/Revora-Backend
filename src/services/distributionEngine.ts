@@ -68,7 +68,9 @@ export class DistributionEngine {
     private distributionRepo: any,
     private balanceProvider?: { getBalances: (offeringId: string, period: any) => Promise<BalanceRow[]> },
     options: DistributionEngineOptions = {},
-    private pool?: Pool
+    private pool?: Pool,
+    private notificationRepo?: any,
+    private notificationPreferencesRepo?: any
   ) {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
@@ -432,6 +434,16 @@ export class DistributionEngine {
       duration,
     });
 
+    try {
+      await this.fanOutNotifications(run, finalStatus, successfulPayouts, failedPayouts);
+    } catch (err) {
+      this.logger.error('Failed to fan out notifications', {
+        offeringId,
+        runId: run.id,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    }
+
     return {
       distributionRun: run,
       successfulPayouts,
@@ -479,6 +491,73 @@ export class DistributionEngine {
       }
     }
     throw lastError;
+  }
+
+  /**
+   * Fans out notifications to investors based on distribution outcomes.
+   */
+  private async fanOutNotifications(
+    run: any,
+    finalStatus: string,
+    successfulPayouts: Array<{ investor_id: string; amount: string }>,
+    failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }>
+  ) {
+    if (!this.notificationRepo || !this.notificationPreferencesRepo || !this.pool) {
+      this.logger.debug('Skipping notification fan-out due to missing dependencies');
+      return;
+    }
+
+    const processNotification = async (
+      investorId: string,
+      type: string,
+      title: string,
+      body: string
+    ) => {
+      const idempotencyKey = `notification:${type}:${run.id}:${investorId}`;
+      try {
+        await this.pool!.query(
+          `INSERT INTO idempotency_keys (key, response_status, response_body, state, created_at) VALUES ($1, 200, '{}', 'completed', NOW())`,
+          [idempotencyKey]
+        );
+      } catch (e: any) {
+        if (e.code === '23505') {
+          return;
+        }
+        throw e;
+      }
+
+      const prefs = await this.notificationPreferencesRepo.getByUserId(investorId);
+      if (prefs && prefs.push_notifications === false && prefs.email_notifications === false) {
+        return;
+      }
+
+      await this.notificationRepo.create({
+        user_id: investorId,
+        type,
+        title,
+        body,
+      });
+    };
+
+    if (finalStatus === 'completed') {
+      for (const payout of successfulPayouts) {
+        await processNotification(
+          payout.investor_id,
+          'distribution.completed',
+          'Distribution Completed',
+          `Your distribution of ${payout.amount} has been processed successfully.`
+        );
+      }
+    }
+
+    for (const payout of failedPayouts) {
+      await processNotification(
+        payout.investor_id,
+        'payout.failed',
+        'Payout Failed',
+        `Your payout of ${payout.amount} failed to process. Reason: ${payout.errorClass || 'Unknown error'}.`
+      );
+    }
   }
 }
 
