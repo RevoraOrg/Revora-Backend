@@ -1,0 +1,6 @@
+- [ ] Update src/index.ts: import payouts/notifications/investments/distributions routers
+- [ ] Update src/index.ts: instantiate SessionRepository(pool) and createRequireAuth(sessionRepository)
+- [ ] Update src/index.ts: mount each router on apiRouter (behind API_VERSION_PREFIX) with proper auth
+- [ ] Ensure requestIdMiddleware stays global and errorHandler remains last
+- [ ] Do not run tests/build/eslint in this step (per instruction)
+- [ ] After code change: run npm test and include notes/output

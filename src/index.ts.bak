@@ -1,38 +1,23 @@
-import "dotenv/config";
-import express, {
-  NextFunction,
-  Request,
-  RequestHandler,
-  Response,
-} from "express";
-import morgan from "morgan";
-import { closePool, dbHealth, query as dbQuery } from "./db/client";
-import { createCorsMiddleware } from "./middleware/cors";
-import { errorHandler } from "./middleware/errorHandler";
-import { requestIdMiddleware } from "./middleware/requestId";
-import { Errors } from "./lib/errors";
-import {
-  classifyStellarRPCFailure,
-  StellarRPCFailureClass,
-} from "./lib/stellarRpcFailure";
-import { createHealthRouter } from "./routes/health";
-import vestingRouter from "./routes/vesting";
-import { offeringSanitizeMiddleware } from "./middleware/offeringSanitize";
-import { createStartupRegisterRateLimit } from "./middleware/startupRegisterRateLimit";
-import { env } from "./config/env";
-import { validateWebhookUrl, SsrfValidationError } from "./lib/ssrfProtection";
-import {
-  WebhookEndpointRepository,
-  WebhookDelivery,
-} from "./db/repositories/webhookEndpointRepository";
-import {
-  WebhookService,
-  WebhookPayload,
-  WebhookEventType,
-} from "./services/webhookService";
-import { pool } from "./db/pool";
-import { createPasswordResetRouter } from "./routes/passwordReset";
-import { emailService } from "./services/emailService";
+import 'dotenv/config';
+import express, { NextFunction, Request, RequestHandler, Response } from 'express';
+import morgan from 'morgan';
+import { closePool, dbHealth, query as dbQuery } from './db/client';
+import { createCorsMiddleware } from './middleware/cors';
+import { errorHandler } from './middleware/errorHandler';
+import { requestIdMiddleware } from './middleware/requestId';
+import { Errors } from './lib/errors';
+import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
+import { createHealthRouter } from './routes/health';
+import vestingRouter from './routes/vesting';
+import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
+import { createStartupRegisterRateLimit } from './middleware/startupRegisterRateLimit';
+import { env } from './config/env';
+import { validateWebhookUrl, SsrfValidationError } from './lib/ssrfProtection';
+import { WebhookEndpointRepository, WebhookDelivery } from './db/repositories/webhookEndpointRepository';
+import { WebhookService, WebhookPayload, WebhookEventType } from './services/webhookService';
+import { pool } from './db/pool';
+import { createPasswordResetRouter } from './routes/passwordReset';
+import { emailService } from './services/emailService';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -171,17 +156,32 @@ function isNonEmptyString(value: unknown, maxLength = 128): value is string {
  * @dev Decimal parser with strict input bounds to resist coercion abuse and NaN payloads.
  */
 function parseMoneyString(value: unknown): number | null {
-  if (typeof value !== "string") return null;
-  if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) return null;
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) {
+    return null;
+  }
+
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return null;
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
   return parsed;
 }
 
 function parseIsoDate(value: unknown): Date | null {
-  if (!isNonEmptyString(value, 64)) return null;
+  if (!isNonEmptyString(value, 64)) {
+    return null;
+  }
+
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return null;
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
   return parsed;
 }
 
@@ -192,11 +192,15 @@ function createStartupRegisterHandler(): RequestHandler {
     const password = body?.password;
 
     if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
-      res.status(400).json({ error: "Email and password are required" });
+      res.status(400).json({
+        error: "Email and password are required",
+      });
       return;
     }
 
-    res.status(201).json({ message: "Startup user registered successfully" });
+    res.status(201).json({
+      message: "Startup user registered successfully",
+    });
   };
 }
 
@@ -217,7 +221,10 @@ function requireOfferingAuth(
     return;
   }
 
-  (req as AuthenticatedRequest).user = { id: userId.trim(), role };
+  (req as AuthenticatedRequest).user = {
+    id: userId.trim(),
+    role,
+  };
   next();
 }
 
@@ -301,6 +308,10 @@ function parseOfferingValidationPayload(
   return payload;
 }
 
+/**
+ * @dev Evaluates the permission and invariant matrix for offering actions.
+ * The result is deterministic and safe to log or return to clients.
+ */
 function evaluateOfferingValidationMatrix(
   actor: AuthenticatedUser,
   payload: OfferingValidationPayload,
@@ -577,7 +588,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createOfferingValidationHandler(),
   );
 
-  apiRouter.use("/vesting", vestingRouter);
+  apiRouter.use('/vesting', vestingRouter);
 
   // Mount password reset router
   app.use(createPasswordResetRouter({ db: pool, emailService }));
@@ -631,13 +642,16 @@ export class WebhookQueue {
     this.service = service;
   }
 
+  /**
+   * @notice Validates a webhook URL using comprehensive SSRF protection.
+   * @dev Enforces HTTPS, rejects private/reserved addresses (IPv4 and IPv6),
+   * resolves DNS to prevent rebinding attacks, and rejects embedded credentials.
+   */
   private static async isSafeUrl(url: string): Promise<boolean> {
     try {
       const result = await validateWebhookUrl(url, true);
       if (!result.valid) {
-        console.error(
-          `[Security] SSRF validation failed for ${url}: ${result.error?.message}`,
-        );
+        console.error(`[Security] SSRF validation failed for ${url}: ${result.error?.message}`);
       }
       return result.valid;
     } catch (error) {
@@ -647,7 +661,10 @@ export class WebhookQueue {
   }
 
   static getBackoffDelay(retryCount: number): number {
-    if (retryCount >= this.MAX_RETRIES) return -1;
+    if (retryCount >= this.MAX_RETRIES) {
+      return -1;
+    }
+
     return this.INITIAL_DELAY * Math.pow(2, retryCount);
   }
 
@@ -673,19 +690,22 @@ export class WebhookQueue {
     }
 
     let delivery: WebhookDelivery | null = null;
-    if (deliveryId) delivery = await this.repo.findDeliveryById(deliveryId);
+    if (deliveryId) {
+      delivery = await this.repo.findDeliveryById(deliveryId);
+    }
 
     if (!delivery) {
       delivery = await this.repo.createDelivery({
         endpoint_id: endpoint.id,
         payload,
-        status: "pending",
-        attempts: 0,
+        status: 'pending',
+        attempts: 0
       });
     }
 
     const currentAttempt = delivery.attempts + 1;
-
+    
+    // Construct WebhookPayload for real delivery
     const webhookPayload: WebhookPayload = {
       id: delivery.id,
       event: (payload as any).event || WebhookEventType.OFFERING_UPDATED,
@@ -693,29 +713,23 @@ export class WebhookQueue {
       timestamp: new Date().toISOString(),
     };
 
-    const result = await this.service.sendAttempt(
-      {
-        id: endpoint.id,
-        url: endpoint.url,
-        secret: endpoint.secret,
-      },
-      webhookPayload,
-    );
+    const result = await this.service.sendAttempt({
+      id: endpoint.id,
+      url: endpoint.url,
+      secret: endpoint.secret
+    }, webhookPayload);
 
     if (result.success) {
       await this.repo.updateDelivery(delivery.id, {
-        status: "completed",
+        status: 'completed',
         attempts: currentAttempt,
         last_error: null,
-        next_retry_at: null,
+        next_retry_at: null
       });
       return true;
     }
 
-    const isRetryable =
-      !result.statusCode ||
-      result.statusCode >= 500 ||
-      result.statusCode === 429;
+    const isRetryable = !result.statusCode || (result.statusCode >= 500) || (result.statusCode === 429);
     const nextDelay = this.getBackoffDelay(currentAttempt);
 
     if (isRetryable && nextDelay !== -1) {
@@ -723,23 +737,23 @@ export class WebhookQueue {
       await this.repo.updateDelivery(delivery.id, {
         attempts: currentAttempt,
         last_error: result.error,
-        next_retry_at: nextRetryAt,
+        next_retry_at: nextRetryAt
       });
-
+      
       setTimeout(() => {
         void this.processDelivery(url, payload, delivery!.id);
       }, nextDelay);
-
+      
+      return false;
+    } else {
+      await this.repo.updateDelivery(delivery.id, {
+        status: nextDelay === -1 ? 'dead_letter' : 'failed',
+        attempts: currentAttempt,
+        last_error: result.error,
+        next_retry_at: null
+      });
       return false;
     }
-
-    await this.repo.updateDelivery(delivery.id, {
-      status: nextDelay === -1 ? "dead_letter" : "failed",
-      attempts: currentAttempt,
-      last_error: result.error,
-      next_retry_at: null,
-    });
-    return false;
   }
 
   static async resumePending(): Promise<void> {
@@ -774,3 +788,4 @@ if (require.main === module && env.NODE_ENV !== "test") {
 }
 
 export default app;
+
