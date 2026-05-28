@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { NextFunction, Request, Response } from 'express';
+import { Pool } from 'pg';
 import {
   createIdempotencyMiddleware,
   InMemoryIdempotencyStore,
