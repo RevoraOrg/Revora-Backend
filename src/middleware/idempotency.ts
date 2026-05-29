@@ -347,7 +347,16 @@ export function createIdempotencyMiddleware(
     }
 
     const requestFingerprint = fingerprint?.(req);
-    const checkResult = await store.checkAndReserve(key);
+    let checkResult;
+    try {
+      checkResult = await store.checkAndReserve(key);
+    } catch (error) {
+      // On internal error, we allow the request to proceed without idempotency
+      // to avoid blocking clients due to infra issues.
+      next();
+      return;
+    }
+
     if (checkResult.state === 'cached') {
       if (
         requestFingerprint &&

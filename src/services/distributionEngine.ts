@@ -1,5 +1,6 @@
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
+import { Decimal } from '../lib/decimal';
 import { Pool } from 'pg';
 import { withTransaction } from '../db/transaction';
 import { 
@@ -10,58 +11,47 @@ import {
 } from '../lib/stellarRpcFailure';
 
 /**
- * @title DistributionEngine
- * @notice Computes per-investor payout amounts based on token balances and persists them.
- * @dev This service handles the core logic for revenue distribution, including:
- * 1. Balance acquisition (via provider or repository)
- * 2. Proration of revenue based on balances
- * 3. Rounding adjustment to ensure total payout equals revenue amount
- * 4. Persistence of distribution runs and individual payouts with a retry strategy
- * 5. Batch processing for large payout sets with partial failure handling
- * 
- * **Security Assumptions & Risk Notes:**
- * - **Trust Boundary**: Balance data is assumed to be validated by the provided `balanceProvider` or `offeringRepo`.
- * - **Idempotency**: Runs are keyed by `(offeringId, periodId, totalAmount)`. Multiple calls with same params will resume or return existing run.
- * - **Data Leakage**: Stellar RPC failures are classified via `classifyStellarRPCFailure` to ensure raw upstream error strings do not leak to client.
- * - **Transactionality**: Payouts are persisted individually within batches. Partial failures are recorded in the `distribution_run` status.
- * - **Rounding**: The "Max Share Adjustment" strategy is used to ensure total payouts exactly match `revenueAmount` to the cent, preventing minor leakage or shortfall.
- */
+    // 6. Process payouts in batches with optional transaction support
+    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
+    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
 
-export interface BalanceRow {
-  investor_id: string;
-  balance: number; // numeric balance; precision handled by callers/tests
-}
+    const successfulPayouts: Array<{ investor_id: string; amount: string }> = existingPayouts.map((p: any) => ({
+      investor_id: p.investor_id,
+      amount: p.amount,
+    }));
+    const failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }> = [];
+    let hasBatchFailure = false;
 
-export interface DistributionResult {
-  distributionRun: any;
-  payouts: Array<{ investor_id: string; amount: string }>;
-}
+    for (let batchStart = 0; batchStart < rounded.length; batchStart += this.batchSize) {
+      const batch = rounded.slice(batchStart, batchStart + this.batchSize);
+      const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
-/** Enhanced result type with batch processing details */
-export interface DistributionBatchResult {
-  distributionRun: any;
-  successfulPayouts: Array<{ investor_id: string; amount: string }>;
-  failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }>;
-  totalPayouts: number;
-}
+      try {
+        if (this.pool) {
+          // Transactional batch: create all payouts within a DB transaction
+          await withTransaction(this.pool, async (client) => {
+            for (const r of batch) {
+              if (existingInvestorIds.has(r.investor_id)) continue;
 
-export interface DistributionEngineOptions {
-  maxRetries?: number;
-  initialDelayMs?: number;
-  backoffFactor?: number;
-  /** Log retry attempts to console/logger */
-  logRetries?: boolean;
-  /** Max payouts per batch to prevent overwhelming the database (default: 50) */
-  batchSize?: number;
-}
+              const amtStr = r.amount.toString();
+              await this.withRetry(() =>
+                // Pass client for transactional repository implementations
+                this.distributionRepo.createPayout({
+                  distribution_run_id: run.id,
+                  investor_id: r.investor_id,
+                  amount: amtStr,
+                  status: 'pending',
+                }, client)
+              );
 
-export class DistributionEngine {
-  private readonly maxRetries: number;
-  private readonly initialDelayMs: number;
-  private readonly backoffFactor: number;
-  private readonly logRetries: boolean;
-  private readonly batchSize: number;
-  private readonly logger: Logger;
+              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
+              existingInvestorIds.add(r.investor_id);
+            }
+          });
+        } else {
+          // Non-transactional fallback for compatibility (used by tests/mocks)
+          for (const r of batch) {
+            if (existingInvestorIds.has(r.investor_id)) continue;
 
   constructor(
     private offeringRepo: any,
@@ -80,48 +70,66 @@ export class DistributionEngine {
     this.logger = globalLogger;
   }
 
-  /**
-   * @notice Distribute revenueAmount across investors for an offering and period.
-   * @dev Security Assumptions:
-   * - revenueAmount must be strictly positive.
-   * - offeringId must be valid and exist (checked by repo).
-   * - totalBalance must be > 0.
-   * - Payouts are persisted with a retry strategy to handle transient failures.
-   * - Batch processing prevents overwhelming the database with large payout sets.
-   *
-   * @param offeringId The unique identifier of the offering
-   * @param period The timeframe for which the distribution is being made
-   * @param revenueAmount The total amount of revenue to be distributed
-   * @returns The created distribution run and the list of payouts
-   */
-  async distribute(
-    offeringId: string,
-    period: { id: string; start: Date; end: Date },
-    revenueAmount: number
-  ): Promise<DistributionResult> {
-    const result = await this.distributeWithBatch(offeringId, period, revenueAmount);
-    
-    if (result.failedPayouts.length > 0) {
-      const firstFailure = result.failedPayouts[0];
-      const errorMsg = firstFailure.errorClass 
-        ? `Distribution failed: ${firstFailure.errorClass}`
-        : 'Distribution completed with partial failures';
-      throw Errors.internal(errorMsg);
+              this.logger.error('Payout creation failed', {
+                offeringId,
+                runId: run.id,
+                investorId: r.investor_id,
+                errorClass: failure.class,
+                batchNumber,
+                rawError: err instanceof Error ? err.message : String(err),
+              });
+
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Action failed with ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
+
+        this.logger.info('Distribution batch processed successfully', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          payoutsInBatch: batch.length,
+          transactional: !!this.pool,
+        });
+      } catch (err) {
+        hasBatchFailure = true;
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'processBatch',
+          offeringId,
+          periodId: period.id,
+        });
+
+        this.logger.error('Payout batch failed', {
+          offeringId,
+          runId: run.id,
+          batchNumber,
+          errorClass: failure.class,
+          investorCount: batch.length,
+          transactional: !!this.pool,
+          rawError: err instanceof Error ? err.message : String(err),
+        });
+
+        // In non-transactional mode, record which specific payouts failed
+        if (!this.pool) {
+          for (const r of batch) {
+            if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
+              const amtStr = r.amount.toString();
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        }
+      }
     }
-
-    // Backward compatibility: return original shape
-    return {
-      distributionRun: result.distributionRun,
-      payouts: result.successfulPayouts,
-    };
-  }
-
-  /**
-   * @notice Distribute revenueAmount with batch processing and partial failure tracking.
-   * @dev This is the enhanced version that returns detailed batch results.
-   *
-   * @param offeringId The unique identifier of the offering
-   * @param period The timeframe for which the distribution is being made
    * @param revenueAmount The total amount of revenue to be distributed
    * @returns Batch result with successful and failed payouts
    */
@@ -188,31 +196,99 @@ export class DistributionEngine {
       throw Errors.badRequest('No investors or balances found for offering');
     }
 
-    // 4. Sum balances and compute shares
-    const totalBalance = balances.reduce((s, b) => s + Number(b.balance), 0);
-    if (totalBalance <= 0) {
+    // 4. Sum balances and compute shares using Decimal for precision
+    // ──────────────────────────────────────────────────────────────
+    // Use BigInt-based Decimal arithmetic to avoid floating-point inaccuracies.
+    // This ensures exact-to-the-cent calculations for financial correctness.
+    // Convert all balances to Decimal first, then sum using Decimal arithmetic.
+    // Convert balances to Decimal without performing JS floating-point arithmetic.
+    // - Format the incoming numeric value to a decimal string with high precision
+    //   (up to 18 places) to preserve any fractional parts.
+    // - Construct a Decimal from that string, then round to 2 decimal places
+    //   using `toSorobanI128(2, 'round')` to produce cent-precision values.
+    const balanceDecimals = balances.map((b) => {
+      const rawStr = (b.balance).toFixed(18); // string representation with up to 18 decimals
+      const rawDecimal = new Decimal(rawStr);
+      const scaled = rawDecimal.toSorobanI128(2, 'round');
+      return Decimal.fromScaledBigInt(scaled, 2);
+    });
+
+    const totalBalanceDecimal = balanceDecimals.reduce((sum, bd) => sum.add(bd), new Decimal('0'));
+
+    if (totalBalanceDecimal.isZero() || totalBalanceDecimal.isNegative()) {
       throw Errors.badRequest('Total balance must be > 0 to distribute revenue');
     }
 
-    const rawShares = balances.map((b) => ({
-      investor_id: b.investor_id,
-      raw: (Number(b.balance) / totalBalance) * revenueAmount,
-    }));
+    // Convert `revenueAmount` to a Decimal without JS numeric rounding.
+    // Use a high-precision string representation then round to 2 decimals via Decimal.
+    const revenueRawStr = revenueAmount.toFixed(18);
+    const revenueRawDecimal = new Decimal(revenueRawStr);
+    const revenueScaled = revenueRawDecimal.toSorobanI128(2, 'round');
+    const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
 
-    const rounded = rawShares.map((r) => ({
-      investor_id: r.investor_id,
-      amount: Math.round(r.raw * 100) / 100,
-    }));
+    // Compute raw shares as Decimals with full precision (up to 18 decimal places).
+    // These are NOT yet rounded; they preserve the exact mathematical division result.
+    interface RawShare {
+      investor_id: string;
+      rawShare: Decimal;
+    }
+    const rawShares: RawShare[] = balances.map((b, index) => {
+      // Use the pre-converted balance Decimal instead of reconverting
+      const balanceDecimal = balanceDecimals[index];
+      // rawShare = (balance / totalBalance) * revenueAmount
+      const share = balanceDecimal.divide(totalBalanceDecimal).multiply(revenueDecimal);
+      return {
+        investor_id: b.investor_id,
+        rawShare: share,
+      };
+    });
 
-    const roundedSum = rounded.reduce((s, r) => s + r.amount, 0);
-    const diff = Math.round((revenueAmount - roundedSum) * 100) / 100;
+    // Round each raw share to 2 decimal places (cents) using "round half up" strategy.
+    // Convert via toSorobanI128 with scale=2 for consistent rounding behavior.
+    interface RoundedShare {
+      investor_id: string;
+      amount: Decimal;
+      rawShare: Decimal;
+    }
+    const rounded: RoundedShare[] = rawShares.map((r) => {
+      // toSorobanI128(2, 'round') scales to 2 decimals and applies round-half-up
+      const scaledValue = r.rawShare.toSorobanI128(2, 'round');
+      const amountDecimal = Decimal.fromScaledBigInt(scaledValue, 2);
+      return {
+        investor_id: r.investor_id,
+        amount: amountDecimal,
+        rawShare: r.rawShare,
+      };
+    });
 
-    if (Math.abs(diff) >= 0.01) {
+    // Calculate total of all rounded amounts to determine if reconciliation is needed.
+    const roundedSum = rounded.reduce(
+      (sum, r) => sum.add(r.amount),
+      new Decimal('0')
+    );
+
+    // **Largest-Share Reconciliation Adjustment**
+    // ────────────────────────────────────────────
+    // Compute the difference between the intended revenue and the sum of rounded amounts.
+    // Due to independent rounding, this difference can be non-zero (typically ±0.01).
+    // Round the difference to 2 decimal places to ensure it fits within cent precision.
+    const rawDiff = revenueDecimal.subtract(roundedSum);
+    const diffScaled = rawDiff.toSorobanI128(2, 'round');
+    const diff = Decimal.fromScaledBigInt(diffScaled, 2);
+
+    if (!diff.isZero()) {
+      // Find the investor with the largest raw share and adjust their payout by `diff`.
+      // This ensures total payouts always equal revenueAmount exactly.
+      // Rationale: The investor with the largest share implicitly benefits most from
+      // the proration algorithm, so the reconciliation adjustment is fair.
       let maxIdx = 0;
       for (let i = 1; i < rawShares.length; i++) {
-        if (rawShares[i].raw > rawShares[maxIdx].raw) maxIdx = i;
+        if (rawShares[i].rawShare.compareTo(rawShares[maxIdx].rawShare) > 0) {
+          maxIdx = i;
+        }
       }
-      rounded[maxIdx].amount = Math.round((rounded[maxIdx].amount + diff) * 100) / 100;
+      // Adjust the largest share investor by the difference
+      rounded[maxIdx].amount = rounded[maxIdx].amount.add(diff);
     }
 
     // 5. Ensure distribution run exists and is in 'processing' state
@@ -298,6 +374,14 @@ export class DistributionEngine {
                 continue;
               }
 
+<<<<<<< HEAD
+          // Decimal with scale 2 toString() returns exactly 2 decimal places
+          const amtStr = r.amount.toString();
+          try {
+            await this.withRetry(() =>
+              this.distributionRepo.createPayout({
+                distribution_run_id: run.id,
+=======
               const amtStr = r.amount.toFixed(2);
               await this.withRetry(() =>
                 this.distributionRepo.createPayout(
@@ -350,6 +434,7 @@ export class DistributionEngine {
               });
 
               failedPayouts.push({
+>>>>>>> origin/master
                 investor_id: r.investor_id,
                 amount: amtStr,
                 error: `Action failed with ${failure.class}`,

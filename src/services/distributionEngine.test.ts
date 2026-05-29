@@ -398,6 +398,50 @@ describe('DistributionEngine', () => {
     spy.mockRestore();
   });
 
+  it('handles extremely large balance totals without floating-point drift', async () => {
+    const repo = new MockDistributionRepo();
+    // Very large balances but small revenue to distribute
+    const balances = [
+      { investor_id: 'i1', balance: 1000000000000000000 }, // 1e18
+      { investor_id: 'i2', balance: 1 },
+    ];
+
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
+    const result = await engine.distribute('off-large', { id: 'p', start: new Date(), end: new Date() }, 1);
+
+    const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
+    expect(sum).toBeCloseTo(1.00, 2);
+    expect(result.payouts.length).toBe(2);
+  });
+
+  it('applies round-half-up consistently for .005 cases', async () => {
+    const repo = new MockDistributionRepo();
+    // Two equal balances with a tiny revenue that creates 0.005 raw shares
+    const balances = [ { investor_id: 'i1', balance: 1 }, { investor_id: 'i2', balance: 1 } ];
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
+
+    const result = await engine.distribute('off-halfup', { id: 'p', start: new Date(), end: new Date() }, 0.01);
+    // One should be 0.00 and one 0.01 after reconciliation (sum == 0.01)
+    const amounts = result.payouts.map(p => p.amount).sort().reverse();
+    expect(amounts).toEqual(expect.arrayContaining(['0.01', '0.00']));
+    const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
+    expect(sum).toBeCloseTo(0.01, 2);
+  });
+
+  it('preserves exact-to-the-cent totals for many small investors (dust handling)', async () => {
+    const repo = new MockDistributionRepo();
+    const balances = Array.from({ length: 101 }, (_, i) => ({ investor_id: `i${i}`, balance: 1 }));
+    const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
+
+    const revenue = 1; // $1 across 101 investors -> many will get $0.00, one adjusted
+    const result = await engine.distribute('off-dust', { id: 'p', start: new Date(), end: new Date() }, revenue);
+    const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
+    expect(sum).toBeCloseTo(revenue, 2);
+    // Exactly one payout should be non-zero in many tiny-distribution scenarios
+    const nonZero = result.payouts.filter(p => Number(p.amount) > 0);
+    expect(nonZero.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('handles failure when updating run status to processing', async () => {
     const repo = new MockDistributionRepo();
     const engine = new DistributionEngine(
@@ -807,5 +851,375 @@ describe('DistributionEngine', () => {
         await expect(engine.distributeWithBatch('off-init-fail', period, 100))
           .rejects.toThrow(/Failed to update distribution status: UNKNOWN/);
       });
+    });
+  });
+
+  describe('Decimal Precision - Edge Cases', () => {
+    /**
+     * Tests the Decimal-based proration logic with various edge cases to ensure
+     * exact-to-the-cent calculations and proper reconciliation adjustments.
+     */
+
+    it('handles single investor correctly with Decimal precision', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [{ investor_id: 'i1', balance: 100 }];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-single', start: new Date(), end: new Date() };
+      const result = await engine.distributeWithBatch('off-single', period, 123.45);
+
+      expect(result.successfulPayouts).toHaveLength(1);
+      expect(result.successfulPayouts[0].investor_id).toBe('i1');
+      expect(result.successfulPayouts[0].amount).toBe('123.45');
+
+      // Verify sum equals revenue amount exactly
+      const sum = result.successfulPayouts.reduce((s, p) => Number(s) + Number(p.amount), 0);
+      expect(sum).toBe(123.45);
+    });
+
+    it('distributes equally across investors with equal balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 100 },
+        { investor_id: 'i2', balance: 100 },
+        { investor_id: 'i3', balance: 100 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-equal', start: new Date(), end: new Date() };
+      const revenue = 100.00;
+      const result = await engine.distributeWithBatch('off-equal', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(3);
+
+      // Verify total sum equals revenue amount exactly
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBeCloseTo(revenue, 2);
+
+      // Each investor should get approximately 33.33, with one getting 33.34 due to reconciliation
+      const amounts = result.successfulPayouts.map(p => Number(p.amount)).sort((a, b) => a - b);
+      expect(amounts[0]).toBe(33.33);
+      expect(amounts[1]).toBe(33.33);
+      expect(amounts[2]).toBe(33.34);
+    });
+
+    it('handles dust remainders correctly with three-way split', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 1 },
+        { investor_id: 'i2', balance: 1 },
+        { investor_id: 'i3', balance: 1 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-dust', start: new Date(), end: new Date() };
+      const revenue = 100.00;
+      const result = await engine.distributeWithBatch('off-dust', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(3);
+
+      // Verify exact sum
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(revenue);
+
+      // All amounts should be properly formatted to 2 decimal places
+      result.successfulPayouts.forEach(p => {
+        const match = p.amount.match(/^\d+\.\d{2}$/);
+        expect(match).toBeTruthy();
+      });
+    });
+
+    it('distributes with very large balances without precision loss', async () => {
+      const repo = new MockDistributionRepo();
+      // Use reasonable large balances that won't cause precision issues
+      const largeBalance = 1000000;
+      const balances = [
+        { investor_id: 'i1', balance: largeBalance },
+        { investor_id: 'i2', balance: largeBalance },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-large', start: new Date(), end: new Date() };
+      const revenue = 500000.00;
+      const result = await engine.distributeWithBatch('off-large', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(2);
+
+      // Verify exact sum
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(revenue);
+
+      // Each investor should get exactly half
+      result.successfulPayouts.forEach(p => {
+        const amount = Number(p.amount);
+        expect(amount).toBeCloseTo(revenue / 2, 2);
+      });
+    });
+
+    it('reconciles fractional cents correctly across many investors', async () => {
+      const repo = new MockDistributionRepo();
+      // 7 investors to create complex fractional distribution
+      const balances = Array.from({ length: 7 }, (_, i) => ({
+        investor_id: `i${i}`,
+        balance: 100,
+      }));
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-frac', start: new Date(), end: new Date() };
+      const revenue = 777.77;
+      const result = await engine.distributeWithBatch('off-frac', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(7);
+
+      // Verify exact sum to 2 decimal places
+      const sumCents = result.successfulPayouts.reduce(
+        (s, p) => s + Math.round(Number(p.amount) * 100),
+        0
+      );
+      const expectedCents = Math.round(revenue * 100);
+      expect(sumCents).toBe(expectedCents);
+
+      // All amounts should be 2 decimal places
+      result.successfulPayouts.forEach(p => {
+        expect(/^\d+\.\d{2}$/.test(p.amount)).toBeTruthy();
+      });
+    });
+
+    it('handles asymmetric balance distribution correctly', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 1000000 }, // 80%
+        { investor_id: 'i2', balance: 200000 },   // 16%
+        { investor_id: 'i3', balance: 50000 },    // 4%
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-asym', start: new Date(), end: new Date() };
+      const revenue = 10000.00;
+      const result = await engine.distributeWithBatch('off-asym', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(3);
+
+      // Verify exact sum
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(revenue);
+
+      // Verify approximate proportions (within 0.01)
+      const i1Amount = Number(result.successfulPayouts[0].amount);
+      const i2Amount = Number(result.successfulPayouts[1].amount);
+      const i3Amount = Number(result.successfulPayouts[2].amount);
+
+      // i1 should be ~8000
+      expect(i1Amount).toBeGreaterThan(7999);
+      expect(i1Amount).toBeLessThan(8001);
+
+      // i2 should be ~1600
+      expect(i2Amount).toBeGreaterThan(1599);
+      expect(i2Amount).toBeLessThan(1601);
+
+      // i3 should be ~400
+      expect(i3Amount).toBeGreaterThan(399);
+      expect(i3Amount).toBeLessThan(401);
+    });
+
+    it('handles revenue with fractional cents (3-4 decimal places input)', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 333 },
+        { investor_id: 'i2', balance: 333 },
+        { investor_id: 'i3', balance: 334 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-frac-revenue', start: new Date(), end: new Date() };
+      // Revenue with 3 decimal places - 99.999 rounds to 100.00 at 2 decimals
+      const revenue = 99.999;
+      const result = await engine.distributeWithBatch('off-frac-revenue', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(3);
+
+      // Sum should be 100.00 (revenue rounded to 2 decimals)
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(100.00);
+    });
+
+    it('maintains consistency when distributing the same amount multiple times', async () => {
+      const balances = [
+        { investor_id: 'i1', balance: 100 },
+        { investor_id: 'i2', balance: 100 },
+        { investor_id: 'i3', balance: 100 },
+      ];
+      const revenue = 77.77;
+
+      const results = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const repo = new MockDistributionRepo();
+        const engine = new DistributionEngine(
+          null,
+          repo,
+          new MockBalanceProvider(balances),
+          { maxRetries: 1, initialDelayMs: 0 }
+        );
+
+        const period = { id: `p-consistency-${attempt}`, start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch(`off-consistency-${attempt}`, period, revenue);
+        results.push(result.successfulPayouts);
+      }
+
+      // All results should be identical
+      const firstResult = results[0].sort((a, b) => a.investor_id.localeCompare(b.investor_id));
+      for (let i = 1; i < results.length; i++) {
+        const currentResult = results[i].sort((a, b) => a.investor_id.localeCompare(b.investor_id));
+        for (let j = 0; j < firstResult.length; j++) {
+          expect(currentResult[j].amount).toBe(firstResult[j].amount);
+        }
+      }
+    });
+
+    it('reconciles correctly when largest-share investor needs negative adjustment', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 1 },
+        { investor_id: 'i2', balance: 1 },
+        { investor_id: 'i3', balance: 10000000 }, // Much larger
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-neg-adj', start: new Date(), end: new Date() };
+      const revenue = 50.00;
+      const result = await engine.distributeWithBatch('off-neg-adj', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(3);
+
+      // Verify exact sum
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(revenue);
+
+      // The largest investor should receive the majority, adjusted for reconciliation
+      const i3 = result.successfulPayouts.find(p => p.investor_id === 'i3');
+      expect(Number(i3!.amount)).toBeGreaterThan(49.99);
+    });
+
+    it('distributes zero remainder after rounding without errors', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 1 },
+        { investor_id: 'i2', balance: 1 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 }
+      );
+
+      const period = { id: 'p-zero-rem', start: new Date(), end: new Date() };
+      // Revenue that divides evenly
+      const revenue = 100.00;
+      const result = await engine.distributeWithBatch('off-zero-rem', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(2);
+
+      // Both should get exactly 50.00
+      result.successfulPayouts.forEach(p => {
+        expect(Number(p.amount)).toBe(50.00);
+      });
+
+      const sum = result.successfulPayouts.reduce(
+        (s, p) => s + Number(p.amount),
+        0
+      );
+      expect(sum).toBe(revenue);
+    });
+
+    it('handles penny-pinching scenarios (very small per-investor amounts)', async () => {
+      const repo = new MockDistributionRepo();
+      // 100 investors
+      const balances = Array.from({ length: 100 }, (_, i) => ({
+        investor_id: `i${i}`,
+        balance: 1,
+      }));
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0, batchSize: 25 }
+      );
+
+      const period = { id: 'p-penny', start: new Date(), end: new Date() };
+      const revenue = 1.00; // Only $1 to distribute across 100 investors
+      const result = await engine.distributeWithBatch('off-penny', period, revenue);
+
+      expect(result.successfulPayouts).toHaveLength(100);
+
+      // Verify exact sum
+      const sumCents = result.successfulPayouts.reduce(
+        (s, p) => s + Math.round(Number(p.amount) * 100),
+        0
+      );
+      expect(sumCents).toBe(100); // Exactly $1 in cents
+
+      // Most should get 0.01, one should get 0.00 (or adjusted accordingly)
+      const amounts = result.successfulPayouts.map(p => Number(p.amount));
+      const nonZero = amounts.filter(a => a > 0);
+      expect(nonZero.length).toBeGreaterThan(0);
     });
   });

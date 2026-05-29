@@ -16,10 +16,10 @@ import { AppError, ErrorCode } from './errors';
  * - Regex patterns are designed to prevent ReDoS (catastrophic backtracking).
  */
 
-// Matches positive integer or decimal strings with up to 18 fractional digits.
+// Matches integer or decimal strings with optional leading sign and up to 18 fractional digits.
 // Requires at least one leading digit before the decimal point (rejects `.5`).
 // This regex is designed to prevent ReDoS by using bounded quantifiers.
-const POSITIVE_DECIMAL_REGEX = /^\d+(\.\d{1,18})?$/;
+const DECIMAL_REGEX = /^-?\d+(\.\d{1,18})?$/;
 
 // Soroban i128 max and min values.
 // i128 is a signed 128-bit integer.
@@ -43,10 +43,10 @@ export class Decimal {
    * @throws {AppError} if the string is not a valid positive decimal or exceeds 18 decimal places.
    */
   constructor(decimalString: string) {
-    if (!POSITIVE_DECIMAL_REGEX.test(decimalString)) {
+    if (!DECIMAL_REGEX.test(decimalString)) {
       throw new AppError(
         ErrorCode.VALIDATION_ERROR,
-        `Invalid decimal string format: "${decimalString}". Must be positive and up to 18 decimal places.`,
+        `Invalid decimal string format: "${decimalString}". Must be a numeric string with up to 18 decimal places.`,
         400,
         { field: 'amount', value: decimalString }
       );
@@ -165,14 +165,20 @@ export class Decimal {
     }
 
     const divisor = 10n ** BigInt(scale);
-    const integerPart = scaledValue / divisor;
-    const fractionalPart = scaledValue % divisor;
+
+    // Handle negative values explicitly to avoid producing strings like "123.-05".
+    const isNegative = scaledValue < 0n;
+    const absValue = isNegative ? -scaledValue : scaledValue;
+    const integerPart = absValue / divisor;
+    const fractionalPart = absValue % divisor;
 
     let decimalString = integerPart.toString();
     if (scale > 0) {
       const fractionalStr = fractionalPart.toString().padStart(scale, '0');
       decimalString += `.${fractionalStr}`;
     }
+
+    if (isNegative) decimalString = `-${decimalString}`;
 
     // Re-parse to ensure consistency and validation
     return new Decimal(decimalString);

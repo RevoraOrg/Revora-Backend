@@ -1,8 +1,6 @@
 import { Router, Request, Response, raw } from 'express';
 import { webhookAuth, WebhookAuthenticatedRequest } from '../middleware/webhookAuth';
 import { verifyWebhookPayload } from '../lib/webhookSignature';
-import { Errors } from '../lib/errors';
-import { globalLogger } from '../lib/logger';
 
 /**
  * @title Webhook Receiver Routes
@@ -54,17 +52,16 @@ export type WebhookEventHandler = (event: WebhookEvent) => Promise<WebhookProces
  * @notice Default webhook event handler that logs events.
  */
 const defaultEventHandler: WebhookEventHandler = async (event: WebhookEvent) => {
-  globalLogger.info('[Webhook] Received event', {
-    eventType: event.event,
-    eventId: event.id,
-    eventTimestamp: event.timestamp,
+  // eslint-disable-next-line no-console
+  console.log(`[Webhook] Received event: ${event.event}`, {
+    id: event.id,
+    timestamp: event.timestamp,
   });
 
-    return {
-      success: true,
-      eventId: event.id,
-      message: `Event ${event.event} processed successfully`,
-    };
+  return {
+    success: true,
+    eventId: event.id,
+    message: `Event ${event.event} processed successfully`,
   };
 };
 
@@ -82,16 +79,8 @@ export interface WebhookRouterConfig {
   maxAgeMs?: number;
   /** Maximum payload size in bytes (default: 1MB) */
   maxPayloadSize?: number;
-  /**
-   * Allowed clock drift for future-dated timestamps in milliseconds (default: 30 seconds).
-   * Sender clocks may run slightly ahead of the server clock; this tolerance avoids
-   * spurious rejections without meaningfully widening the replay window.
-   */
-  clockSkewMs?: number;
   /** Custom webhook endpoint path (default: '/webhooks') */
   path?: string;
-  /** Logger instance for structured logging */
-  logger?: Logger;
 }
 
 /**
@@ -163,13 +152,12 @@ function validateWebhookEvent(body: unknown): { valid: boolean; error?: string; 
 export function createWebhookRouter(config: WebhookRouterConfig): Router {
   const {
     secret,
+    eventHandler = defaultEventHandler,
     requireTimestamp = true,
     maxAgeMs = 5 * 60 * 1000, // 5 minutes
     maxPayloadSize = 1024 * 1024, // 1MB
-    clockSkewMs = 30 * 1000, // 30 seconds clock drift tolerance
   } = config;
 
-  const eventHandler = config.eventHandler ?? createDefaultEventHandler(logger);
   const router = Router();
 
   // Apply raw body parser for signature verification
@@ -182,52 +170,56 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
       const payload = req.body as Buffer;
 
       if (!signature) {
-        globalLogger.warn('[Webhook] Rejected: missing signature header', { path: req.path });
-        const appErr = Errors.unauthorized('Webhook authentication required');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(401).json({
+          error: 'Webhook verification failed',
+          code: 'MISSING_SIGNATURE',
+          message: 'Missing signature header: x-revora-signature',
+        });
         return;
       }
 
       if (!verifyWebhookPayload(secret, payload, signature)) {
-        globalLogger.warn('[Webhook] Rejected: signature verification failed', { path: req.path });
-        const appErr = Errors.forbidden('Webhook verification failed');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(403).json({
+          error: 'Webhook verification failed',
+          code: 'VERIFICATION_FAILED',
+          message: 'Signature verification failed',
+        });
         return;
       }
 
-      // Optional timestamp validation for replay protection with clock skew tolerance
+      // Optional timestamp validation for replay protection
       if (requireTimestamp) {
         const timestampHeader = req.headers['x-webhook-timestamp'] ?? req.headers['x-revora-timestamp'];
         const timestampStr = Array.isArray(timestampHeader) ? timestampHeader[0] : timestampHeader;
 
         if (!timestampStr) {
-          globalLogger.warn('[Webhook] Rejected: missing timestamp header', { path: req.path });
-          const appErr = Errors.forbidden('Webhook timestamp required');
-          res.status(appErr.statusCode).json(appErr.toResponse());
+          res.status(403).json({
+            error: 'Webhook verification failed',
+            code: 'MISSING_TIMESTAMP',
+            message: 'Missing required timestamp header',
+          });
           return;
         }
 
         const timestamp = parseInt(timestampStr, 10);
         if (isNaN(timestamp)) {
-          globalLogger.warn('[Webhook] Rejected: invalid timestamp format', { path: req.path });
-          const appErr = Errors.forbidden('Invalid webhook timestamp');
-          res.status(appErr.statusCode).json(appErr.toResponse());
+          res.status(403).json({
+            error: 'Webhook verification failed',
+            code: 'INVALID_TIMESTAMP',
+            message: 'Invalid timestamp format',
+          });
           return;
         }
 
         const now = Date.now();
         const age = now - timestamp;
 
-        // Negative age = future timestamp; allow up to clockSkewMs of sender clock drift.
-        if (age < -clockSkewMs || age > maxAgeMs) {
-          globalLogger.warn('[Webhook] Rejected: timestamp outside window', {
-            path: req.path,
-            age,
-            maxAgeMs,
-            clockSkewMs,
+        if (age < 0 || age > maxAgeMs) {
+          res.status(403).json({
+            error: 'Webhook verification failed',
+            code: 'TIMESTAMP_EXPIRED',
+            message: 'Webhook timestamp outside acceptable window',
           });
-          const appErr = Errors.forbidden('Webhook timestamp expired');
-          res.status(appErr.statusCode).json(appErr.toResponse());
           return;
         }
       }
@@ -237,21 +229,17 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
         req.body = JSON.parse(payload.toString('utf8'));
         next();
       } catch {
-        const appErr = Errors.badRequest('Request body is not valid JSON');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(400).json({
+          error: 'Invalid JSON',
+          message: 'Request body is not valid JSON',
+        });
       }
     },
     async (req: Request, res: Response): Promise<void> => {
-      const requestId = req.headers['x-request-id'] as string | undefined;
-      
       try {
         // Validate event structure
         const validation = validateWebhookEvent(req.body);
         if (!validation.valid) {
-          logger.warn('Invalid webhook event structure', {
-            requestId,
-            validationError: validation.error,
-          });
           res.status(400).json({
             success: false,
             error: 'Invalid webhook event structure',
@@ -263,21 +251,10 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
         const event = validation.event!;
         const authReq = req as WebhookAuthenticatedRequest;
 
-        logger.info('Processing webhook event', {
-          requestId,
-          eventId: event.id,
-          eventType: event.event,
-        });
-
         // Process the event
         const result = await eventHandler(event);
 
         if (result.success) {
-          logger.info('Webhook event processed successfully', {
-            requestId,
-            eventId: event.id,
-            eventType: event.event,
-          });
           res.status(200).json({
             success: true,
             eventId: result.eventId || event.id,
@@ -286,12 +263,6 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
             verifiedAt: authReq.webhook?.timestamp?.toISOString(),
           });
         } else {
-          logger.warn('Webhook event processing failed', {
-            requestId,
-            eventId: event.id,
-            eventType: event.event,
-            message: result.message,
-          });
           res.status(422).json({
             success: false,
             eventId: event.id,
@@ -300,9 +271,14 @@ export function createWebhookRouter(config: WebhookRouterConfig): Router {
           });
         }
       } catch (error) {
-        globalLogger.error('[Webhook] Error processing webhook event', { error });
-        const appErr = Errors.internal();
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        // eslint-disable-next-line no-console
+        console.error('[Webhook] Error processing webhook:', error);
+
+        res.status(500).json({
+          success: false,
+          error: 'Internal server error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        });
       }
     }
   );
@@ -356,7 +332,6 @@ export function createMultiTenantWebhookRouter(
     requireTimestamp = true,
     maxAgeMs = 5 * 60 * 1000,
     maxPayloadSize = 1024 * 1024,
-    clockSkewMs = 30 * 1000,
   } = config;
 
   const router = Router({ mergeParams: true });
@@ -368,9 +343,10 @@ export function createMultiTenantWebhookRouter(
       const endpointId = req.params.endpointId;
 
       if (!endpointId) {
-        globalLogger.warn('[Webhook] Rejected: missing endpoint identifier', { path: req.path });
-        const appErr = Errors.badRequest('Missing endpoint identifier');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(400).json({
+          success: false,
+          error: 'Missing endpoint identifier',
+        });
         return;
       }
 
@@ -379,14 +355,16 @@ export function createMultiTenantWebhookRouter(
       try {
         secret = await secretProvider(endpointId);
       } catch (error) {
-        globalLogger.error('[Webhook] Error fetching secret', { endpointId, error });
-        const appErr = Errors.internal();
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        // eslint-disable-next-line no-console
+        console.error(`[Webhook] Error fetching secret for endpoint ${endpointId}:`, error);
+        res.status(500).json({
+          success: false,
+          error: 'Internal server error',
+        });
         return;
       }
 
       if (!secret) {
-        globalLogger.warn('[Webhook] Endpoint not found', { endpointId });
         res.status(404).json({
           success: false,
           error: 'Webhook endpoint not found or inactive',
@@ -399,16 +377,20 @@ export function createMultiTenantWebhookRouter(
       const payload = req.body as Buffer;
 
       if (!signature) {
-        globalLogger.warn('[Webhook] Rejected: missing signature header', { path: req.path, endpointId });
-        const appErr = Errors.unauthorized('Webhook authentication required');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(401).json({
+          error: 'Webhook verification failed',
+          code: 'MISSING_SIGNATURE',
+          message: 'Missing signature header: x-revora-signature',
+        });
         return;
       }
 
       if (!verifyWebhookPayload(secret, payload, signature)) {
-        globalLogger.warn('[Webhook] Rejected: signature mismatch', { path: req.path, endpointId });
-        const appErr = Errors.forbidden('Webhook verification failed');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(403).json({
+          error: 'Webhook verification failed',
+          code: 'VERIFICATION_FAILED',
+          message: 'Signature verification failed',
+        });
         return;
       }
 
@@ -417,8 +399,10 @@ export function createMultiTenantWebhookRouter(
         req.body = JSON.parse(payload.toString('utf8'));
         next();
       } catch {
-        const appErr = Errors.badRequest('Request body is not valid JSON');
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        res.status(400).json({
+          error: 'Invalid JSON',
+          message: 'Request body is not valid JSON',
+        });
       }
     },
     async (req: Request, res: Response): Promise<void> => {
@@ -460,9 +444,12 @@ export function createMultiTenantWebhookRouter(
           });
         }
       } catch (error) {
-        globalLogger.error('[Webhook] Error processing multi-tenant webhook', { error });
-        const appErr = Errors.internal();
-        res.status(appErr.statusCode).json(appErr.toResponse());
+        // eslint-disable-next-line no-console
+        console.error('[Webhook] Error processing webhook:', error);
+        res.status(500).json({
+          success: false,
+          error: 'Internal server error',
+        });
       }
     }
   );

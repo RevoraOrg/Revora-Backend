@@ -1,10 +1,13 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { randomUUID } from 'crypto';
+import { globalLogger, Logger } from '../lib/logger';
 
 declare global {
   namespace Express {
     interface Request {
       requestId?: string;
+      // New: Request-scoped logger containing requestId trace parameters
+      logger?: Logger;
     }
   }
 }
@@ -24,9 +27,13 @@ export function requestIdMiddleware(): RequestHandler {
     const fromHeader = pickHeaderId(req.headers['x-request-id']);
     const existing = req.requestId;
     const id = fromHeader ?? existing ?? randomUUID();
+    
     if (!req.requestId) req.requestId = id;
+    
+    // REQUIREMENT: Instantiate a request-scoped logger context payload
+    req.logger = globalLogger.child({ requestId: id });
+    
     res.setHeader('X-Request-Id', id);
     next();
   };
 }
-

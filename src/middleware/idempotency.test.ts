@@ -157,6 +157,320 @@ describe('createIdempotencyMiddleware', () => {
     res1.status(202).send('accepted');
     await Promise.resolve();
   });
+
+  it('releases key and does not cache on 500 response', async () => {
+    const middleware = createIdempotencyMiddleware({
+      store: new InMemoryIdempotencyStore(),
+    });
+
+    const req1 = createRequest('POST', 'error-key') as Request;
+    const res1 = new MockResponse();
+    const next1: NextFunction = jest.fn(() => {
+      res1.status(500).json({ error: 'internal' });
+    });
+
+    await middleware(req1, res1 as unknown as Response, next1);
+    await Promise.resolve();
+
+    // Second request should process as new since first was released
+    const req2 = createRequest('POST', 'error-key') as Request;
+    const res2 = new MockResponse();
+    const next2: NextFunction = jest.fn(() => {
+      res2.status(200).json({ ok: true });
+    });
+
+    await middleware(req2, res2 as unknown as Response, next2);
+    await Promise.resolve();
+
+    expect(next2).toHaveBeenCalledTimes(1);
+    expect(res2.statusCode).toBe(200);
+  });
+
+  it('uses custom header name when provided', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      headerName: 'x-custom-idempotency-key',
+    });
+
+    const req = createRequest('POST') as Request;
+    (req as any).headers = { 'x-custom-idempotency-key': 'custom-key' };
+    (req as any).header = ((name: string) => {
+      if (name.toLowerCase() === 'x-custom-idempotency-key') return 'custom-key';
+      return undefined;
+    }) as Request['header'];
+
+    const res = new MockResponse();
+    const next = jest.fn(() => {
+      res.status(200).json({ ok: true });
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    expect(store).toBeInstanceOf(InMemoryIdempotencyStore);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses custom HTTP methods for idempotency', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      methods: ['DELETE'],
+    });
+
+    const req = createRequest('DELETE', 'delete-key') as Request;
+    const res = new MockResponse();
+    const next = jest.fn(() => {
+      res.status(200).json({ deleted: true });
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(store).toBeDefined();
+  });
+
+  it('respects custom shouldStoreResponse predicate', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      shouldStoreResponse: (status) => status === 201, // Only cache 201
+    });
+
+    const req1 = createRequest('POST', 'store-key') as Request;
+    const res1 = new MockResponse();
+    const next1 = jest.fn(() => {
+      res1.status(200).json({ ok: true });
+    });
+
+    await middleware(req1, res1 as unknown as Response, next1);
+    await Promise.resolve();
+
+    const req2 = createRequest('POST', 'store-key') as Request;
+    const res2 = new MockResponse();
+    const next2 = jest.fn(() => {
+      res2.status(201).json({ created: true });
+    });
+
+    await middleware(req2, res2 as unknown as Response, next2);
+    await Promise.resolve();
+
+    // 200 was not cached, 201 will be cached
+    expect(next2).toHaveBeenCalledTimes(1);
+    expect(res2.statusCode).toBe(201);
+  });
+
+  it('uses fingerprint for request differentiation', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      fingerprint: (req) => `${req.method}:${req.path}`,
+    });
+
+    const req1 = createRequest('POST', 'fp-key') as Request;
+    req1.body = { a: 1 };
+    const res1 = new MockResponse();
+    const next1 = jest.fn(() => {
+      res1.status(200).json({ fingerprint: 'stored' });
+    });
+
+    await middleware(req1, res1 as unknown as Response, next1);
+    await Promise.resolve();
+
+    const req2 = createRequest('POST', 'fp-key') as Request;
+    req2.body = { a: 2 }; // Different body but same fingerprint
+    const res2 = new MockResponse();
+
+    await middleware(req2, res2 as unknown as Response, next1);
+    await Promise.resolve();
+
+    // Same fingerprint means same response (cached)
+    expect(res2.statusCode).toBe(200);
+  });
+
+  it('rejects cached response with mismatched fingerprint', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      fingerprint: (_req) => 'fingerprint-1',
+    });
+
+    const req1 = createRequest('POST', 'fp-mismatch') as Request;
+    const res1 = new MockResponse();
+    const next1 = jest.fn(() => {
+      res1.status(200).json({ ok: true });
+    });
+
+    await middleware(req1, res1 as unknown as Response, next1);
+    await Promise.resolve();
+
+    // Mock store to return cached record with different fingerprint
+    let cachedRecord: any = null;
+    const store2 = new InMemoryIdempotencyStore();
+    (store2 as any).records.set('fp-mismatch', {
+      record: {
+        status: 200,
+        body: '{"ok":true}',
+        fingerprint: 'stored-fingerprint',
+        createdAt: new Date(),
+      },
+    });
+
+    const middleware2 = createIdempotencyMiddleware({
+      store: store2,
+      fingerprint: (_req) => 'different-fingerprint',
+    });
+
+    const req2 = createRequest('POST', 'fp-mismatch') as Request;
+    const res2 = new MockResponse();
+
+    await middleware2(req2, res2 as unknown as Response, next1);
+    await Promise.resolve();
+
+    expect(res2.statusCode).toBe(409);
+    expect(res2.body.error).toContain('different request payload');
+  });
+
+  it('handles non-JSON cached response', async () => {
+    const store = new InMemoryIdempotencyStore();
+    (store as any).records.set('plain-key', {
+      record: {
+        status: 200,
+        body: 'plain text response',
+        createdAt: new Date(),
+      },
+    });
+
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'plain-key') as Request;
+    const res = new MockResponse();
+    const next = jest.fn();
+
+    await middleware(req, res as unknown as Response, next);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('plain text response');
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('handles connection errors gracefully', async () => {
+    const store: IdempotencyStore = {
+      checkAndReserve: jest.fn().mockRejectedValue(new Error('DB connection failed')),
+      save: jest.fn(),
+      release: jest.fn(),
+    };
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'error-key') as Request;
+    const res = new MockResponse() as unknown as Response;
+    const next = jest.fn();
+
+    await middleware(req, res, next);
+    // Should proceed despite store error (fail open)
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles TTL expiration correctly', async () => {
+    const store = new InMemoryIdempotencyStore({ ttlMs: 1 });
+    await store.save('expiring-key', {
+      status: 200,
+      body: 'ok',
+      createdAt: new Date(),
+    });
+
+    // Wait for expiration
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'expiring-key') as Request;
+    const res = new MockResponse();
+    const next = jest.fn(() => {
+      res.status(200).json({ new: true });
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    // Expired record should be treated as new
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles null body in serializeBody', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'null-body-key') as Request;
+    const res = new MockResponse();
+    const next = jest.fn(() => {
+      res.status(200).send(null);
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    // Should store and allow caching
+    const req2 = createRequest('POST', 'null-body-key') as Request;
+    const res2 = new MockResponse();
+    const next2 = jest.fn();
+
+    await middleware(req2, res2 as unknown as Response, next2);
+
+    expect(next2).not.toHaveBeenCalled();
+    expect(res2.statusCode).toBe(200);
+  });
+
+  it('handles malformed JSON in cached response fallback', async () => {
+    const store = new InMemoryIdempotencyStore();
+    (store as any).records.set('malformed-json', {
+      record: {
+        status: 200,
+        body: '{ invalid json }',
+        contentType: 'application/json',
+        createdAt: new Date(),
+      },
+    });
+
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'malformed-json') as Request;
+    const res = new MockResponse();
+    const next = jest.fn();
+
+    await middleware(req, res as unknown as Response, next);
+
+    // Should fall back to send() for malformed JSON
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe('{ invalid json }');
+  });
+
+  it('handles empty body string in serializeBody', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({ store });
+
+    const req = createRequest('POST', 'empty-body') as Request;
+    const res = new MockResponse();
+    const next = jest.fn(() => {
+      res.status(204).send('');
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    // Second request should be cached as new
+    const req2 = createRequest('POST', 'empty-body') as Request;
+    const res2 = new MockResponse();
+    const next2 = jest.fn();
+
+    await middleware(req2, res2 as unknown as Response, next2);
+
+    expect(next2).not.toHaveBeenCalled();
+    expect(res2.statusCode).toBe(204);
+  });
 });
 
 // ---------------------------------------------------------------------------

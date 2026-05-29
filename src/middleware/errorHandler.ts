@@ -16,21 +16,13 @@ interface StructuredErrorLogEntry {
 const isProduction = (): boolean => process.env.NODE_ENV === 'production';
 
 function getRequestId(req: Request): string | undefined {
-  return (req as Request & { requestId?: string }).requestId;
+  return req.requestId;
 }
 
-/**
- * Maps arbitrary thrown values to a structured application error.
- *
- * Security boundary:
- * - AppError instances are trusted to carry client-visible messages/details.
- * - Unknown values are always downgraded to a generic INTERNAL_ERROR.
- */
 export function mapUnknownErrorToAppError(err: unknown): AppError {
   if (err instanceof AppError) {
     return err;
   }
-
   return Errors.internal();
 }
 
@@ -71,9 +63,11 @@ export const errorHandler: ErrorRequestHandler = (
   const requestId = getRequestId(req);
   const mapped = mapUnknownErrorToAppError(err);
   
-  // Use globalLogger for structured logging
+  // REQUIREMENT: Route through the contextual request-scoped logger if present
+  const activeLogger = req.logger ?? globalLogger;
+  
   if (mapped.statusCode >= 500) {
-    globalLogger.error(mapped.message, {
+    activeLogger.error(mapped.message, {
       requestId,
       code: mapped.code,
       statusCode: mapped.statusCode,
@@ -83,7 +77,7 @@ export const errorHandler: ErrorRequestHandler = (
       method: req.method,
     });
   } else {
-    globalLogger.warn(mapped.message, {
+    activeLogger.warn(mapped.message, {
       requestId,
       code: mapped.code,
       statusCode: mapped.statusCode,
@@ -91,6 +85,11 @@ export const errorHandler: ErrorRequestHandler = (
       path: req.path,
       method: req.method,
     });
+  }
+
+  // REQUIREMENT: Include validation tracking parameters inside headers and responses
+  if (requestId) {
+    res.setHeader('X-Request-Id', requestId);
   }
 
   const finalError = mapped.expose ? mapped : Errors.internal();
