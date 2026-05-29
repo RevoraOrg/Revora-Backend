@@ -17,6 +17,14 @@ import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionReposito
 import { LoginService } from './auth/login/loginService';
 import { issueToken } from './lib/jwt';
 import { MetricsCollector } from './lib/metrics';
+import { metricsMiddleware, createPrometheusHandler } from './middleware/metricsMiddleware';
+import { Logger } from './lib/logger';
+import { RefreshService } from './auth/refresh/refreshService';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { RefreshTokenRepository, TokenService } from './auth/refresh/types';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { errorHandler } from './middleware/errorHandler';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -81,6 +89,84 @@ class JwtIssuerImpl implements JwtIssuer {
   }
 }
 
+/**
+ * Middleware to secure the /metrics endpoint with bearer token authentication.
+ * 
+ * Security Assumptions:
+ * - METRICS_TOKEN environment variable must be set in production
+ * - Token should be a cryptographically random string (min 32 characters)
+ * - Requests without valid token are rejected with 401
+ * - In development/test, endpoint is accessible without token for convenience
+ * 
+ * Usage:
+ * Set METRICS_TOKEN environment variable:
+ * ```bash
+ * export METRICS_TOKEN="your-secure-random-token-here"
+ * ```
+ * 
+ * Access metrics:
+ * ```bash
+ * curl -H "Authorization: Bearer your-secure-random-token-here" http://localhost:4000/metrics
+ * ```
+ */
+function createMetricsAuthMiddleware() {
+  return (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+    const metricsToken = process.env.METRICS_TOKEN;
+    const nodeEnv = process.env.NODE_ENV;
+
+    // In development/test, allow access without token for convenience
+    if (nodeEnv === 'development' || nodeEnv === 'test') {
+      next();
+      return;
+    }
+
+    // In production, require METRICS_TOKEN to be set
+    if (!metricsToken) {
+      res.status(503).json({
+        error: 'Metrics endpoint not configured',
+        message: 'METRICS_TOKEN environment variable must be set',
+      });
+      return;
+    }
+
+    // Extract bearer token from Authorization header
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Bearer token required',
+      });
+      return;
+    }
+
+    const token = authHeader.substring(7); // Remove 'Bearer ' prefix
+
+    // Constant-time comparison to prevent timing attacks
+    if (token.length !== metricsToken.length || !timingSafeEqual(Buffer.from(token), Buffer.from(metricsToken))) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid token',
+      });
+      return;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Timing-safe string comparison to prevent timing attacks.
+ * Uses crypto.timingSafeEqual for constant-time comparison.
+ */
+function timingSafeEqual(a: Buffer, b: Buffer): boolean {
+  try {
+    const crypto = require('crypto');
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
 export function createApp() {
   const app = express();
 
@@ -94,6 +180,9 @@ export function createApp() {
     maxCardinality: 1000,
     enablePIIDetection: true,
   });
+
+  // Register metrics middleware to track HTTP requests
+  app.use(metricsMiddleware({ metrics, detailedRoutes: true }));
 
   const sessionRepository = new SessionRepository(pool);
   const requireAuth = createRequireAuth(sessionRepository);
@@ -118,6 +207,9 @@ export function createApp() {
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
   app.use('/api/v1/health', createHealthRouter(pool, dbHealth, metrics));
+
+  // Metrics endpoint (Prometheus format) - secured with internal token
+  app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics));
 
   // Offering sync routes
   app.use('/api/v1/offerings', createOfferingSyncRouter());
