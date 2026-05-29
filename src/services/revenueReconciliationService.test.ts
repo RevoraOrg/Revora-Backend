@@ -5,6 +5,7 @@ import { DistributionRepository } from '../db/repositories/distributionRepositor
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger } from '../lib/logger';
+import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
 
 jest.mock('../db/repositories/revenueReportRepository');
 jest.mock('../db/repositories/distributionRepository');
@@ -45,6 +46,7 @@ describe('RevenueReconciliationService', () => {
   let service: RevenueReconciliationService;
   let mockDb: jest.Mocked<Pool>;
   let mockStellarClient: jest.Mocked<StellarRevenueClient>;
+  let mockTxVerifier: jest.Mocked<StellarTransactionVerifier>;
 
   const offeringId = 'offering-123';
   const contractAddress = 'CONTRACT_ADDRESS_123';
@@ -57,7 +59,10 @@ describe('RevenueReconciliationService', () => {
     mockStellarClient = {
       getRevenueState: jest.fn(),
     };
-    service = new RevenueReconciliationService(mockDb, mockStellarClient);
+    mockTxVerifier = {
+      verifyTransaction: jest.fn(),
+    };
+    service = new RevenueReconciliationService(mockDb, mockStellarClient, mockTxVerifier);
   });
 
   describe('reconcile', () => {
@@ -309,6 +314,298 @@ describe('RevenueReconciliationService', () => {
       const result = await service.validateRevenueReport(offeringId, '10.00', periodStart, periodEnd);
       expect(result.isValid).toBe(false);
       expect(result.errors).toContain('Revenue report already exists for this offering and period');
+    });
+  });
+
+  describe('validateChainEventConsistency with real verifier', () => {
+    it('should successfully validate transactions with matching amounts', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      mockTxVerifier.verifyTransaction.mockResolvedValue({
+        isValid: true,
+        actualAmount: '1000.00',
+        timestamp: '2023-01-15T10:00:00Z',
+      });
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-1', '1000.00');
+      expect(result.discrepancies.filter(d => d.type === 'STELLAR_TX_FAILED')).toHaveLength(0);
+    });
+
+    it('should detect transaction not found on chain', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-missing',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      mockTxVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        errors: ['Transaction not found on chain'],
+      });
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const txFailedDiscrepancy = result.discrepancies.find(d => d.type === 'STELLAR_TX_FAILED');
+      expect(txFailedDiscrepancy).toBeDefined();
+      expect(txFailedDiscrepancy?.severity).toBe('critical');
+      expect(txFailedDiscrepancy?.details.errors).toContain('Transaction not found on chain');
+    });
+
+    it('should detect amount mismatch between DB and chain', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      mockTxVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        actualAmount: '950.00',
+        errors: ['Transaction amount mismatch: expected 1000.00, found 950.00'],
+      });
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const txFailedDiscrepancy = result.discrepancies.find(d => d.type === 'STELLAR_TX_FAILED');
+      expect(txFailedDiscrepancy).toBeDefined();
+      expect(txFailedDiscrepancy?.details.expectedAmount).toBe('1000.00');
+      expect(txFailedDiscrepancy?.details.actualAmount).toBe('950.00');
+    });
+
+    it('should detect transaction timestamp outside reconciliation window', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      // Transaction timestamp is outside the reconciliation period
+      mockTxVerifier.verifyTransaction.mockResolvedValue({
+        isValid: true,
+        actualAmount: '1000.00',
+        timestamp: '2022-12-15T10:00:00Z', // Before periodStart
+      });
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const mismatchDiscrepancy = result.discrepancies.find(d => d.type === 'CHAIN_EVENT_MISMATCH');
+      expect(mismatchDiscrepancy).toBeDefined();
+      expect(mismatchDiscrepancy?.severity).toBe('warning');
+      expect(mismatchDiscrepancy?.message).toContain('timestamp outside reconciliation period');
+    });
+
+    it('should handle timeout errors from verifier', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+      mockTxVerifier.verifyTransaction.mockRejectedValue(timeoutError);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const validationFailedDiscrepancy = result.discrepancies.find(
+        d => d.type === 'CHAIN_EVENT_VALIDATION_FAILED'
+      );
+      expect(validationFailedDiscrepancy).toBeDefined();
+      expect(validationFailedDiscrepancy?.severity).toBe('warning');
+      expect(validationFailedDiscrepancy?.details.failureClass).toBe('TIMEOUT');
+    });
+
+    it('should handle rate limit errors from verifier', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      const rateLimitError = { status: 429 };
+      mockTxVerifier.verifyTransaction.mockRejectedValue(rateLimitError);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const validationFailedDiscrepancy = result.discrepancies.find(
+        d => d.type === 'CHAIN_EVENT_VALIDATION_FAILED'
+      );
+      expect(validationFailedDiscrepancy).toBeDefined();
+      expect(validationFailedDiscrepancy?.details.failureClass).toBe('RATE_LIMIT');
+    });
+
+    it('should report missing transaction hash', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: null,
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      const txNotFoundDiscrepancy = result.discrepancies.find(d => d.type === 'STELLAR_TX_NOT_FOUND');
+      expect(txNotFoundDiscrepancy).toBeDefined();
+      expect(txNotFoundDiscrepancy?.severity).toBe('error');
+      expect(mockTxVerifier.verifyTransaction).not.toHaveBeenCalled();
+    });
+
+    it('should skip validation when verifier is not configured', async () => {
+      const serviceNoVerifier = new RevenueReconciliationService(mockDb, mockStellarClient);
+      
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      const result = await serviceNoVerifier.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      // Should report validation failed because verifier is not configured
+      const validationFailedDiscrepancy = result.discrepancies.find(
+        d => d.type === 'STELLAR_TX_FAILED'
+      );
+      expect(validationFailedDiscrepancy).toBeDefined();
+      expect(validationFailedDiscrepancy?.details.errors).toContain('Transaction verifier not configured');
+    });
+
+    it('should validate multiple transactions in a single reconciliation', async () => {
+      const mockRuns = [
+        {
+          id: 'run-1',
+          stellar_transaction_hash: 'tx-hash-1',
+          total_amount: '1000.00',
+          distribution_date: new Date('2023-01-15'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+        {
+          id: 'run-2',
+          stellar_transaction_hash: 'tx-hash-2',
+          total_amount: '2000.00',
+          distribution_date: new Date('2023-01-20'),
+          status: 'completed',
+          offering_id: offeringId,
+        },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+
+      mockTxVerifier.verifyTransaction
+        .mockResolvedValueOnce({
+          isValid: true,
+          actualAmount: '1000.00',
+          timestamp: '2023-01-15T10:00:00Z',
+        })
+        .mockResolvedValueOnce({
+          isValid: true,
+          actualAmount: '2000.00',
+          timestamp: '2023-01-20T10:00:00Z',
+        });
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd, {
+        validateChainEvents: true,
+      });
+
+      expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledTimes(2);
+      expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-1', '1000.00');
+      expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-2', '2000.00');
+      expect(result.discrepancies.filter(d => d.type === 'STELLAR_TX_FAILED')).toHaveLength(0);
     });
   });
 });

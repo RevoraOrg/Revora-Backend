@@ -18,6 +18,10 @@ import {
   StellarRPCFailureContext 
 } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
+import { 
+  StellarTransactionVerifier,
+  TransactionVerificationResult 
+} from '../lib/stellarTransactionVerifier';
 
 export interface OnChainRevenueState {
   totalDistributed: string;
@@ -94,16 +98,19 @@ export class RevenueReconciliationService {
   private readonly investmentRepo: InvestmentRepository;
   private readonly offeringRepo: OfferingRepository;
   private readonly logger: Logger;
+  private readonly txVerifier?: StellarTransactionVerifier;
 
   constructor(
     private readonly db: Pool,
-    private readonly stellarClient?: StellarRevenueClient
+    private readonly stellarClient?: StellarRevenueClient,
+    txVerifier?: StellarTransactionVerifier
   ) {
     this.revenueReportRepo = new RevenueReportRepository(db);
     this.distributionRepo = new DistributionRepository(db);
     this.investmentRepo = new InvestmentRepository(db);
     this.offeringRepo = new OfferingRepository(db);
     this.logger = logger.child({ service: 'RevenueReconciliationService' });
+    this.txVerifier = txVerifier;
   }
 
   /**
@@ -778,27 +785,27 @@ export class RevenueReconciliationService {
           }
         }
       } catch (error) {
-        const failureClass = classifyStellarRPCFailure(error);
+        const failure = classifyStellarRPCFailure(error);
         this.logger.warn(
           'Failed to validate Stellar transaction',
           {
             offeringId,
             runId: run.id,
             txHash: run.stellar_transaction_hash,
-            failureClass,
+            failureClass: failure.class,
             error: error instanceof Error ? error.message : 'Unknown error',
           }
         );
         
-        if (failureClass !== StellarRPCFailureClass.UNKNOWN) {
+        if (failure.class !== StellarRPCFailureClass.UNKNOWN) {
           discrepancies.push({
             type: 'CHAIN_EVENT_VALIDATION_FAILED',
             severity: 'warning',
-            message: `Chain event validation failed due to ${failureClass}`,
+            message: `Chain event validation failed due to ${failure.class}`,
             details: {
               runId: run.id,
               txHash: run.stellar_transaction_hash,
-              failureClass,
+              failureClass: failure.class,
               error: error instanceof Error ? error.message : 'Unknown error',
             },
             offeringId,
@@ -829,44 +836,17 @@ export class RevenueReconciliationService {
     timestamp?: string;
     errors?: string[];
   }> {
-    // This is a mock implementation - in production, this would call
-    // Stellar RPC to validate the transaction
-    
-    // Simulate network latency and potential failures
-    await new Promise(resolve => setTimeout(resolve, Math.random() * 100));
-    
-    // Simulate different validation scenarios
-    const random = Math.random();
-    if (random < 0.1) {
-      // 10% chance of timeout
-      const timeoutError = new Error('Request timeout');
-      timeoutError.name = 'AbortError';
-      throw timeoutError;
-    } else if (random < 0.15) {
-      // 5% chance of rate limit
-      const rateLimitError = { status: 429 };
-      throw rateLimitError;
-    } else if (random < 0.2) {
-      // 5% chance of transaction not found
+    // If no verifier is configured, return a validation failure
+    if (!this.txVerifier) {
+      this.logger.warn('Transaction verifier not configured', { txHash });
       return {
         isValid: false,
-        errors: ['Transaction not found on chain'],
-      };
-    } else if (random < 0.25) {
-      // 5% chance of amount mismatch
-      return {
-        isValid: false,
-        actualAmount: (parseFloat(expectedAmount) * 0.95).toFixed(2), // 5% less
-        errors: ['Transaction amount does not match expected distribution amount'],
+        errors: ['Transaction verifier not configured'],
       };
     }
-    
-    // 75% chance of success
-    return {
-      isValid: true,
-      actualAmount: expectedAmount,
-      timestamp: new Date().toISOString(),
-    };
+
+    // Use the injected verifier to validate the transaction
+    return await this.txVerifier.verifyTransaction(txHash, expectedAmount);
   }
 
   private async countFailedPayouts(runId: string): Promise<number> {
