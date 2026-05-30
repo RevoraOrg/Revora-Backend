@@ -1,7 +1,9 @@
 import { DistributionRepository } from '../db/repositories/distributionRepository';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { Offering, OfferingRepository } from '../db/repositories/offeringRepository';
+import { Errors } from '../lib/errors';
 import { Logger, globalLogger } from '../lib/logger';
+import { enforceTransition } from '../lib/offeringStatusGuard';
 import {
   getSynchronizedOffering,
   OfferingSyncService,
@@ -29,12 +31,47 @@ export class OfferingService {
   constructor(
     private readonly investmentRepo: Pick<InvestmentRepository, 'getAggregateStats'>,
     private readonly distributionRepo: Pick<DistributionRepository, 'getAggregateStats'>,
-    private readonly offeringRepo: Pick<OfferingRepository, 'listCatalog'>,
+    private readonly offeringRepo: Pick<OfferingRepository, 'listCatalog' | 'findById' | 'updateStatus'>,
     private readonly options: OfferingServiceOptions = {},
   ) {
     this.logger = (options.logger ?? globalLogger).child({
       module: 'OfferingService',
     });
+  }
+
+  /**
+   * Transition an offering to a new status, enforcing the allowed lifecycle.
+   * Reads the current status inside the same logical operation as the write.
+   * Throws AppError (conflict) on illegal transitions, (notFound) if missing.
+   */
+  async updateStatus(offeringId: string, newStatus: string): Promise<Offering> {
+    const offering = await this.offeringRepo.findById(offeringId);
+    if (!offering) {
+      throw Errors.notFound(`Offering ${offeringId} not found`);
+    }
+
+    enforceTransition(offering.status, newStatus);
+
+    const updated = await this.offeringRepo.updateStatus(offeringId, newStatus);
+    if (!updated) {
+      throw Errors.notFound(`Offering ${offeringId} not found`);
+    }
+    return updated;
+  }
+
+  /** Publish a draft offering (draft → open). */
+  async publish(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'open');
+  }
+
+  /** Close an open or paused offering (open|paused → closed). */
+  async close(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'closed');
+  }
+
+  /** Cancel an offering from any non-terminal state. */
+  async cancel(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'cancelled');
   }
 
   async getOfferingStats(offeringId: string): Promise<OfferingStats> {
