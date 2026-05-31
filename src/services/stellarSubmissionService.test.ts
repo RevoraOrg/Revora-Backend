@@ -1,6 +1,15 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { StellarSubmissionService } from './stellarSubmissionService';
 import { env } from '../config/env';
+import { Errors } from '../lib/errors';
+import { StellarRPCFailureClass } from '../lib/stellarRpcFailure';
+
+// Define mock transaction before jest.mock (mocks are hoisted)
+const mockTransaction = {
+  hash: () => Buffer.from('mock-hash', 'hex'),
+  sign: jest.fn(),
+  toXDR: jest.fn().mockReturnValue('mock-xdr'),
+};
 
 // Mock env
 jest.mock('../config/env', () => ({
@@ -62,12 +71,20 @@ jest.mock('@stellar/stellar-sdk', () => {
 });
 
 // Mock environment
-jest.mock('../config/env', () => ({
-  env: {
-    STELLAR_NETWORK: 'testnet',
-    STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
-  },
-}));
+jest.mock('../config/env', () => {
+  const actualEnv = jest.requireActual('../config/env');
+  return {
+    ...actualEnv,
+    env: {
+      STELLAR_HORIZON_URL: 'https://horizon-testnet.stellar.org',
+      STELLAR_TIMEOUT: 30000,
+      STELLAR_MAX_FEE: 100000,
+      STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+      STELLAR_NETWORK: 'testnet',
+      STELLAR_SERVER_SECRET: 'SAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+    },
+  };
+});
 
 describe('StellarSubmissionService', () => {
   let service: StellarSubmissionService;
@@ -77,8 +94,11 @@ describe('StellarSubmissionService', () => {
   beforeEach(() => {
     process.env.STELLAR_SERVER_SECRET = mockSecret;
     jest.clearAllMocks();
+    jest.useFakeTimers();
     service = new StellarSubmissionService();
     mockServer = (StellarSdk.rpc.Server as jest.Mock).mock.results[0].value;
+    // Mock the delay function to avoid actual waiting in tests
+    jest.spyOn(service as any, 'delay').mockImplementation(() => Promise.resolve());
   });
 
   afterEach(() => {
@@ -91,12 +111,16 @@ describe('StellarSubmissionService', () => {
   });
 
   it('should throw error if secret is missing', () => {
-    const originalSecret = process.env.STELLAR_SERVER_SECRET;
-    delete process.env.STELLAR_SERVER_SECRET;
-    expect(() => new StellarSubmissionService()).toThrow(
-      'STELLAR_SERVER_SECRET is not defined in environment variables',
-    );
-    process.env.STELLAR_SERVER_SECRET = originalSecret;
+    const { env } = require('../config/env');
+    const originalSecret = env.STELLAR_SERVER_SECRET;
+    try {
+      delete env.STELLAR_SERVER_SECRET;
+      expect(() => new StellarSubmissionService()).toThrow(
+        'STELLAR_SERVER_SECRET is not defined in environment variables',
+      );
+    } finally {
+      env.STELLAR_SERVER_SECRET = originalSecret;
+    }
   });
 
   it('should throw error if secret is invalid', () => {
@@ -114,7 +138,7 @@ describe('StellarSubmissionService', () => {
 
     const result = await service.submitPayment(to, amount);
 
-    expect(result).toEqual({ hash: 'mock-hash', status: 'PENDING' });
+    expect(result).toEqual({ hash: 'mock-hash', status: 'PENDING', latestLedger: 12345, latestLedgerCloseTime: 1234567890 });
     expect(StellarSdk.Operation.payment).toHaveBeenCalledWith({
       destination: to,
       amount,
@@ -139,7 +163,7 @@ describe('StellarSubmissionService', () => {
 
     const result = await service.submitPayment(to, amount, asset);
 
-    expect(result).toEqual({ hash: 'mock-hash', status: 'SUCCESS' });
+    expect(result).toEqual({ hash: 'mock-hash', status: 'PENDING', latestLedger: 12345, latestLedgerCloseTime: 1234567890 });
     expect(asset.isNative).toHaveBeenCalled();
     expect(StellarSdk.Operation.payment).toHaveBeenCalledWith({
       destination: to,
@@ -155,9 +179,10 @@ describe('StellarSubmissionService', () => {
     }));
 
     const localService = new StellarSubmissionService();
+    jest.spyOn(localService as any, 'delay').mockImplementation(() => Promise.resolve());
 
     await expect(localService.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
-      'Failed to submit payment transaction'
+      'Unknown Stellar network error'
     );
   });
 
@@ -197,5 +222,576 @@ describe('StellarSubmissionService', () => {
     await expect(service.invokeContract('CID', 'func')).rejects.toThrow(
       'Soroban contract invocation not implemented yet',
     );
+  });
+
+  describe('Retry Logic', () => {
+    it('should retry on timeout failure and eventually succeed', async () => {
+      let attemptCount = 0;
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(timeoutError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should retry on rate limit failure and eventually succeed', async () => {
+      let attemptCount = 0;
+      const rateLimitError = {
+        status: 429,
+        message: 'Rate limit exceeded',
+      };
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(rateLimitError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should retry on network error and eventually succeed', async () => {
+      let attemptCount = 0;
+      const networkError = new Error('Network error');
+      networkError.name = 'NetworkError';
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(networkError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should retry on upstream error (500) and eventually succeed', async () => {
+      let attemptCount = 0;
+      const upstreamError = {
+        status: 500,
+        message: 'Internal server error',
+      };
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(upstreamError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should exhaust max retries and throw error', async () => {
+      let attemptCount = 0;
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(timeoutError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should attempt exactly maxRetries times (3)
+      expect(attemptCount).toBe(3);
+    });
+  });
+
+  describe('Non-Retryable Failures', () => {
+    it('should not retry on insufficient funds error', async () => {
+      let attemptCount = 0;
+      const insufficientFundsError = {
+        code: 'INSUFFICIENT_FUNDS',
+        message: 'Insufficient funds',
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(insufficientFundsError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should only attempt once (no retry for insufficient funds)
+      expect(attemptCount).toBe(1);
+    });
+
+    it('should not retry on transaction failed error', async () => {
+      let attemptCount = 0;
+      const transactionFailedError = {
+        code: 'TRANSACTION_FAILED',
+        message: 'Transaction failed',
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(transactionFailedError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should only attempt once (no retry for transaction failed)
+      expect(attemptCount).toBe(1);
+    });
+
+    it('should not retry on unauthorized error (401)', async () => {
+      let attemptCount = 0;
+      const unauthorizedError = {
+        status: 401,
+        message: 'Unauthorized',
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(unauthorizedError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should only attempt once (no retry for unauthorized)
+      expect(attemptCount).toBe(1);
+    });
+
+    it('should not retry on signing error', async () => {
+      let attemptCount = 0;
+      const signingError = {
+        code: 'SIGNING_ERROR',
+        message: 'Invalid signature',
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(signingError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should only attempt once (no retry for signing error)
+      expect(attemptCount).toBe(1);
+    });
+  });
+
+  describe('Secret Safety', () => {
+    it('should never log the secret in error messages', async () => {
+      const logSpy = jest.spyOn(console, 'error').mockImplementation();
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+      const infoSpy = jest.spyOn(console, 'info').mockImplementation();
+
+      const error = new Error('Test error');
+      mockServer.sendTransaction = jest.fn().mockRejectedValue(error);
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Check that secret never appears in any log output
+      const allLogs = [
+        ...logSpy.mock.calls.map(call => JSON.stringify(call)),
+        ...warnSpy.mock.calls.map(call => JSON.stringify(call)),
+        ...infoSpy.mock.calls.map(call => JSON.stringify(call)),
+      ].join(' ');
+
+      expect(allLogs).not.toContain(mockSecret);
+      expect(allLogs).not.toContain('SAXXXXXXXX');
+
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+      infoSpy.mockRestore();
+    });
+
+    it('should never serialize secret into error objects', async () => {
+      const error = new Error('Test error');
+      mockServer.sendTransaction = jest.fn().mockRejectedValue(error);
+
+      try {
+        await service.submitPayment('G-DESTINATION', '10.0');
+      } catch (err: any) {
+        const errorString = JSON.stringify(err);
+        expect(errorString).not.toContain(mockSecret);
+        expect(errorString).not.toContain('SAXXXXXXXX');
+      }
+    });
+  });
+
+  describe('Idempotent Resubmission', () => {
+    it('should prevent duplicate transaction submission', async () => {
+      const mockTransaction = {
+        hash: () => Buffer.from('duplicate-hash-123', 'hex'),
+        sign: jest.fn(),
+      };
+
+      (StellarSdk.TransactionBuilder as unknown as jest.Mock).mockImplementationOnce(() => ({
+        addOperation: jest.fn().mockReturnThis(),
+        setTimeout: jest.fn().mockReturnThis(),
+        build: jest.fn().mockReturnValue(mockTransaction),
+      }));
+
+      const sendTransactionSpy = jest.fn().mockResolvedValue({
+        hash: 'mock-hash',
+        status: 'PENDING',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      mockServer.sendTransaction = sendTransactionSpy;
+
+      // First submission should succeed
+      await service.submitPayment('G-DESTINATION', '10.0');
+
+      // Second submission with same transaction should fail
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
+        'Transaction already submitted'
+      );
+
+      // Should only call sendTransaction once
+      expect(sendTransactionSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should clear transaction cache when requested', async () => {
+      const mockTransaction = {
+        hash: () => Buffer.from('cache-test-hash', 'hex'),
+        sign: jest.fn(),
+      };
+
+      (StellarSdk.TransactionBuilder as unknown as jest.Mock).mockImplementationOnce(() => ({
+        addOperation: jest.fn().mockReturnThis(),
+        setTimeout: jest.fn().mockReturnThis(),
+        build: jest.fn().mockReturnValue(mockTransaction),
+      }));
+
+      const sendTransactionSpy = jest.fn().mockResolvedValue({
+        hash: 'mock-hash',
+        status: 'PENDING',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      mockServer.sendTransaction = sendTransactionSpy;
+
+      // First submission
+      await service.submitPayment('G-DESTINATION', '10.0');
+      expect(service.getTransactionCacheSize()).toBe(1);
+
+      // Clear cache
+      service.clearTransactionCache();
+      expect(service.getTransactionCacheSize()).toBe(0);
+    });
+
+    it('should use idempotency key when provided', async () => {
+      const mockTransaction = {
+        hash: () => Buffer.from('idempotency-hash', 'hex'),
+        sign: jest.fn(),
+      };
+
+      (StellarSdk.TransactionBuilder as unknown as jest.Mock).mockImplementationOnce(() => ({
+        addOperation: jest.fn().mockReturnThis(),
+        setTimeout: jest.fn().mockReturnThis(),
+        build: jest.fn().mockReturnValue(mockTransaction),
+      }));
+
+      const sendTransactionSpy = jest.fn().mockResolvedValue({
+        hash: 'mock-hash',
+        status: 'PENDING',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      mockServer.sendTransaction = sendTransactionSpy;
+
+      // Submit with idempotency key
+      await service.submitPayment('G-DESTINATION', '10.0', undefined, 'test-idempotency-key');
+
+      // Should succeed
+      expect(sendTransactionSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('getAccountWithRetry', () => {
+    it('should retry getAccount on timeout and eventually succeed', async () => {
+      let attemptCount = 0;
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+
+      mockServer.getAccount = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(timeoutError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            accountId: () => 'G-MOCK-PUBLIC-KEY',
+            sequenceNumber: () => '2',
+            incrementSequenceNumber: jest.fn(),
+          });
+        });
+
+      // Access private method via prototype
+      const getAccountWithRetry = (service as any).getAccountWithRetry.bind(service);
+      const result = await getAccountWithRetry('G-MOCK-PUBLIC-KEY', {
+        operation: 'get_account',
+        network: 'testnet',
+        attemptCount: 1,
+      });
+
+      expect(result).toBeDefined();
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should retry getAccount on network error and eventually succeed', async () => {
+      let attemptCount = 0;
+      const networkError = new Error('Network error');
+      networkError.name = 'NetworkError';
+
+      mockServer.getAccount = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(networkError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            accountId: () => 'G-MOCK-PUBLIC-KEY',
+            sequenceNumber: () => '2',
+            incrementSequenceNumber: jest.fn(),
+          });
+        });
+
+      const getAccountWithRetry = (service as any).getAccountWithRetry.bind(service);
+      const result = await getAccountWithRetry('G-MOCK-PUBLIC-KEY', {
+        operation: 'get_account',
+        network: 'testnet',
+        attemptCount: 1,
+      });
+
+      expect(result).toBeDefined();
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should not retry getAccount on non-retryable errors', async () => {
+      let attemptCount = 0;
+      const unauthorizedError = {
+        status: 401,
+        message: 'Unauthorized',
+      };
+
+      mockServer.getAccount = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(unauthorizedError);
+      });
+
+      const getAccountWithRetry = (service as any).getAccountWithRetry.bind(service);
+      
+      await expect(
+        getAccountWithRetry('G-MOCK-PUBLIC-KEY', {
+          operation: 'get_account',
+          network: 'testnet',
+          attemptCount: 1,
+        })
+      ).rejects.toThrow();
+
+      expect(attemptCount).toBe(1);
+    });
+  });
+
+  describe('Edge Cases', () => {
+    it('should handle BAD_SEQUENCE error with retry', async () => {
+      let attemptCount = 0;
+      const badSequenceError = {
+        code: 'BAD_SEQUENCE',
+        message: 'Bad sequence number',
+      };
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(badSequenceError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should handle INSUFFICIENT_FUNDS error without retry', async () => {
+      let attemptCount = 0;
+      const insufficientFundsError = {
+        code: 'INSUFFICIENT_FUNDS',
+        message: 'Insufficient funds for transaction',
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(insufficientFundsError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // Should only attempt once (INSUFFICIENT_FUNDS is non-retryable)
+      expect(attemptCount).toBe(1);
+    });
+
+    it('should handle timeout with retry and backoff', async () => {
+      let attemptCount = 0;
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(timeoutError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.reject(timeoutError);
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'mock-hash',
+            status: 'PENDING',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(attemptCount).toBe(3);
+    });
+
+    it('should handle DUPLICATE status from server', async () => {
+      mockServer.sendTransaction = jest.fn().mockResolvedValue({
+        hash: 'duplicate-hash',
+        status: 'DUPLICATE',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
+        'Transaction already submitted'
+      );
+    });
+
+    it('should handle TRY_AGAIN_LATER status from server', async () => {
+      mockServer.sendTransaction = jest.fn().mockResolvedValue({
+        hash: 'rate-limited-hash',
+        status: 'TRY_AGAIN_LATER',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
+        'Transaction rate limited, try again later'
+      );
+    });
+
+    it('should handle Horizon result codes (tx_bad_seq)', async () => {
+      let attemptCount = 0;
+      const txBadSeqError = {
+        status: 400,
+        extras: {
+          result_codes: {
+            transaction: 'tx_bad_seq',
+            operations: [],
+          },
+        },
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(txBadSeqError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // tx_bad_seq is a protocol error, should not retry
+      expect(attemptCount).toBe(1);
+    });
+
+    it('should handle Horizon operation result codes (op_underfunded)', async () => {
+      let attemptCount = 0;
+      const opUnderfundedError = {
+        status: 400,
+        extras: {
+          result_codes: {
+            transaction: 'tx_success',
+            operations: ['op_underfunded'],
+          },
+        },
+      };
+
+      mockServer.sendTransaction = jest.fn().mockImplementation(() => {
+        attemptCount++;
+        return Promise.reject(opUnderfundedError);
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow();
+
+      // op_underfunded is a protocol error, should not retry
+      expect(attemptCount).toBe(1);
+    });
   });
 });
