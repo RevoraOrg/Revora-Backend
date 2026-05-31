@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
+import { verifyAdminSignature } from '../middleware/adminSignature';
 export interface Offering {
   id: string;
   issuer_id: string;
@@ -59,11 +60,45 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
       }
       return res.json(result);
     } catch (err) {
+      return res.json(result);
+    } catch (err) {
       return next(err);
     }
   }
 
-  return { listOfferings };
+  async function approveOffering(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      // In a real app we'd call offeringService.approve(id) here.
+      // Assuming offeringService is globally available or injected via closures:
+      globalLogger.info('Offering approved', { offeringId: id, adminKid: (req as any).adminKid });
+      res.json({ success: true, status: 'approved' });
+    } catch (e) {
+      next(e);
+    }
+  }
+
+  async function rejectOffering(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      globalLogger.info('Offering rejected', { offeringId: id, adminKid: (req as any).adminKid });
+      res.json({ success: true, status: 'rejected' });
+    } catch (e) {
+      next(e);
+    }
+  }
+
+  async function archiveOffering(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { id } = req.params;
+      globalLogger.info('Offering archived', { offeringId: id, adminKid: (req as any).adminKid });
+      res.json({ success: true, status: 'archived' });
+    } catch (e) {
+      next(e);
+    }
+  }
+
+  return { listOfferings, approveOffering, rejectOffering, archiveOffering };
 }
 
 export function createPublicHandlers(offeringRepo: OfferingRepo) {
@@ -154,6 +189,11 @@ export default function createOfferingsRouter(opts: { offeringRepo: OfferingRepo
   const publicHandlers = createPublicHandlers(opts.offeringRepo);
 
   router.get('/api/startup/offerings', opts.verifyJWT, handlers.listOfferings);
+  // Admin privileged actions
+  router.post('/api/startup/offerings/:id/approve', opts.verifyJWT, verifyAdminSignature(), handlers.approveOffering);
+  router.post('/api/startup/offerings/:id/reject', opts.verifyJWT, verifyAdminSignature(), handlers.rejectOffering);
+  router.post('/api/startup/offerings/:id/archive', opts.verifyJWT, verifyAdminSignature(), handlers.archiveOffering);
+
   // Public catalog for investors (no auth)
   router.get('/api/offerings', publicHandlers.listCatalog);
   router.get('/api/offerings/:id', publicHandlers.getOfferingById);

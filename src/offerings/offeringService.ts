@@ -74,6 +74,21 @@ export class OfferingService {
     return this.updateStatus(offeringId, 'cancelled');
   }
 
+  /** Approve a pending offering */
+  async approve(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'approved');
+  }
+
+  /** Reject a pending offering */
+  async reject(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'rejected');
+  }
+
+  /** Archive a closed or cancelled offering */
+  async archive(offeringId: string): Promise<Offering> {
+    return this.updateStatus(offeringId, 'archived');
+  }
+
   async getOfferingStats(offeringId: string): Promise<OfferingStats> {
     const [investmentStats, distributionStats] = await Promise.all([
       this.investmentRepo.getAggregateStats(offeringId),

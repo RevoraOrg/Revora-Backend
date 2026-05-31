@@ -24,6 +24,7 @@ import { z } from "zod";
  * | STELLAR_TIMEOUT             | No       | 30000                   | Timeout in ms for Stellar operations             |
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
+ * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  */
 
 const envSchema = z.object({
@@ -45,6 +46,7 @@ const envSchema = z.object({
   STELLAR_TIMEOUT: z.coerce.number().int().positive().max(300000).default(30000),
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
+  AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

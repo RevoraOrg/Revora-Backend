@@ -45,6 +45,25 @@ paths:
                   service:
                     type: string
                     example: revora-backend
+                  db:
+                    type: object
+                    additionalProperties: true
+        "503":
+          description: Service is degraded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: degraded
+                  service:
+                    type: string
+                    example: revora-backend
+                  db:
+                    type: object
+                    additionalProperties: true
 
   /api/overview:
     get:

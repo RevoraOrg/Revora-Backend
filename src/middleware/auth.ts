@@ -192,6 +192,49 @@ export function requireInvestor(req: Request, _res: Response, next: NextFunction
   }
 }
 
+// ── requireAdmin ──────────────────────────────────────────────────────────────
+export function requireAdmin(req: Request, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    globalLogger.warn('Auth failed: Missing or invalid Bearer token for admin route', {
+      path: req.path,
+    });
+    next(Errors.unauthorized('Missing or invalid Authorization header'));
+    return;
+  }
+
+  const token = authHeader.slice(7);
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret) {
+    globalLogger.critical('Server config error: JWT_SECRET missing');
+    next(Errors.internal('Server configuration error'));
+    return;
+  }
+
+  try {
+    const secrets = getJwtSecretsForVerification();
+    const payload = verifyJwt(token, secrets);
+    if (payload.role !== 'admin') {
+      globalLogger.warn('Auth failed: Forbidden role for admin route', {
+        role: payload.role,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.forbidden('Forbidden: admin role required'));
+      return;
+    }
+    (req as AuthenticatedRequest).user = { id: payload.sub, role: 'admin' };
+    next();
+  } catch (error) {
+    globalLogger.warn('Auth failed: Admin token verification failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      path: req.path,
+    });
+    next(Errors.unauthorized('Invalid or expired token'));
+  }
+}
+
 // ── authMiddleware (mock — X-Issuer-Id header) ────────────────────────────────
 // NOTE: named export collision with authMiddleware() above is intentional —
 // this const shadows the factory fn for issuer-only routes.
