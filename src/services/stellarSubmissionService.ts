@@ -1,7 +1,7 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { env } from '../config/env';
 import { globalLogger, Logger } from '../lib/logger';
-import { Errors } from '../lib/errors';
+import { Errors, AppError } from '../lib/errors';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailure, 
@@ -26,6 +26,10 @@ export class StellarSubmissionService {
   private server: StellarSdk.rpc.Server;
   private keypair: StellarSdk.Keypair;
   private logger = globalLogger.child({ service: 'stellar-submission' });
+  private submittedTransactionHashes = new Set<string>();
+  private maxRetries = 3;
+  private baseDelayMs = 1000;
+  private maxDelayMs = 30000;
 
   constructor() {
     const horizonUrl =
@@ -79,7 +83,7 @@ export class StellarSubmissionService {
     this.logger.info('Submitting payment transaction', {
       to,
       amount,
-      asset: asset.isNative() ? 'XLM' : asset.getAssetCode(),
+      asset: asset.isNative() ? 'XLM' : asset.code,
     });
 
     try {
@@ -103,7 +107,7 @@ export class StellarSubmissionService {
         .build();
 
       transaction.sign(this.keypair);
-      
+
       // Check for idempotency to prevent duplicate submissions
       const transactionHash = transaction.hash().toString('hex');
       if (this.submittedTransactionHashes.has(transactionHash)) {
@@ -118,7 +122,15 @@ export class StellarSubmissionService {
         });
       }
 
-      const result = await this.server.sendTransaction(transaction);
+      const result = await this.sendTransactionWithRetry(transaction, {
+        operation: 'submit_payment',
+        network: env.STELLAR_NETWORK,
+        attemptCount: 1,
+        idempotencyKey,
+      });
+
+      // Add to submitted hashes after successful submission
+      this.submittedTransactionHashes.add(transactionHash);
 
       this.logger.info('Payment transaction submitted successfully', {
         to,
@@ -258,11 +270,16 @@ export class StellarSubmissionService {
             transactionHash,
           });
         } else if (result.status === 'TRY_AGAIN_LATER') {
-          throw new Error('Transaction rate limited, try again later');
+          throw Errors.serviceUnavailable('Transaction rate limited, try again later');
         } else {
           throw new Error(`Transaction failed: ${result.status}`);
         }
       } catch (error) {
+        // Re-throw AppErrors immediately without classification
+        if (error instanceof Error && error.name === 'AppError') {
+          throw error;
+        }
+
         const failure = classifyStellarRPCFailure(error, {
           ...context,
           operation: 'send_transaction',
