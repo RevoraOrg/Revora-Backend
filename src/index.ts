@@ -33,6 +33,10 @@ import {
 import { pool } from "./db/pool";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
+import { createAdminRouter } from "./routes/admin";
+import { AuditLogRepository } from "./db/repositories/auditLogRepository";
+import { AuditPurgeService } from "./services/auditPurgeService";
+import { MetricsCollector } from "./lib/metrics";
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -594,6 +598,12 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount password reset router
   app.use(createPasswordResetRouter({ db: pool, emailService }));
 
+  // Initialize repositories for admin and audit routes
+  const auditLogRepo = new AuditLogRepository(pool);
+
+  // Mount admin router
+  apiRouter.use("/admin", createAdminRouter(auditLogRepo));
+
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);
@@ -823,6 +833,19 @@ if (require.main === module && env.NODE_ENV !== "test") {
   const service = new WebhookService(repo);
   WebhookQueue.init(repo, service);
   void WebhookQueue.resumePending();
+
+  const auditLogRepo = new AuditLogRepository(pool);
+  const metricsCollector = new MetricsCollector();
+  const auditPurgeService = new AuditPurgeService(auditLogRepo, metricsCollector);
+  
+  auditPurgeService.start(); // Start scheduled purge job
+
+  process.on("SIGTERM", () => {
+    auditPurgeService.stop();
+  });
+  process.on("SIGINT", () => {
+    auditPurgeService.stop();
+  });
 
   server = app.listen(port, () => {
     console.log(`revora-backend listening on http://localhost:${port}`);
