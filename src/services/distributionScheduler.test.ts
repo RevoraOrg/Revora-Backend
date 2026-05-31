@@ -25,6 +25,15 @@ describe('DistributionScheduler', () => {
           amount: '1000.00',
         },
       ]),
+      claimApprovedReportForDistribution: jest.fn().mockImplementation(async (reportId: string) => ({
+        id: reportId,
+        offering_id: 'off-1',
+        period_start: new Date('2026-01-01'),
+        period_end: new Date('2026-01-31'),
+        amount: '1000.00',
+      })),
+      markReportDistributionCompleted: jest.fn().mockResolvedValue(undefined),
+      markReportDistributionFailed: jest.fn().mockResolvedValue(undefined),
     };
 
     scheduler = new DistributionScheduler(engine, revenueReportRepo);
@@ -45,6 +54,22 @@ describe('DistributionScheduler', () => {
       },
       1000
     );
+    expect(revenueReportRepo.claimApprovedReportForDistribution).toHaveBeenCalledWith('report-1');
+    expect(revenueReportRepo.markReportDistributionCompleted).toHaveBeenCalledWith('report-1');
+    expect(revenueReportRepo.markReportDistributionFailed).not.toHaveBeenCalled();
+  });
+
+  it('skips reports claimed by another scheduler', async () => {
+    revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce(null);
+
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.processed).toBe(1);
+    expect(result.successful).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(revenueReportRepo.markReportDistributionCompleted).not.toHaveBeenCalled();
+    expect(revenueReportRepo.markReportDistributionFailed).not.toHaveBeenCalled();
   });
 
   it('handles and sanitizes errors during processing', async () => {
@@ -57,6 +82,7 @@ describe('DistributionScheduler', () => {
     expect(result.successful).toBe(0);
     expect(result.failed).toBe(1);
     expect(result.errors[0].error).toBe('Distribution failed: NETWORK_ERROR');
+    expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-1');
   });
 
   it('preserves AppError messages', async () => {
@@ -76,6 +102,10 @@ describe('DistributionScheduler', () => {
     revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([
       { id: 'report-bad', offering_id: 'off-1' }, // Missing amount and period
     ]);
+    revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce({
+      id: 'report-bad',
+      offering_id: 'off-1',
+    });
 
     const result = await scheduler.processPendingDistributions();
 
@@ -83,5 +113,6 @@ describe('DistributionScheduler', () => {
     expect(result.successful).toBe(0);
     expect(result.failed).toBe(1);
     expect(result.errors[0].error).toBe('Distribution failed: UNKNOWN');
+    expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-bad');
   });
 });

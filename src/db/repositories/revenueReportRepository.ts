@@ -1,5 +1,7 @@
 import { Pool, QueryResult } from 'pg';
 
+export type DistributionStatus = 'in_progress' | 'completed' | 'failed';
+
 export interface RevenueReport {
   id: string;
   offering_id: string;
@@ -9,6 +11,8 @@ export interface RevenueReport {
   amount?: string;
   period_start?: Date;
   period_end?: Date;
+  distribution_status?: DistributionStatus | null;
+  distribution_status_updated_at?: Date | null;
   reported_by: string;
   created_at: Date;
   updated_at: Date;
@@ -181,12 +185,79 @@ export class RevenueReportRepository {
       LEFT JOIN distributions d ON d.period_id = r.id
       WHERE r.status = 'approved'
         AND (d.id IS NULL OR d.status != 'completed')
+        AND (
+          r.distribution_status IS NULL
+          OR r.distribution_status = 'failed'
+          OR (
+            r.distribution_status = 'in_progress'
+            AND r.distribution_status_updated_at < NOW() - INTERVAL '15 minutes'
+          )
+        )
       ORDER BY r.created_at ASC
     `;
 
     const result: QueryResult<RevenueReportRow> = await this.db.query(query);
 
     return result.rows.map((row) => this.mapRevenueReport(row));
+  }
+
+  async claimApprovedReportForDistribution(reportId: string): Promise<RevenueReport | null> {
+    const query = `
+      UPDATE revenue_reports
+      SET distribution_status = 'in_progress',
+          distribution_status_updated_at = NOW()
+      WHERE id = $1
+        AND status = 'approved'
+        AND (
+          distribution_status IS NULL
+          OR distribution_status = 'failed'
+          OR (
+            distribution_status = 'in_progress'
+            AND distribution_status_updated_at < NOW() - INTERVAL '15 minutes'
+          )
+        )
+      RETURNING *
+    `;
+
+    const result: QueryResult<RevenueReportRow> = await this.db.query(query, [reportId]);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.mapRevenueReport(result.rows[0]);
+  }
+
+  async markReportDistributionCompleted(reportId: string): Promise<void> {
+    const query = `
+      UPDATE revenue_reports
+      SET distribution_status = 'completed',
+          distribution_status_updated_at = NOW()
+      WHERE id = $1
+      RETURNING id
+    `;
+
+    const result: QueryResult<RevenueReportRow> = await this.db.query(query, [reportId]);
+
+    if (result.rows.length === 0) {
+      throw new Error(`Failed to mark revenue report ${reportId} as completed`);
+    }
+  }
+
+  async markReportDistributionFailed(reportId: string): Promise<void> {
+    const query = `
+      UPDATE revenue_reports
+      SET distribution_status = 'failed',
+          distribution_status_updated_at = NOW()
+      WHERE id = $1
+      RETURNING id
+    `;
+
+    const result: QueryResult<RevenueReportRow> = await this.db.query(query, [reportId]);
+
+    if (result.rows.length === 0) {
+      throw new Error(`Failed to mark revenue report ${reportId} as failed`);
+    }
   }
 
   private mapRevenueReport(row: RevenueReportRow): RevenueReport {

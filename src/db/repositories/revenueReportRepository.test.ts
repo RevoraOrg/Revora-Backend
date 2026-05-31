@@ -148,4 +148,84 @@ describe('RevenueReportRepository', () => {
       expect(result[0].offering_id).toBe('offering-1');
     });
   });
+
+  describe('distribution status lifecycle', () => {
+    it('claims an approved report for distribution', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [{
+          ...mockReport,
+          distribution_status: 'in_progress',
+          distribution_status_updated_at: new Date('2025-01-10T00:00:00.000Z'),
+        }],
+        rowCount: 1,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const result = await repository.claimApprovedReportForDistribution('report-1');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE revenue_reports'),
+        ['report-1']
+      );
+      expect(result?.distribution_status).toBe('in_progress');
+    });
+
+    it('returns null when a report cannot be claimed', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [],
+        rowCount: 0,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const result = await repository.claimApprovedReportForDistribution('report-1');
+
+      expect(result).toBeNull();
+    });
+
+    it('marks a reported distribution as completed', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [{ id: 'report-1' } as any],
+        rowCount: 1,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      await repository.markReportDistributionCompleted('report-1');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('SET distribution_status = '),
+        ['report-1']
+      );
+    });
+
+    it('marks a reported distribution as failed', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [{ id: 'report-1' } as any],
+        rowCount: 1,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      await repository.markReportDistributionFailed('report-1');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('SET distribution_status = '),
+        ['report-1']
+      );
+    });
+  });
 });

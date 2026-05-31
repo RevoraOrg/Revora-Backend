@@ -49,49 +49,77 @@ export class DistributionScheduler {
     };
 
     for (const report of pendingReports) {
+      let claim: typeof report | null = null;
+
       try {
-        if (!report.period_start || !report.period_end || !report.amount) {
-          throw Errors.badRequest(`Report ${report.id} is missing critical data (period or amount)`);
+        claim = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
+
+        if (!claim) {
+          this.logger.info('Skipping report already claimed by another scheduler', {
+            reportId: report.id,
+          });
+          continue;
+        }
+
+        if (!claim.period_start || !claim.period_end || !claim.amount) {
+          throw Errors.badRequest(`Report ${claim.id} is missing critical data (period or amount)`);
         }
 
         this.logger.info('Processing automated distribution', {
-          reportId: report.id,
-          offeringId: report.offering_id,
-          amount: report.amount,
+          reportId: claim.id,
+          offeringId: claim.offering_id,
+          amount: claim.amount,
         });
 
         await this.distributionEngine.distribute(
-          report.offering_id,
+          claim.offering_id,
           {
-            id: report.id,
-            start: report.period_start,
-            end: report.period_end,
+            id: claim.id,
+            start: claim.period_start,
+            end: claim.period_end,
           },
-          Number(report.amount)
+          Number(claim.amount)
         );
+
+        await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
 
         summary.successful++;
         this.logger.info('Automated distribution successful', {
-          reportId: report.id,
-          offeringId: report.offering_id,
+          reportId: claim.id,
+          offeringId: claim.offering_id,
         });
       } catch (err) {
+        if (claim) {
+          try {
+            await this.revenueReportRepo.markReportDistributionFailed(claim.id);
+          } catch (markErr) {
+            this.logger.error('Failed to update report distribution status after failure', {
+              reportId: claim.id,
+              error: markErr instanceof Error ? markErr.message : String(markErr),
+            });
+          }
+        }
+
+        if (!claim) {
+          continue;
+        }
+
         summary.failed++;
         
         const failure = classifyStellarRPCFailure(err, {
           operation: 'automatedDistribution',
-          offeringId: report.offering_id,
-          periodId: report.id,
+          offeringId: claim.offering_id,
+          periodId: claim.id,
         });
 
         // Use a safe error message for the summary
         const safeError = `Distribution failed: ${failure.class}`;
           
-        summary.errors.push({ reportId: report.id, error: safeError });
+        summary.errors.push({ reportId: claim.id, error: safeError });
         
         this.logger.error('Automated distribution failed', {
-          reportId: report.id,
-          offeringId: report.offering_id,
+          reportId: claim.id,
+          offeringId: claim.offering_id,
           error: err instanceof Error ? err.message : String(err),
           failureClass: failure.class,
           isAppError: err instanceof AppError,
