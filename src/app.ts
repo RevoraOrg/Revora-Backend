@@ -6,6 +6,8 @@ import { pool } from './db/pool';
 import { createRequireAuth } from './middleware/auth';
 import { createCorsMiddleware } from './middleware/cors';
 import { SessionRepository } from './db/repositories/sessionRepository';
+import { WebhookEndpointRepository } from './db/repositories/webhookEndpointRepository';
+import { createAdminWebhooksRouter } from './routes/adminWebhooks';
 import { createLogoutRouter } from './auth/logout/logoutRoute';
 import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
 import { createLoginRouter } from './auth/login/loginRoute';
@@ -186,6 +188,10 @@ export function createApp() {
 
   const sessionRepository = new SessionRepository(pool);
   const requireAuth = createRequireAuth(sessionRepository);
+
+  // Admin webhooks management
+  const webhookRepo = new WebhookEndpointRepository(pool);
+  app.use('/api/v1/admin/webhooks', createAdminWebhooksRouter({ repo: webhookRepo, requireAuth }));
 
   const userRepository = new UserRepository(pool);
   const jwtIssuer = new JwtIssuerImpl();
