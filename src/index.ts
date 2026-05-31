@@ -31,6 +31,7 @@ import {
   WebhookEventType,
 } from "./services/webhookService";
 import { pool } from "./db/pool";
+import { globalMetrics } from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
 import { createAdminRouter } from "./routes/admin";
@@ -805,6 +806,15 @@ export class WebhookQueue {
       last_error: result.error,
       next_retry_at: null,
     });
+    // If the delivery was dead-lettered, update per-endpoint gauge
+    if (nextDelay === -1) {
+      try {
+        const count = await this.repo.countDeadLettersByEndpoint(delivery.endpoint_id);
+        globalMetrics.setGauge('webhook_dead_letter_total', count, { endpoint: endpoint.id }, 'Number of dead-lettered webhook deliveries per endpoint');
+      } catch (err) {
+        console.error('[WebhookQueue] Failed to update dead-letter metric:', err);
+      }
+    }
     return false;
   }
 
