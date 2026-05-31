@@ -138,6 +138,25 @@ export class WebhookEndpointRepository {
     return result.rows[0] ? this.mapDelivery(result.rows[0]) : null;
   }
 
+  async listDeadLettersByEndpoint(endpointId: string, limit = 50, offset = 0): Promise<WebhookDelivery[]> {
+    const result: QueryResult<WebhookDelivery> = await this.db.query(
+      `SELECT * FROM webhook_deliveries
+       WHERE endpoint_id = $1 AND status = 'dead_letter'
+       ORDER BY updated_at DESC
+       LIMIT $2 OFFSET $3`,
+      [endpointId, limit, offset]
+    );
+    return result.rows.map((row) => this.mapDelivery(row));
+  }
+
+  async countDeadLettersByEndpoint(endpointId: string): Promise<number> {
+    const result = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM webhook_deliveries WHERE endpoint_id = $1 AND status = 'dead_letter'`,
+      [endpointId]
+    );
+    return result.rows[0] ? result.rows[0].cnt : 0;
+  }
+
   private map(row: WebhookEndpoint): WebhookEndpoint {
     return {
       id: row.id,
