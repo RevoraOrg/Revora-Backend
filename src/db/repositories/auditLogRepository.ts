@@ -133,4 +133,34 @@ export class AuditLogRepository {
       created_at: row.created_at,
     };
   }
+
+  /**
+   * Purge audit logs created before a specific date
+   * @param cutoffDate The cutoff date
+   * @returns Number of rows deleted
+   */
+  async purgeBefore(cutoffDate: Date): Promise<number> {
+    const query = `
+      DELETE FROM audit_logs
+      WHERE created_at < $1
+    `;
+    const result = await this.db.query(query, [cutoffDate]);
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Get audit logs for CSV export (paginated)
+   * @param limit Number of rows to return
+   * @param offset Offset to start from
+   * @returns Array of audit logs
+   */
+  async getAuditLogsForExport(limit: number, offset: number): Promise<AuditLog[]> {
+    const query = `
+      SELECT * FROM audit_logs
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+    const result = await this.db.query(query, [limit, offset]);
+    return result.rows.map((row) => this.mapAuditLog(row));
+  }
 }
