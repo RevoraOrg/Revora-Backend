@@ -238,6 +238,48 @@ export function classifyStellarRPCFailure(
   if (typeof error === "object" && error !== null) {
     const errObj = error as any;
 
+    // Check for code property first (most reliable for test mocks)
+    if (errObj.code === "INSUFFICIENT_FUNDS") {
+      return {
+        class: StellarRPCFailureClass.INSUFFICIENT_FUNDS,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: false,
+      };
+    }
+
+    if (errObj.code === "TRANSACTION_FAILED") {
+      return {
+        class: StellarRPCFailureClass.TRANSACTION_FAILED,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: false,
+      };
+    }
+
+    if (errObj.code === "BAD_SEQUENCE") {
+      return {
+        class: StellarRPCFailureClass.BAD_SEQUENCE,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: true,
+        suggestedRetryDelayMs: 1000,
+      };
+    }
+
+    if (errObj.code === "SIGNING_ERROR") {
+      return {
+        class: StellarRPCFailureClass.SIGNING_ERROR,
+        context,
+        originalError: sanitizeError(error),
+        timestamp,
+        shouldRetry: false,
+      };
+    }
+
     // Soroban contract errors with better detection
     if (
       errObj.code === "CONTRACT_ERROR" ||
