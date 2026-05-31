@@ -374,14 +374,6 @@ import {
                 continue;
               }
 
-<<<<<<< HEAD
-          // Decimal with scale 2 toString() returns exactly 2 decimal places
-          const amtStr = r.amount.toString();
-          try {
-            await this.withRetry(() =>
-              this.distributionRepo.createPayout({
-                distribution_run_id: run.id,
-=======
               const amtStr = r.amount.toFixed(2);
               await this.withRetry(() =>
                 this.distributionRepo.createPayout(
@@ -434,7 +426,6 @@ import {
               });
 
               failedPayouts.push({
->>>>>>> origin/master
                 investor_id: r.investor_id,
                 amount: amtStr,
                 error: `Action failed with ${failure.class}`,

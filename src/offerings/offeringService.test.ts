@@ -9,7 +9,11 @@ describe('OfferingService', () => {
   let service: OfferingService;
   let mockInvestmentRepo: jest.Mocked<Pick<InvestmentRepository, 'getAggregateStats'>>;
   let mockDistributionRepo: jest.Mocked<Pick<DistributionRepository, 'getAggregateStats'>>;
-  let mockOfferingRepo: jest.Mocked<{ listCatalog: jest.Mock<Promise<Offering[]>, [any]> }>;
+  let mockOfferingRepo: jest.Mocked<{
+    listCatalog: jest.Mock<Promise<Offering[]>, [any]>;
+    findById: jest.Mock<Promise<Offering | null>, [string]>;
+    updateStatus: jest.Mock<Promise<Offering | null>, [string, string]>;
+  }>;
   let mockOfferingSyncService: jest.Mocked<Pick<OfferingSyncService, 'syncOfferingRecord'>>;
 
   const logger = new Logger({ level: LogLevel.TRACE, pretty: false });
@@ -39,6 +43,8 @@ describe('OfferingService', () => {
 
     mockOfferingRepo = {
       listCatalog: jest.fn(),
+      findById: jest.fn(),
+      updateStatus: jest.fn(),
     };
 
     mockOfferingSyncService = {
@@ -190,5 +196,81 @@ describe('OfferingService', () => {
 
     expect(catalog).toEqual([]);
     expect(mockOfferingSyncService.syncOfferingRecord).not.toHaveBeenCalled();
+  });
+
+  // ── Status transition guardrails (issue #345) ─────────────────────────────
+
+  describe('updateStatus', () => {
+    it('allows a valid transition (draft → open)', async () => {
+      const draft: Offering = { id: 'o1', status: 'draft' };
+      const updated: Offering = { id: 'o1', status: 'open' };
+      mockOfferingRepo.findById.mockResolvedValue(draft);
+      mockOfferingRepo.updateStatus.mockResolvedValue(updated);
+
+      const result = await service.updateStatus('o1', 'open');
+      expect(result.status).toBe('open');
+      expect(mockOfferingRepo.updateStatus).toHaveBeenCalledWith('o1', 'open');
+    });
+
+    it('allows open → paused → closed lifecycle', async () => {
+      const open: Offering = { id: 'o2', status: 'open' };
+      mockOfferingRepo.findById.mockResolvedValue(open);
+      mockOfferingRepo.updateStatus.mockResolvedValue({ id: 'o2', status: 'paused' });
+      await service.updateStatus('o2', 'paused');
+
+      const paused: Offering = { id: 'o2', status: 'paused' };
+      mockOfferingRepo.findById.mockResolvedValue(paused);
+      mockOfferingRepo.updateStatus.mockResolvedValue({ id: 'o2', status: 'closed' });
+      const result = await service.updateStatus('o2', 'closed');
+      expect(result.status).toBe('closed');
+    });
+
+    it('throws conflict on illegal transition (closed → open)', async () => {
+      mockOfferingRepo.findById.mockResolvedValue({ id: 'o3', status: 'closed' });
+
+      await expect(service.updateStatus('o3', 'open')).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining('not allowed'),
+      });
+      expect(mockOfferingRepo.updateStatus).not.toHaveBeenCalled();
+    });
+
+    it('throws conflict when cancelling from a terminal state', async () => {
+      mockOfferingRepo.findById.mockResolvedValue({ id: 'o4', status: 'completed' });
+
+      await expect(service.cancel('o4')).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it('throws notFound when offering does not exist', async () => {
+      mockOfferingRepo.findById.mockResolvedValue(null);
+
+      await expect(service.updateStatus('missing', 'open')).rejects.toMatchObject({
+        statusCode: 404,
+      });
+    });
+
+    it('publish() transitions draft → open', async () => {
+      mockOfferingRepo.findById.mockResolvedValue({ id: 'o5', status: 'draft' });
+      mockOfferingRepo.updateStatus.mockResolvedValue({ id: 'o5', status: 'open' });
+
+      const result = await service.publish('o5');
+      expect(result.status).toBe('open');
+    });
+
+    it('close() transitions open → closed', async () => {
+      mockOfferingRepo.findById.mockResolvedValue({ id: 'o6', status: 'open' });
+      mockOfferingRepo.updateStatus.mockResolvedValue({ id: 'o6', status: 'closed' });
+
+      const result = await service.close('o6');
+      expect(result.status).toBe('closed');
+    });
+
+    it('cancel() transitions open → cancelled', async () => {
+      mockOfferingRepo.findById.mockResolvedValue({ id: 'o7', status: 'open' });
+      mockOfferingRepo.updateStatus.mockResolvedValue({ id: 'o7', status: 'cancelled' });
+
+      const result = await service.cancel('o7');
+      expect(result.status).toBe('cancelled');
+    });
   });
 });

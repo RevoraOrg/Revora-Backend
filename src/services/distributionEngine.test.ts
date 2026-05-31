@@ -1223,3 +1223,163 @@ describe('DistributionEngine', () => {
       expect(nonZero.length).toBeGreaterThan(0);
     });
   });
+
+// ── Property-based tests (fast-check) ────────────────────────────────────────
+import * as fc from 'fast-check';
+
+describe('DistributionEngine – property-based rounding invariants', () => {
+  /**
+   * Builds a fresh engine backed by a fresh MockDistributionRepo for each run.
+   */
+  function makeEngine(balances: BalanceRow[]) {
+    return new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider(balances),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+  }
+
+  // Arbitrary: positive integer revenue in cents (1–1_000_000), converted to dollars
+  const revenueArb = fc.integer({ min: 1, max: 1_000_000 }).map((cents) => cents / 100);
+
+  // Arbitrary: non-empty array of positive balances (1–10 investors, balance 1–1e6)
+  const balancesArb = fc
+    .array(fc.integer({ min: 1, max: 1_000_000 }), { minLength: 1, maxLength: 10 })
+    .map((bals) => bals.map((b, i) => ({ investor_id: `i${i}`, balance: b })));
+
+  it('sum(payouts) === revenueAmount for any balances and revenue', async () => {
+    await fc.assert(
+      fc.asyncProperty(balancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-prop', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-prop', period, revenue);
+
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        const expectedCents = Math.round(revenue * 100);
+        return sumCents === expectedCents;
+      }),
+      { numRuns: 200 },
+    );
+  });
+
+  it('every payout >= 0 for any balances and revenue', async () => {
+    await fc.assert(
+      fc.asyncProperty(balancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-nonneg', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-nonneg', period, revenue);
+
+        return result.successfulPayouts.every((p) => Number(p.amount) >= 0);
+      }),
+      { numRuns: 200 },
+    );
+  });
+
+  it('idempotent resume: calling distributeWithBatch twice returns identical totals', async () => {
+    await fc.assert(
+      fc.asyncProperty(balancesArb, revenueArb, async (balances, revenue) => {
+        const repo = new MockDistributionRepo();
+        const engine = new DistributionEngine(
+          null,
+          repo,
+          new MockBalanceProvider(balances),
+          { maxRetries: 1, initialDelayMs: 0 },
+        );
+        const period = { id: 'p-idem', start: new Date(), end: new Date() };
+
+        const r1 = await engine.distributeWithBatch('off-idem', period, revenue);
+        const r2 = await engine.distributeWithBatch('off-idem', period, revenue);
+
+        // Same run id
+        if (r1.distributionRun.id !== r2.distributionRun.id) return false;
+
+        // Same total payout count
+        const sum1 = r1.successfulPayouts.reduce((s, p) => s + Math.round(Number(p.amount) * 100), 0);
+        const sum2 = r2.successfulPayouts.reduce((s, p) => s + Math.round(Number(p.amount) * 100), 0);
+        return sum1 === sum2;
+      }),
+      { numRuns: 100 },
+    );
+  });
+
+  it('single investor always receives the full revenue amount', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.integer({ min: 1, max: 1_000_000 }).map((b) => [{ investor_id: 'solo', balance: b }]),
+        revenueArb,
+        async (balances, revenue) => {
+          const engine = makeEngine(balances);
+          const period = { id: 'p-solo', start: new Date(), end: new Date() };
+          const result = await engine.distributeWithBatch('off-solo', period, revenue);
+
+          const payout = result.successfulPayouts[0];
+          const payoutCents = Math.round(Number(payout.amount) * 100);
+          const expectedCents = Math.round(revenue * 100);
+          return payoutCents === expectedCents;
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it('zero-balance investors are filtered and do not receive payouts', async () => {
+    // Mix of zero and non-zero balances
+    const mixedBalancesArb = fc
+      .array(fc.integer({ min: 0, max: 1_000_000 }), { minLength: 2, maxLength: 10 })
+      .filter((bals) => bals.some((b) => b > 0)) // at least one non-zero
+      .map((bals) => bals.map((b, i) => ({ investor_id: `i${i}`, balance: b })));
+
+    await fc.assert(
+      fc.asyncProperty(mixedBalancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-zero', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-zero', period, revenue);
+
+        // Zero-balance investors should receive 0.00 (or be absent)
+        const zeroIds = new Set(balances.filter((b) => b.balance === 0).map((b) => b.investor_id));
+        for (const p of result.successfulPayouts) {
+          if (zeroIds.has(p.investor_id) && Number(p.amount) > 0) return false;
+        }
+
+        // Sum still equals revenue
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        return sumCents === Math.round(revenue * 100);
+      }),
+      { numRuns: 100 },
+    );
+  });
+
+  it('dust remainder of 0.01 is handled: sum is always exact to the cent', async () => {
+    // Three equal investors with revenue that creates a 0.01 dust remainder
+    const dustArb = fc
+      .integer({ min: 1, max: 333_333 })
+      .map((cents) => (cents * 3 + 1) / 100); // ensures 3-way split has 0.01 remainder
+
+    await fc.assert(
+      fc.asyncProperty(dustArb, async (revenue) => {
+        const balances = [
+          { investor_id: 'a', balance: 1 },
+          { investor_id: 'b', balance: 1 },
+          { investor_id: 'c', balance: 1 },
+        ];
+        const engine = makeEngine(balances);
+        const period = { id: 'p-dust2', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-dust2', period, revenue);
+
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        return sumCents === Math.round(revenue * 100);
+      }),
+      { numRuns: 200 },
+    );
+  });
+});
