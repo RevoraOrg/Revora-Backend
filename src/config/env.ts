@@ -25,6 +25,13 @@ import { z } from "zod";
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
+ * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
+ * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
+ * | SENDGRID_API_KEY            | SendGrid | (empty)                 | SendGrid API key                                 |
+ * | SMTP_HOST                   | SMTP     | (empty)                 | SMTP relay host                                  |
+ * | SMTP_PORT                   | SMTP     | 587                     | SMTP relay port                                  |
+ * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
+ * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
  */
 
 const envSchema = z.object({
@@ -47,6 +54,13 @@ const envSchema = z.object({
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
+  FROM_EMAIL: z.string().email().optional(),
+  SENDGRID_API_KEY: z.string().optional(),
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().positive().max(65535).optional(),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
@@ -58,7 +72,23 @@ const envSchema = z.object({
 .refine(data => {
   if (data.NODE_ENV !== "test" && !data.STELLAR_SERVER_SECRET) return false;
   return true;
-}, { message: "STELLAR_SERVER_SECRET is required", path: ["STELLAR_SERVER_SECRET"] });
+}, { message: "STELLAR_SERVER_SECRET is required", path: ["STELLAR_SERVER_SECRET"] })
+.refine(data => {
+  if (data.EMAIL_PROVIDER === "sendgrid" && !data.SENDGRID_API_KEY) return false;
+  return true;
+}, { message: "SENDGRID_API_KEY is required when EMAIL_PROVIDER=sendgrid", path: ["SENDGRID_API_KEY"] })
+.refine(data => {
+  if (data.EMAIL_PROVIDER === "smtp" && !data.SMTP_HOST) return false;
+  return true;
+}, { message: "SMTP_HOST is required when EMAIL_PROVIDER=smtp", path: ["SMTP_HOST"] })
+.refine(data => {
+  if (Boolean(data.SMTP_USER) !== Boolean(data.SMTP_PASS)) return false;
+  return true;
+}, { message: "SMTP_USER and SMTP_PASS must be provided together", path: ["SMTP_USER"] })
+.refine(data => {
+  if (data.NODE_ENV === "production" && data.EMAIL_PROVIDER === "mock") return false;
+  return true;
+}, { message: "EMAIL_PROVIDER=mock is not permitted in production", path: ["EMAIL_PROVIDER"] });
 
 export type Config = z.infer<typeof envSchema> & { ALLOWED_ORIGINS_ARRAY: string[] };
 
