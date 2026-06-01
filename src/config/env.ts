@@ -25,6 +25,7 @@ import { z } from "zod";
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
+ * | WEBHOOK_QUEUE_MAX_DEPTH     | No       | 100                     | Max in-flight webhook deliveries before deferral |
  */
 
 const envSchema = z.object({
@@ -47,6 +48,7 @@ const envSchema = z.object({
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
