@@ -346,4 +346,76 @@ describe('Decimal Utility', () => {
       expect(positive.isNegative()).toBe(false);
     });
   });
+
+  describe('Property-based algebraic properties (fast-check)', () => {
+    const fc = require('fast-check');
+    const I128_MIN = -170141183460469231731687303715884105728n;
+    const I128_MAX = 170141183460469231731687303715884105727n;
+
+    // Arbitrary for scaled BigInt within i128 bounds and a scale 0..18
+    const scaledBigIntArb = fc.record({
+      scaledValue: fc.bigInt(I128_MIN, I128_MAX),
+      scale: fc.integer(0, 18),
+    }).map(({ scaledValue, scale }) => Decimal.fromScaledBigInt(scaledValue, scale));
+
+    it('addition is associative within i128 envelope or throws DECIMAL_OVERFLOW', () => {
+      fc.assert(
+        fc.property(scaledBigIntArb, scaledBigIntArb, scaledBigIntArb, fc.integer(0, 18), (a, b, c, targetScale) => {
+          try {
+            const left = a.add(b).add(c).toSorobanI128(targetScale);
+            const right = a.add(b.add(c)).toSorobanI128(targetScale);
+            expect(left).toBe(right);
+          } catch (e: any) {
+            expect(e).toBeInstanceOf(AppError);
+            // Structured AppError from Errors.internal should have message 'DECIMAL_OVERFLOW'
+            expect(e.message).toBe('DECIMAL_OVERFLOW');
+          }
+        }),
+      );
+    });
+
+    it('multiplication distributes over addition within i128 envelope or throws DECIMAL_OVERFLOW', () => {
+      // Ensure scales chosen won't force truncation during multiplication: s_a + max(s_b, s_c) <= 18
+      const constrainedArb = fc.tuple(fc.integer(0, 18), fc.integer(0, 18), fc.integer(0, 18)).filter(([sa, sb, sc]) => sa + Math.max(sb, sc) <= 18)
+        .chain(([sa, sb, sc]) =>
+          fc.tuple(
+            fc.bigInt(I128_MIN, I128_MAX).map(v => Decimal.fromScaledBigInt(v, sa)),
+            fc.bigInt(I128_MIN, I128_MAX).map(v => Decimal.fromScaledBigInt(v, sb)),
+            fc.bigInt(I128_MIN, I128_MAX).map(v => Decimal.fromScaledBigInt(v, sc)),
+            fc.integer(0, 18),
+          )
+        );
+
+      fc.assert(
+        fc.property(constrainedArb, ([a, b, c, targetScale]) => {
+          try {
+            const left = a.multiply(b.add(c));
+            const right = a.multiply(b).add(a.multiply(c));
+            // Compare their scaled i128 representations at targetScale
+            const l = left.toSorobanI128(targetScale);
+            const r = right.toSorobanI128(targetScale);
+            expect(l).toBe(r);
+          } catch (e: any) {
+            expect(e).toBeInstanceOf(AppError);
+            expect(e.message).toBe('DECIMAL_OVERFLOW');
+          }
+        }),
+      );
+    });
+
+    it('rounding to a target scale never produces values outside i128 (or throws DECIMAL_OVERFLOW)', () => {
+      fc.assert(
+        fc.property(scaledBigIntArb, fc.integer(0, 18), (d, targetScale) => {
+          try {
+            const v = d.toSorobanI128(targetScale);
+            expect(v).toBeGreaterThanOrEqual(I128_MIN);
+            expect(v).toBeLessThanOrEqual(I128_MAX);
+          } catch (e: any) {
+            expect(e).toBeInstanceOf(AppError);
+            expect(e.message).toBe('DECIMAL_OVERFLOW');
+          }
+        }),
+      );
+    });
+  });
 });

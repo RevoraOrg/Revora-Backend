@@ -1,4 +1,4 @@
-import { AppError, ErrorCode } from './errors';
+import { AppError, ErrorCode, Errors } from './errors';
 
 /**
  * @title Decimal Utility for Soroban i128 Alignment
@@ -137,12 +137,12 @@ export class Decimal {
     }
 
     if (scaledValue > I128_MAX || scaledValue < I128_MIN) {
-      throw new AppError(
-        ErrorCode.VALIDATION_ERROR,
-        `Decimal value ${this.toString()} exceeds Soroban i128 limits after scaling to ${targetScale} decimals.`,
-        400,
-        { value: this.toString(), scaledValue: scaledValue.toString(), targetScale }
-      );
+      throw Errors.internal('DECIMAL_OVERFLOW', {
+        message: `Decimal value ${this.toString()} exceeds Soroban i128 limits after scaling to ${targetScale} decimals.`,
+        value: this.toString(),
+        scaledValue: scaledValue.toString(),
+        targetScale,
+      });
     }
 
     return scaledValue;
