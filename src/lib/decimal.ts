@@ -157,11 +157,7 @@ export class Decimal {
    */
   static fromScaledBigInt(scaledValue: BigInt, scale: number): Decimal {
     if (scale < 0 || scale > 18) {
-      throw new AppError(
-        ErrorCode.INTERNAL_ERROR,
-        `Invalid scale for Decimal.fromScaledBigInt: ${scale}. Must be between 0 and 18.`,
-        500
-      );
+      throw Errors.internal(`Invalid scale for Decimal.fromScaledBigInt: ${scale}. Must be between 0 and 18.`);
     }
 
     const divisor = 10n ** BigInt(scale);
