@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { PoolClient } from 'pg';
 import {
   signPayload,
   WEBHOOK_SIGNATURE_HEADER,
@@ -6,6 +7,7 @@ import {
   WEBHOOK_EVENT_HEADER,
 } from '../lib/webhookSignature';
 import { Logger } from '../lib/logger';
+import { OutboxRepository } from '../db/repositories/outboxRepository';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -50,6 +52,8 @@ export interface WebhookServiceOptions {
   initialDelayMs?: number;
   timeoutMs?: number;
   logger?: Logger;
+  /** Optional outbox repository for transactional event capture. */
+  outboxRepo?: OutboxRepository;
 }
 
 // Re-export signPayload so existing consumers keep working.
@@ -73,6 +77,7 @@ export class WebhookService {
   private readonly initialDelayMs: number;
   private readonly timeoutMs: number;
   private readonly logger: Logger;
+  private readonly outboxRepo?: OutboxRepository;
 
   constructor(
     private readonly endpointRepo: IWebhookEndpointRepository,
@@ -82,6 +87,41 @@ export class WebhookService {
     this.initialDelayMs = options.initialDelayMs ?? 1000;
     this.timeoutMs = options.timeoutMs ?? 10000;
     this.logger = options.logger ?? new Logger({ serviceName: 'webhook-service' });
+    this.outboxRepo = options.outboxRepo;
+  }
+
+  /**
+   * Write an outbox row atomically inside the caller's database transaction.
+   *
+   * Call this instead of `emit()` when you need the event to be captured
+   * atomically with the domain change that produced it.  The dispatcher
+   * (OutboxDispatcher) will drain the row and deliver it later.
+   *
+   * @param client  The transactional PoolClient from the producing transaction.
+   * @param event   Webhook event type.
+   * @param data    Event payload.
+   * @param eventId Optional stable idempotency key; a UUID is generated when omitted.
+   * @returns       The stable event_id written to the outbox row.
+   */
+  async emitToOutbox<T>(
+    client: PoolClient,
+    event: WebhookEventType,
+    data: T,
+    eventId?: string,
+  ): Promise<string> {
+    if (!this.outboxRepo) {
+      throw new Error('WebhookService: outboxRepo is required to use emitToOutbox()');
+    }
+    const row = await this.outboxRepo.insert(
+      { event_type: event, payload: data as unknown, event_id: eventId },
+      client,
+    );
+    this.logger.debug('Webhook event written to outbox', {
+      event,
+      event_id: row.event_id,
+      outbox_id: row.id,
+    });
+    return row.event_id;
   }
 
   /**

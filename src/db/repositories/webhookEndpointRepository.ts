@@ -23,7 +23,7 @@ export interface WebhookDelivery {
   endpoint_id: string;
   payload: any;
   attempts: number;
-  status: 'pending' | 'completed' | 'failed' | 'dead_letter';
+  status: 'pending' | 'completed' | 'failed' | 'dead_letter' | 'deferred';
   next_retry_at: Date | null;
   last_error: string | null;
   created_at: Date;
@@ -136,6 +136,13 @@ export class WebhookEndpointRepository {
       [id]
     );
     return result.rows[0] ? this.mapDelivery(result.rows[0]) : null;
+  }
+
+  async getDeferredDeliveries(): Promise<WebhookDelivery[]> {
+    const result: QueryResult<WebhookDelivery> = await this.db.query(
+      `SELECT * FROM webhook_deliveries WHERE status = 'deferred' ORDER BY created_at ASC`
+    );
+    return result.rows.map(row => this.mapDelivery(row));
   }
 
   async listDeadLettersByEndpoint(endpointId: string, limit = 50, offset = 0): Promise<WebhookDelivery[]> {

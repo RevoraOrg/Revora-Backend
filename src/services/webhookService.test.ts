@@ -12,6 +12,7 @@ import {
   WEBHOOK_TIMESTAMP_HEADER,
   WEBHOOK_EVENT_HEADER,
 } from '../lib/webhookSignature';
+import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -244,10 +245,9 @@ describe('WebhookService.emit', () => {
 
     await expect(svc.emit(WebhookEventType.REVENUE_REPORTED, {})).resolves.toBeUndefined();
     expect(mockFetch).not.toHaveBeenCalled();
+    // The structured logger writes a single formatted string to console.error
     expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining('[WebhookService]'),
-      WebhookEventType.REVENUE_REPORTED,
-      expect.any(Error)
+      expect.stringContaining('Failed to fetch webhook endpoints'),
     );
 
     consoleSpy.mockRestore();
@@ -288,5 +288,66 @@ describe('WebhookEventType', () => {
     expect(WebhookEventType.DISTRIBUTION_COMPLETED).toBe('distribution.completed');
     expect(WebhookEventType.PAYOUT_COMPLETED).toBe('payout.completed');
     expect(WebhookEventType.PAYOUT_FAILED).toBe('payout.failed');
+  });
+});
+
+// ─── WebhookService.emitToOutbox ─────────────────────────────────────────────
+
+describe('WebhookService.emitToOutbox', () => {
+  function makeOutboxRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
+    return {
+      id: 'row-1',
+      event_id: 'stable-uuid',
+      event_type: WebhookEventType.PAYOUT_COMPLETED,
+      payload: {},
+      status: 'pending',
+      attempts: 0,
+      available_at: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+      ...overrides,
+    };
+  }
+
+  it('inserts an outbox row using the provided PoolClient and returns event_id', async () => {
+    const mockClient = {} as any;
+    const row = makeOutboxRow({ event_id: 'stable-uuid' });
+    const outboxRepo = {
+      insert: jest.fn().mockResolvedValue(row),
+    } as unknown as jest.Mocked<OutboxRepository>;
+
+    const svc = new WebhookService(makeRepo(), { outboxRepo });
+    const eventId = await svc.emitToOutbox(mockClient, WebhookEventType.PAYOUT_COMPLETED, { amount: '50' });
+
+    expect(eventId).toBe('stable-uuid');
+    expect(outboxRepo.insert).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: WebhookEventType.PAYOUT_COMPLETED }),
+      mockClient,
+    );
+  });
+
+  it('forwards a caller-supplied event_id to the outbox row', async () => {
+    const mockClient = {} as any;
+    const stableId = 'my-idempotency-key';
+    const row = makeOutboxRow({ event_id: stableId });
+    const outboxRepo = {
+      insert: jest.fn().mockResolvedValue(row),
+    } as unknown as jest.Mocked<OutboxRepository>;
+
+    const svc = new WebhookService(makeRepo(), { outboxRepo });
+    const eventId = await svc.emitToOutbox(mockClient, WebhookEventType.PAYOUT_COMPLETED, {}, stableId);
+
+    expect(eventId).toBe(stableId);
+    expect(outboxRepo.insert).toHaveBeenCalledWith(
+      expect.objectContaining({ event_id: stableId }),
+      mockClient,
+    );
+  });
+
+  it('throws when outboxRepo is not configured', async () => {
+    const svc = new WebhookService(makeRepo());
+    await expect(
+      svc.emitToOutbox({} as any, WebhookEventType.PAYOUT_COMPLETED, {})
+    ).rejects.toThrow('outboxRepo is required');
   });
 });
