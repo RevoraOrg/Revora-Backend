@@ -22,7 +22,8 @@
  *    attacker could observe).
  */
 
-import { randomBytes } from "crypto";
+import { randomBytes, createHash, timingSafeEqual } from "crypto";
+import type { SessionRepository } from "../db/repositories/sessionRepository";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,18 @@ export interface Session {
   createdAt: number;
   /** Last time the session was touched/used. */
   lastSeenAt: number;
+}
+
+/**
+ * The minimal surface the HTTP session middleware depends on. Both the
+ * in-memory {@link SessionStore} and the {@link PostgresSessionStore} satisfy
+ * it, so the middleware can be wired to either without changes.
+ */
+export interface ISessionStore {
+  create(userId: string, role: string): Promise<Session>;
+  get(token: string): Promise<Session | null>;
+  touch(token: string): Promise<boolean>;
+  delete(token: string): Promise<void>;
 }
 
 export interface SessionStoreOptions {
@@ -230,3 +243,167 @@ export class SessionStore {
 
 /** Singleton instance shared across the application. */
 export const sessionStore = new SessionStore();
+
+// ─── Token hashing helpers ──────────────────────────────────────────────────
+
+/**
+ * Derive the at-rest representation of a session token.
+ *
+ * We store a SHA-256 hash, never the plaintext token. SHA-256 (not scrypt) is
+ * the correct choice here: the token already carries 128 bits of cryptographic
+ * entropy, so it is not brute-forceable from its hash — a slow KDF would only
+ * add latency to every request with no security benefit.
+ */
+export function hashSessionToken(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/** Generate a new opaque session token (128 bits of entropy, hex-encoded). */
+export function generateSessionToken(): string {
+  return randomBytes(16).toString("hex");
+}
+
+/**
+ * Constant-time comparison of two hex-encoded hashes of equal length.
+ * Returns false (without leaking via timing) when lengths differ.
+ */
+export function constantTimeHexEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, "hex");
+  const bufB = Buffer.from(b, "hex");
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+// ─── PostgresSessionStore ────────────────────────────────────────────────────
+
+export interface PostgresSessionStoreOptions {
+  /**
+   * Session lifetime in milliseconds.
+   * @default 3_600_000 (1 hour)
+   */
+  ttlMs?: number;
+  /**
+   * How often the cleanup job removes expired rows (milliseconds).
+   * Set to 0 to disable (the default — call {@link PostgresSessionStore.startCleanup}
+   * explicitly from the bootstrap layer).
+   * @default 0
+   */
+  cleanupIntervalMs?: number;
+  /** Injectable clock for deterministic testing. Defaults to Date.now. */
+  now?: () => number;
+}
+
+/**
+ * Postgres-backed {@link ISessionStore}.
+ *
+ * Unlike the in-memory {@link SessionStore}, sessions here survive process
+ * restarts and are shared across instances. Tokens are stored as SHA-256
+ * hashes (never plaintext) and validated with a constant-time comparison.
+ */
+export class PostgresSessionStore implements ISessionStore {
+  private readonly ttlMs: number;
+  private readonly cleanupIntervalMs: number;
+  private readonly now: () => number;
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly repo: SessionRepository,
+    opts: PostgresSessionStoreOptions = {},
+  ) {
+    this.ttlMs = opts.ttlMs ?? 3_600_000;
+    this.cleanupIntervalMs = opts.cleanupIntervalMs ?? 0;
+    this.now = opts.now ?? Date.now;
+  }
+
+  // ─── ISessionStore ─────────────────────────────────────────────────────────
+
+  async create(userId: string, role: string): Promise<Session> {
+    const token = generateSessionToken();
+    const tokenHash = hashSessionToken(token);
+    const now = this.now();
+    const expiresAt = new Date(now + this.ttlMs);
+
+    const row = await this.repo.createWebSession({
+      user_id: userId,
+      role,
+      token_hash: tokenHash,
+      expires_at: expiresAt,
+    });
+
+    return this.toSession(row, token);
+  }
+
+  async get(token: string): Promise<Session | null> {
+    const tokenHash = hashSessionToken(token);
+    const row = await this.repo.findByTokenHash(tokenHash);
+    if (!row) return null;
+
+    // Constant-time guard against any non-exact DB match.
+    if (!constantTimeHexEqual(row.token_hash, tokenHash)) return null;
+
+    // Revoked and expired sessions are treated as if they never existed.
+    if (row.revoked_at) return null;
+    if (new Date(row.expires_at).getTime() <= this.now()) {
+      // Lazy cleanup — best-effort, never blocks the rejection.
+      await this.repo.deleteByTokenHash(tokenHash).catch(() => undefined);
+      return null;
+    }
+
+    return this.toSession(row, token);
+  }
+
+  async touch(token: string): Promise<boolean> {
+    const existing = await this.get(token);
+    if (!existing) return false;
+    const expiresAt = new Date(this.now() + this.ttlMs);
+    await this.repo.touchExpiryByTokenHash(hashSessionToken(token), expiresAt);
+    return true;
+  }
+
+  async delete(token: string): Promise<void> {
+    await this.repo.deleteByTokenHash(hashSessionToken(token));
+  }
+
+  // ─── Cleanup job ─────────────────────────────────────────────────────────
+
+  /** Remove every expired session row. Returns the number deleted. */
+  async cleanupExpired(): Promise<number> {
+    return this.repo.deleteExpired();
+  }
+
+  /** Start the periodic cleanup job. No-op if already running or disabled. */
+  startCleanup(): void {
+    if (this.cleanupTimer !== null || this.cleanupIntervalMs === 0) return;
+    this.cleanupTimer = setInterval(() => {
+      void this.cleanupExpired().catch(() => undefined);
+    }, this.cleanupIntervalMs);
+    if (this.cleanupTimer.unref) this.cleanupTimer.unref();
+  }
+
+  /** Stop the periodic cleanup job. */
+  stop(): void {
+    if (this.cleanupTimer !== null) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  /** Snapshot of store metrics (active = non-expired, non-revoked). */
+  async stats(): Promise<{ activeSessions: number }> {
+    return { activeSessions: await this.repo.countActive() };
+  }
+
+  // ─── Internal ─────────────────────────────────────────────────────────────
+
+  private toSession(row: { user_id: string; role?: string | null; expires_at: Date }, token: string): Session {
+    const now = this.now();
+    return {
+      token,
+      userId: row.user_id,
+      role: row.role ?? "",
+      expiresAt: new Date(row.expires_at).getTime(),
+      createdAt: now,
+      lastSeenAt: now,
+    };
+  }
+}

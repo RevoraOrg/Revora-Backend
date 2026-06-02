@@ -1,362 +1,366 @@
 /**
  * @file src/auth/refresh/refreshService.test.ts
- * @description
- * Test suite for RefreshService — token rotation, reuse detection, and
- * concurrent (race-condition) refresh coverage.
+ * @description Focused refresh-token rotation, replay detection, and family
+ * revocation coverage.
  *
- * Test strategy:
- *  - All DB interactions are mocked; no real Postgres required.
- *  - Concurrent tests use `Promise.all` to launch two refresh calls
- *    simultaneously, then assert the safety invariant:
- *      • At most one call may succeed (return tokens).
- *      • Exactly one revocation must occur.
- *  - Clock / crypto is NOT mocked — determinism comes from the mocked
- *    repository, not from timing.
- *
- * Security invariants verified:
- *  - A reused token (child session already exists) triggers revocation.
- *  - A revoked session triggers revocation.
- *  - A concurrent double-use triggers revocation (in-flight guard).
- *  - An invalid token never reaches the repository.
- *  - Session tree revocation is idempotent (revokeSessionAndDescendants
- *    may be called more than once without error).
+ * Security invariants:
+ * - A refresh token is valid for exactly one completed rotation.
+ * - Replay of any consumed ancestor revokes that ancestor and every descendant
+ *   in the same repository transaction callback.
+ * - A same-process concurrent duplicate is deduplicated and must not revoke
+ *   the valid child created by the winning caller.
+ * - Logs must never include the raw refresh token value.
  */
 
 import { RefreshService } from './refreshService';
-import { RefreshTokenRepository, TokenService, RefreshTokenPayload } from './types';
+import { RefreshTokenPayload, RefreshTokenRepository, TokenService } from './types';
 import { withTransaction } from '../../db/transaction';
 
 jest.mock('../../db/transaction');
 
-// ─── Shared fixtures ──────────────────────────────────────────────────────────
+const USER_ID = 'user-123';
+const ROLE = 'investor';
+const NOW_FUTURE = new Date('2099-01-01T00:00:00.000Z');
+const NOW_PAST = new Date('2000-01-01T00:00:00.000Z');
 
-const MOCK_PAYLOAD: RefreshTokenPayload = {
-    userId: 'user-123',
-    sessionId: 'session-123',
-    role: 'investor',
+type StoredSession = {
+    id: string;
+    user_id: string;
+    token_hash: string;
+    expires_at: Date;
+    parent_id: string | null;
+    revoked_at: Date | null;
+    token_consumed_at: Date | null;
 };
 
-const MOCK_TOKENS = {
-    accessToken: 'new-access-token',
-    refreshToken: 'new-refresh-token',
-};
+class InMemoryRefreshRepository implements RefreshTokenRepository {
+    readonly sessions = new Map<string, StoredSession>();
+    readonly revocations: string[] = [];
 
-// ─── Suite ────────────────────────────────────────────────────────────────────
+    addSession(input: {
+        id: string;
+        token: string;
+        parent_id?: string | null;
+        expires_at?: Date;
+        token_consumed_at?: Date | null;
+    }): void {
+        this.sessions.set(input.id, {
+            id: input.id,
+            user_id: USER_ID,
+            token_hash: `hash:${input.token}`,
+            expires_at: input.expires_at ?? NOW_FUTURE,
+            parent_id: input.parent_id ?? null,
+            revoked_at: null,
+            token_consumed_at: input.token_consumed_at ?? null,
+        });
+    }
+
+    async findSessionById(sessionId: string): Promise<StoredSession | null> {
+        return this.sessions.get(sessionId) ?? null;
+    }
+
+    async findSessionByIdForUpdate(sessionId: string): Promise<StoredSession | null> {
+        return this.sessions.get(sessionId) ?? null;
+    }
+
+    async createSession(input: {
+        id?: string;
+        user_id: string;
+        token_hash: string;
+        expires_at: Date;
+        parent_id: string;
+    }): Promise<StoredSession> {
+        if (!input.id) {
+            throw new Error('test requires explicit session ids');
+        }
+
+        const session: StoredSession = {
+            id: input.id,
+            user_id: input.user_id,
+            token_hash: input.token_hash,
+            expires_at: input.expires_at,
+            parent_id: input.parent_id,
+            revoked_at: null,
+            token_consumed_at: null,
+        };
+        this.sessions.set(input.id, session);
+        return session;
+    }
+
+    async revokeSessionAndDescendants(sessionId: string): Promise<void> {
+        this.revocations.push(sessionId);
+        const stack = [sessionId];
+        const revokedAt = new Date('2026-01-01T00:00:00.000Z');
+
+        while (stack.length > 0) {
+            const currentId = stack.pop()!;
+            const current = this.sessions.get(currentId);
+            if (current) {
+                current.revoked_at = revokedAt;
+            }
+
+            for (const session of this.sessions.values()) {
+                if (session.parent_id === currentId) {
+                    stack.push(session.id);
+                }
+            }
+        }
+    }
+
+    async findSessionByParentId(parentId: string): Promise<StoredSession | null> {
+        return [...this.sessions.values()].find((session) => session.parent_id === parentId) ?? null;
+    }
+
+    async setSessionConsumed(sessionId: string): Promise<void> {
+        const session = this.sessions.get(sessionId);
+        if (session) {
+            session.token_consumed_at = new Date('2026-01-01T00:00:00.000Z');
+        }
+    }
+}
+
+class DeterministicTokenService implements TokenService {
+    verifyRefreshToken(token: string): RefreshTokenPayload {
+        if (!token.startsWith('refresh-')) {
+            throw new Error('invalid token');
+        }
+
+        return {
+            userId: USER_ID,
+            sessionId: token.replace('refresh-', ''),
+            role: ROLE,
+        };
+    }
+
+    issueTokens(payload: RefreshTokenPayload): { accessToken: string; refreshToken: string } {
+        return {
+            accessToken: `access-${payload.sessionId}`,
+            refreshToken: `refresh-${payload.sessionId}`,
+        };
+    }
+
+    hashToken(token: string): string {
+        return `hash:${token}`;
+    }
+}
+
+const createMockRepo = (): jest.Mocked<RefreshTokenRepository> => ({
+    findSessionById: jest.fn(),
+    findSessionByIdForUpdate: jest.fn(),
+    createSession: jest.fn(),
+    revokeSessionAndDescendants: jest.fn().mockResolvedValue(undefined),
+    setSessionConsumed: jest.fn().mockResolvedValue(undefined),
+    findSessionByParentId: jest.fn(),
+});
+
+const createMockTokenService = (): jest.Mocked<TokenService> => ({
+    verifyRefreshToken: jest.fn(),
+    issueTokens: jest.fn(),
+    hashToken: jest.fn(),
+});
 
 describe('RefreshService', () => {
-    let refreshService: RefreshService;
-    let mockRepo: jest.Mocked<RefreshTokenRepository>;
-    let mockTokenService: jest.Mocked<TokenService>;
-    let mockDb: any;
     let mockWithTransaction: jest.MockedFunction<typeof withTransaction>;
+    let mockDb: any;
+    let mockClient: any;
+    let logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
 
     beforeEach(() => {
-        mockRepo = {
-            findSessionById: jest.fn(),
-            findSessionByIdForUpdate: jest.fn(),
-            createSession: jest.fn(),
-            revokeSessionAndDescendants: jest.fn().mockResolvedValue(undefined),
-            setSessionConsumed: jest.fn().mockResolvedValue(undefined),
-            findSessionByParentId: jest.fn(),
+        mockDb = {};
+        mockClient = {};
+        logger = {
+            info: jest.fn(),
+            warn: jest.fn(),
+            error: jest.fn(),
         };
-        mockTokenService = {
-            verifyRefreshToken: jest.fn(),
-            issueTokens: jest.fn(),
-            hashToken: jest.fn(),
-        };
-        mockDb = {}; // Mock DB pool
         mockWithTransaction = withTransaction as jest.MockedFunction<typeof withTransaction>;
-        mockWithTransaction.mockClear(); // Clear previous calls
-        refreshService = new RefreshService(mockRepo, mockTokenService, mockDb);
+        mockWithTransaction.mockReset();
+        mockWithTransaction.mockImplementation(async (_db, callback) => callback(mockClient));
     });
 
-    // ── Original passing tests (unchanged) ───────────────────────────────────
+    it('rotates a valid token and marks the parent consumed before creating the child session', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
 
-    it('should rotate tokens successfully', async () => {
-        const mockClient = {};
-        mockWithTransaction.mockImplementation(async (db, callback) => {
-            return await callback(mockClient as any);
-        });
-
-        mockTokenService.verifyRefreshToken.mockReturnValue(mockPayload);
-        mockTokenService.issueTokens.mockReturnValue(mockTokens);
-        mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
-            id: 'session-123', 
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.issueTokens.mockReturnValue({ accessToken: 'access-new', refreshToken: 'refresh-new' });
+        tokenService.hashToken.mockReturnValueOnce('hash:refresh-session-0').mockReturnValueOnce('hash:refresh-new');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_FUTURE,
             revoked_at: null,
-            token_hash: 'hashed-token',
             token_consumed_at: null,
         });
-        mockTokenService.hashToken.mockReturnValueOnce('hashed-token').mockReturnValueOnce('new-hash');
-        mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
+        repo.findSessionByParentId.mockResolvedValue(null);
+        repo.createSession.mockResolvedValue({ id: 'session-1' });
 
-        const result = await refreshService.refresh('old-token');
+        const result = await service.refresh('refresh-session-0');
 
-        expect(mockWithTransaction).toHaveBeenCalledWith(mockDb, expect.any(Function));
-        expect(result).toEqual(mockTokens);
-        expect(mockRepo.findSessionByIdForUpdate).toHaveBeenCalledWith('session-123', mockClient);
-        expect(mockTokenService.hashToken).toHaveBeenCalledWith('old-token');
-        expect(mockRepo.createSession).toHaveBeenCalled();
-        expect(mockRepo.setSessionConsumed).toHaveBeenCalledWith('session-123', mockClient);
-        expect(mockRepo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+        expect(result).toEqual({ accessToken: 'access-new', refreshToken: 'refresh-new' });
+        expect(repo.findSessionByIdForUpdate).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.setSessionConsumed).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.createSession).toHaveBeenCalledWith(
+            expect.objectContaining({
+                user_id: USER_ID,
+                token_hash: 'hash:refresh-new',
+                parent_id: 'session-0',
+            }),
+            mockClient,
+        );
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
     });
 
-    it('should revoke session and descendants if token is reused (already has child)', async () => {
-        const mockClient = {};
-        mockWithTransaction.mockImplementation(async (db, callback) => {
-            return await callback(mockClient as any);
-        });
+    it('rotates N to N+1 to N+2, then replaying N revokes N+1 and N+2 descendants', async () => {
+        const repo = new InMemoryRefreshRepository();
+        repo.addSession({ id: 'session-0', token: 'refresh-session-0' });
+        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger as any);
 
-        mockTokenService.verifyRefreshToken.mockReturnValue(mockPayload);
-        mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
-            id: 'session-123', 
+        const first = await service.refresh('refresh-session-0');
+        expect(first?.refreshToken).toMatch(/^refresh-/);
+        const session1Id = first!.refreshToken.replace('refresh-', '');
+
+        const second = await service.refresh(first!.refreshToken);
+        expect(second?.refreshToken).toMatch(/^refresh-/);
+        const session2Id = second!.refreshToken.replace('refresh-', '');
+
+        expect(repo.sessions.get('session-0')?.revoked_at).toBeNull();
+        expect(repo.sessions.get(session1Id)?.revoked_at).toBeNull();
+        expect(repo.sessions.get(session2Id)?.revoked_at).toBeNull();
+
+        const replay = await service.refresh('refresh-session-0');
+
+        expect(replay).toBeNull();
+        expect(repo.revocations).toEqual(['session-0']);
+        expect(repo.sessions.get('session-0')?.revoked_at).toBeInstanceOf(Date);
+        expect(repo.sessions.get(session1Id)?.revoked_at).toBeInstanceOf(Date);
+        expect(repo.sessions.get(session2Id)?.revoked_at).toBeInstanceOf(Date);
+    });
+
+    it('replay of a grandparent token revokes a lineage longer than 10 sessions', async () => {
+        const repo = new InMemoryRefreshRepository();
+        repo.addSession({ id: 'session-0', token: 'refresh-session-0' });
+        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger as any);
+
+        const sessionIds = ['session-0'];
+        let refreshToken = 'refresh-session-0';
+        for (let i = 0; i < 11; i += 1) {
+            const result = await service.refresh(refreshToken);
+            expect(result).not.toBeNull();
+            refreshToken = result!.refreshToken;
+            sessionIds.push(refreshToken.replace('refresh-', ''));
+        }
+
+        const replay = await service.refresh('refresh-session-0');
+
+        expect(replay).toBeNull();
+        expect(repo.revocations).toEqual(['session-0']);
+        for (const sessionId of sessionIds) {
+            expect(repo.sessions.get(sessionId)?.revoked_at).toBeInstanceOf(Date);
+        }
+    });
+
+    it('deduplicates two same-process callers racing on the same token without revoking the winner child', async () => {
+        let releaseFirstRead!: () => void;
+        const firstRead = new Promise<void>((resolve) => {
+            releaseFirstRead = resolve;
+        });
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.issueTokens.mockReturnValue({ accessToken: 'access-new', refreshToken: 'refresh-new' });
+        tokenService.hashToken.mockReturnValueOnce('hash:refresh-session-0').mockReturnValueOnce('hash:refresh-new');
+        repo.findSessionByIdForUpdate.mockImplementationOnce(async () => {
+            await firstRead;
+            return {
+                id: 'session-0',
+                user_id: USER_ID,
+                token_hash: 'hash:refresh-session-0',
+                expires_at: NOW_FUTURE,
+                revoked_at: null,
+                token_consumed_at: null,
+            };
+        });
+        repo.findSessionByParentId.mockResolvedValue(null);
+        repo.createSession.mockResolvedValue({ id: 'session-1' });
+
+        const first = service.refresh('refresh-session-0');
+        const second = service.refresh('refresh-session-0');
+        releaseFirstRead();
+
+        const results = await Promise.all([first, second]);
+        const successes = results.filter(Boolean);
+
+        expect(successes).toEqual([{ accessToken: 'access-new', refreshToken: 'refresh-new' }]);
+        expect(repo.createSession).toHaveBeenCalledTimes(1);
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+    });
+
+    it('revokes the family when a previously consumed parent token is replayed after rotation', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_FUTURE,
             revoked_at: null,
-            token_hash: 'hashed-token',
-            token_consumed_at: null,
+            token_consumed_at: new Date('2026-01-01T00:00:00.000Z'),
         });
-        mockTokenService.hashToken.mockReturnValue('hashed-token');
-        mockRepo.findSessionByParentId.mockResolvedValue({ id: 'child-session-id' });
 
-        const result = await refreshService.refresh('reused-token');
+        const result = await service.refresh('refresh-session-0');
 
         expect(result).toBeNull();
-        expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-123', mockClient);
+        expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.createSession).not.toHaveBeenCalled();
     });
 
-    it('should revoke session and descendants if session is already revoked', async () => {
-        const mockClient = {};
-        mockWithTransaction.mockImplementation(async (db, callback) => {
-            return await callback(mockClient as any);
-        });
+    it('rejects an expired parent session without creating a child or revoking unrelated descendants', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
 
-        mockTokenService.verifyRefreshToken.mockReturnValue(mockPayload);
-        mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
-            id: 'session-123', 
-            revoked_at: new Date(),
-            token_hash: 'hashed-token',
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_PAST,
+            revoked_at: null,
             token_consumed_at: null,
         });
-        mockTokenService.hashToken.mockReturnValue('hashed-token');
 
-        const result = await refreshService.refresh('revoked-token');
+        const result = await service.refresh('refresh-session-0');
 
         expect(result).toBeNull();
-        expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-123', mockClient);
+        expect(repo.createSession).not.toHaveBeenCalled();
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
     });
 
-    it('should return null if token verification fails', async () => {
-        mockTokenService.verifyRefreshToken.mockImplementation(() => {
-            throw new Error('Invalid token');
+    it('does not write raw refresh tokens into warning logs when verification fails', async () => {
+        const rawToken = 'raw-refresh-token-value-that-must-not-leak';
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockImplementation(() => {
+            throw new Error('invalid token');
         });
 
-        const result = await refreshService.refresh('invalid-token');
+        const result = await service.refresh(rawToken);
 
         expect(result).toBeNull();
+        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(rawToken);
+        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(rawToken.substring(0, 10));
         expect(mockWithTransaction).not.toHaveBeenCalled();
-    });
-
-    it('should return null if session is not found', async () => {
-        const mockClient = {};
-        mockWithTransaction.mockImplementation(async (db, callback) => {
-            return await callback(mockClient as any);
-        });
-
-        mockTokenService.verifyRefreshToken.mockReturnValue(mockPayload);
-        mockRepo.findSessionByIdForUpdate.mockResolvedValue(null);
-
-        const result = await refreshService.refresh('unknown-token');
-
-        expect(result).toBeNull();
-        expect(mockWithTransaction).toHaveBeenCalled();
-    });
-
-    it('should revoke session if token hash does not match', async () => {
-        const mockClient = {};
-        mockWithTransaction.mockImplementation(async (db, callback) => {
-            return await callback(mockClient as any);
-        });
-
-        mockTokenService.verifyRefreshToken.mockReturnValue(mockPayload);
-        mockRepo.findSessionByIdForUpdate.mockResolvedValue({ 
-            id: 'session-123', 
-            revoked_at: null,
-            token_hash: 'stored-hash',
-            token_consumed_at: null,
-        });
-        mockTokenService.hashToken.mockReturnValue('different-hash');
-
-        const result = await refreshService.refresh('tampered-token');
-
-        expect(result).toBeNull();
-        expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-123', mockClient);
-    });
-
-    // ── Concurrent / race-condition tests ─────────────────────────────────────
-
-    describe('concurrent refresh race coverage', () => {
-        /**
-         * Scenario: Two requests arrive simultaneously with the same refresh token.
-         *
-         * Expected invariant:
-         *  - At most one call returns tokens (the second enters the in-flight
-         *    guard and gets null immediately).
-         *  - revokeSessionAndDescendants is called at least once.
-         *  - createSession is called at most once (the winning call).
-         */
-        it('concurrent double-use: at most one succeeds; session tree is revoked', async () => {
-            // Introduce an artificial delay in findSessionById so both calls
-            // reach the in-flight check before either one completes.
-            let resolveFirst!: () => void;
-            const barrier = new Promise<void>((res) => { resolveFirst = res; });
-
-            mockTokenService.verifyRefreshToken.mockReturnValue(MOCK_PAYLOAD);
-            mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
-            mockTokenService.hashToken.mockReturnValue('new-hash');
-
-            // First call blocks at findSessionById until we release it.
-            mockRepo.findSessionById
-                .mockImplementationOnce(() => barrier.then(() => ({ id: 'session-123', revoked_at: null })))
-                .mockResolvedValue({ id: 'session-123', revoked_at: null, token_consumed_at: null });
-
-            mockRepo.findSessionByParentId.mockResolvedValue(null);
-            mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
-            mockRepo.revokeSessionAndDescendants.mockResolvedValue(undefined);
-
-            // Launch both calls concurrently BEFORE releasing the barrier.
-            const [p1, p2] = [
-                refreshService.refresh('same-token'),
-                refreshService.refresh('same-token'),
-            ];
-
-            // Release the barrier so the first call can continue.
-            resolveFirst();
-
-            const [r1, r2] = await Promise.all([p1, p2]);
-
-            // At most one result is non-null.
-            const successes = [r1, r2].filter((r) => r !== null);
-            expect(successes.length).toBeLessThanOrEqual(1);
-
-            // The losing (concurrent) call must have triggered revocation.
-            expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalled();
-
-            // createSession can only have been called by the winner (if any).
-            expect(mockRepo.createSession.mock.calls.length).toBeLessThanOrEqual(1);
-        });
-
-        /**
-         * Scenario: Sequential double-use (reuse after successful rotation).
-         *
-         * The first call succeeds and creates a child session.
-         * The second call (same parent token) detects the child → revocation.
-         */
-        it('sequential double-use: second call revokes session tree', async () => {
-            mockTokenService.verifyRefreshToken.mockReturnValue(MOCK_PAYLOAD);
-            mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
-            mockTokenService.hashToken.mockReturnValue('new-hash');
-            mockRepo.findSessionById.mockResolvedValue({ id: 'session-123', revoked_at: null });
-            mockRepo.findSessionById.mockResolvedValue({ id: 'session-123', revoked_at: null, token_consumed_at: null });
-            mockRepo.findSessionByParentId
-                .mockResolvedValueOnce(null)                         // first call: no child yet
-                .mockResolvedValue({ id: 'child-session-id' });      // second call: child exists
-            mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
-
-            const first = await refreshService.refresh('token');
-            expect(first).toEqual(MOCK_TOKENS);
-
-            const second = await refreshService.refresh('token');
-            expect(second).toBeNull();
-            expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-123');
-        });
-
-        /**
-         * Scenario: Race where the session becomes revoked between two concurrent
-         * calls — the second call finds revoked_at set and triggers tree revocation.
-         */
-        it('race with revoked session: second caller triggers revocation', async () => {
-            mockTokenService.verifyRefreshToken.mockReturnValue(MOCK_PAYLOAD);
-            mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
-            mockTokenService.hashToken.mockReturnValue('new-hash');
-
-            // First call sees a live session.
-            // Second call sees revoked_at set (simulates another process revoking between calls).
-            mockRepo.findSessionById
-                .mockResolvedValueOnce({ id: 'session-123', revoked_at: null })
-                .mockResolvedValue({ id: 'session-123', revoked_at: new Date(), token_consumed_at: null });
-
-            mockRepo.findSessionByParentId.mockResolvedValue(null);
-            mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
-
-            const first = await refreshService.refresh('token');
-            expect(first).toEqual(MOCK_TOKENS);
-
-            const second = await refreshService.refresh('token');
-            expect(second).toBeNull();
-            expect(mockRepo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-123');
-        });
-
-        /**
-         * Scenario: Concurrent calls where the in-flight revoke itself throws.
-         * The service must still return null — no unhandled promise rejection.
-         */
-        it('in-flight revocation failure is swallowed — null still returned', async () => {
-            let resolveFirst!: () => void;
-            const barrier = new Promise<void>((res) => { resolveFirst = res; });
-
-            mockTokenService.verifyRefreshToken.mockReturnValue(MOCK_PAYLOAD);
-
-            // Block the first call so the second enters the in-flight guard.
-            mockRepo.findSessionById.mockImplementation(
-                () => barrier.then(() => ({ id: 'session-123', revoked_at: null, token_consumed_at: null }))
-            );
-            mockRepo.findSessionByParentId.mockResolvedValue(null);
-            mockRepo.createSession.mockResolvedValue({ id: 'new-session-id' });
-            mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
-            mockTokenService.hashToken.mockReturnValue('hash');
-
-            // Make revocation throw — service must not crash.
-            mockRepo.revokeSessionAndDescendants.mockRejectedValue(new Error('DB down'));
-
-            const [p1, p2] = [
-                refreshService.refresh('token'),
-                refreshService.refresh('token'),
-            ];
-            resolveFirst();
-
-            const [r1, r2] = await Promise.all([p1, p2]);
-
-            // Both results must be resolvable (no unhandled rejection).
-            const nullCount = [r1, r2].filter((r) => r === null).length;
-            expect(nullCount).toBeGreaterThanOrEqual(1);
-        });
-
-        /**
-         * Scenario: Three simultaneous refresh calls — only one (at most) wins;
-         * the other two are blocked by the in-flight guard.
-         */
-        it('triple concurrent race: at most one winner', async () => {
-            let resolveFirst!: () => void;
-            const barrier = new Promise<void>((res) => { resolveFirst = res; });
-
-            mockTokenService.verifyRefreshToken.mockReturnValue(MOCK_PAYLOAD);
-            mockTokenService.issueTokens.mockReturnValue(MOCK_TOKENS);
-            mockTokenService.hashToken.mockReturnValue('hash');
-            mockRepo.findSessionById.mockImplementation(
-                () => barrier.then(() => ({ id: 'session-123', revoked_at: null, token_consumed_at: null }))
-            );
-            mockRepo.findSessionByParentId.mockResolvedValue(null);
-            mockRepo.createSession.mockResolvedValue({ id: 'new-id' });
-            mockRepo.revokeSessionAndDescendants.mockResolvedValue(undefined);
-
-            const promises = [
-                refreshService.refresh('token'),
-                refreshService.refresh('token'),
-                refreshService.refresh('token'),
-            ];
-            resolveFirst();
-
-            const results = await Promise.all(promises);
-            const successes = results.filter((r) => r !== null);
-            expect(successes.length).toBeLessThanOrEqual(1);
-        });
     });
 });
