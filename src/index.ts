@@ -684,18 +684,29 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
 };
 
 /**
- * Webhook delivery queue with exponential backoff and SSRF-aware URL blocking.
- * @notice Uses comprehensive SSRF protection including IPv6, link-local, and DNS rebinding prevention.
+ * Webhook delivery queue with exponential backoff, SSRF-aware URL blocking,
+ * bounded depth, and back-pressure via deferred persistence.
+ *
+ * @notice When in-flight count reaches WEBHOOK_QUEUE_MAX_DEPTH the delivery is
+ *         persisted as 'deferred' (never dropped) and webhook_queue_shed_total
+ *         is incremented. Call resumeDeferred() to re-enqueue them once capacity
+ *         is available.
  */
 export class WebhookQueue {
   private static repo: WebhookEndpointRepository;
   private static service: WebhookService;
   private static MAX_RETRIES = 5;
   private static INITIAL_DELAY = 1000;
+  /** Number of deliveries currently scheduled / in-flight. */
+  private static inFlight = 0;
 
   static init(repo: WebhookEndpointRepository, service: WebhookService) {
     this.repo = repo;
     this.service = service;
+  }
+
+  private static get maxDepth(): number {
+    return env.WEBHOOK_QUEUE_MAX_DEPTH;
   }
 
   private static async isSafeUrl(url: string): Promise<boolean> {
@@ -739,6 +750,26 @@ export class WebhookQueue {
       return false;
     }
 
+    // --- Back-pressure: defer when at capacity ---
+    if (this.inFlight >= this.maxDepth) {
+      const deferred = await this.repo.createDelivery({
+        endpoint_id: endpoint.id,
+        payload,
+        status: 'deferred',
+        attempts: 0,
+      });
+      globalMetrics.incrementCounter(
+        'webhook_queue_shed_total',
+        { endpoint: endpoint.id },
+        1,
+        'Total webhook deliveries deferred due to queue depth limit',
+      );
+      console.warn(
+        `[WebhookQueue] Queue full (${this.inFlight}/${this.maxDepth}), deferred delivery ${deferred.id}`,
+      );
+      return false;
+    }
+
     let delivery: WebhookDelivery | null = null;
     if (deliveryId) delivery = await this.repo.findDeliveryById(deliveryId);
 
@@ -751,6 +782,19 @@ export class WebhookQueue {
       });
     }
 
+    this.inFlight++;
+    try {
+      return await this._attempt(endpoint, delivery, payload);
+    } finally {
+      this.inFlight--;
+    }
+  }
+
+  private static async _attempt(
+    endpoint: { id: string; url: string; secret: string },
+    delivery: WebhookDelivery,
+    payload: any,
+  ): Promise<boolean> {
     const currentAttempt = delivery.attempts + 1;
 
     const webhookPayload: WebhookPayload = {
@@ -761,11 +805,7 @@ export class WebhookQueue {
     };
 
     const result = await this.service.sendAttempt(
-      {
-        id: endpoint.id,
-        url: endpoint.url,
-        secret: endpoint.secret,
-      },
+      { id: endpoint.id, url: endpoint.url, secret: endpoint.secret },
       webhookPayload,
     );
 
@@ -794,7 +834,7 @@ export class WebhookQueue {
       });
 
       setTimeout(() => {
-        void this.processDelivery(url, payload, delivery!.id);
+        void this.processDelivery(endpoint.url, payload, delivery.id);
       }, nextDelay);
 
       return false;
@@ -806,11 +846,16 @@ export class WebhookQueue {
       last_error: result.error,
       next_retry_at: null,
     });
-    // If the delivery was dead-lettered, update per-endpoint gauge
+
     if (nextDelay === -1) {
       try {
         const count = await this.repo.countDeadLettersByEndpoint(delivery.endpoint_id);
-        globalMetrics.setGauge('webhook_dead_letter_total', count, { endpoint: endpoint.id }, 'Number of dead-lettered webhook deliveries per endpoint');
+        globalMetrics.setGauge(
+          'webhook_dead_letter_total',
+          count,
+          { endpoint: endpoint.id },
+          'Number of dead-lettered webhook deliveries per endpoint',
+        );
       } catch (err) {
         console.error('[WebhookQueue] Failed to update dead-letter metric:', err);
       }
@@ -826,6 +871,23 @@ export class WebhookQueue {
       if (endpoint) {
         void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
       }
+    }
+  }
+
+  /**
+   * Re-enqueue deferred deliveries up to available capacity.
+   * Safe to call repeatedly; excess deferred rows remain deferred.
+   */
+  static async resumeDeferred(): Promise<void> {
+    if (!this.repo) return;
+    const deferred = await this.repo.getDeferredDeliveries();
+    for (const delivery of deferred) {
+      if (this.inFlight >= this.maxDepth) break;
+      const endpoint = await this.repo.findById(delivery.endpoint_id);
+      if (!endpoint) continue;
+      // Promote back to pending so processDelivery can pick it up
+      await this.repo.updateDelivery(delivery.id, { status: 'pending' });
+      void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
     }
   }
 }
