@@ -317,8 +317,22 @@ describe('SessionRepository', () => {
 
       const [query, params] = mockPool.query.mock.calls[0] as [string, any[]];
       expect(query).toContain('WITH RECURSIVE');
+      expect(query).toContain('JOIN descendants d ON s.parent_id = d.id');
       expect(query).toContain('revoked_at = NOW()');
+      expect(query).toContain('WHERE id IN (SELECT id FROM descendants)');
       expect(params).toEqual(['session-123']);
+    });
+
+    it('revokes the entire session family in one recursive UPDATE statement', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 12 } as any);
+
+      await repository.revokeSessionAndDescendants('grandparent-session');
+
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+      const [query, params] = mockPool.query.mock.calls[0] as [string, any[]];
+      expect(query).toMatch(/WITH RECURSIVE[\s\S]+UPDATE sessions/);
+      expect(query).not.toMatch(/;\s*(SELECT|UPDATE|DELETE|INSERT)\b/i);
+      expect(params).toEqual(['grandparent-session']);
     });
 
     it('is idempotent (second call does not throw)', async () => {

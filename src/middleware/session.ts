@@ -24,8 +24,90 @@
 
 import type { Request, Response, NextFunction } from "express";
 import { Router }                               from "express";
-import type { SessionStore }                    from "../lib/sessionStore";
+import type { ISessionStore }                   from "../lib/sessionStore";
 import { AuthenticatedRequest }                from "./auth";
+
+// ─── Secure session cookie issuer ──────────────────────────────────────────────
+
+/** Name of the browser session cookie. */
+export const SESSION_COOKIE_NAME = "session";
+
+export interface SessionCookieOptions {
+  /** Cookie name. @default {@link SESSION_COOKIE_NAME} */
+  name?: string;
+  /** Cookie path. @default "/" */
+  path?: string;
+  /**
+   * Whether the `Secure` attribute is set. Defaults to whether we're in
+   * production. In production a non-Secure cookie is refused (throws).
+   */
+  secure?: boolean;
+  /** Whether we're running in production. @default NODE_ENV === "production" */
+  isProduction?: boolean;
+}
+
+/**
+ * Build a hardened `Set-Cookie` header value for a session token.
+ *
+ * The cookie always carries `HttpOnly`, `SameSite=Strict`, and `Path=/`.
+ * In production the `Secure` attribute is mandatory: issuing a non-Secure
+ * session cookie in production throws, so a session token can never be sent
+ * over plaintext HTTP.
+ *
+ * @param token     The opaque session token.
+ * @param expiresAt Absolute expiry (ms since epoch); drives Max-Age/Expires.
+ * @throws if a non-Secure cookie is requested in production.
+ */
+export function buildSessionCookie(
+  token: string,
+  expiresAt: number,
+  opts: SessionCookieOptions = {},
+): string {
+  const isProduction = opts.isProduction ?? process.env.NODE_ENV === "production";
+  const secure       = opts.secure ?? isProduction;
+  const name         = opts.name ?? SESSION_COOKIE_NAME;
+  const path         = opts.path ?? "/";
+
+  if (isProduction && !secure) {
+    throw new Error(
+      "Refusing to issue a session cookie without the Secure attribute in production.",
+    );
+  }
+
+  const maxAgeSeconds = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+
+  const attributes = [
+    `${name}=${token}`,
+    `Path=${path}`,
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`,
+    `Expires=${new Date(expiresAt).toUTCString()}`,
+  ];
+  if (secure) attributes.push("Secure");
+
+  return attributes.join("; ");
+}
+
+/**
+ * Attach a hardened session cookie to the response.
+ * Uses `res.append` so it does not clobber other `Set-Cookie` headers.
+ */
+export function issueSessionCookie(
+  res: Response,
+  token: string,
+  expiresAt: number,
+  opts: SessionCookieOptions = {},
+): void {
+  res.append("Set-Cookie", buildSessionCookie(token, expiresAt, opts));
+}
+
+/** Build the `Set-Cookie` header that clears the session cookie (logout). */
+export function clearSessionCookie(opts: SessionCookieOptions = {}): string {
+  const name = opts.name ?? SESSION_COOKIE_NAME;
+  const path = opts.path ?? "/";
+  return `${name}=; Path=${path}; HttpOnly; SameSite=Strict; Max-Age=0`;
+}
 
 // ─── Middleware factory ───────────────────────────────────────────────────────
 
@@ -37,7 +119,7 @@ import { AuthenticatedRequest }                from "./auth";
  * @example
  * app.use("/api", createSessionAuth(sessionStore));
  */
-export function createSessionAuth(store: SessionStore) {
+export function createSessionAuth(store: ISessionStore) {
   return async function sessionAuth(
     req:  AuthenticatedRequest,
     res:  Response,
@@ -88,7 +170,7 @@ export function createSessionAuth(store: SessionStore) {
  *  - The session token returned by login is the ONLY credential for subsequent
  *    requests.  Headers are not re-read after login.
  */
-export function createSessionRouter(store: SessionStore): Router {
+export function createSessionRouter(store: ISessionStore): Router {
   const router = Router();
   const auth   = createSessionAuth(store);
 
@@ -110,6 +192,10 @@ export function createSessionRouter(store: SessionStore): Router {
 
     const session = await store.create(userId, role);
 
+    // Issue a hardened cookie for browser clients (Secure/HttpOnly/SameSite=Strict).
+    // In production a non-Secure cookie is refused by buildSessionCookie.
+    issueSessionCookie(res, session.token, session.expiresAt);
+
     res.status(201).json({
       token:     session.token,
       expiresAt: new Date(session.expiresAt).toISOString(),
@@ -123,6 +209,7 @@ export function createSessionRouter(store: SessionStore): Router {
    */
   router.post("/session/logout", auth, async (req: AuthenticatedRequest, res: Response) => {
     await store.delete(req.user!.sessionToken!);
+    res.append("Set-Cookie", clearSessionCookie());
     res.status(204).send();
   });
 
