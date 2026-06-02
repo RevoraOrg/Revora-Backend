@@ -81,4 +81,42 @@ describe('env config', () => {
     const cfg = buildConfig();
     expect(cfg.ALLOWED_ORIGINS_ARRAY).toEqual(['http://example.com', 'https://test.com']);
   });
+
+  it('should reject mock email provider in production', () => {
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+      throw new Error(`Process.exit called with ${code}`);
+    });
+    const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL = 'postgres://user:pass@localhost:5432/revora';
+    process.env.JWT_SECRET = 'test-secret-key-that-is-at-least-32-characters-long!';
+    process.env.STELLAR_SERVER_SECRET = 'valid';
+    process.env.EMAIL_PROVIDER = 'mock';
+
+    expect(() => buildConfig()).toThrow('Process.exit called with 1');
+    expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('EMAIL_PROVIDER'));
+
+    mockExit.mockRestore();
+    mockConsoleError.mockRestore();
+  });
+
+  it('should require SMTP_USER and SMTP_PASS together', () => {
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+      throw new Error(`Process.exit called with ${code}`);
+    });
+    const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    process.env.NODE_ENV = 'test';
+    process.env.EMAIL_PROVIDER = 'smtp';
+    process.env.SMTP_HOST = 'smtp.example.com';
+    process.env.SMTP_USER = 'smtp-user';
+    delete process.env.SMTP_PASS;
+
+    expect(() => buildConfig()).toThrow('Process.exit called with 1');
+    expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('SMTP_USER'));
+
+    mockExit.mockRestore();
+    mockConsoleError.mockRestore();
+  });
 });
