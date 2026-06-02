@@ -1,57 +1,90 @@
 import { Logger, globalLogger } from '../lib/logger';
-import { Errors } from '../lib/errors';
+import { Errors, AppError } from '../lib/errors';
 import { Decimal } from '../lib/decimal';
-import { Pool } from 'pg';
-import { withTransaction } from '../db/transaction';
-import { 
-  classifyStellarRPCFailure, 
+import { Pool, PoolClient } from 'pg';
+import { withTransaction, TransactionError } from '../db/transaction';
+import {
+  classifyStellarRPCFailure,
   StellarRPCFailureClass,
   StellarRPCFailure,
-  StellarRPCFailureContext 
+  StellarRPCFailureContext
 } from '../lib/stellarRpcFailure';
 
+export interface BalanceRow {
+  investor_id: string;
+  balance: number;
+}
+
+export interface DistributionBatchResult {
+  distributionRun: any;
+  successfulPayouts: Array<{ investor_id: string; amount: string }>;
+  failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }>;
+  totalPayouts: number;
+}
+
+export interface DistributionEngineOptions {
+  maxRetries?: number;
+  initialDelayMs?: number;
+  backoffFactor?: number;
+  logRetries?: boolean;
+  batchSize?: number;
+}
+
 /**
-    // 6. Process payouts in batches with optional transaction support
-    const existingPayouts = await this.distributionRepo.getPayoutsForRun(run.id);
-    const existingInvestorIds = new Set(existingPayouts.map((p: any) => p.investor_id));
+ * Compute a stable 32-bit advisory lock key from (offeringId, periodId).
+ *
+ * pg_try_advisory_xact_lock takes a single bigint or two int4 values.
+ * We use the two-argument form: (classId, objectId) where both are int4.
+ * We derive them by hashing the concatenated string with a simple djb2-style
+ * hash and splitting the 32-bit result into two 16-bit halves, then sign-extending
+ * to int4 so Postgres accepts them.
+ *
+ * Collision probability is negligible for the expected cardinality of
+ * (offering_id, period_id) pairs in a single deployment.
+ */
+export function advisoryLockKey(offeringId: string, periodId: string): [number, number] {
+  const input = `${offeringId}:${periodId}`;
+  let h = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    // FNV prime: 0x01000193
+    h = Math.imul(h, 0x01000193);
+  }
+  // Split into two signed int16 values (Postgres int4 range is fine with these)
+  const hi = (h >>> 16) & 0xffff;
+  const lo = h & 0xffff;
+  // Convert to signed int32 range so Postgres accepts them as integer literals
+  return [hi | 0, lo | 0];
+}
 
-    const successfulPayouts: Array<{ investor_id: string; amount: string }> = existingPayouts.map((p: any) => ({
-      investor_id: p.investor_id,
-      amount: p.amount,
-    }));
-    const failedPayouts: Array<{ investor_id: string; amount: string; error: string; errorClass?: string }> = [];
-    let hasBatchFailure = false;
+/**
+ * Attempt to acquire a Postgres transaction-scoped advisory lock for the given
+ * (offeringId, periodId) pair. Returns true if the lock was acquired, false if
+ * another session already holds it.
+ *
+ * The lock is automatically released when the surrounding transaction commits
+ * or rolls back — no explicit release is needed.
+ */
+export async function tryAcquireDistributionLock(
+  client: PoolClient,
+  offeringId: string,
+  periodId: string
+): Promise<boolean> {
+  const [classId, objectId] = advisoryLockKey(offeringId, periodId);
+  const result = await client.query<{ acquired: boolean }>(
+    'SELECT pg_try_advisory_xact_lock($1, $2) AS acquired',
+    [classId, objectId]
+  );
+  return result.rows[0].acquired;
+}
 
-    for (let batchStart = 0; batchStart < rounded.length; batchStart += this.batchSize) {
-      const batch = rounded.slice(batchStart, batchStart + this.batchSize);
-      const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
-
-      try {
-        if (this.pool) {
-          // Transactional batch: create all payouts within a DB transaction
-          await withTransaction(this.pool, async (client) => {
-            for (const r of batch) {
-              if (existingInvestorIds.has(r.investor_id)) continue;
-
-              const amtStr = r.amount.toString();
-              await this.withRetry(() =>
-                // Pass client for transactional repository implementations
-                this.distributionRepo.createPayout({
-                  distribution_run_id: run.id,
-                  investor_id: r.investor_id,
-                  amount: amtStr,
-                  status: 'pending',
-                }, client)
-              );
-
-              successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
-              existingInvestorIds.add(r.investor_id);
-            }
-          });
-        } else {
-          // Non-transactional fallback for compatibility (used by tests/mocks)
-          for (const r of batch) {
-            if (existingInvestorIds.has(r.investor_id)) continue;
+class DistributionEngine {
+  private readonly maxRetries: number;
+  private readonly initialDelayMs: number;
+  private readonly backoffFactor: number;
+  private readonly logRetries: boolean;
+  private readonly batchSize: number;
+  private readonly logger: Logger;
 
   constructor(
     private offeringRepo: any,
@@ -70,72 +103,72 @@ import {
     this.logger = globalLogger;
   }
 
-              this.logger.error('Payout creation failed', {
-                offeringId,
-                runId: run.id,
-                investorId: r.investor_id,
-                errorClass: failure.class,
-                batchNumber,
-                rawError: err instanceof Error ? err.message : String(err),
-              });
+  /**
+   * Public entry point. Delegates to distributeWithBatch, wrapped in an
+   * advisory lock when a pool is available so that concurrent callers for the
+   * same (offeringId, period.id) are serialised at the database level.
+   *
+   * If the lock cannot be acquired the method throws Errors.conflict so the
+   * caller receives a structured 409 response rather than blocking.
+   *
+   * If any payouts fail, throws an error with the failure class of the first
+   * failed payout so callers get a clean rejection rather than a partial result.
+   */
+  async distribute(
+    offeringId: string,
+    period: { id: string; start: Date; end: Date },
+    revenueAmount: number
+  ): Promise<DistributionBatchResult & { payouts: Array<{ investor_id: string; amount: string }> }> {
+    let batchResult: DistributionBatchResult;
 
-              failedPayouts.push({
-                investor_id: r.investor_id,
-                amount: amtStr,
-                error: `Action failed with ${failure.class}`,
-                errorClass: failure.class,
-              });
-            }
+    if (!this.pool) {
+      // No pool — run without locking (test / legacy path)
+      batchResult = await this.distributeWithBatch(offeringId, period, revenueAmount);
+    } else {
+      // Wrap the entire batch inside a single transaction so the advisory lock
+      // (which is transaction-scoped) is held for the full duration.
+      let result: DistributionBatchResult | undefined;
+      try {
+        await withTransaction(this.pool, async (client) => {
+          const acquired = await tryAcquireDistributionLock(client, offeringId, period.id);
+          if (!acquired) {
+            throw Errors.conflict(
+              `Distribution for offering ${offeringId} / period ${period.id} is already in progress`
+            );
           }
-        }
-
-        this.logger.info('Distribution batch processed successfully', {
-          offeringId,
-          runId: run.id,
-          batchNumber,
-          payoutsInBatch: batch.length,
-          transactional: !!this.pool,
+          result = await this.distributeWithBatch(offeringId, period, revenueAmount);
         });
       } catch (err) {
-        hasBatchFailure = true;
-        const failure = classifyStellarRPCFailure(err, {
-          operation: 'processBatch',
-          offeringId,
-          periodId: period.id,
-        });
-
-        this.logger.error('Payout batch failed', {
-          offeringId,
-          runId: run.id,
-          batchNumber,
-          errorClass: failure.class,
-          investorCount: batch.length,
-          transactional: !!this.pool,
-          rawError: err instanceof Error ? err.message : String(err),
-        });
-
-        // In non-transactional mode, record which specific payouts failed
-        if (!this.pool) {
-          for (const r of batch) {
-            if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
-              const amtStr = r.amount.toString();
-              failedPayouts.push({
-                investor_id: r.investor_id,
-                amount: amtStr,
-                error: `Batch processing failed: ${failure.class}`,
-                errorClass: failure.class,
-              });
-            }
-          }
+        // withTransaction wraps errors in TransactionError; unwrap AppErrors so
+        // callers receive the original structured error (e.g. 409 CONFLICT).
+        if (err instanceof TransactionError && err.cause instanceof AppError) {
+          throw err.cause;
         }
+        throw err;
       }
+      batchResult = result!;
     }
+
+    // Throw if any payouts failed so callers get a clean rejection
+    if (batchResult.failedPayouts.length > 0) {
+      const firstFailure = batchResult.failedPayouts[0];
+      throw new Error(`Distribution failed: ${firstFailure.errorClass ?? 'UNKNOWN'}`);
+    }
+
+    return { ...batchResult, payouts: batchResult.successfulPayouts };
+  }
+
+  /**
+   * Core distribution logic: prorate revenue across investors and record payouts.
+   *
+   * @param offeringId  The offering to distribute revenue for
+   * @param period      Distribution period (must include an `id` field)
    * @param revenueAmount The total amount of revenue to be distributed
    * @returns Batch result with successful and failed payouts
    */
   async distributeWithBatch(
     offeringId: string,
-    period: { start: Date; end: Date },
+    period: { id?: string; start: Date; end: Date } & Record<string, any>,
     revenueAmount: number
   ): Promise<DistributionBatchResult> {
     const startTime = Date.now();
@@ -149,7 +182,7 @@ import {
 
     // 2. Idempotency Check: Look for an existing run
     let run = await this.distributionRepo.findRunByParams(offeringId, period.id, amtStr);
-    
+
     if (run) {
       if (run.status === 'completed') {
         this.logger.info('Distribution already completed, returning cached results', {
@@ -197,17 +230,8 @@ import {
     }
 
     // 4. Sum balances and compute shares using Decimal for precision
-    // ──────────────────────────────────────────────────────────────
-    // Use BigInt-based Decimal arithmetic to avoid floating-point inaccuracies.
-    // This ensures exact-to-the-cent calculations for financial correctness.
-    // Convert all balances to Decimal first, then sum using Decimal arithmetic.
-    // Convert balances to Decimal without performing JS floating-point arithmetic.
-    // - Format the incoming numeric value to a decimal string with high precision
-    //   (up to 18 places) to preserve any fractional parts.
-    // - Construct a Decimal from that string, then round to 2 decimal places
-    //   using `toSorobanI128(2, 'round')` to produce cent-precision values.
     const balanceDecimals = balances.map((b) => {
-      const rawStr = (b.balance).toFixed(18); // string representation with up to 18 decimals
+      const rawStr = (b.balance).toFixed(18);
       const rawDecimal = new Decimal(rawStr);
       const scaled = rawDecimal.toSorobanI128(2, 'round');
       return Decimal.fromScaledBigInt(scaled, 2);
@@ -219,75 +243,46 @@ import {
       throw Errors.badRequest('Total balance must be > 0 to distribute revenue');
     }
 
-    // Convert `revenueAmount` to a Decimal without JS numeric rounding.
-    // Use a high-precision string representation then round to 2 decimals via Decimal.
     const revenueRawStr = revenueAmount.toFixed(18);
     const revenueRawDecimal = new Decimal(revenueRawStr);
     const revenueScaled = revenueRawDecimal.toSorobanI128(2, 'round');
     const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
 
-    // Compute raw shares as Decimals with full precision (up to 18 decimal places).
-    // These are NOT yet rounded; they preserve the exact mathematical division result.
     interface RawShare {
       investor_id: string;
       rawShare: Decimal;
     }
     const rawShares: RawShare[] = balances.map((b, index) => {
-      // Use the pre-converted balance Decimal instead of reconverting
       const balanceDecimal = balanceDecimals[index];
-      // rawShare = (balance / totalBalance) * revenueAmount
       const share = balanceDecimal.divide(totalBalanceDecimal).multiply(revenueDecimal);
-      return {
-        investor_id: b.investor_id,
-        rawShare: share,
-      };
+      return { investor_id: b.investor_id, rawShare: share };
     });
 
-    // Round each raw share to 2 decimal places (cents) using "round half up" strategy.
-    // Convert via toSorobanI128 with scale=2 for consistent rounding behavior.
     interface RoundedShare {
       investor_id: string;
       amount: Decimal;
       rawShare: Decimal;
     }
     const rounded: RoundedShare[] = rawShares.map((r) => {
-      // toSorobanI128(2, 'round') scales to 2 decimals and applies round-half-up
       const scaledValue = r.rawShare.toSorobanI128(2, 'round');
       const amountDecimal = Decimal.fromScaledBigInt(scaledValue, 2);
-      return {
-        investor_id: r.investor_id,
-        amount: amountDecimal,
-        rawShare: r.rawShare,
-      };
+      return { investor_id: r.investor_id, amount: amountDecimal, rawShare: r.rawShare };
     });
 
-    // Calculate total of all rounded amounts to determine if reconciliation is needed.
-    const roundedSum = rounded.reduce(
-      (sum, r) => sum.add(r.amount),
-      new Decimal('0')
-    );
+    const roundedSum = rounded.reduce((sum, r) => sum.add(r.amount), new Decimal('0'));
 
-    // **Largest-Share Reconciliation Adjustment**
-    // ────────────────────────────────────────────
-    // Compute the difference between the intended revenue and the sum of rounded amounts.
-    // Due to independent rounding, this difference can be non-zero (typically ±0.01).
-    // Round the difference to 2 decimal places to ensure it fits within cent precision.
+    // Largest-Share Reconciliation Adjustment
     const rawDiff = revenueDecimal.subtract(roundedSum);
     const diffScaled = rawDiff.toSorobanI128(2, 'round');
     const diff = Decimal.fromScaledBigInt(diffScaled, 2);
 
     if (!diff.isZero()) {
-      // Find the investor with the largest raw share and adjust their payout by `diff`.
-      // This ensures total payouts always equal revenueAmount exactly.
-      // Rationale: The investor with the largest share implicitly benefits most from
-      // the proration algorithm, so the reconciliation adjustment is fair.
       let maxIdx = 0;
       for (let i = 1; i < rawShares.length; i++) {
         if (rawShares[i].rawShare.compareTo(rawShares[maxIdx].rawShare) > 0) {
           maxIdx = i;
         }
       }
-      // Adjust the largest share investor by the difference
       rounded[maxIdx].amount = rounded[maxIdx].amount.add(diff);
     }
 
@@ -366,15 +361,12 @@ import {
       const batchNumber = Math.floor(batchStart / this.batchSize) + 1;
 
       try {
-        // Process batch with transaction support if pool is available
         if (this.pool) {
           await withTransaction(this.pool, async (client) => {
             for (const r of batch) {
-              if (existingInvestorIds.has(r.investor_id)) {
-                continue;
-              }
+              if (existingInvestorIds.has(r.investor_id)) continue;
 
-              const amtStr = r.amount.toFixed(2);
+              const amtStr = r.amount.toString();
               await this.withRetry(() =>
                 this.distributionRepo.createPayout(
                   {
@@ -393,11 +385,9 @@ import {
         } else {
           // Fallback to non-transactional processing for backward compatibility
           for (const r of batch) {
-            if (existingInvestorIds.has(r.investor_id)) {
-              continue;
-            }
+            if (existingInvestorIds.has(r.investor_id)) continue;
 
-            const amtStr = r.amount.toFixed(2);
+            const amtStr = r.amount.toString();
             try {
               await this.withRetry(() =>
                 this.distributionRepo.createPayout({
@@ -415,7 +405,7 @@ import {
                 offeringId,
                 periodId: period.id,
               });
-              
+
               this.logger.error('Payout creation failed', {
                 offeringId,
                 runId: run.id,
@@ -460,13 +450,11 @@ import {
           rawError: err instanceof Error ? err.message : String(err),
         });
 
-        // When a transactional batch fails, don't add individual failures 
-        // because the entire batch rolled back
         if (!this.pool) {
-          // In non-transactional mode, any payout that wasn't already added to successfulPayouts failed
           for (const r of batch) {
+            if (!r) continue; // guard against poisoned/null batch items
             if (!existingInvestorIds.has(r.investor_id) && !successfulPayouts.some(p => p.investor_id === r.investor_id)) {
-              const amtStr = r.amount.toFixed(2);
+              const amtStr = r.amount.toString();
               failedPayouts.push({
                 investor_id: r.investor_id,
                 amount: amtStr,
@@ -481,7 +469,7 @@ import {
 
     const duration = Date.now() - startTime;
     const finalStatus = (failedPayouts.length === 0 && !hasBatchFailure) ? 'completed' : 'failed';
-    
+
     try {
       await this.distributionRepo.updateRunStatus(run.id, finalStatus);
       run.status = finalStatus;
