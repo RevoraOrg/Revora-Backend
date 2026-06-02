@@ -48,6 +48,8 @@ export interface ListOfferingsFilters {
 export interface UpdateOfferingStateInput {
   status?: 'draft' | 'active' | 'closed' | 'completed';
   total_raised?: string;
+  /** Basis points (0–10000) from on-chain config. NULL clears any existing cap. */
+  max_investor_share_bps?: number | null;
 }
 
 export class OfferingRepository {
@@ -244,12 +246,13 @@ export class OfferingRepository {
   }
 
   /**
-   * Update offering state (status and/or total_raised)
+   * Update offering state (status and/or total_raised and/or max_investor_share_bps)
    */
   async updateState(id: string, input: UpdateOfferingStateInput): Promise<Offering | null> {
     const partial: UpdateOfferingInput = {};
     if (input.status !== undefined) partial['status'] = input.status;
     if (input.total_raised !== undefined) partial['total_raised'] = input.total_raised;
+    if (input.max_investor_share_bps !== undefined) partial['max_investor_share_bps'] = input.max_investor_share_bps;
     return this.update(id, partial);
   }
 

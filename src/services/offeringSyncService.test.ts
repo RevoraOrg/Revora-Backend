@@ -236,4 +236,63 @@ describe('OfferingSyncService', () => {
       failureClass: StellarRPCFailureClass.UPSTREAM_ERROR,
     });
   });
+
+  describe('max_investor_share_bps sync', () => {
+    it('syncs max_investor_share_bps when the on-chain value changes', async () => {
+      const offeringWithCap = { ...mockOffering, max_investor_share_bps: null };
+      const updatedOffering = { ...offeringWithCap, max_investor_share_bps: 500 };
+
+      mockStellarClient.getOfferingState.mockResolvedValueOnce({
+        status: 'active',
+        total_raised: '5000.00',
+        max_investor_share_bps: 500,
+      });
+      mockOfferingRepo.updateState.mockResolvedValueOnce(updatedOffering);
+
+      const result = await service.syncOfferingRecord(offeringWithCap);
+
+      expect(result.success).toBe(true);
+      expect(result.updated).toBe(true);
+      expect(mockOfferingRepo.updateState).toHaveBeenCalledWith(
+        'offering-1',
+        expect.objectContaining({ max_investor_share_bps: 500 }),
+      );
+    });
+
+    it('treats missing on-chain max_investor_share_bps as null (no cap)', async () => {
+      // On-chain config returns no cap field → should persist null
+      const offeringWithCap = { ...mockOffering, max_investor_share_bps: 1000 };
+      const updatedOffering = { ...offeringWithCap, max_investor_share_bps: null };
+
+      mockStellarClient.getOfferingState.mockResolvedValueOnce({
+        status: 'active',
+        total_raised: '5000.00',
+        // max_investor_share_bps intentionally absent
+      });
+      mockOfferingRepo.updateState.mockResolvedValueOnce(updatedOffering);
+
+      const result = await service.syncOfferingRecord(offeringWithCap);
+
+      expect(result.updated).toBe(true);
+      expect(mockOfferingRepo.updateState).toHaveBeenCalledWith(
+        'offering-1',
+        expect.objectContaining({ max_investor_share_bps: null }),
+      );
+    });
+
+    it('does not update when max_investor_share_bps is unchanged', async () => {
+      const offeringWithCap = { ...mockOffering, max_investor_share_bps: 1000 };
+
+      mockStellarClient.getOfferingState.mockResolvedValueOnce({
+        status: 'active',
+        total_raised: '5000.00',
+        max_investor_share_bps: 1000,
+      });
+
+      const result = await service.syncOfferingRecord(offeringWithCap);
+
+      expect(result.updated).toBe(false);
+      expect(mockOfferingRepo.updateState).not.toHaveBeenCalled();
+    });
+  });
 });

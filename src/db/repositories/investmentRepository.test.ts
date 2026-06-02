@@ -230,4 +230,92 @@ describe('InvestmentRepository', () => {
       expect(stats.investorCount).toBe(10);
     });
   });
+
+  describe('lockOffering', () => {
+    let mockClient: { query: jest.Mock };
+
+    beforeEach(() => {
+      mockClient = { query: jest.fn() };
+    });
+
+    it('returns offering row with max_investor_share_bps when found', async () => {
+      mockClient.query.mockResolvedValueOnce({
+        rows: [{ max_investor_share_bps: 1000, total_raised: '50000' }],
+      });
+
+      const result = await repository.lockOffering(mockClient as any, 'offering-1');
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('FOR UPDATE'),
+        ['offering-1'],
+      );
+      expect(result).toEqual({ max_investor_share_bps: 1000, total_raised: '50000' });
+    });
+
+    it('returns null when offering does not exist', async () => {
+      mockClient.query.mockResolvedValueOnce({ rows: [] });
+
+      const result = await repository.lockOffering(mockClient as any, 'missing');
+
+      expect(result).toBeNull();
+    });
+
+    it('returns row with null max_investor_share_bps when no cap is set', async () => {
+      mockClient.query.mockResolvedValueOnce({
+        rows: [{ max_investor_share_bps: null, total_raised: '0' }],
+      });
+
+      const result = await repository.lockOffering(mockClient as any, 'offering-1');
+
+      expect(result?.max_investor_share_bps).toBeNull();
+    });
+  });
+
+  describe('getInvestorTotalForOffering', () => {
+    let mockClient: { query: jest.Mock };
+
+    beforeEach(() => {
+      mockClient = { query: jest.fn() };
+    });
+
+    it('returns the summed total as a string', async () => {
+      mockClient.query.mockResolvedValueOnce({ rows: [{ total: '75000.50' }] });
+
+      const result = await repository.getInvestorTotalForOffering(
+        mockClient as any,
+        'investor-1',
+        'offering-1',
+      );
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining("status != 'failed'"),
+        ['investor-1', 'offering-1'],
+      );
+      expect(result).toBe('75000.50');
+    });
+
+    it('returns "0" when investor has no investments', async () => {
+      mockClient.query.mockResolvedValueOnce({ rows: [{ total: '0' }] });
+
+      const result = await repository.getInvestorTotalForOffering(
+        mockClient as any,
+        'investor-new',
+        'offering-1',
+      );
+
+      expect(result).toBe('0');
+    });
+
+    it('excludes failed investments from the total', async () => {
+      // The SQL itself filters these out; verify the WHERE clause is present
+      mockClient.query.mockResolvedValueOnce({ rows: [{ total: '1000' }] });
+
+      await repository.getInvestorTotalForOffering(mockClient as any, 'investor-1', 'offering-1');
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining("status != 'failed'"),
+        expect.any(Array),
+      );
+    });
+  });
 });

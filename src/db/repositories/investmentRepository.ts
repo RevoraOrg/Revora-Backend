@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 
 /**
  * Investment entity
@@ -161,6 +161,37 @@ export class InvestmentRepository {
       totalInvested: row.total_invested.toString(),
       investorCount: parseInt(row.investor_count, 10),
     };
+  }
+
+  /**
+   * Lock an offering row FOR UPDATE within the provided transaction client.
+   * Returns the offering row (including max_investor_share_bps) or null if not found.
+   * @param client An active PoolClient with an open transaction
+   * @param offeringId Offering ID
+   */
+  async lockOffering(client: PoolClient, offeringId: string): Promise<{ max_investor_share_bps: number | null; total_raised: string } | null> {
+    const result = await client.query<{ max_investor_share_bps: number | null; total_raised: string }>(
+      'SELECT max_investor_share_bps, total_raised FROM offerings WHERE id = $1 FOR UPDATE',
+      [offeringId],
+    );
+    return result.rows[0] ?? null;
+  }
+
+  /**
+   * Sum all non-failed investments by a given investor in a given offering.
+   * Uses the provided transaction client so the read is part of the same tx.
+   * @param client An active PoolClient with an open transaction
+   */
+  async getInvestorTotalForOffering(client: PoolClient, investorId: string, offeringId: string): Promise<string> {
+    const result = await client.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total
+         FROM investments
+        WHERE investor_id = $1
+          AND offering_id = $2
+          AND status != 'failed'`,
+      [investorId, offeringId],
+    );
+    return result.rows[0]?.total ?? '0';
   }
 
   /**

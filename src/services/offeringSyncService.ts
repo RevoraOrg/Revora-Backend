@@ -17,6 +17,8 @@ import { Logger, globalLogger } from '../lib/logger';
 export interface OnChainOfferingState {
   status: 'draft' | 'active' | 'closed' | 'completed';
   total_raised: string;
+  /** Basis points (0–10000). Absent/null means no cap. */
+  max_investor_share_bps?: number | null;
   last_updated_ledger?: number;
 }
 
@@ -244,7 +246,8 @@ export class OfferingSyncService {
 
       const hasChanged =
         normalizedChainStatus !== normalizedLocalStatus ||
-        onChain.total_raised !== offering.total_raised;
+        onChain.total_raised !== offering.total_raised ||
+        onChain.max_investor_share_bps !== (offering.max_investor_share_bps as number | null | undefined);
 
       if (!hasChanged) {
         const result: SyncResult = {
@@ -268,6 +271,7 @@ export class OfferingSyncService {
       const update: UpdateOfferingStateInput = {
         status: normalizedChainStatus,
         total_raised: onChain.total_raised,
+        max_investor_share_bps: onChain.max_investor_share_bps ?? null,
       };
 
       const updatedOffering =
@@ -291,6 +295,7 @@ export class OfferingSyncService {
         updated: true,
         offering: updatedOffering,
       };
+      return result;
     } catch (error) {
       const failureClass = classifyStellarRPCFailure(error);
 
