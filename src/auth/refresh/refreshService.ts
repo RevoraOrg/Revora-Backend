@@ -11,28 +11,27 @@ import {
 /**
  * @module auth/refresh/RefreshService
  * @description
- * Stateless-safe refresh token rotation with reuse detection and concurrent
- * request deduplication.
+ * Stateless-safe refresh token rotation with reuse detection and in-process
+ * concurrent request deduplication.
  *
  * Security assumptions:
  *  - Each refresh token is single-use; using it a second time (even before the
  *    first response is returned) triggers full revocation of the session tree.
  *  - `findSessionByParentId` is the reuse-detection probe: if a child session
  *    already exists, the parent token has been consumed.
- *  - A concurrent double-use (two simultaneous calls with the same token) is
- *    handled by an in-flight `Set` keyed on `sessionId`.  The second concurrent
- *    caller is treated identically to a reuse attempt: the session tree is
- *    revoked and `null` is returned.
+ *  - A concurrent duplicate refresh in this process is deduplicated with an
+ *    in-flight `Set` keyed on `sessionId`; the second caller receives `null`
+ *    without revoking the child created by the winning caller.
  *  - The in-flight lock is always released via `finally`; a DB crash cannot
  *    leave a session permanently locked.
- *  - `revokeSessionAndDescendants` is idempotent — safe to call multiple times.
+ *  - `revokeSessionAndDescendants` is idempotent and safe to call multiple times.
  *
  * Abuse / failure paths:
- *  - Invalid / expired refresh token    → null  (no revocation)
- *  - Session not found                  → null
- *  - Session already revoked            → null + revokeSessionAndDescendants
- *  - Token already used (child present) → null + revokeSessionAndDescendants
- *  - Concurrent double-use              → null + revokeSessionAndDescendants
+ *  - Invalid / expired refresh token    -> null (no revocation)
+ *  - Session not found                  -> null
+ *  - Session already revoked            -> null + revokeSessionAndDescendants
+ *  - Token already used after rotation  -> null + revokeSessionAndDescendants
+ *  - Concurrent duplicate in-process    -> null (no revocation)
  */
 export class RefreshService {
     /**
@@ -64,12 +63,21 @@ export class RefreshService {
         } catch (error) {
             this.logger.warn('Refresh token verification failed', {
                 error: error instanceof Error ? error.message : String(error),
-                tokenPrefix: token.substring(0, 10) + '...',
             });
             return null;
         }
 
         const { sessionId, userId, role } = payload;
+
+        if (this.inFlightSessions.has(sessionId)) {
+            this.logger.warn('Concurrent refresh already in flight', {
+                userId,
+                sessionId,
+            });
+            return null;
+        }
+
+        this.inFlightSessions.add(sessionId);
 
         this.logger.info('Processing refresh request', {
             userId,
@@ -100,6 +108,15 @@ export class RefreshService {
                 });
                 // Token hash mismatch - revoke the session family
                 await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            if (session.expires_at && session.expires_at <= new Date()) {
+                this.logger.warn('Attempted refresh on expired session', {
+                    userId,
+                    sessionId,
+                    expiresAt: session.expires_at,
+                });
                 return null;
             }
 
@@ -176,6 +193,8 @@ export class RefreshService {
                 error: error instanceof Error ? error.message : String(error),
             });
             throw error;
+        }).finally(() => {
+            this.inFlightSessions.delete(sessionId);
         });
     }
 }
