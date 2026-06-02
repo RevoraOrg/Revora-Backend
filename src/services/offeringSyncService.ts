@@ -13,6 +13,8 @@ import {
   StellarRPCFailureContext
 } from '../lib/stellarRpcFailure';
 import { Logger, globalLogger } from '../lib/logger';
+import { HorizonClient } from '../lib/stellar';
+import { Errors } from '../lib/errors';
 
 export interface OnChainOfferingState {
   status: 'draft' | 'active' | 'closed' | 'completed';
