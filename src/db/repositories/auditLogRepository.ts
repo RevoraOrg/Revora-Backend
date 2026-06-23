@@ -12,6 +12,10 @@ export interface AuditLog {
   ip_address?: string | null;
   user_agent?: string | null;
   created_at: Date;
+  /** Hash of the previous row in the tamper-evident chain (genesis for first row). */
+  prev_hash?: string;
+  /** SHA-256 hash of canonical row payload linked to prev_hash. */
+  row_hash?: string;
 }
 
 /**
@@ -131,6 +135,8 @@ export class AuditLogRepository {
       ip_address: row.ip_address,
       user_agent: row.user_agent,
       created_at: row.created_at,
+      prev_hash: row.prev_hash,
+      row_hash: row.row_hash,
     };
   }
 

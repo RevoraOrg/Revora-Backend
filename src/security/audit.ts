@@ -189,3 +189,29 @@ export const createSecurityAuditRepository = (
   
   return new InMemorySecurityAuditRepository();
 };
+
+/**
+ * Audit log hash-chain integrity verification (audit_logs table).
+ * Re-exported for security review and operational tooling.
+ */
+export {
+  AUDIT_LOG_GENESIS_HASH,
+  buildAuditCanonicalPayload,
+  computeAuditRowHash,
+  verifyAuditHashChain,
+  verifyAuditLogIntegrity,
+} from './auditHashChain';
+
+export type {
+  AuditIntegrityFailure,
+  AuditIntegrityFailureType,
+  AuditIntegrityResult,
+  AuditLogChainRow,
+} from './auditHashChain';
+
+export {
+  AuditIntegrityScheduler,
+  createAuditIntegrityScheduler,
+} from './auditIntegrityScheduler';
+
+export type { AuditIntegritySchedulerOptions } from './auditIntegrityScheduler';
