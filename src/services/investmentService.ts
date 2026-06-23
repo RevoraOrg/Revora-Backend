@@ -2,6 +2,8 @@ import { Pool } from 'pg';
 import { InvestmentRepository, CreateInvestmentInput, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { Errors } from '../lib/errors';
+import { AMLService } from '../aml/amlService';
+import { TransactionContext } from '../aml/types';
 
 /**
  * Input for creating an investment
@@ -20,7 +22,8 @@ export interface CreateInvestmentRequest {
 export class InvestmentService {
   constructor(
     private investmentRepo: InvestmentRepository,
-    private offeringRepo: OfferingRepository
+    private offeringRepo: OfferingRepository,
+    private amlService?: AMLService
   ) {}
 
   /**
@@ -64,6 +67,29 @@ export class InvestmentService {
 
     const investment = await this.investmentRepo.create(investmentInput);
 
+    // 6. Run AML transaction monitoring if service is available
+    if (this.amlService) {
+      try {
+        const context: TransactionContext = {
+          investment_id: investment.id,
+          investor_id: investment.investor_id,
+          offering_id: investment.offering_id,
+          amount: investment.amount,
+          asset: investment.asset,
+          timestamp: investment.created_at,
+        };
+        
+        // Run AML evaluation asynchronously (non-blocking)
+        this.amlService.evaluateTransaction(context).catch(error => {
+          // Log error but don't fail the investment creation
+          console.error('AML evaluation failed:', error);
+        });
+      } catch (error) {
+        // Log error but don't fail the investment creation
+        console.error('AML evaluation setup failed:', error);
+      }
+    }
+
     return investment;
   }
 }
@@ -71,9 +97,10 @@ export class InvestmentService {
 /**
  * Factory function to create InvestmentService with dependencies
  */
-export function createInvestmentService(db: Pool): InvestmentService {
+export function createInvestmentService(db: Pool, amlService?: AMLService): InvestmentService {
   return new InvestmentService(
     new InvestmentRepository(db),
-    new OfferingRepository(db)
+    new OfferingRepository(db),
+    amlService
   );
 }
