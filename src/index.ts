@@ -37,6 +37,8 @@ import { emailService } from "./services/emailService";
 import { createAdminRouter } from "./routes/admin";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
+import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
 
 const port = env.PORT;
@@ -912,11 +914,22 @@ if (require.main === module && env.NODE_ENV !== "test") {
   
   auditPurgeService.start(); // Start scheduled purge job
 
+  const payoutDriftRepo = new PayoutDriftRepository(pool);
+  const payoutDriftDetector = new PayoutDriftDetector(
+    pool,
+    payoutDriftRepo,
+    metricsCollector
+  );
+  
+  payoutDriftDetector.start(); // Start nightly payout drift detection
+
   process.on("SIGTERM", () => {
     auditPurgeService.stop();
+    payoutDriftDetector.stop();
   });
   process.on("SIGINT", () => {
     auditPurgeService.stop();
+    payoutDriftDetector.stop();
   });
 
   server = app.listen(port, () => {
