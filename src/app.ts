@@ -27,6 +27,11 @@ import { RefreshTokenRepository, TokenService } from './auth/refresh/types';
 import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
 import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
 import { errorHandler } from './middleware/errorHandler';
+import { SocialIdentityRepository } from './db/repositories/socialIdentityRepository';
+import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryAdapter';
+import { SocialAuthService } from './auth/social/socialAuthService';
+import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
+import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -200,6 +205,13 @@ export function createApp() {
     new SessionRepositoryAdapter(sessionRepository),
     jwtIssuer,
   );
+  const socialAuthService = new SocialAuthService(
+    new SocialUserRepositoryAdapter(userRepository),
+    new SocialIdentityRepository(pool),
+    new SessionRepositoryAdapter(sessionRepository),
+    jwtIssuer,
+    createDefaultSocialTokenVerifierFromEnv(),
+  );
 
   // Refresh service
   const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
@@ -209,6 +221,7 @@ export function createApp() {
 
   // Auth and health routes
   app.use(createLoginRouter({ loginService }));
+  app.use(createSocialAuthRouter({ socialAuthService, requireAuth }));
   app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
