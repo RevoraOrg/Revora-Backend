@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
 import { verifyAdminSignature } from '../middleware/adminSignature';
+
 export interface Offering {
   id: string;
   issuer_id: string;
@@ -15,7 +16,6 @@ export interface OfferingRepo {
   listByIssuer: (issuerId: string, opts?: { status?: string; limit?: number; offset?: number }) => Promise<Offering[]>;
   countByIssuer?: (issuerId: string, opts?: { status?: string }) => Promise<number>;
   getById: (id: string) => Promise<Offering | null>;
-  // Optional public listing for investors / catalog
   listPublic?: (opts?: { status?: string; limit?: number; offset?: number; sort?: string }) => Promise<Partial<Offering>[]>;
   countPublic?: (opts?: { status?: string }) => Promise<number>;
 }
@@ -42,7 +42,6 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
         globalLogger.warn('Unauthorized access attempt to offerings list');
         return next(Errors.unauthorized());
       }
-      // Only startups allowed; optional role check
       if (user.role && user.role !== 'startup') {
         globalLogger.warn('Forbidden access attempt to offerings list', { userId: user.id, role: user.role });
         return next(Errors.forbidden());
@@ -60,8 +59,9 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
       }
       return res.json(result);
     } catch (err) {
-      return res.json(result);
-    } catch (err) {
+      // FIX: Original had two catch blocks on the same try — TypeScript only allows
+      // one. The first erroneous catch referenced out-of-scope `result` and used
+      // res.json instead of next(err). Replaced with a single correct catch.
       return next(err);
     }
   }
@@ -69,8 +69,6 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
   async function approveOffering(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      // In a real app we'd call offeringService.approve(id) here.
-      // Assuming offeringService is globally available or injected via closures:
       globalLogger.info('Offering approved', { offeringId: id, adminKid: (req as any).adminKid });
       res.json({ success: true, status: 'approved' });
     } catch (e) {
@@ -122,7 +120,7 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
           return next(Errors.badRequest('Invalid offset parameter'));
         }
       }
-      
+
       const sort = typeof req.query.sort === 'string' ? req.query.sort : undefined;
 
       if (typeof offeringRepo.listPublic !== 'function') {
@@ -136,10 +134,7 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
         result.total = await offeringRepo.countPublic({ status });
       }
 
-      globalLogger.info('Catalog list fetched', { 
-        status, limit, offset, sort, count: offerings.length 
-      });
-
+      globalLogger.info('Catalog list fetched', { status, limit, offset, sort, count: offerings.length });
       return res.json(result);
     } catch (err) {
       return next(err);
@@ -168,12 +163,7 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
         (user.role === 'startup' || user.role === 'issuer') &&
         user.id === offeringIssuerId;
 
-      globalLogger.info('Offering detail fetched', { 
-        id, 
-        isIssuer, 
-        userId: user?.id 
-      });
-
+      globalLogger.info('Offering detail fetched', { id, isIssuer, userId: user?.id });
       return res.json(isIssuer ? offering : toPublicOffering(offering));
     } catch (err) {
       return next(err);
@@ -183,18 +173,18 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
   return { listCatalog, getOfferingById };
 }
 
-export default function createOfferingsRouter(opts: { offeringRepo: OfferingRepo; verifyJWT: express.RequestHandler }) {
+export default function createOfferingsRouter(opts: {
+  offeringRepo: OfferingRepo;
+  verifyJWT: express.RequestHandler;
+}) {
   const router = express.Router();
   const handlers = createOfferingHandlers(opts.offeringRepo);
   const publicHandlers = createPublicHandlers(opts.offeringRepo);
 
   router.get('/api/startup/offerings', opts.verifyJWT, handlers.listOfferings);
-  // Admin privileged actions
   router.post('/api/startup/offerings/:id/approve', opts.verifyJWT, verifyAdminSignature(), handlers.approveOffering);
   router.post('/api/startup/offerings/:id/reject', opts.verifyJWT, verifyAdminSignature(), handlers.rejectOffering);
   router.post('/api/startup/offerings/:id/archive', opts.verifyJWT, verifyAdminSignature(), handlers.archiveOffering);
-
-  // Public catalog for investors (no auth)
   router.get('/api/offerings', publicHandlers.listCatalog);
   router.get('/api/offerings/:id', publicHandlers.getOfferingById);
 

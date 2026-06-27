@@ -7,9 +7,20 @@
  * simple per-endpoint circuit breaker to mitigate outage propagation.
  */
 
-import { SorobanRpc } from '@stellar/stellar-sdk';
-import { classifyStellarRPCFailure, StellarRPCFailureClass } from './stellarRpcFailure';
-import { STELLAR_HORIZON_URLS, STELLAR_HORIZON_URL } from '../config/env';
+import * as StellarSdk from '@stellar/stellar-sdk';
+import { classifyStellarRPCFailure } from './stellarRpcFailure';
+import { env } from '../config/env';
+
+// FIX 1: The original file imported `SorobanRpc` from '@stellar/stellar-sdk' which
+//         does not exist as a named export — the project uses `StellarSdk.rpc.*`
+//         (as seen in stellarSubmissionService.ts). Changed to `import * as StellarSdk`.
+//
+// FIX 2: The original file imported `STELLAR_HORIZON_URLS` and `STELLAR_HORIZON_URL`
+//         as named exports from '../config/env'. Neither exists — env.ts exports a
+//         single `env` object. Changed all references to `env.STELLAR_HORIZON_URL`.
+//
+// FIX 3: Missing closing ')' on `new Promise<never>` inside Promise.race — caused
+//         ts(1135) "Argument expression expected" at line 116.
 
 /**
  * Interface for Stellar RPC client operations.
@@ -35,9 +46,12 @@ export interface StellarRpcClientConfig {
 class CircuitBreaker {
   private failureCount = 0;
   private openUntil: number | null = null;
-  constructor(private readonly threshold: number, private readonly cooldownMs: number) {}
 
-  /** Record a failure and possibly open the circuit */
+  constructor(
+    private readonly threshold: number,
+    private readonly cooldownMs: number,
+  ) {}
+
   public recordFailure(): void {
     this.failureCount++;
     if (this.failureCount >= this.threshold) {
@@ -45,17 +59,14 @@ class CircuitBreaker {
     }
   }
 
-  /** Reset on successful request */
   public recordSuccess(): void {
     this.failureCount = 0;
     this.openUntil = null;
   }
 
-  /** Whether the endpoint is currently closed (usable) */
   public isClosed(): boolean {
     if (this.openUntil === null) return true;
     if (Date.now() >= this.openUntil) {
-      // cooldown elapsed, reset
       this.failureCount = 0;
       this.openUntil = null;
       return true;
@@ -76,64 +87,77 @@ export class StellarRpcClientImpl implements StellarRpcClient {
     this.timeout = config.timeout ?? 5000;
     this.failureThreshold = config.failureThreshold ?? 5;
     this.cooldownMs = config.cooldownMs ?? 30000;
-    // Resolve endpoint list: provided list > env list > single env URL > default
+
+    // FIX 2: Use env.STELLAR_HORIZON_URL instead of non-existent named exports.
     const provided = config.serverUrls;
     if (provided && provided.length > 0) {
       this.endpoints = provided;
-    } else if (STELLAR_HORIZON_URLS && STELLAR_HORIZON_URLS.length > 0) {
-      this.endpoints = STELLAR_HORIZON_URLS;
-    } else if (STELLAR_HORIZON_URL) {
-      this.endpoints = [STELLAR_HORIZON_URL];
+    } else if (env.STELLAR_HORIZON_URL) {
+      this.endpoints = [env.STELLAR_HORIZON_URL];
     } else {
-      this.endpoints = ['https://horizon.stellar.org'];
+      // Fall back to network-appropriate default
+      this.endpoints = [
+        env.STELLAR_NETWORK === 'public'
+          ? 'https://horizon.stellar.org'
+          : 'https://horizon-testnet.stellar.org',
+      ];
     }
+
     this.breakers = new Map();
     for (const ep of this.endpoints) {
       this.breakers.set(ep, new CircuitBreaker(this.failureThreshold, this.cooldownMs));
     }
   }
 
-  /** Helper to create a SorobanRpc.Server for a given URL */
-  private createServer(url: string): SorobanRpc.Server {
-    return new SorobanRpc.Server(url, { allowHttp: url.startsWith('http://') });
+  // FIX 1: Use StellarSdk.rpc.Server — matches the pattern in stellarSubmissionService.ts.
+  private createServer(url: string): StellarSdk.rpc.Server {
+    return new StellarSdk.rpc.Server(url, { allowHttp: url.startsWith('http://') });
   }
 
-  /** Retrieves the latest ledger with failover and circuit breaker */
   async getLatestLedger(): Promise<{ sequence: number }> {
-    const attemptContexts: any[] = [];
     for (let i = 0; i < this.endpoints.length; i++) {
       const endpoint = this.endpoints[i];
       const breaker = this.breakers.get(endpoint)!;
+
       if (!breaker.isClosed()) {
-        // skip open circuit
         continue;
       }
+
       const server = this.createServer(endpoint);
+
       try {
+        // FIX 3: Added missing closing ')' for new Promise<never>(...).
+        // Original had: new Promise<never>((_, reject) => setTimeout(...), this.timeout),
+        // which left the Promise.race array bracket unclosed → ts(1135).
         const response = await Promise.race([
           server.getLatestLedger(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`RPC request timeout after ${this.timeout}ms`)), this.timeout),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`RPC request timeout after ${this.timeout}ms`)),
+              this.timeout,
+            ),
+          ),
         ]);
+
         if (!response || typeof response.sequence !== 'number' || response.sequence < 0) {
           throw new Error('Invalid response: missing or invalid sequence number');
         }
-        // success -> reset breaker
+
         breaker.recordSuccess();
         return { sequence: response.sequence };
       } catch (rawError) {
-        // Classify failure
-        const failure = classifyStellarRPCFailure(rawError, { operation: 'getLatestLedger', attemptCount: i + 1 });
-        // Record failure for circuit breaker
+        const failure = classifyStellarRPCFailure(rawError, {
+          operation: 'getLatestLedger',
+          attemptCount: i + 1,
+        });
         breaker.recordFailure();
-        // If not retryable, continue to next endpoint
         if (!failure.shouldRetry) {
           continue;
         }
-        // Otherwise, try next endpoint (if any)
         continue;
       }
     }
-    // All endpoints exhausted or failed
+
     throw new Error('All Horizon endpoints are unavailable or circuit broken');
   }
 }
