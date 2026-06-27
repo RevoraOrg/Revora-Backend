@@ -572,7 +572,21 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     });
   });
 
-  app.use("/health", createHealthRouter(healthQuery as any, healthStatus));
+  app.get("/health/failover", async (_req: Request, res: Response) => {
+    const region = env.REGION;
+    const activeRegion = env.FAILOVER_ACTIVE_REGION ?? region;
+    const db = await healthStatus();
+    res.status(db.healthy ? 200 : 503).json({
+      region,
+      activeRegion,
+      isActive: region === activeRegion,
+      db: db.healthy ? "up" : "down",
+      failoverActive: region !== activeRegion,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.use("/health", createHealthRouter(healthQuery as any, healthStatus, undefined, env.REGION));
 
   apiRouter.get("/overview", (_req: Request, res: Response) => {
     res.json({

@@ -16,6 +16,7 @@ import {
   createHealthRouter,
   healthLiveHandler,
   healthReadyHandler,
+  healthRegionHandler,
   healthRootHandler,
   healthStartupHandler,
   mapHealthDependencyFailure,
@@ -1263,6 +1264,112 @@ describe("healthRootHandler - dependency graph aggregation", () => {
     const dbCheck = response.body.checks.find((c: DependencyHealth) => c.name === "database");
     expect(Array.isArray(dbCheck.dependsOn)).toBe(true);
     expect(dbCheck.dependsOn).toContain("db-pool");
+  });
+
+  it("returns region info from healthRegionHandler", async () => {
+    const app = express();
+    app.get("/region", healthRegionHandler("eu-west-1"));
+
+    const response = await request(app).get("/region");
+
+    expect(response.status).toBe(200);
+    expect(response.body.region).toBe("eu-west-1");
+    expect(response.body.activeRegion).toBe("eu-west-1");
+    expect(response.body.isActive).toBe(true);
+    expect(response.body.service).toBe("revora-backend");
+    expect(response.body.timestamp).toBeDefined();
+  });
+
+  it("healthRegionHandler defaults to us-east-1 when no region provided", async () => {
+    const app = express();
+    app.get("/region", healthRegionHandler());
+
+    const response = await request(app).get("/region");
+
+    expect(response.body.region).toBe("us-east-1");
+    expect(response.body.isActive).toBe(true);
+  });
+
+  it("healthRegionHandler reports inactive when region mismatch", async () => {
+    process.env.FAILOVER_ACTIVE_REGION = "eu-west-1";
+    const app = express();
+    app.get("/region", healthRegionHandler("us-east-1"));
+
+    const response = await request(app).get("/region");
+
+    expect(response.body.region).toBe("us-east-1");
+    expect(response.body.activeRegion).toBe("eu-west-1");
+    expect(response.body.isActive).toBe(false);
+
+    delete process.env.FAILOVER_ACTIVE_REGION;
+  });
+
+  it("failover endpoint returns failover status from createApp", async () => {
+    process.env.REGION = "eu-west-1";
+    process.env.FAILOVER_ACTIVE_REGION = "eu-west-1";
+    const app = createApp({
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: true,
+        latencyMs: 5,
+        pool: { totalCount: 2, idleCount: 2, waitingCount: 0, maxConnections: 10 },
+      }),
+      healthQuery: jest.fn(),
+    });
+
+    const response = await request(app).get("/health/failover");
+
+    expect(response.status).toBe(200);
+    expect(response.body.region).toBe("eu-west-1");
+    expect(response.body.activeRegion).toBe("eu-west-1");
+    expect(response.body.isActive).toBe(true);
+    expect(response.body.failoverActive).toBe(false);
+    expect(response.body.db).toBe("up");
+
+    delete process.env.REGION;
+    delete process.env.FAILOVER_ACTIVE_REGION;
+  });
+
+  it("failover endpoint reports failoverActive=true when region mismatch", async () => {
+    const originalRegion = process.env.REGION;
+    process.env.REGION = "us-east-1";
+    process.env.FAILOVER_ACTIVE_REGION = "eu-west-1";
+    const app = createApp({
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: true,
+        latencyMs: 5,
+        pool: { totalCount: 2, idleCount: 2, waitingCount: 0, maxConnections: 10 },
+      }),
+      healthQuery: jest.fn(),
+    });
+
+    const response = await request(app).get("/health/failover");
+
+    expect(response.status).toBe(200);
+    expect(response.body.region).toBe("us-east-1");
+    expect(response.body.activeRegion).toBe("eu-west-1");
+    expect(response.body.isActive).toBe(false);
+    expect(response.body.failoverActive).toBe(true);
+
+    if (originalRegion) process.env.REGION = originalRegion;
+    else delete process.env.REGION;
+    delete process.env.FAILOVER_ACTIVE_REGION;
+  });
+
+  it("failover endpoint returns 503 when db is down", async () => {
+    const app = createApp({
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: false,
+        latencyMs: 100,
+        error: "connection refused",
+        pool: { totalCount: 0, idleCount: 0, waitingCount: 0, maxConnections: 10 },
+      }),
+      healthQuery: jest.fn(),
+    });
+
+    const response = await request(app).get("/health/failover");
+
+    expect(response.status).toBe(503);
+    expect(response.body.db).toBe("down");
   });
 
   it("returns 503 unhealthy when both DB and Horizon are down", async () => {

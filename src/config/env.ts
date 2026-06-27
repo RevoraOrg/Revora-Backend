@@ -32,6 +32,8 @@ import { z } from "zod";
  * | SMTP_PORT                   | SMTP     | 587                     | SMTP relay port                                  |
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
+ * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
+ * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
  */
 
 const envSchema = z.object({
@@ -56,6 +58,8 @@ const envSchema = z.object({
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
+  REGION: z.string().default("us-east-1"),
+  FAILOVER_ACTIVE_REGION: z.string().optional(),
   SENDGRID_API_KEY: z.string().optional(),
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.coerce.number().int().positive().max(65535).optional(),

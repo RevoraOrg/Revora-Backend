@@ -609,16 +609,32 @@ export const healthReadyHandler =
     }
   };
 
+export const healthRegionHandler =
+  (region?: string) =>
+  async (_req: Request, res: Response): Promise<void> => {
+    const currentRegion = region ?? process.env.REGION ?? "us-east-1";
+    const activeRegion = process.env.FAILOVER_ACTIVE_REGION ?? currentRegion;
+    res.status(200).json({
+      region: currentRegion,
+      activeRegion,
+      isActive: currentRegion === activeRegion,
+      service: "revora-backend",
+      timestamp: new Date().toISOString(),
+    });
+  };
+
 export const createHealthRouter = (
   db: QueryableDb,
   dbHealth: DbHealthChecker,
   metrics?: MetricsCollector,
+  region?: string,
 ): Router => {
   const router = Router();
   router.get("/", healthRootHandler(dbHealth));
   router.get("/live", healthLiveHandler());
   router.get("/ready", healthReadyHandler(db, metrics));
   router.get("/startup", healthStartupHandler(dbHealth));
+  router.get("/region", healthRegionHandler(region));
   return router;
 };
 
