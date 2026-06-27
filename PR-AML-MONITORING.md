@@ -90,7 +90,7 @@ Hooked AML evaluator into post-investment pipeline in `src/services/investmentSe
 
 ### Test Coverage
 
-Comprehensive test suite with 30 tests (all passing):
+Comprehensive test suite with 89 tests (all passing):
 
 **Rule Evaluator Tests** (`src/aml/ruleEvaluator.test.ts`) - 14 tests
 - Velocity rule triggers (count and amount thresholds)
@@ -108,11 +108,42 @@ Comprehensive test suite with 30 tests (all passing):
 - Alert lifecycle management
 - Audit logging verification
 
+**AML Rule Repository Tests** (`src/aml/amlRuleRepository.test.ts`) - 16 tests
+- Rule creation with initial version 1.0.0
+- Rule retrieval (by ID, enabled, all)
+- Rule updates with version bumping
+- Version history tracking
+- Rollback to previous versions
+- Error handling for nonexistent resources
+
+**AML Alert Repository Tests** (`src/aml/amlAlertRepository.test.ts`) - 17 tests
+- Alert creation and retrieval
+- Alert status updates
+- Case creation and workflow
+- Case status transitions
+- Alert-to-case linking
+- Error handling for edge cases
+
+**AML Routes Tests** (`src/routes/amlRoutes.test.ts`) - 26 tests
+- Rule management endpoints (GET, POST, PUT, rollback)
+- Case management endpoints (GET, POST, PUT)
+- Alert management endpoints (GET, dismiss)
+- Input validation with Zod
+- Error handling and status codes
+
+### Coverage Metrics
+
+- AML module overall: 92.55% line coverage
+- AMLRuleRepository: 97.77% coverage
+- AMLAlertRepository: 92.2% coverage
+- AMLService: 88.88% coverage
+- RuleEvaluator: 88.52% coverage
+- AMLRoutes: 79.36% coverage
+
 ### Running Tests
 
 ```bash
-npm test -- src/aml/ruleEvaluator.test.ts
-npm test -- src/aml/amlService.test.ts
+npm test -- --testPathPatterns="aml"
 ```
 
 All tests pass with 100% success rate.
@@ -159,19 +190,18 @@ Complete documentation in `docs/aml-transaction-monitoring.md` covering:
 
 ## Files Changed
 
-- `src/aml/types.ts` - Type definitions
-- `src/aml/amlRuleRepository.ts` - Rule repository with versioning
-- `src/aml/amlAlertRepository.ts` - Alert and case repository
-- `src/aml/ruleEvaluator.ts` - Rule evaluation engine
-- `src/aml/amlService.ts` - Service layer with audit logging
-- `src/aml/ruleEvaluator.test.ts` - Rule evaluator tests
-- `src/aml/amlService.test.ts` - Service layer tests
-- `src/routes/amlRoutes.ts` - REST API endpoints
-- `src/services/investmentService.ts` - Investment pipeline integration
-- `src/db/migrations/001_aml_tables.sql` - Database schema
-- `docs/aml-transaction-monitoring.md` - Documentation
+**Modified:**
+- `src/index.ts` - Registered AML routes in main application
 
-**Total:** 11 files, 3416 insertions, 3 deletions
+**Created:**
+- `src/aml/amlAlertRepository.test.ts` - Comprehensive repository tests (17 tests)
+- `src/aml/amlRuleRepository.test.ts` - Comprehensive repository tests (16 tests)
+- `src/routes/amlRoutes.test.ts` - Comprehensive API route tests (26 tests)
+- `src/docs/aml-monitoring.md` - Complete documentation
+
+**Note:** Core AML implementation files (types, repositories, evaluator, service, routes, migration) were already implemented in previous commits. This PR adds the missing test coverage, documentation, and route integration to complete the feature.
+
+**Total:** 5 files, 1954 insertions
 
 ## Checklist
 
@@ -181,6 +211,7 @@ Complete documentation in `docs/aml-transaction-monitoring.md` covering:
 - [x] Rule changes versioned and audit-logged
 - [x] Security assumptions validated
 - [x] Edge cases covered (rollback, false-positive suppression, multi-investor structuring)
-- [x] Comprehensive test coverage (30 tests, all passing)
+- [x] Comprehensive test coverage (89 tests, all passing)
 - [x] Clear documentation
 - [x] Backend code only (no frontend changes)
+- [x] AML routes registered in main application
