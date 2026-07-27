@@ -35,6 +35,7 @@ import { globalMetrics } from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
 import { createAdminRouter } from "./routes/admin";
+import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { AuditPurgeService } from "./services/auditPurgeService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
@@ -620,12 +621,13 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const amlAuditRepo = new InMemorySecurityAuditRepository();
 
   // Mount admin router
   apiRouter.use("/admin", createAdminRouter(auditLogRepo));
+  apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
 
   // Initialize AML service and routes
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
 

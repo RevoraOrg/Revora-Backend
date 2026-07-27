@@ -57,7 +57,7 @@ export function authMiddleware(): RequestHandler {
         error: error instanceof Error ? error.message : 'Unknown error',
         path: req.path,
       });
-      next(Errors.unauthorized(errorMessage));
+      next(Errors.unauthorized('Invalid or expired token'));
     }
   };
 }
