@@ -13,6 +13,8 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 import { globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
+import { TenantSettingsRepository } from '../db/repositories/tenantSettingsRepository';
+import { verifyReproducibleBuildAttestation } from '../security/attestationVerifier';
 import { env } from '../config/env';
 
 const logger = globalLogger.child({ service: 'contract-upgrade-orchestrator' });
@@ -23,6 +25,7 @@ export type UpgradeStatus = 'pending' | 'approved' | 'applied' | 'failed';
 
 export interface ContractUpgrade {
   id: string;
+  tenant_id: string;
   contract_id: string;
   target_code_id: string;
   status: UpgradeStatus;
@@ -39,9 +42,11 @@ export interface ContractUpgrade {
 }
 
 export interface CreateUpgradeInput {
+  tenant_id: string;
   contract_id: string;
   target_code_id: string;
   proposed_by: string;
+  attestation: unknown;
 }
 
 export interface SimulateResult {
@@ -55,6 +60,7 @@ export interface SimulateResult {
 function mapRow(row: any): ContractUpgrade {
   return {
     id: row.id,
+    tenant_id: row.tenant_id,
     contract_id: row.contract_id,
     target_code_id: row.target_code_id,
     status: row.status,
@@ -79,6 +85,7 @@ export class ContractUpgradeOrchestratorService {
   constructor(
     private readonly db: Pool,
     private readonly auditLog: AuditLogRepository,
+    private readonly tenantSettingsRepo: TenantSettingsRepository,
     private readonly keypair: StellarSdk.Keypair,
   ) {
     const horizonUrl =
@@ -103,20 +110,56 @@ export class ContractUpgradeOrchestratorService {
    * Pins the target_code_id at creation time so it cannot be swapped later.
    */
   async createUpgrade(input: CreateUpgradeInput): Promise<ContractUpgrade> {
-    const { contract_id, target_code_id, proposed_by } = input;
+    const { tenant_id, contract_id, target_code_id, proposed_by, attestation } = input;
 
-    if (!contract_id || !target_code_id || !proposed_by) {
+    if (!tenant_id || !contract_id || !target_code_id || !proposed_by || attestation === undefined) {
       throw Errors.validationError(
-        'contract_id, target_code_id and proposed_by are required',
+        'tenant_id, contract_id, target_code_id, proposed_by and attestation are required',
       );
     }
 
+    const tenantSettings = await this.tenantSettingsRepo.findByTenantId(tenant_id);
+    if (!tenantSettings) {
+      throw Errors.notFound(`Tenant settings for '${tenant_id}' not found`);
+    }
+
+    const builderIdentities = Array.isArray(tenantSettings.settings.builder_identities)
+      ? tenantSettings.settings.builder_identities.filter(
+          (item): item is string => typeof item === 'string' && item.trim().length > 0,
+        )
+      : [];
+
+    if (builderIdentities.length === 0) {
+      throw Errors.badRequest(
+        `Tenant '${tenant_id}' has no configured builder identities`,
+      );
+    }
+
+    const verifiedAttestation = verifyReproducibleBuildAttestation(
+      attestation,
+      target_code_id,
+      builderIdentities,
+    );
+
+    await this.auditLog.createAuditLog({
+      user_id: proposed_by,
+      action: 'upgrade.attestation.verified',
+      resource: `tenants/${tenant_id}`,
+      details: JSON.stringify({
+        tenant_id,
+        contract_id,
+        target_code_id,
+        builder_id: verifiedAttestation.builderId,
+        subject_name: verifiedAttestation.subjectName,
+      }),
+    });
+
     const result = await this.db.query<ContractUpgrade>(
       `INSERT INTO contract_upgrades
-         (contract_id, target_code_id, proposed_by, status)
-       VALUES ($1, $2, $3, 'pending')
+         (tenant_id, contract_id, target_code_id, proposed_by, status)
+       VALUES ($1, $2, $3, $4, 'pending')
        RETURNING *`,
-      [contract_id, target_code_id, proposed_by],
+      [tenant_id, contract_id, target_code_id, proposed_by],
     );
 
     const upgrade = mapRow(result.rows[0]);
