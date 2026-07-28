@@ -43,6 +43,7 @@ import { z } from "zod";
  * | OFAC_SIG_URL                | No       | (empty)                 | URL for OFAC SDN list Ed25519 signature (hex)     |
  * | OFAC_TRUST_ANCHOR_BASE64    | No       | (empty)                 | Base64-encoded Ed25519 public key for OFAC sig vfy |
  * | OFAC_FETCH_TIMEOUT_MS       | No       | 30000                   | Timeout in ms for OFAC list fetch                 |
+ * | SCIM_TOKEN                  | No       | (empty)                 | Bearer token for SCIM 2.0 provisioning API       |
  */
 
 const envSchema = z.object({
@@ -83,6 +84,7 @@ const envSchema = z.object({
   OFAC_SIG_URL: z.string().optional(),
   OFAC_TRUST_ANCHOR_BASE64: z.string().optional(),
   OFAC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  SCIM_TOKEN: z.string().optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

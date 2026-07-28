@@ -52,6 +52,8 @@ import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
 import { Keypair } from '@stellar/stellar-sdk';
 import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
+import { createScimRouter } from './routes/scim';
+import { UserRepository } from './db/repositories/userRepository';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -691,6 +693,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Initialize AML service and routes
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
+
+  const userRepo = new UserRepository(pool);
+  const scimToken = env.SCIM_TOKEN ?? '';
+  app.use('/scim/v2', createScimRouter(userRepo, scimToken, '/scim/v2'));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));

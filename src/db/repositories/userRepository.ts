@@ -36,6 +36,7 @@ export interface CreateUserInput {
 export interface UpdateUserInput {
   id: string;
   email?: string;
+  name?: string;
   password_hash?: string;
   role?: 'startup' | 'investor';
   kyc_risk_tier?: KycRiskTier;
@@ -152,6 +153,10 @@ export class UserRepository {
     if (input.email !== undefined) {
       sets.push(`email = $${idx++}`);
       values.push(input.email);
+    }
+    if (input.name !== undefined) {
+      sets.push(`name = $${idx++}`);
+      values.push(input.name);
     }
     if (input.password_hash !== undefined) {
       sets.push(`password_hash = $${idx++}`);
