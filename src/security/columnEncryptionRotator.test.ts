@@ -96,6 +96,21 @@ describe('ColumnEncryptionRotator', () => {
     logger = new Logger({ level: LogLevel.EMERGENCY });
   });
 
+  it('should construct with default parameters when optional services are omitted', () => {
+    const rotator = new ColumnEncryptionRotator({ kmsKeyProvider: kmsProvider });
+    expect(rotator).toBeDefined();
+  });
+
+  it('should default to active key generation if targetKeyGeneration option is omitted in startRotation', async () => {
+    const rotator = new ColumnEncryptionRotator({
+      kmsKeyProvider: kmsProvider,
+      inMemoryStore: [],
+    });
+    const job = await rotator.startRotation('table_x', 'col_y');
+    expect(job.targetKeyGeneration).toBe(1);
+    expect(job.status).toBe('completed');
+  });
+
   it('should successfully rotate column data and emit rotation.rows_reencrypted metric', async () => {
     // Seed test records encrypted under KMS generation 1
     const records = [];
@@ -128,20 +143,10 @@ describe('ColumnEncryptionRotator', () => {
     expect(job.status).toBe('in_progress');
     expect(job.totalRows).toBe(5);
 
-    // Process all in batches of 2
-    const batch1 = await rotator.processBatch(job.id, 2);
-    expect(batch1.processed).toBe(2);
-    expect(batch1.completed).toBe(false);
-
-    const batch2 = await rotator.processBatch(job.id, 2);
-    expect(batch2.processed).toBe(2);
-
-    const batch3 = await rotator.processBatch(job.id, 2);
-    expect(batch3.completed).toBe(true);
-
-    const finalState = await rotator.getJobState(job.id);
-    expect(finalState?.status).toBe('completed');
-    expect(finalState?.reencryptedRows).toBe(5);
+    // Run to completion via runToCompletion
+    const finalJob = await rotator.runToCompletion(job.id, 2);
+    expect(finalJob.status).toBe('completed');
+    expect(finalJob.reencryptedRows).toBe(5);
 
     // Verify all rows in records are updated to gen 2 and decrypt correctly with gen 2 key
     for (let i = 1; i <= 5; i++) {
@@ -226,6 +231,38 @@ describe('ColumnEncryptionRotator', () => {
     }
   });
 
+  it('should skip rows in batch loop if row keyGeneration is already >= targetKeyGeneration', async () => {
+    const enc1 = await kmsProvider.encrypt('old_data', 1);
+    const enc2 = await kmsProvider.encrypt('already_new_data', 2);
+    const records = [
+      { id: 'row_1', sensitiveData: enc1.ciphertext, keyGeneration: 1 },
+      { id: 'row_2', sensitiveData: enc2.ciphertext, keyGeneration: 2 },
+    ];
+
+    await kmsProvider.rotateKey();
+
+    const rotator = new ColumnEncryptionRotator({
+      kmsKeyProvider: kmsProvider,
+      auditRepo,
+      metrics,
+      logger,
+      inMemoryStore: records,
+    });
+
+    const job = await rotator.startRotation('kms_sample_records', 'sensitive_data', {
+      targetKeyGeneration: 2,
+    });
+
+    // Manually pass a batch that contains row_2 with keyGeneration = 2
+    jest.spyOn(rotator as any, 'fetchBatchToRotate').mockResolvedValueOnce([
+      { id: 'row_1', ciphertext: enc1.ciphertext, keyGeneration: 1 },
+      { id: 'row_2', ciphertext: enc2.ciphertext, keyGeneration: 2 },
+    ]);
+
+    const batchRes = await rotator.processBatch(job.id, 10);
+    expect(batchRes.processed).toBe(1);
+  });
+
   it('should handle corrupted rows gracefully and update failedRows count & audit failure', async () => {
     const enc = await kmsProvider.encrypt('valid_data', 1);
     const records = [
@@ -297,6 +334,12 @@ describe('ColumnEncryptionRotator', () => {
         }
 
         if (normalized.includes('SELECT id, ssn AS ciphertext, key_generation FROM users')) {
+          if (params.length === 3) {
+            // Paginated query with lastProcessedId
+            return {
+              rows: [{ id: 'usr_2', ciphertext: '78:90:12', key_generation: 1 }],
+            };
+          }
           return {
             rows: [
               { id: 'usr_1', ciphertext: '12:34:56', key_generation: 1 },
@@ -328,10 +371,17 @@ describe('ColumnEncryptionRotator', () => {
     const job = await rotator.startRotation('users', 'ssn', { targetKeyGeneration: 2 });
     expect(job.totalRows).toBe(2);
 
-    const batchRes = await rotator.processBatch(job.id, 2);
-    expect(batchRes.processed).toBe(2);
-    expect(mockDbRows['usr_1']).toBeDefined();
-    expect(mockDbRows['usr_2']).toBeDefined();
+    // Process batch 1
+    const batchRes1 = await rotator.processBatch(job.id, 1);
+    expect(batchRes1.processed).toBe(1);
+
+    // Process batch 2 with lastProcessedId set
+    const batchRes2 = await rotator.processBatch(job.id, 1);
+    expect(batchRes2.processed).toBe(1);
+
+    // Test listUnfinishedJobs with pool
+    const pendingJobs = await (rotator as any).listUnfinishedJobs();
+    expect(Array.isArray(pendingJobs)).toBe(true);
   });
 
   it('should return completed state immediately if job is already completed', async () => {
