@@ -4,7 +4,7 @@
  * REST API endpoints for AML transaction monitoring and case management.
  */
 
-import { Router, Request, Response } from 'express';
+import { NextFunction, Router, Request, RequestHandler, Response } from 'express';
 import { AMLService } from '../aml/amlService';
 import { CaseAssignmentService } from '../aml/caseAssignmentService';
 import { z } from 'zod';
@@ -50,6 +50,68 @@ const rollbackRuleSchema = z.object({
   }),
 });
 
+const createOFACReviewSchema = z.object({
+  alert_id: z.string().min(1),
+  case_id: z.string().min(1).optional(),
+  investor_id: z.string().min(1),
+  matched_name: z.string().min(1).max(255),
+  list_entry_id: z.string().min(1).max(255).optional(),
+  rationale: z.string().min(10).max(4000),
+  expires_at: z.string().datetime().optional(),
+});
+
+const approveOFACReviewSchema = z.object({
+  rationale: z.string().min(10).max(4000),
+});
+
+export interface AMLRouteOptions {
+  reviewQueueGuards?: RequestHandler[];
+}
+
+function zodDetails(error: z.ZodError): unknown {
+  return error.issues;
+}
+
+function getActor(req: Request): { id?: string; role?: string } {
+  const user = (req as any).user;
+  const securityUser = (req as any).securityContext?.user;
+
+  return {
+    id: user?.id || securityUser?.id || req.header('x-user-id') || undefined,
+    role: user?.role || securityUser?.role || req.header('x-user-role') || undefined,
+  };
+}
+
+function requireReviewQueueRole(req: Request, res: Response, next: NextFunction): void {
+  const actor = getActor(req);
+  const allowedRoles = ['admin', 'compliance', 'compliance_officer'];
+
+  if (!actor.id || !actor.role) {
+    res.status(401).json({ success: false, error: 'Authentication required' });
+    return;
+  }
+
+  if (!allowedRoles.includes(actor.role)) {
+    res.status(403).json({ success: false, error: 'Compliance role required' });
+    return;
+  }
+
+  (req as any).amlActor = actor;
+  next();
+}
+
+function requireCsrfToken(req: Request, res: Response, next: NextFunction): void {
+  const csrfHeader = req.header('x-csrf-token');
+  const csrfCookie = req.header('cookie')?.match(/(?:^|;\s*)csrfToken=([^;]+)/)?.[1];
+
+  if (!csrfHeader || (csrfCookie && csrfHeader !== decodeURIComponent(csrfCookie))) {
+    res.status(403).json({ success: false, error: 'Valid CSRF token required' });
+    return;
+  }
+
+  next();
+}
+
 /**
  * Create AML routes
  */
@@ -58,6 +120,8 @@ export function createAMLRoutes(
   assignmentService?: CaseAssignmentService,
 ): Router {
   const router = Router();
+  const reviewQueueGuards = options.reviewQueueGuards || [requireReviewQueueRole];
+  const reviewQueueMutationGuards = [...reviewQueueGuards, requireCsrfToken];
 
   /**
    * GET /aml/rules

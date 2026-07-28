@@ -9,13 +9,14 @@ import request from 'supertest';
 import express, { Express } from 'express';
 import { createAMLRoutes } from './amlRoutes';
 import { AMLService } from '../aml/amlService';
-import { AMLRule, AMLCase, AMLAlert, SemVer } from '../aml/types';
+import { AMLRule, AMLCase, AMLAlert, OFACReview, SemVer } from '../aml/types';
 
 // Mock AMLService
 class MockAMLService {
   private rules: AMLRule[] = [];
   private cases: AMLCase[] = [];
   private alerts: AMLAlert[] = [];
+  private ofacReviews: OFACReview[] = [];
 
   async getRules(): Promise<AMLRule[]> {
     return this.rules;
@@ -208,6 +209,54 @@ class MockAMLService {
       status: 'dismissed',
     };
     return this.alerts[index];
+  }
+
+  async getOFACReviewQueue(): Promise<OFACReview[]> {
+    return this.ofacReviews.filter(review =>
+      review.status === 'pending_first_approval' || review.status === 'pending_second_approval'
+    );
+  }
+
+  async createOFACReview(input: any, creatorId: string): Promise<OFACReview> {
+    const review: OFACReview = {
+      id: `ofac_${Date.now()}`,
+      ...input,
+      status: 'pending_first_approval',
+      created_by: creatorId,
+      created_at: new Date(),
+      clearance_rationale: input.rationale,
+      expires_at: input.expires_at || new Date(Date.now() + 86400000),
+      updated_at: new Date(),
+    };
+    this.ofacReviews.push(review);
+    return review;
+  }
+
+  async approveOFACReview(reviewId: string, approverId: string, rationale: string): Promise<OFACReview> {
+    const review = this.ofacReviews.find(item => item.id === reviewId);
+    if (!review) {
+      throw new Error('OFAC review not found');
+    }
+    if (review.created_by === approverId) {
+      throw new Error('Review creator cannot approve their own OFAC clearance');
+    }
+    if (review.first_approver_id === approverId) {
+      throw new Error('Same compliance officer cannot approve an OFAC review twice');
+    }
+    if (review.status === 'pending_first_approval') {
+      review.status = 'pending_second_approval';
+      review.first_approver_id = approverId;
+      review.first_approval_rationale = rationale;
+      review.first_approved_at = new Date();
+      return review;
+    }
+
+    review.status = 'cleared';
+    review.second_approver_id = approverId;
+    review.second_approval_rationale = rationale;
+    review.second_approved_at = new Date();
+    review.cleared_at = new Date();
+    return review;
   }
 }
 
