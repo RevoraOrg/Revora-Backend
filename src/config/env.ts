@@ -39,6 +39,10 @@ import { z } from "zod";
  * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
  * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
  * | BOUNCE_RATIO_ALARM_THRESHOLD| No       | 0.05                    | Bounce ratio threshold for alarms (e.g. 0.05=5%)|
+ * | KYC_WEBHOOK_SECRET         | No       | (empty)                 | Secret key for KYC webhook verification          |
+ * | KYC_WEBHOOK_KEY            | No       | (empty)                 | Alias key for KYC webhook verification           |
+ * | KYC_WEBHOOK_KEY_NEXT       | No       | (empty)                 | Next secret key during KYC webhook key rotation  |
+ * | KYC_WEBHOOK_KEY_NEXT_EXPIRY| No       | (empty)                 | Expiry deadline timestamp for next key acceptance|
  */
 
 const envSchema = z.object({
@@ -75,6 +79,10 @@ const envSchema = z.object({
   SES_SNS_TOPIC_ARN: z.string().optional(),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
+  KYC_WEBHOOK_SECRET: z.string().optional(),
+  KYC_WEBHOOK_KEY: z.string().optional(),
+  KYC_WEBHOOK_KEY_NEXT: z.string().optional(),
+  KYC_WEBHOOK_KEY_NEXT_EXPIRY: z.string().optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
