@@ -41,6 +41,14 @@ export class OidcProviderRepository {
     return rows[0] ?? null;
   }
 
+  async findByIssuerUrl(issuerUrl: string): Promise<OidcProviderRow | null> {
+    const { rows } = await this.db.query<OidcProviderRow>(
+      'SELECT * FROM oidc_providers WHERE issuer_url = $1 AND enabled = TRUE LIMIT 1',
+      [issuerUrl],
+    );
+    return rows[0] ?? null;
+  }
+
   async findAll(): Promise<OidcProviderRow[]> {
     const { rows } = await this.db.query<OidcProviderRow>(
       'SELECT * FROM oidc_providers ORDER BY created_at DESC',
