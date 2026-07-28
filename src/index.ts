@@ -51,6 +51,7 @@ import { createAMLRoutes } from "./routes/amlRoutes";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
 import { Keypair } from '@stellar/stellar-sdk';
+import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -709,6 +710,10 @@ export const __test = {
    *      inspect tier resolution or reset counters without restarting the app.
    */
   createStartupAuthTierLimiter,
+  /**
+   * @dev Exposes the OFAC loader for integration tests.
+   */
+  OfacSanctionsLoader,
 };
 
 export { classifyStellarRPCFailure, StellarRPCFailureClass };
