@@ -359,3 +359,23 @@ Potential improvements:
 - Integration with external watchlists
 - Automated case assignment
 - Regulatory report generation
+## OFAC False-Positive Review Queue
+
+OFAC name-collision hits can be placed into `ofac_reviews` instead of being
+silently paused. Reviews are visible through the AML admin queue and move
+through `pending_first_approval`, `pending_second_approval`, and `cleared`.
+
+Clearance requires dual control:
+
+- The review creator cannot approve the clearance.
+- The second approver must be different from the first approver.
+- Each approval requires a written rationale.
+- Final clearance records `ofac_review_cleared` in the immutable security audit
+  event stream with approver IDs, review ID, alert ID, investor ID, and rationale
+  metadata.
+
+Queue endpoints are restricted to admin/compliance actors. Mutating review
+endpoints require a CSRF token via `x-csrf-token`; when a `csrfToken` cookie is
+present, the header must match it. Pending second-approval reviews whose
+`expires_at` has passed are reset to `pending_first_approval` and re-enter the
+queue so stale single approvals cannot clear an investor later.
