@@ -6,6 +6,7 @@
 
 import { Router, Request, Response } from 'express';
 import { AMLService } from '../aml/amlService';
+import { CaseAssignmentService } from '../aml/caseAssignmentService';
 import { z } from 'zod';
 
 /**
@@ -16,14 +17,14 @@ const createRuleSchema = z.object({
   description: z.string().min(1).max(1000),
   type: z.enum(['velocity', 'structuring', 'geo_mismatch', 'amount_threshold']),
   severity: z.enum(['low', 'medium', 'high', 'critical']),
-  config: z.record(z.unknown()),
+  config: z.record(z.string(), z.unknown()),
 });
 
 const updateRuleSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   description: z.string().min(1).max(1000).optional(),
   enabled: z.boolean().optional(),
-  config: z.record(z.unknown()).optional(),
+  config: z.record(z.string(), z.unknown()).optional(),
   change_reason: z.string().min(1).max(500),
 });
 
@@ -52,7 +53,10 @@ const rollbackRuleSchema = z.object({
 /**
  * Create AML routes
  */
-export function createAMLRoutes(amlService: AMLService): Router {
+export function createAMLRoutes(
+  amlService: AMLService,
+  assignmentService?: CaseAssignmentService,
+): Router {
   const router = Router();
 
   /**
@@ -109,7 +113,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.status(201).json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to create rule' });
@@ -129,7 +133,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to update rule' });
@@ -149,7 +153,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error rolling back AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to rollback rule' });
@@ -179,6 +183,25 @@ export function createAMLRoutes(amlService: AMLService): Router {
     } catch (error) {
       console.error('Error fetching AML cases:', error);
       res.status(500).json({ success: false, error: 'Failed to fetch cases' });
+    }
+  });
+
+  /**
+   * GET /aml/cases/reviewer-capacities
+   * Get capacity snapshots for all configured reviewers
+   */
+  router.get('/cases/reviewer-capacities', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
+    }
+
+    try {
+      const capacities = await assignmentService.getReviewerCapacities();
+      res.json({ success: true, data: capacities });
+    } catch (error) {
+      console.error('Error fetching reviewer capacities:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch reviewer capacities' });
     }
   });
 
@@ -229,7 +252,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.status(201).json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to create case' });
@@ -249,7 +272,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to update case' });
@@ -298,6 +321,54 @@ export function createAMLRoutes(amlService: AMLService): Router {
     } catch (error) {
       console.error('Error dismissing alert:', error);
       res.status(500).json({ success: false, error: 'Failed to dismiss alert' });
+    }
+  });
+
+  /**
+   * POST /aml/cases/assign-auto
+   * Auto-assign a single open case to the least-loaded eligible reviewer
+   */
+  router.post('/cases/assign-auto', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
+    }
+
+    try {
+      const { case_id } = req.body;
+      if (!case_id || typeof case_id !== 'string') {
+        res.status(400).json({ success: false, error: 'case_id is required' });
+        return;
+      }
+
+      const result = await assignmentService.assignCase(case_id);
+      res.json({ success: true, data: result });
+    } catch (error: any) {
+      if (error?.statusCode) {
+        res.status(error.statusCode).json({ success: false, error: error.message, details: error.details });
+      } else {
+        console.error('Error auto-assigning AML case:', error);
+        res.status(500).json({ success: false, error: 'Failed to auto-assign case' });
+      }
+    }
+  });
+
+  /**
+   * POST /aml/cases/assign-all
+   * Auto-assign all unassigned open cases (oldest-first)
+   */
+  router.post('/cases/assign-all', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
+    }
+
+    try {
+      const results = await assignmentService.assignAllOpenCases();
+      res.json({ success: true, data: results, assigned_count: results.length });
+    } catch (error: any) {
+      console.error('Error batch auto-assigning AML cases:', error);
+      res.status(500).json({ success: false, error: 'Failed to batch auto-assign cases' });
     }
   });
 
