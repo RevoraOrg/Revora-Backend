@@ -8,6 +8,7 @@
 import { Pool } from 'pg';
 import { AMLRuleRepository } from './amlRuleRepository';
 import { AMLAlertRepository } from './amlAlertRepository';
+import { OFACReviewRepository } from './ofacReviewRepository';
 import { RuleEvaluator } from './ruleEvaluator';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
@@ -20,6 +21,8 @@ import {
   UpdateCaseInput,
   AMLCase,
   AMLAlert,
+  CreateOFACReviewInput,
+  OFACReview,
   SemVer,
 } from './types';
 
@@ -32,7 +35,8 @@ export class AMLService {
     private alertRepo: AMLAlertRepository,
     private evaluator: RuleEvaluator,
     private auditRepo: SecurityAuditRepository,
-    private currentUserId: string
+    private currentUserId: string,
+    private ofacReviewRepo?: OFACReviewRepository
   ) {}
 
   /**
@@ -369,6 +373,54 @@ export class AMLService {
     return alert;
   }
 
+  async createOFACReview(input: CreateOFACReviewInput, creatorId = this.currentUserId): Promise<OFACReview> {
+    const repo = this.requireOFACReviewRepo();
+    const review = await repo.create(input, creatorId);
+
+    await this.recordAudit('VALIDATION', creatorId, 'ofac_review_created', `ofac_review/${review.id}`, {
+      review_id: review.id,
+      alert_id: input.alert_id,
+      investor_id: input.investor_id,
+      matched_name: input.matched_name,
+      expires_at: review.expires_at,
+    });
+
+    return review;
+  }
+
+  async getOFACReviewQueue(now = new Date()): Promise<OFACReview[]> {
+    return this.requireOFACReviewRepo().findQueue(now);
+  }
+
+  async approveOFACReview(
+    reviewId: string,
+    approverId: string,
+    rationale: string,
+    now = new Date()
+  ): Promise<OFACReview> {
+    if (!rationale.trim()) {
+      throw new Error('OFAC clearance rationale is required');
+    }
+
+    const repo = this.requireOFACReviewRepo();
+    const before = await repo.findById(reviewId);
+    const review = await repo.approve(reviewId, approverId, rationale, now);
+    const action = review.status === 'cleared' ? 'ofac_review_cleared' : 'ofac_review_first_approved';
+
+    await this.recordAudit('VALIDATION', approverId, action, `ofac_review/${review.id}`, {
+      review_id: review.id,
+      alert_id: review.alert_id,
+      investor_id: review.investor_id,
+      status: review.status,
+      first_approver_id: review.first_approver_id,
+      second_approver_id: review.second_approver_id,
+      previous_status: before?.status,
+      rationale,
+    });
+
+    return review;
+  }
+
   /**
    * Generate unique audit ID
    */
@@ -382,6 +434,38 @@ export class AMLService {
   private generateRequestId(): string {
     return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
+
+  private requireOFACReviewRepo(): OFACReviewRepository {
+    if (!this.ofacReviewRepo) {
+      throw new Error('OFAC review repository is not configured');
+    }
+    return this.ofacReviewRepo;
+  }
+
+  private async recordAudit(
+    type: AuditEvent['type'],
+    userId: string,
+    action: string,
+    resource: string,
+    details: Record<string, unknown>
+  ): Promise<void> {
+    await this.auditRepo.record({
+      id: this.generateAuditId(),
+      type,
+      userId,
+      action,
+      resource,
+      outcome: 'SUCCESS',
+      details,
+      securityContext: {
+        requestId: this.generateRequestId(),
+        ipAddress: 'system',
+        userAgent: 'aml-service',
+        timestamp: new Date(),
+      },
+      timestamp: new Date(),
+    });
+  }
 }
 
 /**
@@ -391,7 +475,8 @@ export function createAMLService(db: Pool, auditRepo: SecurityAuditRepository, u
   const investmentRepo = new InvestmentRepository(db);
   const ruleRepo = new AMLRuleRepository(db);
   const alertRepo = new AMLAlertRepository(db);
+  const ofacReviewRepo = new OFACReviewRepository(db);
   const evaluator = new RuleEvaluator(investmentRepo);
 
-  return new AMLService(ruleRepo, alertRepo, evaluator, auditRepo, userId);
+  return new AMLService(ruleRepo, alertRepo, evaluator, auditRepo, userId, ofacReviewRepo);
 }

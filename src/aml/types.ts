@@ -182,3 +182,42 @@ export interface UpdateCaseInput {
   disposition?: AMLDisposition;
   notes?: string;
 }
+
+export type OFACReviewStatus =
+  | 'pending_first_approval'
+  | 'pending_second_approval'
+  | 'cleared'
+  | 'expired'
+  | 'rejected';
+
+export interface OFACReview {
+  id: string;
+  alert_id: string;
+  case_id?: string;
+  investor_id: string;
+  matched_name: string;
+  list_entry_id?: string;
+  status: OFACReviewStatus;
+  created_by: string;
+  created_at: Date;
+  first_approver_id?: string;
+  first_approval_rationale?: string;
+  first_approved_at?: Date;
+  second_approver_id?: string;
+  second_approval_rationale?: string;
+  second_approved_at?: Date;
+  clearance_rationale?: string;
+  cleared_at?: Date;
+  expires_at: Date;
+  updated_at: Date;
+}
+
+export interface CreateOFACReviewInput {
+  alert_id: string;
+  case_id?: string;
+  investor_id: string;
+  matched_name: string;
+  list_entry_id?: string;
+  rationale: string;
+  expires_at?: Date;
+}
