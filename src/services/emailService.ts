@@ -3,6 +3,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { once } from 'node:events';
 import { env } from '../config/env';
+import { EmailDeliverabilityService } from './emailDeliverabilityService';
+import { Errors } from '../lib/errors';
 
 export interface EmailOptions {
   to: string;
@@ -299,11 +301,72 @@ export class MockEmailProvider implements EmailProvider {
 }
 
 export class EmailService {
-  constructor(private provider: EmailProvider) {}
+  private deliverabilityService?: EmailDeliverabilityService;
 
-  async sendMail(to: string, subject: string, body: string, template?: string): Promise<void> {
-    await this.provider.send({ to, subject, body, template });
+  constructor(
+    private provider: EmailProvider,
+    deliverabilityService?: EmailDeliverabilityService,
+  ) {
+    this.deliverabilityService = deliverabilityService;
   }
+
+  /**
+   * Set or replace the deliverability service (useful for late binding).
+   */
+  setDeliverabilityService(service: EmailDeliverabilityService | undefined): void {
+    this.deliverabilityService = service;
+  }
+
+  /**
+   * Send a transactional email.
+   *
+   * When a deliverability service is configured:
+   * 1. Checks the suppression list before sending — throws FORBIDDEN if suppressed.
+   * 2. After successful send, records the send event for domain reputation tracking.
+   *
+   * Security:
+   * - Suppressed recipients are rejected before any provider API call is made,
+   *   preventing unnecessary exposure of the message body to the provider.
+   * - The suppression check is always performed when deliverability is enabled.
+   */
+  async sendMail(to: string, subject: string, body: string, template?: string): Promise<void> {
+    // Suppression check (when deliverability tracking is enabled)
+    if (this.deliverabilityService?.enabled) {
+      const suppressed = await this.deliverabilityService.isSuppressed(to);
+      if (suppressed) {
+        throw Errors.forbidden(`Recipient ${to} is suppressed`);
+      }
+    }
+
+    await this.provider.send({ to, subject, body, template });
+
+    // Record successful send for domain reputation tracking
+    if (this.deliverabilityService?.enabled) {
+      const domain = extractEmailDomain(to);
+      const providerName = this.getProviderName();
+      await this.deliverabilityService.recordSend(to, domain, providerName).catch((err) => {
+        console.error('[EmailService] Failed to record send event:', err);
+      });
+    }
+  }
+
+  /**
+   * Best-effort provider name detection.
+   */
+  private getProviderName(): string {
+    if (this.provider instanceof SendGridEmailProvider) return 'sendgrid';
+    if (this.provider instanceof SmtpEmailProvider) return 'smtp';
+    return 'mock';
+  }
+}
+
+/**
+ * Extract domain from an email address.
+ */
+function extractEmailDomain(email: string): string {
+  const atIndex = email.lastIndexOf('@');
+  if (atIndex === -1) return 'unknown';
+  return email.slice(atIndex + 1).toLowerCase();
 }
 
 /**

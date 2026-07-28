@@ -1,6 +1,6 @@
 import { Pool, PoolClient, QueryResult } from 'pg';
 import { randomUUID } from 'crypto';
-import { WebhookEventType } from '../services/webhookService';
+import { WebhookEventType } from '../../services/webhookService';
 
 export interface OutboxRow {
   id: string;
@@ -105,6 +105,22 @@ export class OutboxRepository {
         [id]
       );
     }
+  }
+
+  /**
+   * Fetch the oldest pending outbox row (by created_at).
+   * Used for measuring outbox lag without claiming the row.
+   *
+   * @returns The oldest pending row, or null if no pending records exist.
+   */
+  async getOldestPending(): Promise<OutboxRow | null> {
+    const result: QueryResult<OutboxRow> = await this.db.query(
+      `SELECT * FROM webhook_outbox
+       WHERE status = 'pending' AND available_at <= NOW()
+       ORDER BY created_at ASC
+       LIMIT 1`
+    );
+    return result.rows.length > 0 ? this.map(result.rows[0]) : null;
   }
 
   private map(row: any): OutboxRow {
