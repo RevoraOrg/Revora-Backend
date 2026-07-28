@@ -6,6 +6,8 @@ import {
   verifyWebhook,
   WebhookSignatureError,
   WebhookVerificationConfig,
+  parseExpiryTimestamp,
+  verifyWebhookPayloadDualKey,
 } from './webhookSignature';
 
 // ─── Test Constants ───────────────────────────────────────────────────────────
@@ -656,5 +658,150 @@ describe('WebhookSignatureError', () => {
       expect(e).toBeInstanceOf(WebhookSignatureError);
       expect((e as WebhookSignatureError).message).toBe('Test error');
     }
+  });
+});
+
+// ─── Dual Key Signature Rotation Tests ────────────────────────────────────────
+
+describe('parseExpiryTimestamp', () => {
+  it('should return undefined for empty/undefined values', () => {
+    expect(parseExpiryTimestamp(undefined)).toBeUndefined();
+    expect(parseExpiryTimestamp(null as any)).toBeUndefined();
+    expect(parseExpiryTimestamp('')).toBeUndefined();
+    expect(parseExpiryTimestamp('   ')).toBeUndefined();
+  });
+
+  it('should parse Date instance', () => {
+    const d = new Date('2026-12-31T23:59:59Z');
+    expect(parseExpiryTimestamp(d)).toBe(d.getTime());
+  });
+
+  it('should parse ISO date strings', () => {
+    const str = '2026-12-31T23:59:59Z';
+    expect(parseExpiryTimestamp(str)).toBe(Date.parse(str));
+  });
+
+  it('should parse numeric string in epoch seconds', () => {
+    const secs = 1785542400; // 2026-08-01 00:00:00 UTC
+    expect(parseExpiryTimestamp(String(secs))).toBe(secs * 1000);
+  });
+
+  it('should parse numeric string in epoch milliseconds', () => {
+    const ms = 1785542400000;
+    expect(parseExpiryTimestamp(String(ms))).toBe(ms);
+  });
+
+  it('should parse number values', () => {
+    const ms = 1785542400000;
+    expect(parseExpiryTimestamp(ms)).toBe(ms);
+
+    const secs = 1785542400;
+    expect(parseExpiryTimestamp(secs)).toBe(secs * 1000);
+  });
+
+  it('should return undefined for invalid date string', () => {
+    expect(parseExpiryTimestamp('invalid-date-string')).toBeUndefined();
+  });
+});
+
+describe('verifyWebhookPayloadDualKey', () => {
+  const CURRENT_SECRET = 'primary-secret-key-12345';
+  const NEXT_SECRET = 'secondary-next-secret-key-67890';
+  const PAYLOAD = '{"kyc_status":"approved","user_id":"usr_999"}';
+
+  it('should verify signature using current primary key', () => {
+    const sig = signWebhookPayload(CURRENT_SECRET, PAYLOAD);
+    const result = verifyWebhookPayloadDualKey(
+      { secret: CURRENT_SECRET, nextSecret: NEXT_SECRET },
+      PAYLOAD,
+      sig
+    );
+    expect(result).toEqual({ valid: true, verifiedByKey: 'current' });
+  });
+
+  it('should verify signature using unexpired next key', () => {
+    const sig = signWebhookPayload(NEXT_SECRET, PAYLOAD);
+    const futureExpiry = Date.now() + 3600000; // 1 hour in future
+    const result = verifyWebhookPayloadDualKey(
+      { secret: CURRENT_SECRET, nextSecret: NEXT_SECRET, nextSecretExpiry: futureExpiry },
+      PAYLOAD,
+      sig
+    );
+    expect(result).toEqual({ valid: true, verifiedByKey: 'next' });
+  });
+
+  it('should reject next key when deadline has elapsed', () => {
+    const sig = signWebhookPayload(NEXT_SECRET, PAYLOAD);
+    const pastExpiry = Date.now() - 3600000; // 1 hour in past
+    const result = verifyWebhookPayloadDualKey(
+      { secret: CURRENT_SECRET, nextSecret: NEXT_SECRET, nextSecretExpiry: pastExpiry },
+      PAYLOAD,
+      sig
+    );
+    expect(result).toEqual({ valid: false, expired: true });
+  });
+
+  it('should return invalid when signature does not match any key', () => {
+    const sig = signWebhookPayload('some-other-secret', PAYLOAD);
+    const result = verifyWebhookPayloadDualKey(
+      { secret: CURRENT_SECRET, nextSecret: NEXT_SECRET },
+      PAYLOAD,
+      sig
+    );
+    expect(result).toEqual({ valid: false });
+  });
+});
+
+describe('verifyWebhook with dual key options', () => {
+  const CURRENT_SECRET = 'current-kyc-key';
+  const NEXT_SECRET = 'next-kyc-key';
+  const PAYLOAD = '{"event":"kyc_update"}';
+
+  it('should return verifiedByKey current for primary key signature', () => {
+    const signature = signWebhookPayload(CURRENT_SECRET, PAYLOAD);
+    const headers = { 'x-revora-signature': signature };
+    const result = verifyWebhook(
+      { secret: CURRENT_SECRET, nextSecret: NEXT_SECRET, metricName: 'kyc.webhook.verified_by_key' },
+      PAYLOAD,
+      headers
+    );
+
+    expect(result.valid).toBe(true);
+    expect(result.verifiedByKey).toBe('current');
+  });
+
+  it('should return verifiedByKey next for secondary key signature', () => {
+    const signature = signWebhookPayload(NEXT_SECRET, PAYLOAD);
+    const headers = { 'x-revora-signature': signature };
+    const result = verifyWebhook(
+      {
+        secret: CURRENT_SECRET,
+        nextSecret: NEXT_SECRET,
+        nextSecretExpiry: Date.now() + 10000,
+        metricName: 'kyc.webhook.verified_by_key',
+      },
+      PAYLOAD,
+      headers
+    );
+
+    expect(result.valid).toBe(true);
+    expect(result.verifiedByKey).toBe('next');
+  });
+
+  it('should fail verification when secondary key signature is expired', () => {
+    const signature = signWebhookPayload(NEXT_SECRET, PAYLOAD);
+    const headers = { 'x-revora-signature': signature };
+    const result = verifyWebhook(
+      {
+        secret: CURRENT_SECRET,
+        nextSecret: NEXT_SECRET,
+        nextSecretExpiry: Date.now() - 10000,
+      },
+      PAYLOAD,
+      headers
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.error?.message).toContain('secondary key expired');
   });
 });
