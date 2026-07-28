@@ -55,6 +55,16 @@ export interface SimulateResult {
   error?: string;
 }
 
+export interface PostUpgradeHealthSignal {
+  revert_rate: number;
+  failed_reconciliations: number;
+}
+
+export interface RollbackPlan {
+  id: string;
+  approved: boolean;
+}
+
 // ── Repository helpers ────────────────────────────────────────────────────────
 
 function mapRow(row: any): ContractUpgrade {
@@ -500,6 +510,65 @@ export class ContractUpgradeOrchestratorService {
         { upgrade_id: upgradeId, error: String(err?.message ?? err) },
       );
     }
+  }
+
+  // ── Post-upgrade health monitoring ───────────────────────────────────────
+
+  /**
+   * Watches post-upgrade health signals and auto-triggers rollback once the
+   * regression thresholds are exceeded, provided an already-approved rollback
+   * plan exists and the upgrade is still in a recoverable state.
+   */
+  async monitorPostUpgradeHealth(
+    upgradeId: string,
+    actor_id: string,
+    signal: PostUpgradeHealthSignal,
+    rollbackPlan: RollbackPlan | null,
+  ): Promise<boolean> {
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    const revertRateThreshold = 0.1;
+    const failedReconciliationsThreshold = 10;
+    const shouldRollback =
+      upgrade.status === 'applied' &&
+      rollbackPlan?.approved === true &&
+      signal.revert_rate >= revertRateThreshold &&
+      signal.failed_reconciliations >= failedReconciliationsThreshold;
+
+    if (!shouldRollback) {
+      return false;
+    }
+
+    const reason = `Auto-rollback triggered after health-signal regression: revert_rate=${signal.revert_rate}, failed_reconciliations=${signal.failed_reconciliations}`;
+
+    await this.db.query(
+      `UPDATE contract_upgrades
+          SET status = 'failed',
+              failure_reason = $1
+        WHERE id = $2 AND status = 'applied'`,
+      [reason, upgrade.id],
+    );
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'upgrade.autorollback.triggered',
+      resource: `contract_upgrades/${upgrade.id}`,
+      details: JSON.stringify({
+        upgrade_id: upgrade.id,
+        rollback_plan_id: rollbackPlan?.id ?? null,
+        cause: reason,
+        signal,
+      }),
+    });
+
+    logger.warn('Contract upgrade auto-rollback triggered', {
+      upgrade_id: upgrade.id,
+      rollback_plan_id: rollbackPlan?.id ?? null,
+      cause: reason,
+      signal,
+    });
+
+    return true;
   }
 
   // ── Queries ───────────────────────────────────────────────────────────────
