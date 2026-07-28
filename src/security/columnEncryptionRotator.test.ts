@@ -257,34 +257,66 @@ describe('ColumnEncryptionRotator', () => {
     expect(auditEvents.some((e) => e.action === 'KMS_ROW_REENCRYPT_FAILED')).toBe(true);
   });
 
-  it('should work with PostgreSQL pool queries when dbPool is provided', async () => {
-    const mockQuery = jest.fn();
+  it('should work with PostgreSQL pool queries when pool is provided', async () => {
+    const mockDbRows: Record<string, any> = {};
+    const mockJobs: Record<string, any> = {};
 
-    // Mock count query
-    mockQuery.mockResolvedValueOnce({ rows: [{ count: 3 }] });
-    // Mock insert job state
-    mockQuery.mockResolvedValueOnce({ rows: [] });
-    // Mock fetch batch query
-    mockQuery.mockResolvedValueOnce({
-      rows: [
-        { id: '1', ciphertext: 'iv:tag:enc1', key_generation: 1 },
-        { id: '2', ciphertext: 'iv:tag:enc2', key_generation: 1 },
-      ],
-    });
-    // Mock update row 1
-    mockQuery.mockResolvedValueOnce({ rows: [] });
-    // Mock update row 2
-    mockQuery.mockResolvedValueOnce({ rows: [] });
-    // Mock remaining count check
-    mockQuery.mockResolvedValueOnce({ rows: [{ count: 0 }] });
-    // Mock update job completed
-    mockQuery.mockResolvedValueOnce({ rows: [] });
+    const mockPool = {
+      query: jest.fn(async (sql: string, params: any[]) => {
+        const normalized = sql.trim().replace(/\s+/g, ' ');
 
-    // Mock decrypt / encrypt on kmsProvider
-    jest.spyOn(kmsProvider, 'decrypt').mockResolvedValue('decrypted_text');
-    jest.spyOn(kmsProvider, 'encrypt').mockResolvedValue({ ciphertext: 'iv:tag:new_enc', keyGeneration: 2 });
+        if (normalized.includes('SELECT COUNT(*)::int AS count FROM users')) {
+          return { rows: [{ count: 2 }] };
+        }
 
-    const mockPool = { query: mockQuery };
+        if (normalized.includes('INSERT INTO kms_rotation_state')) {
+          mockJobs[params[0]] = {
+            id: params[0],
+            target_table: params[1],
+            target_column: params[2],
+            target_key_generation: params[3],
+            last_processed_id: params[4],
+            status: params[5],
+            total_rows: String(params[6]),
+            reencrypted_rows: String(params[7]),
+            failed_rows: String(params[8]),
+            created_at: params[9],
+            updated_at: params[10],
+            completed_at: params[11],
+          };
+          return { rows: [] };
+        }
+
+        if (normalized.includes('SELECT * FROM kms_rotation_state WHERE id =')) {
+          const job = mockJobs[params[0]];
+          return { rows: job ? [job] : [] };
+        }
+
+        if (normalized.includes('SELECT * FROM kms_rotation_state WHERE status IN')) {
+          return { rows: Object.values(mockJobs).filter((j: any) => j.status === 'pending' || j.status === 'in_progress') };
+        }
+
+        if (normalized.includes('SELECT id, ssn AS ciphertext, key_generation FROM users')) {
+          return {
+            rows: [
+              { id: 'usr_1', ciphertext: '12:34:56', key_generation: 1 },
+              { id: 'usr_2', ciphertext: '78:90:12', key_generation: 1 },
+            ],
+          };
+        }
+
+        if (normalized.includes('UPDATE users SET ssn = $1, key_generation = $2')) {
+          mockDbRows[params[2]] = { ciphertext: params[0], keyGen: params[1] };
+          return { rows: [] };
+        }
+
+        return { rows: [] };
+      }),
+    };
+
+    jest.spyOn(kmsProvider, 'decrypt').mockResolvedValue('decrypted_ssn');
+    jest.spyOn(kmsProvider, 'encrypt').mockResolvedValue({ ciphertext: 'new_enc_ssn', keyGeneration: 2 });
+
     const rotator = new ColumnEncryptionRotator({
       pool: mockPool as any,
       kmsKeyProvider: kmsProvider,
@@ -294,30 +326,12 @@ describe('ColumnEncryptionRotator', () => {
     });
 
     const job = await rotator.startRotation('users', 'ssn', { targetKeyGeneration: 2 });
-    expect(job.totalRows).toBe(3);
-
-    // Mock getJobState return for processBatch
-    mockQuery.mockResolvedValueOnce({
-      rows: [
-        {
-          id: job.id,
-          target_table: 'users',
-          target_column: 'ssn',
-          target_key_generation: 2,
-          last_processed_id: null,
-          status: 'in_progress',
-          total_rows: '3',
-          reencrypted_rows: '0',
-          failed_rows: '0',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          completed_at: null,
-        },
-      ],
-    });
+    expect(job.totalRows).toBe(2);
 
     const batchRes = await rotator.processBatch(job.id, 2);
     expect(batchRes.processed).toBe(2);
+    expect(mockDbRows['usr_1']).toBeDefined();
+    expect(mockDbRows['usr_2']).toBeDefined();
   });
 
   it('should return completed state immediately if job is already completed', async () => {
@@ -344,5 +358,35 @@ describe('ColumnEncryptionRotator', () => {
     const batchRes = await rotator.processBatch(job.id, 10);
     expect(batchRes.completed).toBe(true);
     expect(batchRes.processed).toBe(0);
+  });
+
+  it('should throw error if processBatch is called with non-existent job ID', async () => {
+    const rotator = new ColumnEncryptionRotator({
+      kmsKeyProvider: kmsProvider,
+      auditRepo,
+      metrics,
+      logger,
+      inMemoryStore: [],
+    });
+
+    await expect(rotator.processBatch('non_existent_job')).rejects.toThrow(
+      'KMS rotation job non_existent_job not found'
+    );
+  });
+
+  it('should handle countRowsToRotate and fetchBatchToRotate when no inMemoryStore or pool provided', async () => {
+    const rotator = new ColumnEncryptionRotator({
+      kmsKeyProvider: kmsProvider,
+      auditRepo,
+      metrics,
+      logger,
+    });
+
+    const job = await rotator.startRotation('empty_table', 'col', { targetKeyGeneration: 2 });
+    expect(job.totalRows).toBe(0);
+
+    const res = await rotator.processBatch(job.id, 10);
+    expect(res.completed).toBe(true);
+    expect(res.processed).toBe(0);
   });
 });
