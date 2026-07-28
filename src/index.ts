@@ -11,6 +11,7 @@ import { createCorsMiddleware } from "./middleware/cors";
 import { errorHandler } from "./middleware/errorHandler";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { Errors } from "./lib/errors";
+import { globalSampler } from "./lib/sampler";
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -55,6 +56,9 @@ import { InMemorySecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
+import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
+import { createScimRouter } from './routes/scim';
+import { UserRepository } from './db/repositories/userRepository';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -699,9 +703,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
 
-  // Mobile companion API with per-device Ed25519 request signatures
-  const deviceKeyStore = new InMemoryDeviceKeyStore();
-  apiRouter.use("/mobile", createMobileCompanionRouter({ keyStore: deviceKeyStore }));
+  const userRepo = new UserRepository(pool);
+  const scimToken = env.SCIM_TOKEN ?? '';
+  app.use('/scim/v2', createScimRouter(userRepo, scimToken, '/scim/v2'));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -721,6 +725,10 @@ export const __test = {
    *      inspect tier resolution or reset counters without restarting the app.
    */
   createStartupAuthTierLimiter,
+  /**
+   * @dev Exposes the OFAC loader for integration tests.
+   */
+  OfacSanctionsLoader,
 };
 
 export { classifyStellarRPCFailure, StellarRPCFailureClass };
@@ -734,6 +742,7 @@ async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
+  globalSampler.stop();
   console.log(`\n[server] ${signal} shutting down`);
 
   if (server) {
@@ -1012,8 +1021,15 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   const metricsCollector = new MetricsCollector();
 
-  // --- Batch / background services (only for "batch" and "all" roles) ---
-  const backgroundStopFns: Array<() => void> = [];
+  const payoutDriftRepo = new PayoutDriftRepository(pool);
+  const payoutDriftDetector = new PayoutDriftDetector(
+    pool,
+    payoutDriftRepo,
+    metricsCollector
+  );
+  
+  payoutDriftDetector.start(); // Start nightly payout drift detection
+  globalSampler.start(); // Start event loop lag monitoring
 
   if (roleConfig.auditPurge) {
     const auditLogRepo = new AuditLogRepository(pool);

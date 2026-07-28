@@ -553,89 +553,217 @@ describe('AML Routes', () => {
     });
   });
 
-  describe('OFAC review queue guards', () => {
-    it('should require an authenticated compliance actor', async () => {
-      const response = await request(app).get('/aml/ofac-reviews');
+  // ── Case Assignment Service Endpoints ──────────────────────────────────────
 
-      expect(response.status).toBe(401);
+  describe('POST /aml/cases/assign-auto', () => {
+    let assignmentApp: Express;
+    let mockAssignmentService: any;
+
+    beforeEach(() => {
+      mockAssignmentService = {
+        assignCase: jest.fn(),
+        assignAllOpenCases: jest.fn(),
+        getReviewerCapacities: jest.fn(),
+      };
+
+      assignmentApp = express();
+      assignmentApp.use(express.json());
+      assignmentApp.use(
+        '/aml',
+        createAMLRoutes(mockService as any, mockAssignmentService as any),
+      );
+    });
+
+    it('should auto-assign a case successfully', async () => {
+      mockAssignmentService.assignCase.mockResolvedValue({
+        case_id: 'c1',
+        assigned_to: 'r1',
+        age_days: 3,
+        reviewer_capacities: [],
+      });
+
+      const response = await request(assignmentApp)
+        .post('/aml/cases/assign-auto')
+        .send({ case_id: 'c1' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.assigned_to).toBe('r1');
+    });
+
+    it('should return 400 when case_id is missing', async () => {
+      const response = await request(assignmentApp)
+        .post('/aml/cases/assign-auto')
+        .send({});
+
+      expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
 
-    it('should reject non-compliance roles', async () => {
-      const response = await request(app)
-        .get('/aml/ofac-reviews')
-        .set('x-user-id', 'investor_1')
-        .set('x-user-role', 'investor');
+    it('should return 409 when no reviewer is eligible', async () => {
+      mockAssignmentService.assignCase.mockRejectedValue({
+        statusCode: 409,
+        message: 'No eligible reviewer available',
+      });
 
-      expect(response.status).toBe(403);
+      const response = await request(assignmentApp)
+        .post('/aml/cases/assign-auto')
+        .send({ case_id: 'c1' });
+
+      expect(response.status).toBe(409);
       expect(response.body.success).toBe(false);
     });
 
-    it('should require CSRF token for review creation', async () => {
-      const response = await request(app)
-        .post('/aml/ofac-reviews')
-        .set('x-user-id', 'officer_1')
-        .set('x-user-role', 'compliance_officer')
-        .send({
-          alert_id: 'alert_1',
-          investor_id: 'investor_1',
-          matched_name: 'John Smith',
-          rationale: 'Verified false positive from identity documents.',
-        });
+    it('should return 503 when assignment service is not available', async () => {
+      const noServiceApp = express();
+      noServiceApp.use(express.json());
+      noServiceApp.use('/aml', createAMLRoutes(mockService as any));
 
-      expect(response.status).toBe(403);
-      expect(response.body.error).toBe('Valid CSRF token required');
+      const response = await request(noServiceApp)
+        .post('/aml/cases/assign-auto')
+        .send({ case_id: 'c1' });
+
+      expect(response.status).toBe(503);
+      expect(response.body.error).toContain('not available');
+    });
+
+    it('should handle generic errors', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      mockAssignmentService.assignCase.mockRejectedValue(new Error('DB connection lost'));
+
+      const response = await request(assignmentApp)
+        .post('/aml/cases/assign-auto')
+        .send({ case_id: 'c1' });
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
     });
   });
 
-  describe('OFAC review queue workflow', () => {
-    const csrf = 'csrf_test_token';
+  describe('POST /aml/cases/assign-all', () => {
+    let assignmentApp: Express;
+    let mockAssignmentService: any;
 
-    const complianceRequest = (verb: 'get' | 'post', path: string) =>
-      request(app)[verb](path)
-        .set('x-user-id', 'officer_1')
-        .set('x-user-role', 'compliance_officer')
-        .set('x-csrf-token', csrf)
-        .set('cookie', `csrfToken=${csrf}`);
+    beforeEach(() => {
+      mockAssignmentService = {
+        assignCase: jest.fn(),
+        assignAllOpenCases: jest.fn(),
+        getReviewerCapacities: jest.fn(),
+      };
 
-    it('should create and list OFAC reviews', async () => {
-      const createResponse = await complianceRequest('post', '/aml/ofac-reviews')
-        .send({
-          alert_id: 'alert_1',
-          investor_id: 'investor_1',
-          matched_name: 'John Smith',
-          list_entry_id: 'sdn_123',
-          rationale: 'Verified false positive from identity documents.',
-        });
-
-      expect(createResponse.status).toBe(201);
-      expect(createResponse.body.data.status).toBe('pending_first_approval');
-
-      const listResponse = await request(app)
-        .get('/aml/ofac-reviews')
-        .set('x-user-id', 'officer_1')
-        .set('x-user-role', 'compliance_officer');
-
-      expect(listResponse.status).toBe(200);
-      expect(listResponse.body.data).toHaveLength(1);
+      assignmentApp = express();
+      assignmentApp.use(express.json());
+      assignmentApp.use(
+        '/aml',
+        createAMLRoutes(mockService as any, mockAssignmentService as any),
+      );
     });
 
-    it('should approve a review and return conflict for creator approval', async () => {
-      const createResponse = await complianceRequest('post', '/aml/ofac-reviews')
-        .send({
-          alert_id: 'alert_1',
-          investor_id: 'investor_1',
-          matched_name: 'John Smith',
-          rationale: 'Verified false positive from identity documents.',
-        });
+    it('should batch-assign all open cases', async () => {
+      mockAssignmentService.assignAllOpenCases.mockResolvedValue([
+        { case_id: 'c1', assigned_to: 'r1', age_days: 5, reviewer_capacities: [] },
+        { case_id: 'c2', assigned_to: 'r2', age_days: 2, reviewer_capacities: [] },
+      ]);
 
-      const approveResponse = await complianceRequest(
-        'post',
-        `/aml/ofac-reviews/${createResponse.body.data.id}/approve`
-      ).send({ rationale: 'Creator should be blocked from approving.' });
+      const response = await request(assignmentApp).post('/aml/cases/assign-all');
 
-      expect(approveResponse.status).toBe(409);
-      expect(approveResponse.body.error).toContain('creator cannot approve');
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data).toHaveLength(2);
+      expect(response.body.assigned_count).toBe(2);
+    });
+
+    it('should return empty array when no cases to assign', async () => {
+      mockAssignmentService.assignAllOpenCases.mockResolvedValue([]);
+
+      const response = await request(assignmentApp).post('/aml/cases/assign-all');
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toHaveLength(0);
+    });
+
+    it('should return 503 when assignment service is not available', async () => {
+      const noServiceApp = express();
+      noServiceApp.use(express.json());
+      noServiceApp.use('/aml', createAMLRoutes(mockService as any));
+
+      const response = await request(noServiceApp).post('/aml/cases/assign-all');
+
+      expect(response.status).toBe(503);
+    });
+
+    it('should handle generic errors', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      mockAssignmentService.assignAllOpenCases.mockRejectedValue(new Error('Pool exhausted'));
+
+      const response = await request(assignmentApp).post('/aml/cases/assign-all');
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+  });
+
+  describe('GET /aml/cases/reviewer-capacities', () => {
+    let assignmentApp: Express;
+    let mockAssignmentService: any;
+
+    beforeEach(() => {
+      mockAssignmentService = {
+        assignCase: jest.fn(),
+        assignAllOpenCases: jest.fn(),
+        getReviewerCapacities: jest.fn(),
+      };
+
+      assignmentApp = express();
+      assignmentApp.use(express.json());
+      assignmentApp.use(
+        '/aml',
+        createAMLRoutes(mockService as any, mockAssignmentService as any),
+      );
+    });
+
+    it('should return reviewer capacities', async () => {
+      mockAssignmentService.getReviewerCapacities.mockResolvedValue([
+        {
+          reviewer_id: 'r1',
+          active_cases: 3,
+          max_capacity: 10,
+          remaining_capacity: 7,
+          last_closed_at: null,
+          in_cool_down: false,
+          eligible: true,
+        },
+      ]);
+
+      const response = await request(assignmentApp).get('/aml/cases/reviewer-capacities');
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data).toHaveLength(1);
+      expect(response.body.data[0].eligible).toBe(true);
+    });
+
+    it('should return 503 when assignment service is not available', async () => {
+      const noServiceApp = express();
+      noServiceApp.use(express.json());
+      noServiceApp.use('/aml', createAMLRoutes(mockService as any));
+
+      const response = await request(noServiceApp).get('/aml/cases/reviewer-capacities');
+
+      expect(response.status).toBe(503);
+    });
+
+    it('should handle generic errors', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      mockAssignmentService.getReviewerCapacities.mockRejectedValue(new Error('Timeout'));
+
+      const response = await request(assignmentApp).get('/aml/cases/reviewer-capacities');
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
     });
   });
 });

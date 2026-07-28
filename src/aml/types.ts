@@ -12,7 +12,8 @@ export type AMLRuleType =
   | 'velocity'           // High transaction frequency/amount in time window
   | 'structuring'        // Breaking large transactions into smaller ones
   | 'geo_mismatch'       // Geographic inconsistency in transactions
-  | 'amount_threshold';  // Single transaction exceeds threshold
+  | 'amount_threshold'   // Single transaction exceeds threshold
+  | 'sanctions_screening'; // Sanctions list screening (exact & Jaro-Winkler fuzzy)
 
 /**
  * Rule severity levels for prioritization
@@ -64,10 +65,25 @@ export interface TransactionContext {
   amount: string;
   asset: string;
   timestamp: Date;
+  investor_name?: string;
   investor_country?: string;
   investor_ip_country?: string;
   previous_transactions?: TransactionContext[];
   status?: 'pending' | 'completed' | 'failed';
+  tenant_id?: string;
+  tenant_settings?: {
+    sanctions_threshold?: number;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Sanctions rule configuration schema
+ */
+export interface SanctionsRuleConfig {
+  sanctions_list: string[];
+  jaro_winkler_threshold?: number;
+  fuzzy_enabled?: boolean;
 }
 
 /**
@@ -183,41 +199,44 @@ export interface UpdateCaseInput {
   notes?: string;
 }
 
-export type OFACReviewStatus =
-  | 'pending_first_approval'
-  | 'pending_second_approval'
-  | 'cleared'
-  | 'expired'
-  | 'rejected';
-
-export interface OFACReview {
-  id: string;
-  alert_id: string;
-  case_id?: string;
-  investor_id: string;
-  matched_name: string;
-  list_entry_id?: string;
-  status: OFACReviewStatus;
-  created_by: string;
-  created_at: Date;
-  first_approver_id?: string;
-  first_approval_rationale?: string;
-  first_approved_at?: Date;
-  second_approver_id?: string;
-  second_approval_rationale?: string;
-  second_approved_at?: Date;
-  clearance_rationale?: string;
-  cleared_at?: Date;
-  expires_at: Date;
-  updated_at: Date;
+/**
+ * Reviewer profile for load-balancer capacity tracking
+ */
+export interface ReviewerProfile {
+  /** Reviewer user ID. */
+  reviewer_id: string;
+  /** Maximum concurrent open cases this reviewer may hold. */
+  max_capacity: number;
+  /** Minimum hours after closing a case before the reviewer is eligible again. */
+  cool_down_hours: number;
 }
 
-export interface CreateOFACReviewInput {
-  alert_id: string;
-  case_id?: string;
-  investor_id: string;
-  matched_name: string;
-  list_entry_id?: string;
-  rationale: string;
-  expires_at?: Date;
+/**
+ * Reviewer capacity snapshot (computed at assignment time)
+ */
+export interface ReviewerCapacity {
+  reviewer_id: string;
+  active_cases: number;
+  max_capacity: number;
+  remaining_capacity: number;
+  /** ISO-8601 timestamp of the reviewer's most recent case closure, or null. */
+  last_closed_at: string | null;
+  /** Whether the reviewer is currently in cool-down. */
+  in_cool_down: boolean;
+  /** Whether the reviewer is eligible for a new assignment. */
+  eligible: boolean;
+}
+
+/**
+ * Result of an auto-assignment attempt
+ */
+export interface AssignmentResult {
+  /** The case that was assigned. */
+  case_id: string;
+  /** The reviewer who received the assignment. */
+  assigned_to: string;
+  /** Age of the case in days at assignment time. */
+  age_days: number;
+  /** Snapshot of all reviewer capacities at the time of assignment. */
+  reviewer_capacities: ReviewerCapacity[];
 }

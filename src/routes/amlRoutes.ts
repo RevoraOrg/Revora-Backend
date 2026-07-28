@@ -6,6 +6,7 @@
 
 import { NextFunction, Router, Request, RequestHandler, Response } from 'express';
 import { AMLService } from '../aml/amlService';
+import { CaseAssignmentService } from '../aml/caseAssignmentService';
 import { z } from 'zod';
 
 /**
@@ -114,7 +115,10 @@ function requireCsrfToken(req: Request, res: Response, next: NextFunction): void
 /**
  * Create AML routes
  */
-export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions = {}): Router {
+export function createAMLRoutes(
+  amlService: AMLService,
+  assignmentService?: CaseAssignmentService,
+): Router {
   const router = Router();
   const reviewQueueGuards = options.reviewQueueGuards || [requireReviewQueueRole];
   const reviewQueueMutationGuards = [...reviewQueueGuards, requireCsrfToken];
@@ -173,7 +177,7 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
       res.status(201).json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to create rule' });
@@ -193,7 +197,7 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to update rule' });
@@ -213,7 +217,7 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error rolling back AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to rollback rule' });
@@ -243,6 +247,25 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
     } catch (error) {
       console.error('Error fetching AML cases:', error);
       res.status(500).json({ success: false, error: 'Failed to fetch cases' });
+    }
+  });
+
+  /**
+   * GET /aml/cases/reviewer-capacities
+   * Get capacity snapshots for all configured reviewers
+   */
+  router.get('/cases/reviewer-capacities', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
+    }
+
+    try {
+      const capacities = await assignmentService.getReviewerCapacities();
+      res.json({ success: true, data: capacities });
+    } catch (error) {
+      console.error('Error fetching reviewer capacities:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch reviewer capacities' });
     }
   });
 
@@ -293,7 +316,7 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
       res.status(201).json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to create case' });
@@ -313,7 +336,7 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
       res.json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to update case' });
@@ -365,52 +388,51 @@ export function createAMLRoutes(amlService: AMLService, options: AMLRouteOptions
     }
   });
 
-  router.get('/ofac-reviews', ...reviewQueueGuards, async (req: Request, res: Response) => {
-    try {
-      const reviews = await amlService.getOFACReviewQueue();
-      res.json({ success: true, data: reviews });
-    } catch (error) {
-      console.error('Error fetching OFAC review queue:', error);
-      res.status(500).json({ success: false, error: 'Failed to fetch OFAC review queue' });
+  /**
+   * POST /aml/cases/assign-auto
+   * Auto-assign a single open case to the least-loaded eligible reviewer
+   */
+  router.post('/cases/assign-auto', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
     }
-  });
 
-  router.post('/ofac-reviews', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
     try {
-      const actor = (req as any).amlActor || getActor(req);
-      const validated = createOFACReviewSchema.parse(req.body);
-      const review = await amlService.createOFACReview({
-        ...validated,
-        expires_at: validated.expires_at ? new Date(validated.expires_at) : undefined,
-      }, actor.id);
+      const { case_id } = req.body;
+      if (!case_id || typeof case_id !== 'string') {
+        res.status(400).json({ success: false, error: 'case_id is required' });
+        return;
+      }
 
-      res.status(201).json({ success: true, data: review });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+      const result = await assignmentService.assignCase(case_id);
+      res.json({ success: true, data: result });
+    } catch (error: any) {
+      if (error?.statusCode) {
+        res.status(error.statusCode).json({ success: false, error: error.message, details: error.details });
       } else {
-        console.error('Error creating OFAC review:', error);
-        res.status(500).json({ success: false, error: 'Failed to create OFAC review' });
+        console.error('Error auto-assigning AML case:', error);
+        res.status(500).json({ success: false, error: 'Failed to auto-assign case' });
       }
     }
   });
 
-  router.post('/ofac-reviews/:reviewId/approve', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
+  /**
+   * POST /aml/cases/assign-all
+   * Auto-assign all unassigned open cases (oldest-first)
+   */
+  router.post('/cases/assign-all', async (req: Request, res: Response) => {
+    if (!assignmentService) {
+      res.status(503).json({ success: false, error: 'Case assignment service not available' });
+      return;
+    }
+
     try {
-      const actor = (req as any).amlActor || getActor(req);
-      const { reviewId } = req.params;
-      const validated = approveOFACReviewSchema.parse(req.body);
-      const review = await amlService.approveOFACReview(reviewId, actor.id, validated.rationale);
-      res.json({ success: true, data: review });
-    } catch (error) {
-      if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
-      } else if (error instanceof Error && /creator|twice|already cleared/.test(error.message)) {
-        res.status(409).json({ success: false, error: error.message });
-      } else {
-        console.error('Error approving OFAC review:', error);
-        res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
-      }
+      const results = await assignmentService.assignAllOpenCases();
+      res.json({ success: true, data: results, assigned_count: results.length });
+    } catch (error: any) {
+      console.error('Error batch auto-assigning AML cases:', error);
+      res.status(500).json({ success: false, error: 'Failed to batch auto-assign cases' });
     }
   });
 
