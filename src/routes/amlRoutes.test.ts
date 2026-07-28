@@ -9,13 +9,14 @@ import request from 'supertest';
 import express, { Express } from 'express';
 import { createAMLRoutes } from './amlRoutes';
 import { AMLService } from '../aml/amlService';
-import { AMLRule, AMLCase, AMLAlert, SemVer } from '../aml/types';
+import { AMLRule, AMLCase, AMLAlert, OFACReview, SemVer } from '../aml/types';
 
 // Mock AMLService
 class MockAMLService {
   private rules: AMLRule[] = [];
   private cases: AMLCase[] = [];
   private alerts: AMLAlert[] = [];
+  private ofacReviews: OFACReview[] = [];
 
   async getRules(): Promise<AMLRule[]> {
     return this.rules;
@@ -208,6 +209,54 @@ class MockAMLService {
       status: 'dismissed',
     };
     return this.alerts[index];
+  }
+
+  async getOFACReviewQueue(): Promise<OFACReview[]> {
+    return this.ofacReviews.filter(review =>
+      review.status === 'pending_first_approval' || review.status === 'pending_second_approval'
+    );
+  }
+
+  async createOFACReview(input: any, creatorId: string): Promise<OFACReview> {
+    const review: OFACReview = {
+      id: `ofac_${Date.now()}`,
+      ...input,
+      status: 'pending_first_approval',
+      created_by: creatorId,
+      created_at: new Date(),
+      clearance_rationale: input.rationale,
+      expires_at: input.expires_at || new Date(Date.now() + 86400000),
+      updated_at: new Date(),
+    };
+    this.ofacReviews.push(review);
+    return review;
+  }
+
+  async approveOFACReview(reviewId: string, approverId: string, rationale: string): Promise<OFACReview> {
+    const review = this.ofacReviews.find(item => item.id === reviewId);
+    if (!review) {
+      throw new Error('OFAC review not found');
+    }
+    if (review.created_by === approverId) {
+      throw new Error('Review creator cannot approve their own OFAC clearance');
+    }
+    if (review.first_approver_id === approverId) {
+      throw new Error('Same compliance officer cannot approve an OFAC review twice');
+    }
+    if (review.status === 'pending_first_approval') {
+      review.status = 'pending_second_approval';
+      review.first_approver_id = approverId;
+      review.first_approval_rationale = rationale;
+      review.first_approved_at = new Date();
+      return review;
+    }
+
+    review.status = 'cleared';
+    review.second_approver_id = approverId;
+    review.second_approval_rationale = rationale;
+    review.second_approved_at = new Date();
+    review.cleared_at = new Date();
+    return review;
   }
 }
 
@@ -501,6 +550,92 @@ describe('AML Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.data.status).toBe('dismissed');
+    });
+  });
+
+  describe('OFAC review queue guards', () => {
+    it('should require an authenticated compliance actor', async () => {
+      const response = await request(app).get('/aml/ofac-reviews');
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should reject non-compliance roles', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set('x-user-id', 'investor_1')
+        .set('x-user-role', 'investor');
+
+      expect(response.status).toBe(403);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should require CSRF token for review creation', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set('x-user-id', 'officer_1')
+        .set('x-user-role', 'compliance_officer')
+        .send({
+          alert_id: 'alert_1',
+          investor_id: 'investor_1',
+          matched_name: 'John Smith',
+          rationale: 'Verified false positive from identity documents.',
+        });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toBe('Valid CSRF token required');
+    });
+  });
+
+  describe('OFAC review queue workflow', () => {
+    const csrf = 'csrf_test_token';
+
+    const complianceRequest = (verb: 'get' | 'post', path: string) =>
+      request(app)[verb](path)
+        .set('x-user-id', 'officer_1')
+        .set('x-user-role', 'compliance_officer')
+        .set('x-csrf-token', csrf)
+        .set('cookie', `csrfToken=${csrf}`);
+
+    it('should create and list OFAC reviews', async () => {
+      const createResponse = await complianceRequest('post', '/aml/ofac-reviews')
+        .send({
+          alert_id: 'alert_1',
+          investor_id: 'investor_1',
+          matched_name: 'John Smith',
+          list_entry_id: 'sdn_123',
+          rationale: 'Verified false positive from identity documents.',
+        });
+
+      expect(createResponse.status).toBe(201);
+      expect(createResponse.body.data.status).toBe('pending_first_approval');
+
+      const listResponse = await request(app)
+        .get('/aml/ofac-reviews')
+        .set('x-user-id', 'officer_1')
+        .set('x-user-role', 'compliance_officer');
+
+      expect(listResponse.status).toBe(200);
+      expect(listResponse.body.data).toHaveLength(1);
+    });
+
+    it('should approve a review and return conflict for creator approval', async () => {
+      const createResponse = await complianceRequest('post', '/aml/ofac-reviews')
+        .send({
+          alert_id: 'alert_1',
+          investor_id: 'investor_1',
+          matched_name: 'John Smith',
+          rationale: 'Verified false positive from identity documents.',
+        });
+
+      const approveResponse = await complianceRequest(
+        'post',
+        `/aml/ofac-reviews/${createResponse.body.data.id}/approve`
+      ).send({ rationale: 'Creator should be blocked from approving.' });
+
+      expect(approveResponse.status).toBe(409);
+      expect(approveResponse.body.error).toContain('creator cannot approve');
     });
   });
 });
