@@ -10,6 +10,7 @@ import {
   CronSchedule,
 } from '../services/distributionScheduler';
 import { ALLOWED_TIMEZONES, isValidTimezone } from '../lib/timezoneAllowlist';
+import { requireMobileAttestation } from '../security/mobileAttestation';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -342,7 +343,7 @@ export default function createDistributionsRouter(opts: {
   const router = express.Router();
   const handlers = createDistributionHandlers(opts.distributionEngine, opts.offeringRepo);
 
-  router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
+  router.post('/offerings/:id/distribute', opts.verifyJWT, requireMobileAttestation, handlers.triggerDistribution);
   router.get('/offerings/:id/schedules', opts.verifyJWT, handlers.getSchedule);
   router.put('/offerings/:id/schedules/timezone', opts.verifyJWT, handlers.updateScheduleTimezone);
   router.post('/offerings/:id/schedules/preview', opts.verifyJWT, handlers.previewScheduleWindow);
