@@ -71,6 +71,11 @@ const envSchema = z.object({
   HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
   HOLIDAY_CALENDAR_SECRET: z.string().optional(),
   HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
+  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(false),
+  SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(30),
+  BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().default(0.05),
+  SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(1000),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

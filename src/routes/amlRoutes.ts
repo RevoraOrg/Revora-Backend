@@ -16,14 +16,14 @@ const createRuleSchema = z.object({
   description: z.string().min(1).max(1000),
   type: z.enum(['velocity', 'structuring', 'geo_mismatch', 'amount_threshold']),
   severity: z.enum(['low', 'medium', 'high', 'critical']),
-  config: z.record(z.unknown()),
+  config: z.record(z.string(), z.unknown()),
 });
 
 const updateRuleSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   description: z.string().min(1).max(1000).optional(),
   enabled: z.boolean().optional(),
-  config: z.record(z.unknown()).optional(),
+  config: z.record(z.string(), z.unknown()).optional(),
   change_reason: z.string().min(1).max(500),
 });
 
@@ -109,7 +109,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.status(201).json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to create rule' });
@@ -129,7 +129,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to update rule' });
@@ -149,7 +149,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error rolling back AML rule:', error);
         res.status(500).json({ success: false, error: 'Failed to rollback rule' });
@@ -229,7 +229,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.status(201).json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error creating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to create case' });
@@ -249,7 +249,7 @@ export function createAMLRoutes(amlService: AMLService): Router {
       res.json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
-        res.status(400).json({ success: false, error: 'Invalid input', details: error.errors });
+        res.status(400).json({ success: false, error: 'Invalid input', details: error.issues });
       } else {
         console.error('Error updating AML case:', error);
         res.status(500).json({ success: false, error: 'Failed to update case' });
