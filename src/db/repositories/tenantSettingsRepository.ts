@@ -26,6 +26,19 @@ export class TenantSettingsRepository {
     return this.mapRow(result.rows[0]);
   }
 
+  async upsertSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
+    const result: QueryResult = await this.db.query(
+      `INSERT INTO tenant_settings (tenant_id, settings, created_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (tenant_id)
+       DO UPDATE SET settings = $2, updated_at = NOW()
+       RETURNING tenant_id, settings, created_at, updated_at`,
+      [tenantId, JSON.stringify(settings)],
+    );
+
+    return this.mapRow(result.rows[0]);
+  }
+
   private mapRow(row: any): TenantSettingsRow {
     return {
       tenant_id: row.tenant_id,
