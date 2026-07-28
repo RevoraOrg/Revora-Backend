@@ -1,0 +1,63 @@
+name: RBAC Policy Diff Gate
+
+# Enforces that any pull request which changes the RBAC permission matrix
+# carries an `rbac-approved` label before it can be merged.
+#
+# Security assumptions and design decisions:
+#   - Runs on pull_request_target (not pull_request) so the check also fires
+#     for PRs opened from forks and can be marked as a required status check.
+#   - Workflow-level permissions grant only `contents: read` and
+#     `pull-requests: read`. The GITHUB_TOKEN can never modify the repo.
+#   - The job checks out the base branch (trusted) and reads the PR head
+#     via `git show` only as raw data; it never executes untrusted PR code
+#     with a privileged token.
+#   - No-diff PRs pass automatically without requiring any label.
+#   - PRs with a non-empty policy diff block unless labeled `rbac-approved`.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  rbac-policy-diff:
+    runs-on: ubuntu-latest
+    outputs:
+      has_diff: ${{ steps.diff.outputs.has_diff }}
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch PR head
+        run: |
+          git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-head
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compute RBAC policy diff
+        id: diff
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: npx ts-node scripts/rbac-policy-diff.ts
+
+      - name: Notify if policy changed without RBAC approval
+        if: ${{ steps.diff.outputs.has_diff == 'true' && !contains(github.event.pull_request.labels.*.name, 'rbac-approved') }}
+        run: |
+          echo "::error::RBAC permission matrix changed but this PR does not carry the 'rbac-approved' label."
+          echo "::warning::An authorized reviewer must add the 'rbac-approved' label to authorize the permission change."
+          exit 1

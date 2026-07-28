@@ -4,9 +4,11 @@ import {
     CreateRevenueReportInput,
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
+import { LedgerPeriodLockRepository } from '../db/repositories/ledgerPeriodLockRepository';
 import { Errors } from '../lib/errors';
 import { Logger } from '../lib/logger';
 import { LogLevel } from '../lib/logger';
+import { PoolClient } from 'pg';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -54,7 +56,8 @@ export class RevenueService {
 
     constructor(
         private offeringRepo: OfferingRepository,
-        private revenueReportRepo: RevenueReportRepository
+        private revenueReportRepo: RevenueReportRepository,
+        private ledgerLockRepo?: LedgerPeriodLockRepository
     ) {
         this.logger = new Logger({ level: LogLevel.INFO });
     }
@@ -68,11 +71,16 @@ export class RevenueService {
      * - Input validation: Rejects amounts exceeding these boundaries.
      * - String storage: Amounts stored as strings in JSON to preserve precision.
      * 
+     * Period Locking:
+     * - Rejects writes to periods that have been locked via ledger close operations.
+     * - This ensures locked periods cannot be modified after close.
+     * 
      * @param input - The revenue report data containing offering, amount, and period.
+     * @param client - Optional transaction client for race-safe locking checks
      * @returns The persisted RevenueReport object.
-     * @throws AppError if validation fails or unauthorized access is detected.
+     * @throws AppError if validation fails, unauthorized access, or period is locked.
      */
-    async submitReport(input: SubmitRevenueReportInput): Promise<RevenueReport> {
+    async submitReport(input: SubmitRevenueReportInput, client?: PoolClient): Promise<RevenueReport> {
         // 1. Validate offering existence and ownership
         const offering = await this.offeringRepo.findById(input.offeringId);
         if (!offering) {
@@ -132,7 +140,23 @@ export class RevenueService {
             );
         }
 
-        // 5. Save the report
+        // 5. Check if period is locked (prevent writes to closed periods)
+        // This is the critical race-safety check: must use same transaction isolation as close operation
+        if (this.ledgerLockRepo) {
+            const isPeriodLocked = await this.ledgerLockRepo.isPeriodLocked(
+                input.offeringId,
+                input.periodStart.toISOString().split('T')[0], // ISO date as period identifier
+                client
+            );
+
+            if (isPeriodLocked) {
+                throw Errors.conflict(
+                    `Period starting ${input.periodStart.toISOString()} is locked and cannot accept new journal entries`
+                );
+            }
+        }
+
+        // 6. Save the report
         const reportData: CreateRevenueReportInput = {
             offering_id: input.offeringId,
             amount: input.amount,

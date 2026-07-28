@@ -123,4 +123,104 @@ describe('ContractUpgradeOrchestratorService', () => {
       }),
     ).rejects.toThrow("Tenant 'tenant-1' has no configured builder identities");
   });
+
+  it('triggers an auto-rollback when health signals regress beyond thresholds and the rollback plan is approved', async () => {
+    mockPool.query
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 'upgrade-2',
+          tenant_id: 'tenant-1',
+          contract_id: 'contract-1',
+          target_code_id: 'deadbeef',
+          status: 'applied',
+          proposed_by: 'user-1',
+          approved_by: 'approver-1',
+          simulate_result: null,
+          simulate_ok: true,
+          transaction_hash: 'tx-hash',
+          failure_reason: null,
+          created_at: new Date().toISOString(),
+          approved_at: new Date().toISOString(),
+          applied_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    const triggered = await service.monitorPostUpgradeHealth(
+      'upgrade-2',
+      'operator-1',
+      { revert_rate: 0.18, failed_reconciliations: 12 },
+      { id: 'rollback-plan-1', approved: true },
+    );
+
+    expect(triggered).toBe(true);
+    expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'upgrade.autorollback.triggered',
+    }));
+  });
+
+  it('does not trigger rollback when the rollback plan is not approved', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{
+        id: 'upgrade-3',
+        tenant_id: 'tenant-1',
+        contract_id: 'contract-1',
+        target_code_id: 'deadbeef',
+        status: 'applied',
+        proposed_by: 'user-1',
+        approved_by: 'approver-1',
+        simulate_result: null,
+        simulate_ok: true,
+        transaction_hash: 'tx-hash',
+        failure_reason: null,
+        created_at: new Date().toISOString(),
+        approved_at: new Date().toISOString(),
+        applied_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }],
+    });
+
+    const triggered = await service.monitorPostUpgradeHealth(
+      'upgrade-3',
+      'operator-1',
+      { revert_rate: 0.18, failed_reconciliations: 12 },
+      { id: 'rollback-plan-2', approved: false },
+    );
+
+    expect(triggered).toBe(false);
+    expect(mockPool.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not oscillate rollback when the upgrade is already marked failed', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{
+        id: 'upgrade-4',
+        tenant_id: 'tenant-1',
+        contract_id: 'contract-1',
+        target_code_id: 'deadbeef',
+        status: 'failed',
+        proposed_by: 'user-1',
+        approved_by: 'approver-1',
+        simulate_result: null,
+        simulate_ok: true,
+        transaction_hash: 'tx-hash',
+        failure_reason: 'Auto-rollback triggered',
+        created_at: new Date().toISOString(),
+        approved_at: new Date().toISOString(),
+        applied_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }],
+    });
+
+    const triggered = await service.monitorPostUpgradeHealth(
+      'upgrade-4',
+      'operator-1',
+      { revert_rate: 0.18, failed_reconciliations: 12 },
+      { id: 'rollback-plan-3', approved: true },
+    );
+
+    expect(triggered).toBe(false);
+    expect(mockPool.query).toHaveBeenCalledTimes(1);
+  });
 });

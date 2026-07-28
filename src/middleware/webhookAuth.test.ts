@@ -3,10 +3,12 @@ import {
   webhookAuth,
   webhookVerify,
   webhookAuthWithProvider,
+  kycWebhookAuth,
   WebhookAuthOptions,
   WebhookAuthenticatedRequest,
 } from './webhookAuth';
 import { signWebhookPayload, WebhookSignatureError } from '../lib/webhookSignature';
+import { globalMetrics } from '../lib/metrics';
 
 // ─── Test Constants ───────────────────────────────────────────────────────────
 
@@ -1058,5 +1060,124 @@ describe('Webhook Auth Edge Cases', () => {
     middleware(mockReq, mockRes, mockNext);
 
     expect(mockNext).toHaveBeenCalled();
+  });
+});
+
+// ─── Dual-Key Rotation and KYC Webhook Auth Tests ────────────────────────────
+
+describe('kycWebhookAuth & Dual-Key Signature Rotation', () => {
+  let mockReq: jest.Mocked<Request>;
+  let mockRes: jest.Mocked<Response>;
+  let mockNext: jest.MockedFunction<NextFunction>;
+
+  const PRIMARY_KEY = 'kyc-primary-signing-key-32bytes';
+  const NEXT_KEY = 'kyc-next-signing-key-32bytes-long';
+
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    mockReq = createMockRequest();
+    mockRes = createMockResponse();
+    mockNext = createMockNext();
+    process.env = { ...originalEnv };
+    jest.clearAllMocks();
+  });
+
+  afterAll(() => {
+    process.env = originalEnv;
+  });
+
+  it('should accept delivery signed with current key and increment metric counter', () => {
+    process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY = String(Date.now() + 86400000);
+
+    const signature = signWebhookPayload(PRIMARY_KEY, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const incrementSpy = jest.spyOn(globalMetrics, 'incrementCounter');
+
+    const middleware = kycWebhookAuth();
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+    const authReq = mockReq as WebhookAuthenticatedRequest;
+    expect(authReq.webhook?.verified).toBe(true);
+    expect(authReq.webhook?.verifiedByKey).toBe('current');
+    expect(incrementSpy).toHaveBeenCalledWith('kyc.webhook.verified_by_key', { key: 'current' });
+  });
+
+  it('should accept delivery signed with next key within unexpired window and increment metric', () => {
+    process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY = String(Date.now() + 86400000); // 24 hours in future
+
+    const signature = signWebhookPayload(NEXT_KEY, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const incrementSpy = jest.spyOn(globalMetrics, 'incrementCounter');
+
+    const middleware = kycWebhookAuth();
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+    const authReq = mockReq as WebhookAuthenticatedRequest;
+    expect(authReq.webhook?.verified).toBe(true);
+    expect(authReq.webhook?.verifiedByKey).toBe('next');
+    expect(incrementSpy).toHaveBeenCalledWith('kyc.webhook.verified_by_key', { key: 'next' });
+  });
+
+  it('should REJECT delivery signed with next key after hard deadline has elapsed', () => {
+    process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY = String(Date.now() - 5000); // 5 seconds in past (expired!)
+
+    const signature = signWebhookPayload(NEXT_KEY, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const incrementSpy = jest.spyOn(globalMetrics, 'incrementCounter');
+
+    const middleware = kycWebhookAuth();
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(incrementSpy).not.toHaveBeenCalledWith('kyc.webhook.verified_by_key', expect.anything());
+  });
+
+  it('should reject when signature does not match primary or next key', () => {
+    process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+
+    const signature = signWebhookPayload('bogus-secret', TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = kycWebhookAuth();
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).not.toHaveBeenCalled();
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+  });
+
+  it('should support provider returning dual-key configuration object', async () => {
+    const signature = signWebhookPayload(NEXT_KEY, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.params = { endpointId: 'ep_kyc_01' };
+
+    const secretProvider = jest.fn().mockResolvedValue({
+      secret: PRIMARY_KEY,
+      nextSecret: NEXT_KEY,
+      nextSecretExpiry: Date.now() + 60000,
+    });
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      metricName: 'kyc.webhook.verified_by_key',
+    });
+
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+    const authReq = mockReq as WebhookAuthenticatedRequest;
+    expect(authReq.webhook?.verifiedByKey).toBe('next');
   });
 });
