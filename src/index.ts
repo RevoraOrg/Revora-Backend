@@ -11,6 +11,7 @@ import { createCorsMiddleware } from "./middleware/cors";
 import { errorHandler } from "./middleware/errorHandler";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { Errors } from "./lib/errors";
+import { globalSampler } from "./lib/sampler";
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -722,6 +723,7 @@ async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
+  globalSampler.stop();
   console.log(`\n[server] ${signal} shutting down`);
 
   if (server) {
@@ -1011,6 +1013,7 @@ if (require.main === module && env.NODE_ENV !== "test") {
   );
   
   payoutDriftDetector.start(); // Start nightly payout drift detection
+  globalSampler.start(); // Start event loop lag monitoring
 
   process.on("SIGTERM", () => {
     auditPurgeService.stop();
