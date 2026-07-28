@@ -18,7 +18,7 @@
  *  - Raw pg errors that are NOT `23505` are re-thrown unchanged.
  */
 
-import { Pool, QueryResult } from 'pg';
+import { Pool, QueryResult, QueryResultRow } from 'pg';
 import { UserRepository, User, CreateUserInput, UpdateUserInput } from './userRepository';
 import { UniqueConstraintError } from '../../lib/errors';
 
@@ -30,11 +30,12 @@ const BASE_USER: User = {
   password_hash: 'salt:hash',
   name: 'Alice',
   role: 'investor',
+  kyc_risk_tier: 'standard',
   created_at: new Date('2024-01-01'),
   updated_at: new Date('2024-01-01'),
 };
 
-function makeQueryResult<T>(rows: T[]): QueryResult<T> {
+function makeQueryResult<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
@@ -170,7 +171,7 @@ describe('UserRepository', () => {
       expect(result.email).toBe('bob@example.com');
       expect(mockPool.query).toHaveBeenCalledWith(
         expect.stringContaining('INSERT INTO users'),
-        expect.arrayContaining(['bob@example.com', 's:h', 'Bob', 'startup']),
+        expect.arrayContaining(['bob@example.com', 's:h', 'Bob', 'startup', 'standard']),
       );
     });
 
@@ -181,6 +182,7 @@ describe('UserRepository', () => {
 
       const params = mockPool.query.mock.calls[0][1] as any[];
       expect(params[3]).toBe('startup'); // 4th positional param is role
+      expect(params[4]).toBe('standard'); // 5th is kyc_risk_tier default
     });
 
     it('passes null for name when not provided', async () => {

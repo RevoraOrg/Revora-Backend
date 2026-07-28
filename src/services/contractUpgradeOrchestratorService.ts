@@ -13,6 +13,8 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 import { globalLogger } from '../lib/logger';
 import { Errors } from '../lib/errors';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
+import { TenantSettingsRepository } from '../db/repositories/tenantSettingsRepository';
+import { verifyReproducibleBuildAttestation } from '../security/attestationVerifier';
 import { env } from '../config/env';
 
 const logger = globalLogger.child({ service: 'contract-upgrade-orchestrator' });
@@ -23,6 +25,7 @@ export type UpgradeStatus = 'pending' | 'approved' | 'applied' | 'failed';
 
 export interface ContractUpgrade {
   id: string;
+  tenant_id: string;
   contract_id: string;
   target_code_id: string;
   status: UpgradeStatus;
@@ -39,9 +42,11 @@ export interface ContractUpgrade {
 }
 
 export interface CreateUpgradeInput {
+  tenant_id: string;
   contract_id: string;
   target_code_id: string;
   proposed_by: string;
+  attestation: unknown;
 }
 
 export interface SimulateResult {
@@ -50,11 +55,22 @@ export interface SimulateResult {
   error?: string;
 }
 
+export interface PostUpgradeHealthSignal {
+  revert_rate: number;
+  failed_reconciliations: number;
+}
+
+export interface RollbackPlan {
+  id: string;
+  approved: boolean;
+}
+
 // ── Repository helpers ────────────────────────────────────────────────────────
 
 function mapRow(row: any): ContractUpgrade {
   return {
     id: row.id,
+    tenant_id: row.tenant_id,
     contract_id: row.contract_id,
     target_code_id: row.target_code_id,
     status: row.status,
@@ -79,6 +95,7 @@ export class ContractUpgradeOrchestratorService {
   constructor(
     private readonly db: Pool,
     private readonly auditLog: AuditLogRepository,
+    private readonly tenantSettingsRepo: TenantSettingsRepository,
     private readonly keypair: StellarSdk.Keypair,
   ) {
     const horizonUrl =
@@ -103,20 +120,56 @@ export class ContractUpgradeOrchestratorService {
    * Pins the target_code_id at creation time so it cannot be swapped later.
    */
   async createUpgrade(input: CreateUpgradeInput): Promise<ContractUpgrade> {
-    const { contract_id, target_code_id, proposed_by } = input;
+    const { tenant_id, contract_id, target_code_id, proposed_by, attestation } = input;
 
-    if (!contract_id || !target_code_id || !proposed_by) {
+    if (!tenant_id || !contract_id || !target_code_id || !proposed_by || attestation === undefined) {
       throw Errors.validationError(
-        'contract_id, target_code_id and proposed_by are required',
+        'tenant_id, contract_id, target_code_id, proposed_by and attestation are required',
       );
     }
 
+    const tenantSettings = await this.tenantSettingsRepo.findByTenantId(tenant_id);
+    if (!tenantSettings) {
+      throw Errors.notFound(`Tenant settings for '${tenant_id}' not found`);
+    }
+
+    const builderIdentities = Array.isArray(tenantSettings.settings.builder_identities)
+      ? tenantSettings.settings.builder_identities.filter(
+          (item): item is string => typeof item === 'string' && item.trim().length > 0,
+        )
+      : [];
+
+    if (builderIdentities.length === 0) {
+      throw Errors.badRequest(
+        `Tenant '${tenant_id}' has no configured builder identities`,
+      );
+    }
+
+    const verifiedAttestation = verifyReproducibleBuildAttestation(
+      attestation,
+      target_code_id,
+      builderIdentities,
+    );
+
+    await this.auditLog.createAuditLog({
+      user_id: proposed_by,
+      action: 'upgrade.attestation.verified',
+      resource: `tenants/${tenant_id}`,
+      details: JSON.stringify({
+        tenant_id,
+        contract_id,
+        target_code_id,
+        builder_id: verifiedAttestation.builderId,
+        subject_name: verifiedAttestation.subjectName,
+      }),
+    });
+
     const result = await this.db.query<ContractUpgrade>(
       `INSERT INTO contract_upgrades
-         (contract_id, target_code_id, proposed_by, status)
-       VALUES ($1, $2, $3, 'pending')
+         (tenant_id, contract_id, target_code_id, proposed_by, status)
+       VALUES ($1, $2, $3, $4, 'pending')
        RETURNING *`,
-      [contract_id, target_code_id, proposed_by],
+      [tenant_id, contract_id, target_code_id, proposed_by],
     );
 
     const upgrade = mapRow(result.rows[0]);
@@ -457,6 +510,65 @@ export class ContractUpgradeOrchestratorService {
         { upgrade_id: upgradeId, error: String(err?.message ?? err) },
       );
     }
+  }
+
+  // ── Post-upgrade health monitoring ───────────────────────────────────────
+
+  /**
+   * Watches post-upgrade health signals and auto-triggers rollback once the
+   * regression thresholds are exceeded, provided an already-approved rollback
+   * plan exists and the upgrade is still in a recoverable state.
+   */
+  async monitorPostUpgradeHealth(
+    upgradeId: string,
+    actor_id: string,
+    signal: PostUpgradeHealthSignal,
+    rollbackPlan: RollbackPlan | null,
+  ): Promise<boolean> {
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    const revertRateThreshold = 0.1;
+    const failedReconciliationsThreshold = 10;
+    const shouldRollback =
+      upgrade.status === 'applied' &&
+      rollbackPlan?.approved === true &&
+      signal.revert_rate >= revertRateThreshold &&
+      signal.failed_reconciliations >= failedReconciliationsThreshold;
+
+    if (!shouldRollback) {
+      return false;
+    }
+
+    const reason = `Auto-rollback triggered after health-signal regression: revert_rate=${signal.revert_rate}, failed_reconciliations=${signal.failed_reconciliations}`;
+
+    await this.db.query(
+      `UPDATE contract_upgrades
+          SET status = 'failed',
+              failure_reason = $1
+        WHERE id = $2 AND status = 'applied'`,
+      [reason, upgrade.id],
+    );
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'upgrade.autorollback.triggered',
+      resource: `contract_upgrades/${upgrade.id}`,
+      details: JSON.stringify({
+        upgrade_id: upgrade.id,
+        rollback_plan_id: rollbackPlan?.id ?? null,
+        cause: reason,
+        signal,
+      }),
+    });
+
+    logger.warn('Contract upgrade auto-rollback triggered', {
+      upgrade_id: upgrade.id,
+      rollback_plan_id: rollbackPlan?.id ?? null,
+      cause: reason,
+      signal,
+    });
+
+    return true;
   }
 
   // ── Queries ───────────────────────────────────────────────────────────────
