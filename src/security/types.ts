@@ -31,7 +31,7 @@ export interface SecurityContext {
 
 export interface AuditEvent {
   id: string;
-  type: 'AUTHENTICATION' | 'AUTHORIZATION' | 'VALIDATION' | 'SECURITY_VIOLATION';
+  type: 'AUTHENTICATION' | 'AUTHORIZATION' | 'VALIDATION' | 'SECURITY_VIOLATION' | 'KEY_ROTATION';
   userId?: string;
   sessionId?: string;
   action: string;
@@ -40,6 +40,27 @@ export interface AuditEvent {
   details: Record<string, unknown>;
   securityContext: Omit<SecurityContext, 'user'>;
   timestamp: Date;
+}
+
+export interface KMSRotationJobState {
+  id: string;
+  targetTable: string;
+  targetColumn: string;
+  targetKeyGeneration: number;
+  lastProcessedId: string | null;
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused';
+  totalRows: number;
+  reencryptedRows: number;
+  failedRows: number;
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt?: Date | null;
+}
+
+export interface KMSRotationOptions {
+  batchSize?: number;
+  targetKeyGeneration?: number;
+  pauseOnError?: boolean;
 }
 
 export interface SecurityAuditRepository {
