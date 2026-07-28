@@ -1,5 +1,10 @@
 import { Pool, QueryResult } from 'pg';
 import { UniqueConstraintError } from '../../lib/errors';
+import {
+  DEFAULT_KYC_RISK_TIER,
+  KycRiskTier,
+  parseKycRiskTier,
+} from '../../lib/kycRiskTierCaps';
 
 /**
  * Full user row — password_hash included for internal auth use only.
@@ -11,6 +16,8 @@ export interface User {
   password_hash: string;
   name?: string;
   role: 'startup' | 'investor';
+  /** KYC risk tier used to scale per-offering investment caps. */
+  kyc_risk_tier: KycRiskTier;
   created_at: Date;
   updated_at: Date;
 }
@@ -23,6 +30,7 @@ export interface CreateUserInput {
   password_hash: string;
   name?: string;
   role?: 'startup' | 'investor';
+  kyc_risk_tier?: KycRiskTier;
 }
 
 export interface UpdateUserInput {
@@ -30,6 +38,7 @@ export interface UpdateUserInput {
   email?: string;
   password_hash?: string;
   role?: 'startup' | 'investor';
+  kyc_risk_tier?: KycRiskTier;
 }
 
 /**
@@ -54,7 +63,7 @@ export class UserRepository {
    */
   async findById(id: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -73,7 +82,7 @@ export class UserRepository {
    */
   async findByEmail(email: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, created_at, updated_at
       FROM users
       WHERE email = $1
       LIMIT 1
@@ -97,8 +106,8 @@ export class UserRepository {
    */
   async createUser(input: CreateUserInput): Promise<User> {
     const query = `
-      INSERT INTO users (email, password_hash, name, role, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, NOW(), NOW())
+      INSERT INTO users (email, password_hash, name, role, kyc_risk_tier, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
       RETURNING *
     `;
     const values = [
@@ -106,6 +115,7 @@ export class UserRepository {
       input.password_hash,
       input.name ?? null,
       input.role ?? 'startup',
+      input.kyc_risk_tier ?? DEFAULT_KYC_RISK_TIER,
     ];
     let result: QueryResult<User>;
     try {
@@ -151,6 +161,10 @@ export class UserRepository {
       sets.push(`role = $${idx++}`);
       values.push(input.role);
     }
+    if (input.kyc_risk_tier !== undefined) {
+      sets.push(`kyc_risk_tier = $${idx++}`);
+      values.push(input.kyc_risk_tier);
+    }
 
     if (sets.length === 0) {
       const existing = await this.findById(input.id);
@@ -178,6 +192,14 @@ export class UserRepository {
   }
 
   /**
+   * Persist a new KYC risk tier for an investor.
+   * Does not emit audit events — callers (KycRiskTierService) own that.
+   */
+  async updateKycRiskTier(userId: string, tier: KycRiskTier): Promise<User> {
+    return this.updateUser({ id: userId, kyc_risk_tier: tier });
+  }
+
+  /**
    * Update a user's password hash directly.
    */
   async updatePasswordHash(userId: string, newPasswordHash: string): Promise<void> {
@@ -196,6 +218,7 @@ export class UserRepository {
       password_hash: row.password_hash,
       name: row.name ?? undefined,
       role: row.role as 'startup' | 'investor',
+      kyc_risk_tier: parseKycRiskTier(row.kyc_risk_tier),
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
