@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response, Router } from 'express';
+import { AuthenticatedRequest } from '../../middleware/auth';
 import { OidcAdapterService } from './oidcAdapterService';
 import { OidcProviderRepository, CreateOidcProviderInput } from '../../db/repositories/oidcProviderRepository';
 
@@ -7,6 +8,8 @@ export interface OidcRouterDependencies {
   oidcProviderRepo: OidcProviderRepository;
   /** Express middleware that enforces admin role and attaches req.user */
   requireAdmin: (req: Request, res: Response, next: NextFunction) => void;
+  /** Optional audit hook for JWKS refresh events */
+  auditRefresh?: (event: Record<string, unknown>) => void | Promise<void>;
 }
 
 /**
@@ -19,8 +22,48 @@ export interface OidcRouterDependencies {
  *  GET  /api/auth/oidc/providers               — (admin) list providers
  */
 export function createOidcRouter(deps: OidcRouterDependencies): Router {
-  const { oidcAdapter, oidcProviderRepo, requireAdmin } = deps;
+  const { oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh } = deps;
   const router = Router();
+  const refreshCooldownMs = 60_000;
+  const refreshAttempts = new Map<string, number>();
+
+  const handleRefreshRequest = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const issuerUrl = typeof req.body?.issuerUrl === 'string' ? req.body.issuerUrl : undefined;
+      const confirmationHeader = req.get('x-revora-oidc-jwks-confirmation') === 'true';
+      const confirmationBody = req.body?.confirmation === true || req.body?.confirmation === 'true';
+      const confirmed = confirmationHeader && confirmationBody;
+      const actorId = req.user?.id ?? req.ip ?? 'anonymous';
+      const key = `${actorId}:${issuerUrl ?? 'global'}`;
+      const now = Date.now();
+
+      if (!issuerUrl) {
+        await auditRefresh?.({ action: 'jwks_refresh', actorId, issuerUrl, status: 'blocked', reason: 'missing_issuer' });
+        res.status(400).json({ error: 'Bad Request', message: 'issuerUrl is required' });
+        return;
+      }
+
+      if (!confirmed) {
+        await auditRefresh?.({ action: 'jwks_refresh', actorId, issuerUrl, status: 'blocked', reason: 'missing_confirmation' });
+        res.status(400).json({ error: 'Bad Request', message: 'Dual confirmation is required' });
+        return;
+      }
+
+      const lastAttempt = refreshAttempts.get(key) ?? 0;
+      if (now - lastAttempt < refreshCooldownMs) {
+        await auditRefresh?.({ action: 'jwks_refresh', actorId, issuerUrl, status: 'blocked', reason: 'rate_limited' });
+        res.status(429).json({ error: 'Too Many Requests', message: 'JWKS refresh is rate-limited for this actor' });
+        return;
+      }
+
+      refreshAttempts.set(key, now);
+      await oidcAdapter.refreshJwks(issuerUrl);
+      await auditRefresh?.({ action: 'jwks_refresh', actorId, issuerUrl, status: 'success' });
+      res.status(200).json({ ok: true, issuerUrl, refreshedAt: new Date().toISOString() });
+    } catch (err) {
+      next(err);
+    }
+  };
 
   // ── Start SSO flow ───────────────────────────────────────────────────────
   router.get('/api/auth/oidc/authorize', async (req: Request, res: Response, next: NextFunction) => {
@@ -83,6 +126,9 @@ export function createOidcRouter(deps: OidcRouterDependencies): Router {
       next(err);
     }
   });
+
+  router.post('/api/auth/oidc/jwks/refresh', requireAdmin, handleRefreshRequest);
+  router.post('/auth/oidc/jwks/refresh', requireAdmin, handleRefreshRequest);
 
   // ── Admin: register provider ─────────────────────────────────────────────
   router.post('/api/auth/oidc/providers', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
