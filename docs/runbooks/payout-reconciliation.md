@@ -19,7 +19,8 @@
 9. [Partial Fills](#partial-fills)
 10. [Replay Procedure](#replay-procedure)
 11. [Metrics and Alarms](#metrics-and-alarms)
-12. [Related Code](#related-code)
+12. [Postmortems](#postmortems)
+13. [Related Code](#related-code)
 
 ---
 
@@ -299,6 +300,22 @@ Recommended evaluation interval: 5 minutes, with a 5-minute trigger window to av
 ### Automated Resolution
 
 The alarm auto-clears when the next nightly run detects zero drift. No manual intervention is required for transient issues that self-resolve.
+
+---
+
+## Postmortems
+
+Any incident triaged above as **CRITICAL** (or otherwise labeled `SEV-1` on its
+tracking PR/issue) requires a written postmortem before the fix is merged.
+
+- **Template:** [`docs/postmortems/_template.md`](../postmortems/_template.md)
+- **File naming:** `docs/postmortems/pr-<PR_NUMBER>.md` or
+  `docs/postmortems/pr-<PR_NUMBER>-<slug>.md`
+- **Required sections:** timeline, blast radius, total decimals (monetary drift)
+  affected, and at least one "what would have prevented this" action item.
+- **Enforcement:** `.github/workflows/postmortem-required.yml` fails the PR's
+  status check if it carries the `SEV-1` label and no matching postmortem file
+  is present among its changed files; removing the label skips the check.
 
 ---
 

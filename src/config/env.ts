@@ -34,6 +34,11 @@ import { z } from "zod";
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
+ * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
+ * | SENDGRID_EVENT_WEBHOOK_SECRET| No      | (empty)                 | Secret for SendGrid event webhook verification   |
+ * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
+ * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
+ * | BOUNCE_RATIO_ALARM_THRESHOLD| No       | 0.05                    | Bounce ratio threshold for alarms (e.g. 0.05=5%)|
  */
 
 const envSchema = z.object({
@@ -65,6 +70,11 @@ const envSchema = z.object({
   SMTP_PORT: z.coerce.number().int().positive().max(65535).optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
+  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
+  SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
+  SES_SNS_TOPIC_ARN: z.string().optional(),
+  SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
+  BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

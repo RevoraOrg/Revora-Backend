@@ -18,7 +18,7 @@ import {
 import { createHealthRouter } from "./routes/health";
 import vestingRouter from "./routes/vesting";
 import { offeringSanitizeMiddleware } from "./middleware/offeringSanitize";
-import { createStartupRegisterRateLimit } from "./middleware/startupRegisterRateLimit";
+import { createStartupAuthTierLimiter } from "./middleware/startupAuthRateTierPolicy";
 import { env } from "./config/env";
 import { validateWebhookUrl, SsrfValidationError } from "./lib/ssrfProtection";
 import {
@@ -34,8 +34,15 @@ import { pool } from "./db/pool";
 import { globalMetrics } from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
+import { EmailDeliverabilityService } from "./services/emailDeliverabilityService";
+import { EmailDeliverabilityRepository } from "./db/repositories/emailDeliverabilityRepository";
+import { createEmailWebhooksRouter } from "./routes/emailWebhooks";
 import { createAdminRouter } from "./routes/admin";
+import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
+import { TenantSettingsRepository } from "./db/repositories/tenantSettingsRepository";
+import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
+import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
@@ -43,6 +50,7 @@ import { MetricsCollector } from "./lib/metrics";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
+import { Keypair } from '@stellar/stellar-sdk';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -600,9 +608,22 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     });
   });
 
+  /**
+   * @notice Rate-limiter tier policy enforcement for the STARTUP_REGISTER endpoint.
+   *
+   * Security assumptions:
+   * - Tier resolution is performed via the `x-revora-rate-tier` request header.
+   * - Privileged tiers (`trusted`, `internal`) require a valid shared secret in
+   *   `x-revora-tier-secret`; an absent, empty, or mismatched secret causes
+   *   silent downgrade to the `standard` tier (fail-safe).
+   * - If no tier header is supplied, the request is treated as `standard`.
+   * - Rate-limit state is in-process; a distributed store (e.g. Redis) must be
+   *   substituted for multi-instance deployments.
+   */
+  const startupTierLimiter = createStartupAuthTierLimiter();
   apiRouter.post(
     "/startup/register",
-    createStartupRegisterRateLimit(),
+    startupTierLimiter.middleware,
     createStartupRegisterHandler(),
   );
 
@@ -618,14 +639,55 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount password reset router
   app.use(createPasswordResetRouter({ db: pool, emailService }));
 
+  // Initialize email deliverability service (when enabled)
+  if (env.EMAIL_DELIVERABILITY_ENABLED) {
+    const emailDeliverabilityRepo = new EmailDeliverabilityRepository(pool);
+    const emailDeliverabilityService = new EmailDeliverabilityService(
+      emailDeliverabilityRepo,
+      new MetricsCollector({ enabled: true }),
+      {
+        enabled: env.EMAIL_DELIVERABILITY_ENABLED,
+        suppressionAutoExpireDays: env.SUPPRESSION_AUTO_EXPIRE_DAYS,
+        bounceRatioAlarmThreshold: env.BOUNCE_RATIO_ALARM_THRESHOLD,
+      },
+    );
+
+    // Wire into the existing email service
+    emailService.setDeliverabilityService(emailDeliverabilityService);
+
+    // Mount email bounce webhook routes
+    app.use(
+      '/api/v1/email/webhooks',
+      createEmailWebhooksRouter(emailDeliverabilityService, {
+        sendgridWebhookSecret: env.SENDGRID_EVENT_WEBHOOK_SECRET,
+      }),
+    );
+  }
+
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const tenantSettingsRepo = new TenantSettingsRepository(pool);
+  const contractUpgradeService = env.STELLAR_SERVER_SECRET
+    ? new ContractUpgradeOrchestratorService(
+        pool,
+        auditLogRepo,
+        tenantSettingsRepo,
+        Keypair.fromSecret(env.STELLAR_SERVER_SECRET),
+      )
+    : null;
 
   // Mount admin router
   apiRouter.use("/admin", createAdminRouter(auditLogRepo));
+  apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
+
+  if (contractUpgradeService) {
+    apiRouter.use(
+      "/contract-upgrades",
+      createContractUpgradeRouter(contractUpgradeService),
+    );
+  }
 
   // Initialize AML service and routes
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
 
@@ -642,6 +704,11 @@ export const __test = {
   parseIsoDate,
   parseOfferingValidationPayload,
   evaluateOfferingValidationMatrix,
+  /**
+   * @dev Exposes the tier-limiter factory for integration tests that need to
+   *      inspect tier resolution or reset counters without restarting the app.
+   */
+  createStartupAuthTierLimiter,
 };
 
 export { classifyStellarRPCFailure, StellarRPCFailureClass };

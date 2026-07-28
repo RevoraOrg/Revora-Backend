@@ -23,6 +23,11 @@ import {
   HealthDependencyGraph,
   DependencyHealth,
 } from "./health";
+import {
+  STARTUP_AUTH_RATE_TIER_HEADER,
+  STARTUP_AUTH_TIER_SECRET_HEADER,
+  STARTUP_AUTH_RATE_TIER_POLICIES,
+} from "../middleware/startupAuthRateTierPolicy";
 
 afterAll(async () => {
   await closePool();
@@ -1392,3 +1397,274 @@ describe("healthRootHandler - dependency graph aggregation", () => {
     expect(response.body.checks[1].status).toBe("down");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate Limiter Tier Policies — integration tests (BE-011)
+//
+// Security assumptions under test:
+//   1. Tier resolution defaults to "standard" when no tier header is sent.
+//   2. Privileged tiers require the correct shared secret; wrong/absent secret
+//      silently downgrades to standard (fail-safe, never leaks tier info).
+//   3. X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, and
+//      X-RateLimit-Tier headers are always emitted.
+//   4. Requests beyond the tier quota receive 429 with Retry-After.
+//   5. Rate-limit counters are isolated per tier key prefix.
+//   6. Non-register endpoints (/health) are unaffected by register rate limits.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("Rate Limiter Tier Policies (BE-011)", () => {
+  const tierSecret = "integration-test-secret-be011";
+  const API = "/api/v1";
+
+  /**
+   * @dev Each test builds its own createApp() instance so rate-limit counters
+   *      start fresh — the in-process store is not shared across app instances.
+   */
+  function makeApp() {
+    process.env.STARTUP_AUTH_TIER_SECRET = tierSecret;
+    const app = createApp({
+      healthQuery: jest.fn().mockResolvedValue({ rows: [{ now: new Date() }] }),
+      healthStatus: jest.fn().mockResolvedValue({
+        healthy: true,
+        latencyMs: 2,
+        pool: { totalCount: 1, idleCount: 1, waitingCount: 0, maxConnections: 10 },
+      }),
+    });
+    return app;
+  }
+
+  afterEach(() => {
+    delete process.env.STARTUP_AUTH_TIER_SECRET;
+  });
+
+  // ── Header presence ─────────────────────────────────────────────────────────
+
+  it("emits X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, and X-RateLimit-Tier on every 201", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .send({ email: "user@example.com", password: "secret" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-limit"]).toBeDefined();
+    expect(res.headers["x-ratelimit-remaining"]).toBeDefined();
+    expect(res.headers["x-ratelimit-reset"]).toBeDefined();
+    expect(res.headers["x-ratelimit-tier"]).toBeDefined();
+  });
+
+  // ── Standard tier (default) ─────────────────────────────────────────────────
+
+  it("resolves to standard tier when no tier header is provided", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .send({ email: "user@example.com", password: "secret" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit),
+    );
+  });
+
+  it("blocks standard-tier requests after quota is exhausted (6th request → 429)", async () => {
+    const app = makeApp();
+    const body = { email: "u@example.com", password: "p" };
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      const r = await request(app).post(`${API}/startup/register`).send(body);
+      expect(r.status).toBe(201);
+    }
+
+    const blocked = await request(app).post(`${API}/startup/register`).send(body);
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-tier"]).toBe("standard");
+    expect(blocked.headers["retry-after"]).toBeDefined();
+    expect(parseInt(blocked.headers["retry-after"], 10)).toBeGreaterThan(0);
+  });
+
+  // ── Trusted tier ─────────────────────────────────────────────────────────────
+
+  it("resolves to trusted tier when valid secret is supplied", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send({ email: "t@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("trusted");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.trusted.limit),
+    );
+  });
+
+  it("allows exactly trusted-limit requests and blocks the next one (11th → 429)", async () => {
+    const app = makeApp();
+    const body = { email: "t@example.com", password: "p" };
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.trusted.limit; i++) {
+      const r = await request(app)
+        .post(`${API}/startup/register`)
+        .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+        .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+        .send(body);
+      expect(r.status).toBe(201);
+    }
+
+    const blocked = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send(body);
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-tier"]).toBe("trusted");
+    expect(blocked.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.trusted.limit),
+    );
+  });
+
+  // ── Internal tier ────────────────────────────────────────────────────────────
+
+  it("resolves to internal tier when valid secret is supplied", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send({ email: "i@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("internal");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.internal.limit),
+    );
+  });
+
+  // ── Security: downgrade on bad secret ───────────────────────────────────────
+
+  it("downgrades 'trusted' request with wrong secret to standard tier (fail-safe)", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, "wrong-secret")
+      .send({ email: "spoof@example.com", password: "p" });
+
+    // Must be treated as standard — does not reveal tier info
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit),
+    );
+  });
+
+  it("downgrades 'internal' request with absent secret to standard tier", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+      // no secret header
+      .send({ email: "spoof@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+  });
+
+  it("spoofed trusted requests consume the standard counter; real trusted counter is untouched", async () => {
+    const app = makeApp();
+    const body = { email: "s@example.com", password: "p" };
+
+    // Exhaust standard counter via spoofed trusted requests (wrong secret)
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      const r = await request(app)
+        .post(`${API}/startup/register`)
+        .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+        .set(STARTUP_AUTH_TIER_SECRET_HEADER, "bad-secret")
+        .send(body);
+      expect(r.status).toBe(201);
+      expect(r.headers["x-ratelimit-tier"]).toBe("standard");
+    }
+
+    // Standard counter is now exhausted — spoofed request is blocked
+    const spoofBlocked = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, "bad-secret")
+      .send(body);
+    expect(spoofBlocked.status).toBe(429);
+    expect(spoofBlocked.headers["x-ratelimit-tier"]).toBe("standard");
+
+    // Trusted counter is completely fresh — real trusted request must succeed
+    const trustedOk = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send(body);
+    expect(trustedOk.status).toBe(201);
+    expect(trustedOk.headers["x-ratelimit-tier"]).toBe("trusted");
+  });
+
+  it("unknown tier value is treated as standard (no elevation)", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "vip")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send({ email: "vip@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+  });
+
+  // ── Isolation from other endpoints ──────────────────────────────────────────
+
+  it("/health endpoint is completely unaffected when /startup/register is rate-limited", async () => {
+    const app = makeApp();
+    const body = { email: "flood@example.com", password: "p" };
+
+    // Exhaust the standard tier
+    for (let i = 0; i <= STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      await request(app).post(`${API}/startup/register`).send(body);
+    }
+
+    // /health must still respond 200
+    const healthRes = await request(app).get("/health");
+    expect(healthRes.status).toBe(200);
+  });
+
+  // ── X-RateLimit-Remaining correctness ────────────────────────────────────────
+
+  it("X-RateLimit-Remaining decrements correctly on successive standard-tier requests", async () => {
+    const app = makeApp();
+    const body = { email: "count@example.com", password: "p" };
+    const limit = STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit;
+
+    const r1 = await request(app).post(`${API}/startup/register`).send(body);
+    expect(r1.status).toBe(201);
+    const r1Remaining = parseInt(r1.headers["x-ratelimit-remaining"], 10);
+    expect(r1Remaining).toBe(limit - 1);
+
+    const r2 = await request(app).post(`${API}/startup/register`).send(body);
+    expect(r2.status).toBe(201);
+    const r2Remaining = parseInt(r2.headers["x-ratelimit-remaining"], 10);
+    expect(r2Remaining).toBe(limit - 2);
+  });
+
+  // ── 429 response body ────────────────────────────────────────────────────────
+
+  it("429 response body includes a human-readable message for the blocked tier", async () => {
+    const app = makeApp();
+    const body = { email: "msg@example.com", password: "p" };
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      await request(app).post(`${API}/startup/register`).send(body);
+    }
+
+    const blocked = await request(app).post(`${API}/startup/register`).send(body);
+    expect(blocked.status).toBe(429);
+    expect(typeof blocked.body.message).toBe("string");
+    expect(blocked.body.message.length).toBeGreaterThan(0);
+  });
+});
+
