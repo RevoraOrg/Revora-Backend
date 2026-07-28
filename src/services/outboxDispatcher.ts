@@ -1,5 +1,10 @@
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 import { WebhookEventType } from './webhookService';
+import { PressureGauge, PressureTier, PressureGaugeConfig, PressureStateChangeCallback, PressureState } from '../lib/pressureGauge';
+import { MetricsCollector } from '../lib/metrics';
+
+// Re-export for convenient access
+export { PressureTier, PressureGaugeConfig, PressureStateChangeCallback } from '../lib/pressureGauge';
 
 /**
  * Callback type that the dispatcher uses to hand a row to the delivery layer.
@@ -17,6 +22,10 @@ export interface OutboxDispatcherOptions {
   maxAttempts?: number;
   /** Base delay (ms) for exponential retry back-off. Default: 1000. */
   retryBaseMs?: number;
+  /** Configuration for pressure gauge thresholds. */
+  pressureConfig?: PressureGaugeConfig;
+  /** Metrics collector for emitting outbox.lag_seconds gauge. */
+  metrics?: MetricsCollector;
 }
 
 /**
@@ -28,12 +37,19 @@ export interface OutboxDispatcherOptions {
  * - A crash mid-dispatch leaves the row pending; the next poll retries it with
  *   the same event_id, so the receiver can deduplicate via webhookEventOrdering.
  * - After maxAttempts failures the row is marked 'failed' (dead-letter).
+ *
+ * Outbox lag monitoring:
+ * - Continuously measures age of oldest unsent record (outbox.lag_seconds metric).
+ * - Emits saturation alerts on escalating pressure tiers (info, warning, critical).
+ * - Signals backpressure via PressureGauge to allow producers to pause.
  */
 export class OutboxDispatcher {
   private readonly batchSize: number;
   private readonly intervalMs: number;
   private readonly maxAttempts: number;
   private readonly retryBaseMs: number;
+  private readonly pressureGauge: PressureGauge;
+  private readonly metrics: MetricsCollector;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
 
@@ -46,6 +62,11 @@ export class OutboxDispatcher {
     this.intervalMs = options.intervalMs ?? 5000;
     this.maxAttempts = options.maxAttempts ?? 5;
     this.retryBaseMs = options.retryBaseMs ?? 1000;
+    this.pressureGauge = new PressureGauge(options.pressureConfig);
+    this.metrics = options.metrics ?? new MetricsCollector({ enabled: true });
+
+    // Listen for pressure state changes and emit alerts
+    this.pressureGauge.onStateChange(this.handlePressureStateChange.bind(this));
   }
 
   /** Start the polling loop. Safe to call multiple times (idempotent). */
@@ -65,15 +86,116 @@ export class OutboxDispatcher {
   }
 
   /**
+   * Get the current pressure gauge state.
+   * Useful for monitoring and testing.
+   */
+  getPressureState() {
+    return this.pressureGauge.getState();
+  }
+
+  /**
+   * Get the current pressure tier.
+   * Can be used by producers to decide whether to pause.
+   */
+  getPressureTier(): PressureTier {
+    return this.pressureGauge.getTier();
+  }
+
+  /**
+   * Check if pressure is at or above a given tier.
+   * @param tier Tier to check against.
+   * @returns True if current pressure is at or above the given tier.
+   */
+  isUnderPressure(tier: PressureTier = PressureTier.WARNING): boolean {
+    return this.pressureGauge.isAtLeast(tier);
+  }
+
+  /**
+   * Register a callback to be invoked when pressure state changes.
+   * Allows external consumers to react to backpressure signals.
+   */
+  onPressureStateChange(callback: PressureStateChangeCallback): void {
+    this.pressureGauge.onStateChange(callback);
+  }
+
+  /**
    * Run a single drain cycle. Exposed for testing and one-shot use.
    * Returns the number of rows processed.
+   *
+   * Also measures and updates outbox lag, emitting appropriate metrics
+   * and pressure state transitions.
    */
   async drainOnce(): Promise<number> {
+    // Measure lag before draining
+    await this.measureAndUpdateLag();
+
     const rows = await this.outboxRepo.drainPending(this.batchSize);
     for (const row of rows) {
       await this.processRow(row);
     }
     return rows.length;
+  }
+
+  /**
+   * Measure the age of the oldest pending outbox record and update pressure gauge.
+   * Emits outbox.lag_seconds gauge metric.
+   */
+  private async measureAndUpdateLag(): Promise<void> {
+    try {
+      const oldestRow = await this.outboxRepo.getOldestPending();
+      let lagSeconds = -1; // -1 indicates no pending records
+
+      if (oldestRow) {
+        // Calculate lag in seconds
+        lagSeconds = (Date.now() - oldestRow.created_at.getTime()) / 1000;
+      }
+
+      // Update pressure gauge (handles tier transitions internally)
+      this.pressureGauge.updateLag(lagSeconds);
+
+      // Emit gauge metric
+      this.metrics.setGauge('outbox_lag_seconds', lagSeconds >= 0 ? lagSeconds : 0, {
+        status: lagSeconds < 0 ? 'normal' : 'pending',
+      });
+    } catch (error) {
+      // Log but don't throw – lag measurement failure shouldn't stop dispatcher
+      console.error('[OutboxDispatcher] Failed to measure lag:', error);
+    }
+  }
+
+  /**
+   * Internal callback invoked when pressure tier changes.
+   * Emits appropriate alerts and metrics.
+   */
+  private handlePressureStateChange(oldState: PressureState, newState: PressureState): void {
+    const { tier: oldTier, lagSeconds: oldLag } = oldState;
+    const { tier: newTier, lagSeconds: newLag } = newState;
+
+    // Emit metric for tier transition
+    this.metrics.incrementCounter('outbox_pressure_tier_transitions', {
+      from: oldTier,
+      to: newTier,
+    });
+
+    // Emit alert based on severity
+    const severityMap: Record<string, string> = {
+      [PressureTier.NORMAL]: 'info',
+      [PressureTier.INFO]: 'info',
+      [PressureTier.WARNING]: 'warning',
+      [PressureTier.CRITICAL]: 'critical',
+    };
+
+    const severity = severityMap[newTier];
+    this.metrics.incrementCounter('outbox_saturation_alerts', {
+      severity,
+      tier: newTier,
+    });
+
+    console.log(
+      `[OutboxDispatcher] Outbox saturation alert [${severity}] ` +
+        `lag: ${oldLag.toFixed(2)}s → ${newLag.toFixed(2)}s, ` +
+        `tier: ${oldTier} → ${newTier}`
+    );
   }
 
   private scheduleNext(): void {
