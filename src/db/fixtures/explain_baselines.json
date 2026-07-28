@@ -1,0 +1,7 @@
+{
+  "activeSessionLookupByUserId": {
+    "total_cost": 15.5,
+    "plan_type": "Index Scan",
+    "index_name": "idx_sessions_active_user_id"
+  }
+}
