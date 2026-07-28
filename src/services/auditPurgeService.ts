@@ -4,7 +4,8 @@ import { globalLogger } from '../lib/logger';
 import { env } from '../config/env';
 
 /**
- * Service to manage the scheduled purging of audit logs based on retention policy
+ * Service to manage the scheduled purging of audit logs based on retention policy.
+ * Active legal-hold labels cause matching periods to be skipped (see retention_labels).
  */
 export class AuditPurgeService {
   private intervalId?: NodeJS.Timeout;
@@ -53,9 +54,11 @@ export class AuditPurgeService {
   }
 
   /**
-   * Executes a single purge cycle
+   * Executes a single purge cycle.
+   * Legal-hold periods are never deleted here; they only become eligible after
+   * a dual-controlled release and on a subsequent cycle.
    */
-  async runPurge(): Promise<void> {
+  async runPurge(): Promise<{ deletedCount: number; skippedHoldCount: number }> {
     const startTime = Date.now();
     try {
       const cutoffDate = new Date();
@@ -63,16 +66,28 @@ export class AuditPurgeService {
 
       globalLogger.info('Running audit log purge', { cutoffDate: cutoffDate.toISOString() });
 
-      const deletedCount = await this.auditLogRepo.purgeBefore(cutoffDate);
+      const { deletedCount, skippedHoldCount } = await this.auditLogRepo.purgeBefore(cutoffDate);
       
       const duration = Date.now() - startTime;
       
-      globalLogger.info('Audit log purge complete', { deletedCount, durationMs: duration });
+      globalLogger.info('Audit log purge complete', {
+        deletedCount,
+        skippedHoldCount,
+        durationMs: duration,
+      });
 
       if (this.metricsCollector) {
         this.metricsCollector.incrementCounter('audit_logs_purged_total', { status: 'success' }, deletedCount);
+        this.metricsCollector.incrementCounter(
+          'purge.skipped_hold',
+          { status: 'success' },
+          skippedHoldCount,
+          'Audit/ledger rows skipped because their period is under legal hold',
+        );
         this.metricsCollector.recordHistogram('audit_purge_duration_ms', duration, { status: 'success' });
       }
+
+      return { deletedCount, skippedHoldCount };
     } catch (error) {
       const duration = Date.now() - startTime;
       if (this.metricsCollector) {

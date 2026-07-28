@@ -1,0 +1,109 @@
+{
+  "provider": "example_kyc",
+  "version": 1,
+  "recordedAt": "2026-01-15T12:00:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/kyc/verify",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Api-Key": "[REDACTED_APIKEY_0000]"
+        },
+        "body": {
+          "applicant": {
+            "firstName": "[REDACTED_FIRSTNAME_0000]",
+            "lastName": "[REDACTED_LASTNAME_0000]",
+            "email": "__EMAIL__",
+            "phone": "__PHONE__",
+            "dateOfBirth": "[REDACTED_DATEOFBIRTH_0000]",
+            "address": "[REDACTED_ADDRESS_0000]"
+          },
+          "documentType": "passport"
+        },
+        "timestamp": "2026-01-15T12:00:00.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "status": "verified",
+          "score": 0.95,
+          "checks": {
+            "document_authenticity": "passed",
+            "face_match": "passed",
+            "address_verification": "passed"
+          },
+          "transactionId": "txn_example_001"
+        },
+        "timestamp": "2026-01-15T12:00:00.500Z"
+      },
+      "label": "kyc_verification_success"
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/kyc/verify",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-Api-Key": "[REDACTED_APIKEY_0000]"
+        },
+        "body": {
+          "applicant": {
+            "firstName": "[REDACTED_FIRSTNAME_0001]",
+            "lastName": "[REDACTED_LASTNAME_0001]",
+            "email": "__EMAIL__",
+            "phone": "__PHONE__",
+            "dateOfBirth": "[REDACTED_DATEOFBIRTH_0001]"
+          },
+          "documentType": "drivers_license"
+        },
+        "timestamp": "2026-01-15T12:01:00.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "status": "review_required",
+          "score": 0.65,
+          "checks": {
+            "document_authenticity": "passed",
+            "face_match": "failed",
+            "address_verification": "inconclusive"
+          },
+          "transactionId": "txn_example_002"
+        },
+        "timestamp": "2026-01-15T12:01:00.300Z"
+      },
+      "label": "kyc_verification_review_required"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/aml/screen",
+        "headers": {
+          "X-Api-Key": "[REDACTED_APIKEY_0000]"
+        },
+        "timestamp": "2026-01-15T12:02:00.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "result": "clear",
+          "riskScore": 0.1,
+          "matches": [],
+          "sanctionsChecked": true,
+          "pepChecked": true
+        },
+        "timestamp": "2026-01-15T12:02:00.200Z"
+      },
+      "label": "aml_screening_clear"
+    }
+  ],
+  "redaction": {
+    "totalRedactions": 3,
+    "placeholderCount": 12
+  }
+}
