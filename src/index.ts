@@ -44,6 +44,8 @@ import { TenantSettingsRepository } from "./db/repositories/tenantSettingsReposi
 import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
 import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { RetentionLabelRepository } from "./db/repositories/retentionLabelRepository";
+import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
@@ -666,6 +668,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const retentionLabelService = new RetentionLabelService(
+    new RetentionLabelRepository(pool),
+    auditLogRepo,
+  );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
@@ -677,7 +683,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     : null;
 
   // Mount admin router
-  apiRouter.use("/admin", createAdminRouter(auditLogRepo));
+  apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
 
   if (contractUpgradeService) {
