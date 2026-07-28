@@ -33,8 +33,11 @@ import { z } from "zod";
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
- * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
- */
+  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
+  * | HOLIDAY_CALENDAR_FILE_PATH  | No       | (empty)                 | Path to signed static holiday calendar file      |
+  * | HOLIDAY_CALENDAR_SECRET     | No       | (empty)                 | HMAC secret for holiday calendar signature       |
+  * | HOLIDAY_FALLBACK_SHIFT_POLICY | No     | previous                | Fallback shift policy: previous or next business day |
+  */
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -65,6 +68,9 @@ const envSchema = z.object({
   SMTP_PORT: z.coerce.number().int().positive().max(65535).optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
+  HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
+  HOLIDAY_CALENDAR_SECRET: z.string().optional(),
+  HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

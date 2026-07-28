@@ -1,11 +1,14 @@
 import { Logger, globalLogger } from '../lib/logger';
-import { DistributionEngine } from './distributionEngine';
+import DistributionEngine from './distributionEngine';
 import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
 import { AppError, Errors } from '../lib/errors';
 import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
 
 export interface DistributionSchedulerOptions {
   logger?: Logger;
+  holidayCalendarService?: HolidayCalendarService;
+  resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
 }
 
 /**
@@ -16,6 +19,8 @@ export interface DistributionSchedulerOptions {
  */
 export class DistributionScheduler {
   private readonly logger: Logger;
+  private readonly holidayCalendarService?: HolidayCalendarService;
+  private readonly resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
@@ -23,6 +28,8 @@ export class DistributionScheduler {
     options: DistributionSchedulerOptions = {}
   ) {
     this.logger = options.logger ?? globalLogger;
+    this.holidayCalendarService = options.holidayCalendarService;
+    this.resolveJurisdiction = options.resolveJurisdiction;
   }
 
   /**
@@ -71,12 +78,32 @@ export class DistributionScheduler {
           amount: claim.amount,
         });
 
+        let periodEnd = claim.period_end;
+        const jurisdiction = await this.resolveOfferingJurisdiction(claim.offering_id);
+
+        if (this.holidayCalendarService && jurisdiction) {
+          const shiftDecision = this.holidayCalendarService.getShiftedDate(claim.period_end, [jurisdiction]);
+
+          if (shiftDecision.shifted) {
+            periodEnd = shiftDecision.shiftedDate;
+            this.logger.info('Distribution window shifted due to blackout', {
+              reportId: claim.id,
+              offeringId: claim.offering_id,
+              originalDate: shiftDecision.originalDate.toISOString(),
+              shiftedDate: shiftDecision.shiftedDate.toISOString(),
+              direction: shiftDecision.direction,
+              jurisdictions: shiftDecision.jurisdictions,
+              reason: shiftDecision.reason,
+            });
+          }
+        }
+
         await this.distributionEngine.distribute(
           claim.offering_id,
           {
             id: claim.id,
             start: claim.period_start,
-            end: claim.period_end,
+            end: periodEnd,
           },
           Number(claim.amount)
         );
@@ -129,5 +156,15 @@ export class DistributionScheduler {
 
     this.logger.info('Automated distribution processing complete', summary);
     return summary;
+  }
+
+  private async resolveOfferingJurisdiction(offeringId: string): Promise<string | null> {
+    if (!this.resolveJurisdiction) return null;
+    try {
+      const result = this.resolveJurisdiction(offeringId);
+      return result instanceof Promise ? await result : result;
+    } catch {
+      return null;
+    }
   }
 }
