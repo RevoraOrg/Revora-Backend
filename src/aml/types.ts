@@ -12,7 +12,8 @@ export type AMLRuleType =
   | 'velocity'           // High transaction frequency/amount in time window
   | 'structuring'        // Breaking large transactions into smaller ones
   | 'geo_mismatch'       // Geographic inconsistency in transactions
-  | 'amount_threshold';  // Single transaction exceeds threshold
+  | 'amount_threshold'   // Single transaction exceeds threshold
+  | 'sanctions_screening'; // Sanctions list screening (exact & Jaro-Winkler fuzzy)
 
 /**
  * Rule severity levels for prioritization
@@ -64,10 +65,25 @@ export interface TransactionContext {
   amount: string;
   asset: string;
   timestamp: Date;
+  investor_name?: string;
   investor_country?: string;
   investor_ip_country?: string;
   previous_transactions?: TransactionContext[];
   status?: 'pending' | 'completed' | 'failed';
+  tenant_id?: string;
+  tenant_settings?: {
+    sanctions_threshold?: number;
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Sanctions rule configuration schema
+ */
+export interface SanctionsRuleConfig {
+  sanctions_list: string[];
+  jaro_winkler_threshold?: number;
+  fuzzy_enabled?: boolean;
 }
 
 /**
