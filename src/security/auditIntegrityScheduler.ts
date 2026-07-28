@@ -9,6 +9,8 @@ import {
   AuditIntegrityResult,
   verifyAuditLogIntegrity,
 } from './auditHashChain';
+import { AuditWitnessPublisher } from './auditWitnessPublisher';
+import { MockWitnessClient } from './witnessClient';
 
 export interface AuditIntegritySchedulerOptions {
   /** Verification interval in milliseconds (default: 24 hours). */
@@ -19,6 +21,8 @@ export interface AuditIntegritySchedulerOptions {
   logger?: Logger;
   /** Optional metrics collector override. */
   metrics?: typeof globalMetrics;
+  /** Optional witness publisher override. */
+  witnessPublisher?: AuditWitnessPublisher;
 }
 
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -28,6 +32,7 @@ export class AuditIntegrityScheduler {
   private running = false;
   private readonly logger: Logger;
   private readonly metrics: typeof globalMetrics;
+  private readonly witnessPublisher: AuditWitnessPublisher;
 
   constructor(
     private readonly pool: Pick<Pool, 'query'>,
@@ -35,6 +40,10 @@ export class AuditIntegrityScheduler {
   ) {
     this.logger = options.logger ?? globalLogger;
     this.metrics = options.metrics ?? globalMetrics;
+    this.witnessPublisher = options.witnessPublisher ?? new AuditWitnessPublisher(pool, new MockWitnessClient(), {
+      logger: this.logger,
+      metrics: this.metrics,
+    });
   }
 
   /** Start periodic verification (nightly by default). */
@@ -93,6 +102,12 @@ export class AuditIntegrityScheduler {
           durationMs: result.durationMs,
           headHash: result.headHash,
         });
+
+        if (result.headHash) {
+          // Publish the root hash to the public witness in the background
+          // (Errors are caught internally and won't fail the scheduler)
+          void this.witnessPublisher.publishLatest(result.headHash);
+        }
       } else {
         this.raiseAlarm(result);
       }

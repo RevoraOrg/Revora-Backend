@@ -49,6 +49,7 @@ export interface ISessionStore {
   get(token: string): Promise<Session | null>;
   touch(token: string): Promise<boolean>;
   delete(token: string): Promise<void>;
+  deleteAllForUser(userId: string): Promise<void>;
 }
 
 export interface SessionStoreOptions {
@@ -192,6 +193,17 @@ export class SessionStore {
    */
   async delete(token: string): Promise<void> {
     this.sessions.delete(token);
+  }
+
+  /**
+   * Delete all sessions for a specific user.
+   */
+  async deleteAllForUser(userId: string): Promise<void> {
+    for (const [token, session] of this.sessions) {
+      if (session.userId === userId) {
+        this.evict(token);
+      }
+    }
   }
 
   /**
@@ -362,6 +374,10 @@ export class PostgresSessionStore implements ISessionStore {
 
   async delete(token: string): Promise<void> {
     await this.repo.deleteByTokenHash(hashSessionToken(token));
+  }
+
+  async deleteAllForUser(userId: string): Promise<void> {
+    await this.repo.deleteAllSessionsByUserId(userId);
   }
 
   // ─── Cleanup job ─────────────────────────────────────────────────────────

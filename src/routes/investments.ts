@@ -5,6 +5,7 @@ import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
 import { InvestmentService, createInvestmentService } from '../services/investmentService';
 import { AppError } from '../lib/errors';
 import { createIdempotencyMiddleware } from '../middleware/idempotency';
+import { requireMobileAttestation } from '../security/mobileAttestation';
 import crypto from 'crypto';
 
 /**
@@ -69,6 +70,7 @@ export function createInvestmentsRouter(db: Pool): Router {
     requireInvestor,
     requireIdempotencyKey,
     idempotencyMiddleware,
+    requireMobileAttestation,
     async (req: Request, res: Response, next: NextFunction) => {
     const authenticatedReq = req as AuthenticatedRequest;
     
