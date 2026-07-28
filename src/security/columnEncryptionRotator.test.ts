@@ -32,10 +32,17 @@ describe('LocalKMSKeyProvider', () => {
     expect(provider.hasKeyGeneration(2)).toBe(true);
   });
 
-  it('should allow adding custom key generation', () => {
+  it('should allow adding custom key generation both higher and lower than active generation', () => {
     const provider = new LocalKMSKeyProvider();
-    const customKey = crypto.randomBytes(32);
-    provider.addKeyGeneration(5, customKey);
+    const key1 = crypto.randomBytes(32);
+    const key2 = crypto.randomBytes(32);
+
+    // Add key generation 1 (equal to activeGeneration 1)
+    provider.addKeyGeneration(1, key1);
+    expect(provider.getCurrentKeyGeneration()).toBe(1);
+
+    // Add key generation 5 (higher than activeGeneration)
+    provider.addKeyGeneration(5, key2);
     expect(provider.hasKeyGeneration(5)).toBe(true);
     expect(provider.getCurrentKeyGeneration()).toBe(5);
 
@@ -335,9 +342,9 @@ describe('ColumnEncryptionRotator', () => {
 
         if (normalized.includes('SELECT id, ssn AS ciphertext, key_generation FROM users')) {
           if (params.length === 3) {
-            // Paginated query with lastProcessedId
+            // Paginated query with lastProcessedId (r.key_generation is null to test fallback to 1)
             return {
-              rows: [{ id: 'usr_2', ciphertext: '78:90:12', key_generation: 1 }],
+              rows: [{ id: 'usr_2', ciphertext: '78:90:12', key_generation: null }],
             };
           }
           return {
@@ -379,9 +386,9 @@ describe('ColumnEncryptionRotator', () => {
     const batchRes2 = await rotator.processBatch(job.id, 1);
     expect(batchRes2.processed).toBe(1);
 
-    // Test listUnfinishedJobs with pool
-    const pendingJobs = await (rotator as any).listUnfinishedJobs();
-    expect(Array.isArray(pendingJobs)).toBe(true);
+    // Test listUnfinishedJobs and resumePendingRotations with pool
+    const resumedJobs = await rotator.resumePendingRotations(10);
+    expect(Array.isArray(resumedJobs)).toBe(true);
   });
 
   it('should return completed state immediately if job is already completed', async () => {
