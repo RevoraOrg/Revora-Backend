@@ -195,6 +195,22 @@ export class InvestmentRepository {
   }
 
   /**
+   * Sum non-failed investments for an investor in an offering (pool-backed).
+   * Used by the investment service for KYC-tier cap checks on new intents.
+   */
+  async sumInvestorCommitment(investorId: string, offeringId: string): Promise<string> {
+    const result = await this.db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount), 0)::text AS total
+         FROM investments
+        WHERE investor_id = $1
+          AND offering_id = $2
+          AND status != 'failed'`,
+      [investorId, offeringId],
+    );
+    return result.rows[0]?.total ?? '0';
+  }
+
+  /**
    * Map database row to Investment entity
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

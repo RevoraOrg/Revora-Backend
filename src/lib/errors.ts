@@ -147,3 +147,15 @@ export class BadRequestError extends AppError {
     this.name = 'BadRequestError';
   }
 }
+
+export class UniqueConstraintError extends Error {
+  public readonly field: string;
+
+  constructor(field: string) {
+    super(`Unique constraint violation on ${field}`);
+    Object.setPrototypeOf(this, new.target.prototype);
+    this.name = 'UniqueConstraintError';
+    this.field = field;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
