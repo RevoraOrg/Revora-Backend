@@ -45,6 +45,8 @@ import { TenantSettingsRepository } from "./db/repositories/tenantSettingsReposi
 import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
 import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { SessionCompactionService } from "./services/sessionCompactionService";
+import { SessionRepository } from "./db/repositories/sessionRepository";
 import { RetentionLabelRepository } from "./db/repositories/retentionLabelRepository";
 import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
@@ -1037,6 +1039,14 @@ if (require.main === module && env.NODE_ENV !== "test") {
     auditPurgeService.start();
     backgroundStopFns.push(() => auditPurgeService.stop());
     console.log("[server] AuditPurgeService started");
+  }
+
+  if (roleConfig.auditPurge) { // Reusing auditPurge role for general cleanup tasks
+    const sessionRepo = new SessionRepository(pool);
+    const sessionCompactionService = new SessionCompactionService(sessionRepo, metricsCollector);
+    sessionCompactionService.start();
+    backgroundStopFns.push(() => sessionCompactionService.stop());
+    console.log("[server] SessionCompactionService started");
   }
 
   if (roleConfig.payoutDrift) {
