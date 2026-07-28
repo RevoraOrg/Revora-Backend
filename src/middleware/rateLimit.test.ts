@@ -377,3 +377,90 @@ describe('createRateLimitMiddleware — header and error correctness', () => {
     expect(resB.headers['x-ratelimit-remaining']).toBe('0');
   });
 });
+
+// Task 544 — perProviderSub keying
+describe('createRateLimitMiddleware — perProviderSub', () => {
+  it('uses req.socialProviderSub as the bucket key when set', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 2, windowMs: 60_000, perProviderSub: true, store });
+    const makeSubReq = (sub: string) =>
+      makeReq({ ['socialProviderSub' as any]: sub } as any);
+    const next: NextFunction = jest.fn();
+
+    mw(makeSubReq('google:sub-1'), makeRes(), next); // count = 1
+    mw(makeSubReq('google:sub-1'), makeRes(), next); // count = 2
+    mw(makeSubReq('google:sub-1'), makeRes(), next); // count = 3 — blocked
+
+    expect(next).toHaveBeenCalledTimes(3);
+    expect((next as jest.Mock).mock.calls[2][0]).toBeInstanceOf(AppError);
+    expect(((next as jest.Mock).mock.calls[2][0] as AppError).code).toBe('TOO_MANY_REQUESTS');
+  });
+
+  it('tracks different provider-sub pairs independently', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 1, windowMs: 60_000, perProviderSub: true, store });
+    const nextA: NextFunction = jest.fn();
+    const nextB: NextFunction = jest.fn();
+
+    const reqA1 = makeReq({ ['socialProviderSub' as any]: 'google:sub-a' } as any);
+    const reqA2 = makeReq({ ['socialProviderSub' as any]: 'google:sub-a' } as any);
+    const reqB1 = makeReq({ ['socialProviderSub' as any]: 'google:sub-b' } as any);
+
+    mw(reqA1, makeRes(), nextA); // sub-a count=1 allowed
+    mw(reqA2, makeRes(), nextA); // sub-a count=2 blocked
+    mw(reqB1, makeRes(), nextB); // sub-b count=1 allowed (independent bucket)
+
+    expect((nextA as jest.Mock).mock.calls[0][0]).toBeUndefined();
+    expect((nextA as jest.Mock).mock.calls[1][0]).toBeInstanceOf(AppError);
+    expect((nextB as jest.Mock).mock.calls[0][0]).toBeUndefined();
+  });
+
+  it('falls back to IP-based keying when socialProviderSub is absent', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 2, windowMs: 60_000, perProviderSub: true, store });
+    const req = makeReq({ ip: '5.5.5.5' }); // no socialProviderSub
+    const next: NextFunction = jest.fn();
+
+    mw(req, makeRes(), next); // count = 1
+    mw(req, makeRes(), next); // count = 2
+    mw(req, makeRes(), next); // count = 3 — blocked via IP
+
+    expect((next as jest.Mock).mock.calls[2][0]).toBeInstanceOf(AppError);
+  });
+
+  it('isolates perProviderSub counters from perUser counters when using keyPrefix', () => {
+    const store = new InMemoryRateLimitStore();
+    const subLimiter = createRateLimitMiddleware({
+      limit: 1, windowMs: 60_000, perProviderSub: true, keyPrefix: 'social', store,
+    });
+    const userLimiter = createRateLimitMiddleware({
+      limit: 5, windowMs: 60_000, perUser: true, keyPrefix: 'api', store,
+    });
+    const nextSub: NextFunction = jest.fn();
+    const nextUser: NextFunction = jest.fn();
+
+    const subReq1 = makeReq({ ['socialProviderSub' as any]: 'google:same-sub' } as any);
+    const subReq2 = makeReq({ ['socialProviderSub' as any]: 'google:same-sub' } as any);
+    const userReq = makeReq({ ['user' as any]: { sub: 'same-sub' } } as any);
+
+    subLimiter(subReq1, makeRes(), nextSub); // sub: count=1 allowed
+    subLimiter(subReq2, makeRes(), nextSub); // sub: count=2 blocked
+    userLimiter(userReq, makeRes(), nextUser); // user: count=1 allowed (different prefix)
+
+    expect((nextSub as jest.Mock).mock.calls[1][0]).toBeInstanceOf(AppError);
+    expect((nextUser as jest.Mock).mock.calls[0][0]).toBeUndefined();
+  });
+
+  it('sets X-RateLimit-* headers correctly when using perProviderSub', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 5, windowMs: 60_000, perProviderSub: true, store });
+    const req = makeReq({ ['socialProviderSub' as any]: 'google:header-sub' } as any);
+    const res = makeRes();
+    const next: NextFunction = jest.fn();
+
+    mw(req, res, next);
+    expect(res.headers['x-ratelimit-limit']).toBe('5');
+    expect(res.headers['x-ratelimit-remaining']).toBe('4');
+    expect(res.headers['x-ratelimit-reset']).toBeDefined();
+  });
+});

@@ -28,6 +28,7 @@ export interface Offering {
   status?: OfferingStatus;
   total_raised?: string;
   target_amount?: string;
+  timezone?: string;
   created_at?: Date;
   updated_at?: Date;
   [key: string]: unknown;
