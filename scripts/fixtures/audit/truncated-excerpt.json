@@ -1,0 +1,26 @@
+[
+  {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "user_id": "usr_101",
+    "action": "user.login",
+    "resource": "auth",
+    "details": "User logged in successfully",
+    "ip_address": "192.168.1.1",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0)",
+    "created_at": "2026-01-15T10:00:00.000Z",
+    "prev_hash": "bee58147dc813f93e3b43277b5da53c1a1620f2258f953b75a25fe5774f999be",
+    "row_hash": "a3e229a68b3c83900e4336016e82497741df9e61d15dbeece37d21d20b7208ba"
+  },
+  {
+    "id": "00000000-0000-4000-8000-000000000002",
+    "user_id": "usr_101",
+    "action": "offering.invest",
+    "resource": "offering_99",
+    "details": "Investment of 1000 USD",
+    "ip_address": "192.168.1.1",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0)",
+    "created_at": "2026-01-15T10:05:00.000Z",
+    "prev_hash": "a3e229a68b3c83900e4336016e82497741df9e61d15dbeece37d21d20b7208ba",
+    "row_hash": "195c4364aed08e4ed3a82422eef7910b96fdbdf1947c751728751517241d93d8"
+  }
+]
