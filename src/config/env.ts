@@ -75,6 +75,7 @@ const envSchema = z.object({
   SES_SNS_TOPIC_ARN: z.string().optional(),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
+  TREASURY_ED25519_PUBKEY: z.string().optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
