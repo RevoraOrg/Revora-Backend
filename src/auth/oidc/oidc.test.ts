@@ -1,6 +1,9 @@
 import { createSign, generateKeyPairSync } from 'crypto';
+import express from 'express';
+import request from 'supertest';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
+import { createOidcRouter } from './oidcRoute';
 import { ALLOWED_ID_TOKEN_ALGORITHMS, OidcProviderRow } from './types';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -264,6 +267,7 @@ describe('OidcAdapterService', () => {
 describe('JwksCacheService', () => {
   let cache: JwksCacheService;
   const uri = 'https://idp.example.com/.well-known/jwks.json';
+  const issuer = 'https://idp.example.com';
   const { publicKey: ecPub } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const jwk = ecPub.export({ type: 'spki', format: 'jwk' });
 
@@ -319,5 +323,86 @@ describe('JwksCacheService', () => {
   it('throws on non-200 JWKS response', async () => {
     global.fetch = jest.fn().mockResolvedValueOnce({ ok: false, status: 404, statusText: 'Not Found' } as any);
     await expect(cache.getKey(uri, 'k')).rejects.toThrow(/JWKS fetch failed/);
+  });
+
+  it('coalesces concurrent refreshes and exposes issuer age', async () => {
+    const metrics = { setGauge: jest.fn() } as any;
+    const freshCache = new JwksCacheService({ metrics });
+    global.fetch = jest.fn().mockResolvedValueOnce(mockJwks([{ ...jwk, kid: 'k4' }]));
+
+    await Promise.all([
+      freshCache.refresh(uri, issuer),
+      freshCache.refresh(uri, issuer),
+    ]);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(freshCache.getCacheAgeSeconds(issuer)).toBeGreaterThanOrEqual(0);
+    expect(metrics.setGauge).toHaveBeenCalledWith(
+      'oidc.jwks.age_seconds',
+      expect.any(Number),
+      { issuer },
+      expect.any(String),
+    );
+  });
+});
+
+// ── OIDC route ───────────────────────────────────────────────────────────
+
+describe('createOidcRouter JWKS refresh', () => {
+  it('requires admin dual confirmation before refreshing JWKS', async () => {
+    const oidcAdapter = {
+      getDiscovery: jest.fn(),
+      refreshJwks: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    const oidcProviderRepo = {} as any;
+    const auditRefresh = jest.fn();
+    const requireAdmin = (req: any, _res: any, next: () => void) => {
+      req.user = { id: 'admin-1' };
+      next();
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({ oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh }));
+
+    const missingConfirmation = await request(app)
+      .post('/api/auth/oidc/jwks/refresh')
+      .set('x-revora-oidc-jwks-confirmation', 'true')
+      .send({ confirmation: false, issuerUrl: 'https://idp.example.com' });
+
+    expect(missingConfirmation.status).toBe(400);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+    expect(auditRefresh).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }));
+  });
+
+  it('rate-limits repeated refresh attempts for the same actor', async () => {
+    const oidcAdapter = {
+      getDiscovery: jest.fn(),
+      refreshJwks: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    const oidcProviderRepo = {} as any;
+    const auditRefresh = jest.fn();
+    const requireAdmin = (req: any, _res: any, next: () => void) => {
+      req.user = { id: 'admin-2' };
+      next();
+    };
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({ oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh }));
+
+    const first = await request(app)
+      .post('/api/auth/oidc/jwks/refresh')
+      .set('x-revora-oidc-jwks-confirmation', 'true')
+      .send({ confirmation: true, issuerUrl: 'https://idp.example.com' });
+
+    const second = await request(app)
+      .post('/api/auth/oidc/jwks/refresh')
+      .set('x-revora-oidc-jwks-confirmation', 'true')
+      .send({ confirmation: true, issuerUrl: 'https://idp.example.com' });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+    expect(oidcAdapter.refreshJwks).toHaveBeenCalledTimes(1);
   });
 });
