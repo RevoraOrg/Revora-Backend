@@ -5,23 +5,28 @@ import {
   WebhookSignatureError,
   WebhookVerificationConfig,
   verifyWebhook,
+  verifyWebhookPayloadDualKey,
 } from '../lib/webhookSignature';
 import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
+import { globalMetrics } from '../lib/metrics';
 
 /**
  * @title Webhook Authentication Middleware
  * @notice Express middleware for verifying webhook signatures on incoming requests.
- * @dev Validates HMAC-SHA256 signatures to ensure webhooks are authentic.
+ * @dev Validates HMAC-SHA256 signatures to ensure webhooks are authentic. Supports dual-key
+ * rotation windows with expiry deadlines for zero-downtime key rollover.
  *
  * Security assumptions:
  * - Webhook secrets are securely stored and never exposed
  * - Requests contain the raw body (before JSON parsing) for signature verification
  * - Signatures follow the format: sha256=<hex>
+ * - Secondary/Next key window expires on a strict hard deadline
  *
  * Abuse/failure paths handled:
  * - Missing or malformed signature headers
  * - Invalid signatures (tampered payloads)
+ * - Expired secondary key signatures during rotation
  * - Replay attacks (via optional timestamp validation)
  * - Timing attacks (via constant-time comparison)
  */
@@ -30,8 +35,14 @@ import { globalLogger } from '../lib/logger';
  * @notice Configuration options for webhook authentication middleware.
  */
 export interface WebhookAuthOptions {
-  /** The shared secret for signature verification */
+  /** The shared primary secret for signature verification */
   secret: string;
+  /** Secondary next secret key for dual-key acceptance window during key rotation */
+  nextSecret?: string;
+  /** Expiry deadline for secondary key acceptance window (Date, ISO string, or timestamp ms) */
+  nextSecretExpiry?: Date | string | number;
+  /** Metric counter name for verification tracking (e.g. 'kyc.webhook.verified_by_key') */
+  metricName?: string;
   /** Custom header name for signature (default: 'x-revora-signature') */
   headerName?: string;
   /** Whether to require timestamp header for replay protection (default: false) */
@@ -55,6 +66,7 @@ export interface WebhookAuthOptions {
 export interface WebhookAuthenticatedRequest extends Request {
   webhook?: {
     verified: boolean;
+    verifiedByKey?: 'current' | 'next';
     timestamp?: Date;
   };
 }
@@ -74,36 +86,17 @@ function defaultErrorHandler(error: WebhookSignatureError, _req: Request, res: R
 
 /**
  * @notice Creates Express middleware for webhook signature verification.
- * @dev Verifies the HMAC-SHA256 signature of incoming webhook requests.
+ * @dev Verifies the HMAC-SHA256 signature of incoming webhook requests with dual-key support.
  *
  * @param options Configuration options for verification
  * @returns Express middleware function
- *
- * @example
- * ```typescript
- * // Basic usage
- * app.post('/webhooks', webhookAuth({ secret: 'my-secret' }), webhookHandler);
- *
- * // With replay protection
- * app.post('/webhooks', webhookAuth({
- *   secret: 'my-secret',
- *   requireTimestamp: true,
- *   maxAgeMs: 300000 // 5 minutes
- * }), webhookHandler);
- *
- * // With custom error handling
- * app.post('/webhooks', webhookAuth({
- *   secret: 'my-secret',
- *   onError: (err, req, res) => {
- *     logger.warn('Invalid webhook', err);
- *     res.status(401).json({ error: 'Invalid webhook' });
- *   }
- * }), webhookHandler);
- * ```
  */
 export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
   const {
     secret,
+    nextSecret,
+    nextSecretExpiry,
+    metricName,
     headerName = 'x-revora-signature',
     requireTimestamp = false,
     maxAgeMs = 5 * 60 * 1000, // 5 minutes
@@ -114,7 +107,6 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
 
   return (req: Request, res: Response, next: NextFunction): void => {
     // Get the raw body for signature verification
-    // Note: This requires express.raw() or express.json() with verify option
     const payload = req.body;
 
     if (!payload) {
@@ -134,7 +126,6 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
     } else if (typeof payload === 'string') {
       payloadString = payload;
     } else {
-      // If body was parsed as JSON, re-stringify for verification
       payloadString = JSON.stringify(payload);
     }
 
@@ -177,15 +168,36 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
       return;
     }
 
-    // Verify signature using constant-time comparison (timingSafeEqual in verifyWebhookPayload)
-    if (!verifyWebhookPayload(secret, payloadString, signature)) {
-      globalLogger.warn('Webhook rejected: signature mismatch', { path: req.path });
+    // Perform dual-key signature verification
+    const dualKeyResult = verifyWebhookPayloadDualKey(
+      { secret, nextSecret, nextSecretExpiry },
+      payloadString,
+      signature
+    );
+
+    if (!dualKeyResult.valid) {
+      if (dualKeyResult.expired) {
+        globalLogger.warn('Webhook rejected: secondary signature key has expired', { path: req.path });
+      } else {
+        globalLogger.warn('Webhook rejected: signature mismatch', { path: req.path });
+      }
       onError(
         new WebhookSignatureError('Signature verification failed', 'VERIFICATION_FAILED'),
         req,
         res
       );
       return;
+    }
+
+    const verifiedByKey = dualKeyResult.verifiedByKey ?? 'current';
+
+    // Emit metric if metricName is specified
+    if (metricName) {
+      try {
+        globalMetrics.incrementCounter(metricName, { key: verifiedByKey });
+      } catch {
+        // Silently swallow metric collection errors
+      }
     }
 
     // Optional timestamp/replay protection
@@ -219,7 +231,6 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
       const now = Date.now();
       const age = now - timestamp.getTime();
 
-      // Negative age = future timestamp; allow up to clockSkewMs for sender clock drift.
       if (age < -clockSkewMs || age > maxAgeMs) {
         globalLogger.warn('Webhook rejected: timestamp outside acceptable window', {
           path: req.path,
@@ -239,11 +250,12 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
       }
     }
 
-    globalLogger.debug('Webhook signature verified', { path: req.path });
+    globalLogger.debug('Webhook signature verified', { path: req.path, verifiedByKey });
 
     // Attach webhook verification info to request
     (req as WebhookAuthenticatedRequest).webhook = {
       verified: true,
+      verifiedByKey,
       timestamp,
     };
 
@@ -252,22 +264,38 @@ export function webhookAuth(options: WebhookAuthOptions): RequestHandler {
 }
 
 /**
+ * @notice Express middleware for KYC provider webhook signature verification with dual-key support.
+ * @dev Inspects process.env for KYC_WEBHOOK_SECRET / KYC_WEBHOOK_KEY, KYC_WEBHOOK_KEY_NEXT,
+ * and KYC_WEBHOOK_KEY_NEXT_EXPIRY, and emits `kyc.webhook.verified_by_key` metric labeled by key slot.
+ *
+ * @param options Optional override options for KYC webhook authentication
+ * @returns Express middleware function
+ */
+export function kycWebhookAuth(options: Partial<WebhookAuthOptions> = {}): RequestHandler {
+  const secret =
+    options.secret ??
+    process.env.KYC_WEBHOOK_SECRET ??
+    process.env.KYC_WEBHOOK_KEY ??
+    '';
+  const nextSecret = options.nextSecret ?? process.env.KYC_WEBHOOK_KEY_NEXT;
+  const nextSecretExpiry = options.nextSecretExpiry ?? process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY;
+  const metricName = options.metricName ?? 'kyc.webhook.verified_by_key';
+
+  return webhookAuth({
+    secret,
+    nextSecret,
+    nextSecretExpiry,
+    metricName,
+    ...options,
+  });
+}
+
+/**
  * @notice Creates a comprehensive webhook verification middleware using the full verification function.
  * @dev Provides more detailed configuration options than webhookAuth.
  *
  * @param config Webhook verification configuration
  * @returns Express middleware function
- *
- * @example
- * ```typescript
- * app.post('/webhooks', webhookVerify({
- *   secret: 'my-secret',
- *   headerName: 'x-custom-signature',
- *   requireTimestamp: true,
- *   maxAgeMs: 60000,
- *   maxPayloadSize: 512 * 1024 // 512KB
- * }), webhookHandler);
- * ```
  */
 export function webhookVerify(config: WebhookVerificationConfig): RequestHandler {
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -291,7 +319,7 @@ export function webhookVerify(config: WebhookVerificationConfig): RequestHandler
       payloadData = JSON.stringify(payload);
     }
 
-    // Perform verification (clockSkewMs is honoured via WebhookVerificationConfig)
+    // Perform verification (clockSkewMs and dual-key parameters are honoured)
     const result = verifyWebhook(config, payloadData, req.headers);
 
     if (!result.valid) {
@@ -312,6 +340,7 @@ export function webhookVerify(config: WebhookVerificationConfig): RequestHandler
     // Attach webhook verification info to request
     (req as WebhookAuthenticatedRequest).webhook = {
       verified: true,
+      verifiedByKey: result.verifiedByKey,
       timestamp: result.timestamp,
     };
 
@@ -320,23 +349,25 @@ export function webhookVerify(config: WebhookVerificationConfig): RequestHandler
 }
 
 /**
+ * @notice Type for secret provider return value supporting dual-key configuration.
+ */
+export type WebhookSecretProviderResult =
+  | string
+  | null
+  | undefined
+  | {
+      secret: string;
+      nextSecret?: string;
+      nextSecretExpiry?: Date | string | number;
+    };
+
+/**
  * @notice Factory function to create a webhook auth middleware with a secret provider.
  * @dev Useful when secrets are stored in a database or external service.
  *
- * @param secretProvider Async function that returns the secret for a given webhook endpoint
+ * @param secretProvider Async function that returns the secret or dual-key config for a given webhook endpoint
  * @param options Additional middleware options
  * @returns Express middleware function
- *
- * @example
- * ```typescript
- * app.post('/webhooks/:endpointId', webhookAuthWithProvider(
- *   async (endpointId) => {
- *     const endpoint = await db.webhookEndpoints.findById(endpointId);
- *     return endpoint?.secret;
- *   },
- *   { requireTimestamp: true }
- * ), webhookHandler);
- * ```
  */
 export interface WebhookAuthProviderOptions extends Omit<WebhookAuthOptions, 'secret'> {
   /** Extract endpoint identifier from request for secret lookup */
@@ -344,11 +375,12 @@ export interface WebhookAuthProviderOptions extends Omit<WebhookAuthOptions, 'se
 }
 
 export function webhookAuthWithProvider(
-  secretProvider: (endpointId: string) => Promise<string | null | undefined>,
+  secretProvider: (endpointId: string) => Promise<WebhookSecretProviderResult>,
   options: WebhookAuthProviderOptions = {}
 ): RequestHandler {
   const {
     endpointIdExtractor = (req: Request) => req.params.endpointId,
+    metricName = options.metricName,
     headerName = 'x-revora-signature',
     requireTimestamp = false,
     maxAgeMs = 5 * 60 * 1000,
@@ -371,9 +403,9 @@ export function webhookAuthWithProvider(
     }
 
     // Fetch secret from provider
-    let secret: string | null | undefined;
+    let secretResult: WebhookSecretProviderResult;
     try {
-      secret = await secretProvider(endpointId);
+      secretResult = await secretProvider(endpointId);
     } catch (error) {
       globalLogger.warn('Webhook rejected: secret provider error', {
         path: req.path,
@@ -387,7 +419,7 @@ export function webhookAuthWithProvider(
       return;
     }
 
-    if (!secret) {
+    if (!secretResult) {
       globalLogger.warn('Webhook rejected: endpoint not found', { path: req.path, endpointId });
       onError(
         new WebhookSignatureError('Webhook endpoint not found or inactive', 'VERIFICATION_FAILED'),
@@ -395,6 +427,18 @@ export function webhookAuthWithProvider(
         res
       );
       return;
+    }
+
+    let secret: string;
+    let nextSecret: string | undefined = options.nextSecret;
+    let nextSecretExpiry: Date | string | number | undefined = options.nextSecretExpiry;
+
+    if (typeof secretResult === 'string') {
+      secret = secretResult;
+    } else {
+      secret = secretResult.secret;
+      if (secretResult.nextSecret !== undefined) nextSecret = secretResult.nextSecret;
+      if (secretResult.nextSecretExpiry !== undefined) nextSecretExpiry = secretResult.nextSecretExpiry;
     }
 
     // Get the raw body
@@ -459,8 +503,14 @@ export function webhookAuthWithProvider(
       return;
     }
 
-    // Verify signature using constant-time comparison
-    if (!verifyWebhookPayload(secret, payloadString, signature)) {
+    // Perform dual-key signature verification
+    const dualKeyResult = verifyWebhookPayloadDualKey(
+      { secret, nextSecret, nextSecretExpiry },
+      payloadString,
+      signature
+    );
+
+    if (!dualKeyResult.valid) {
       globalLogger.warn('Webhook rejected: signature mismatch', { path: req.path, endpointId });
       onError(
         new WebhookSignatureError('Signature verification failed', 'VERIFICATION_FAILED'),
@@ -468,6 +518,16 @@ export function webhookAuthWithProvider(
         res
       );
       return;
+    }
+
+    const verifiedByKey = dualKeyResult.verifiedByKey ?? 'current';
+
+    if (metricName) {
+      try {
+        globalMetrics.incrementCounter(metricName, { key: verifiedByKey });
+      } catch {
+        // Silently swallow metric errors
+      }
     }
 
     // Optional timestamp validation with clock skew tolerance
@@ -501,7 +561,6 @@ export function webhookAuthWithProvider(
       const now = Date.now();
       const age = now - timestamp.getTime();
 
-      // Negative age = future timestamp; allow up to clockSkewMs for sender clock drift.
       if (age < -clockSkewMs || age > maxAgeMs) {
         globalLogger.warn('Webhook rejected: timestamp outside acceptable window', {
           path: req.path,
@@ -521,11 +580,12 @@ export function webhookAuthWithProvider(
       }
     }
 
-    globalLogger.debug('Webhook signature verified (provider)', { path: req.path, endpointId });
+    globalLogger.debug('Webhook signature verified (provider)', { path: req.path, endpointId, verifiedByKey });
 
     // Attach webhook verification info
     (req as WebhookAuthenticatedRequest).webhook = {
       verified: true,
+      verifiedByKey,
       timestamp,
     };
 

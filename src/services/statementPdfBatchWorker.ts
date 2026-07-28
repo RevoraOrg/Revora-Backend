@@ -14,7 +14,7 @@ import {
   PdfRenderJobRow,
   PdfRenderBatchRow,
 } from '../db/repositories/pdfRenderJobRepository';
-import { StatementRenderFn } from './statementPdfService';
+import { StatementRenderFn, StatementRenderOptions } from './statementPdfService';
 
 export const METRIC_PDF_JOBS_ENQUEUED = 'statement_pdf_jobs_enqueued_total';
 export const METRIC_PDF_JOBS_COMPLETED = 'statement_pdf_jobs_completed_total';
@@ -36,6 +36,8 @@ export interface StatementPdfBatchWorkerOptions {
   retryBaseMs?: number;
   /** Reclaim processing jobs older than this. Default: 15 minutes. */
   staleAfterMs?: number;
+  /** Optional render configuration (watermark suppression, treasury keys, etc.) */
+  renderOptions?: StatementRenderOptions;
 }
 
 function shortLabel(id: string): string {
@@ -73,6 +75,7 @@ export class StatementPdfBatchWorker {
   private readonly maxAttempts: number;
   private readonly retryBaseMs: number;
   private readonly staleAfterMs: number;
+  private readonly renderOptions?: StatementRenderOptions;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private completedWindow: Array<{ at: number }> = [];
@@ -89,6 +92,7 @@ export class StatementPdfBatchWorker {
     this.maxAttempts = options.maxAttempts ?? 5;
     this.retryBaseMs = options.retryBaseMs ?? 1000;
     this.staleAfterMs = options.staleAfterMs ?? 15 * 60 * 1000;
+    this.renderOptions = options.renderOptions;
   }
 
   /** Start the polling loop (idempotent). */
@@ -163,7 +167,7 @@ export class StatementPdfBatchWorker {
   private async processJob(job: PdfRenderJobRow): Promise<void> {
     const started = Date.now();
     try {
-      const result = await this.render(job);
+      const result = await this.render(job, this.renderOptions);
       await this.jobRepo.markCompleted(job.id, result.storageKey, result.checksum);
       this.metrics.incrementCounter(METRIC_PDF_JOBS_COMPLETED, {
         period: job.period_id.slice(0, 16),

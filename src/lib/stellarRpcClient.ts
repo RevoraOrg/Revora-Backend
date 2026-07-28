@@ -10,6 +10,7 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { classifyStellarRPCFailure } from './stellarRpcFailure';
 import { env } from '../config/env';
+import { globalMetrics } from './metrics';
 
 // FIX 1: The original file imported `SorobanRpc` from '@stellar/stellar-sdk' which
 //         does not exist as a named export — the project uses `StellarSdk.rpc.*`
@@ -139,8 +140,9 @@ export class StellarRpcClientImpl implements StellarRpcClient {
           ),
         ]);
 
-        if (!response || typeof response.sequence !== 'number' || response.sequence < 0) {
-          throw new Error('Invalid response: missing or invalid sequence number');
+        if (!response || typeof response.sequence !== 'number' || response.sequence < 0 || typeof response.id !== 'string' || typeof response.protocolVersion !== 'string') {
+          globalMetrics.incrementCounter('ingest.partial.rejected');
+          throw new SyntaxError('Invalid response: missing or invalid sequence number or truncated fields');
         }
 
         breaker.recordSuccess();
