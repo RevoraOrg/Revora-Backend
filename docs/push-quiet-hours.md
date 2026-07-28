@@ -58,6 +58,27 @@ A scheduler calls `flush(deliverFn)` periodically. Each deferred push is
 re-evaluated against the **current** clock and its own config; any whose window
 has ended are delivered, the rest remain queued.
 
+### Scheduler wiring
+
+[`PushQuietHoursScheduler`](../src/services/pushQuietHoursScheduler.ts) drives
+`flush()` on a fixed interval (default 60s). It is transport-agnostic — the
+application bootstrap injects the `PushDeliveryFn` (FCM/APNs/etc.) and owns
+delivery. Wire it up during startup:
+
+```typescript
+const pushQuietHours = new PushQuietHoursService();
+const scheduler = new PushQuietHoursScheduler(pushQuietHours, deliverFn, {
+  intervalMs: 60_000,
+});
+scheduler.start();          // release deferred pushes as windows end
+// on shutdown:
+scheduler.stop();
+```
+
+The interval timer is `unref`'d so it never keeps the process alive on its own,
+and flush errors are caught, counted (`push_flush_errors_total`), and logged so a
+transient delivery failure never tears down the loop.
+
 ### Bounded queue
 
 The deferred queue is capped at `MAX_QUEUE_SIZE` (1000). On overflow the oldest
@@ -88,6 +109,8 @@ No user identifiers are ever used as labels.
 | `push_urgent_bypass_total`            | counter | Urgent pushes that bypassed quiet hours (audit).|
 | `push_deferred_queue_size`            | gauge   | Current deferred-queue depth (set on flush).    |
 | `push_deferred_queue_overflow_total`  | counter | Deferred pushes dropped on queue overflow.      |
+| `push_flush_delivered_total`          | counter | Deferred pushes released by the scheduler.      |
+| `push_flush_errors_total`             | counter | Scheduler flush ticks that threw.               |
 
 ## Security notes
 
