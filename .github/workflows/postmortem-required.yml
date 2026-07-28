@@ -47,7 +47,10 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        # Use npm install (not npm ci) so the check is resilient to transient
+        # lock-file drift on the base branch.  The postmortem gate only needs
+        # ts-node; a hermetic reproducible install is not required here.
+        run: npm install --ignore-scripts
 
       - name: List PR changed files
         id: files
