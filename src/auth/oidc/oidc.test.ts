@@ -80,14 +80,22 @@ describe('OidcAdapterService', () => {
     });
 
     it('returns cached doc without re-fetching', async () => {
-      (service as any).discoveryCache.set('https://idp.example.com', makeDiscovery());
+      const doc = makeDiscovery();
+      (service as any).discoveryCache.set('https://idp.example.com', {
+        doc,
+        cachedUntil: Date.now() + 60_000,
+      });
       global.fetch = jest.fn();
       await service.getDiscovery('https://idp.example.com');
       expect(global.fetch).not.toHaveBeenCalled();
     });
 
     it('re-fetches an expired cached doc', async () => {
-      (service as any).discoveryCache.set('https://idp.example.com', makeDiscovery({ _cachedUntil: Date.now() - 1 }));
+      const doc = makeDiscovery({ _cachedUntil: Date.now() - 1 });
+      (service as any).discoveryCache.set('https://idp.example.com', {
+        doc,
+        cachedUntil: Date.now() - 1,
+      });
       global.fetch = jest.fn().mockResolvedValueOnce({ ok: true, json: async () => makeDiscovery() } as any);
       await service.getDiscovery('https://idp.example.com');
       expect(global.fetch).toHaveBeenCalledTimes(1);
@@ -106,6 +114,80 @@ describe('OidcAdapterService', () => {
     it('throws on missing required fields', async () => {
       global.fetch = jest.fn().mockResolvedValueOnce({ ok: true, json: async () => ({ issuer: 'https://idp.example.com' }) } as any);
       await expect(service.getDiscovery('https://idp.example.com')).rejects.toThrow(/missing required fields/);
+    });
+
+    it('stores a per-issuer digest and alerts on fixture rotation', async () => {
+      const metrics = { incrementCounter: jest.fn() };
+      let now = 1_000_000;
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      service = new OidcAdapterService(jwksCache, {
+        metrics,
+        discoveryTtlMs: 60_000,
+        now: () => now,
+      });
+
+      const fixtureA = makeDiscovery();
+      const fixtureB = makeDiscovery({
+        authorization_endpoint: 'https://idp.example.com/v2/authorize',
+        token_endpoint: 'https://idp.example.com/v2/token',
+      });
+
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => fixtureA } as any)
+        .mockResolvedValueOnce({ ok: true, json: async () => fixtureB } as any);
+
+      await service.getDiscovery('https://idp.example.com');
+      const firstDigest = service.getDiscoveryDigest('https://idp.example.com');
+      expect(firstDigest).toMatch(/^[a-f0-9]{64}$/);
+      expect(metrics.incrementCounter).not.toHaveBeenCalled();
+
+      now += 60_001;
+      await service.getDiscovery('https://idp.example.com');
+
+      expect(service.getDiscoveryDigest('https://idp.example.com')).not.toBe(firstDigest);
+      expect(metrics.incrementCounter).toHaveBeenCalledWith(
+        'oidc.discovery.changed',
+        { issuer: 'https://idp.example.com' },
+        1,
+        expect.any(String),
+      );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('oidc.discovery.changed'));
+      warn.mockRestore();
+    });
+
+    it('treats whitespace-only discovery changes as no delta', async () => {
+      const metrics = { incrementCounter: jest.fn() };
+      let now = 1_000_000;
+      service = new OidcAdapterService(jwksCache, {
+        metrics,
+        discoveryTtlMs: 60_000,
+        now: () => now,
+      });
+
+      const compact = makeDiscovery();
+      // Same fields, different property insertion order after parse — still no delta.
+      const padded = {
+        jwks_uri: compact.jwks_uri,
+        token_endpoint: compact.token_endpoint,
+        authorization_endpoint: compact.authorization_endpoint,
+        issuer: compact.issuer,
+      };
+
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => compact } as any)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => JSON.parse(JSON.stringify(padded, null, 4)),
+        } as any);
+
+      await service.getDiscovery('https://idp.example.com');
+      const digest = service.getDiscoveryDigest('https://idp.example.com');
+
+      now += 60_001;
+      await service.getDiscovery('https://idp.example.com');
+
+      expect(service.getDiscoveryDigest('https://idp.example.com')).toBe(digest);
+      expect(metrics.incrementCounter).not.toHaveBeenCalled();
     });
   });
 
