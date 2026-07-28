@@ -198,3 +198,45 @@ export interface UpdateCaseInput {
   disposition?: AMLDisposition;
   notes?: string;
 }
+
+/**
+ * Reviewer profile for load-balancer capacity tracking
+ */
+export interface ReviewerProfile {
+  /** Reviewer user ID. */
+  reviewer_id: string;
+  /** Maximum concurrent open cases this reviewer may hold. */
+  max_capacity: number;
+  /** Minimum hours after closing a case before the reviewer is eligible again. */
+  cool_down_hours: number;
+}
+
+/**
+ * Reviewer capacity snapshot (computed at assignment time)
+ */
+export interface ReviewerCapacity {
+  reviewer_id: string;
+  active_cases: number;
+  max_capacity: number;
+  remaining_capacity: number;
+  /** ISO-8601 timestamp of the reviewer's most recent case closure, or null. */
+  last_closed_at: string | null;
+  /** Whether the reviewer is currently in cool-down. */
+  in_cool_down: boolean;
+  /** Whether the reviewer is eligible for a new assignment. */
+  eligible: boolean;
+}
+
+/**
+ * Result of an auto-assignment attempt
+ */
+export interface AssignmentResult {
+  /** The case that was assigned. */
+  case_id: string;
+  /** The reviewer who received the assignment. */
+  assigned_to: string;
+  /** Age of the case in days at assignment time. */
+  age_days: number;
+  /** Snapshot of all reviewer capacities at the time of assignment. */
+  reviewer_capacities: ReviewerCapacity[];
+}

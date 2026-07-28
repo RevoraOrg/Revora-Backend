@@ -141,17 +141,48 @@ export class AuditLogRepository {
   }
 
   /**
-   * Purge audit logs created before a specific date
-   * @param cutoffDate The cutoff date
-   * @returns Number of rows deleted
+   * Purge audit logs created before a specific date.
+   *
+   * Rows whose UTC `YYYY-MM` period has an active legal hold in
+   * `retention_labels` are skipped and counted separately.
    */
-  async purgeBefore(cutoffDate: Date): Promise<number> {
-    const query = `
-      DELETE FROM audit_logs
-      WHERE created_at < $1
-    `;
-    const result = await this.db.query(query, [cutoffDate]);
-    return result.rowCount ?? 0;
+  async purgeBefore(cutoffDate: Date): Promise<{
+    deletedCount: number;
+    skippedHoldCount: number;
+  }> {
+    const skippedResult = await this.db.query<{ count: string | number }>(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM audit_logs a
+      WHERE a.created_at < $1
+        AND EXISTS (
+          SELECT 1
+          FROM retention_labels rl
+          WHERE rl.legal_hold = TRUE
+            AND rl.period_id = to_char((a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM')
+        )
+      `,
+      [cutoffDate],
+    );
+
+    const deleteResult = await this.db.query(
+      `
+      DELETE FROM audit_logs a
+      WHERE a.created_at < $1
+        AND NOT EXISTS (
+          SELECT 1
+          FROM retention_labels rl
+          WHERE rl.legal_hold = TRUE
+            AND rl.period_id = to_char((a.created_at AT TIME ZONE 'UTC'), 'YYYY-MM')
+        )
+      `,
+      [cutoffDate],
+    );
+
+    return {
+      deletedCount: deleteResult.rowCount ?? 0,
+      skippedHoldCount: Number(skippedResult.rows[0]?.count ?? 0),
+    };
   }
 
   /**

@@ -44,12 +44,16 @@ import { TenantSettingsRepository } from "./db/repositories/tenantSettingsReposi
 import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
 import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { RetentionLabelRepository } from "./db/repositories/retentionLabelRepository";
+import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
+import { createMobileCompanionRouter } from "./routes/mobileCompanion";
+import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
 
 const port = env.PORT;
@@ -666,6 +670,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const retentionLabelService = new RetentionLabelService(
+    new RetentionLabelRepository(pool),
+    auditLogRepo,
+  );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
@@ -677,7 +685,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     : null;
 
   // Mount admin router
-  apiRouter.use("/admin", createAdminRouter(auditLogRepo));
+  apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
 
   if (contractUpgradeService) {
@@ -690,6 +698,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Initialize AML service and routes
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
+
+  // Mobile companion API with per-device Ed25519 request signatures
+  const deviceKeyStore = new InMemoryDeviceKeyStore();
+  apiRouter.use("/mobile", createMobileCompanionRouter({ keyStore: deviceKeyStore }));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -992,38 +1004,61 @@ if (require.main === module && env.NODE_ENV !== "test") {
     void shutdown("SIGINT");
   });
 
-  const repo = new WebhookEndpointRepository(pool);
-  const service = new WebhookService(repo);
-  WebhookQueue.init(repo, service);
-  void WebhookQueue.resumePending();
+  // Resolve worker role — fail-fast on invalid value
+  const { resolveWorkerRole, getRoleConfig } = require("./config/workerRole");
+  const workerRole = resolveWorkerRole(env.ROLE, env.NODE_ENV);
+  const roleConfig = getRoleConfig(workerRole);
+  console.log(`[server] Starting with role="${workerRole}"`, roleConfig);
 
-  const auditLogRepo = new AuditLogRepository(pool);
   const metricsCollector = new MetricsCollector();
-  const auditPurgeService = new AuditPurgeService(auditLogRepo, metricsCollector);
-  
-  auditPurgeService.start(); // Start scheduled purge job
 
-  const payoutDriftRepo = new PayoutDriftRepository(pool);
-  const payoutDriftDetector = new PayoutDriftDetector(
-    pool,
-    payoutDriftRepo,
-    metricsCollector
-  );
-  
-  payoutDriftDetector.start(); // Start nightly payout drift detection
+  // --- Batch / background services (only for "batch" and "all" roles) ---
+  const backgroundStopFns: Array<() => void> = [];
 
-  process.on("SIGTERM", () => {
-    auditPurgeService.stop();
-    payoutDriftDetector.stop();
-  });
-  process.on("SIGINT", () => {
-    auditPurgeService.stop();
-    payoutDriftDetector.stop();
-  });
+  if (roleConfig.auditPurge) {
+    const auditLogRepo = new AuditLogRepository(pool);
+    const auditPurgeService = new AuditPurgeService(auditLogRepo, metricsCollector);
+    auditPurgeService.start();
+    backgroundStopFns.push(() => auditPurgeService.stop());
+    console.log("[server] AuditPurgeService started");
+  }
 
-  server = app.listen(port, () => {
-    console.log(`revora-backend listening on http://localhost:${port}`);
-  });
+  if (roleConfig.payoutDrift) {
+    const payoutDriftRepo = new PayoutDriftRepository(pool);
+    const payoutDriftDetector = new PayoutDriftDetector(
+      pool,
+      payoutDriftRepo,
+      metricsCollector,
+    );
+    payoutDriftDetector.start();
+    backgroundStopFns.push(() => payoutDriftDetector.stop());
+    console.log("[server] PayoutDriftDetector started");
+  }
+
+  // --- Hot-path services (only for "api" and "all" roles) ---
+
+  if (roleConfig.webhookQueue) {
+    const repo = new WebhookEndpointRepository(pool);
+    const service = new WebhookService(repo);
+    WebhookQueue.init(repo, service);
+    void WebhookQueue.resumePending();
+    console.log("[server] WebhookQueue started");
+  }
+
+  for (const stopFn of backgroundStopFns) {
+    process.on("SIGTERM", stopFn);
+    process.on("SIGINT", stopFn);
+  }
+
+  // --- HTTP server (only for "api" and "all" roles) ---
+
+  if (roleConfig.httpServer) {
+    server = app.listen(port, () => {
+      console.log(`revora-backend listening on http://localhost:${port} (role=${workerRole})`);
+    });
+  } else {
+    console.log(`[server] HTTP server disabled for role="${workerRole}". Running background workers only.`);
+  }
 }
 
 export default app;
