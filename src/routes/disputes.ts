@@ -235,7 +235,7 @@ export function createDisputeSLAHandlers(
   async function processRefund(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { disputeId } = req.params;
-      const { amount, originalDisbursement, reason, ledgerEventId } = req.body || {};
+      const { amount, originalDisbursement, reason, ledgerEventId, distributionId } = req.body || {};
 
       if (!disputeId) {
         res.status(400).json({ error: 'disputeId path parameter is required' });
@@ -258,6 +258,7 @@ export function createDisputeSLAHandlers(
         originalDisbursement: String(originalDisbursement),
         reason,
         ledgerEventId,
+        distributionId,
       });
 
       res.status(201).json({ refund });
