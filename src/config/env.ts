@@ -41,6 +41,7 @@ import { z } from "zod";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  ROLE: z.enum(["api", "batch", "all"]).optional(),
   PORT: z.coerce.number().int().positive().default(4000),
   API_VERSION_PREFIX: z.string().default("/api/v1"),
   DATABASE_URL: z.string().optional(),
