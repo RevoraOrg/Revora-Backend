@@ -10,7 +10,15 @@ import { AMLRuleRepository } from './amlRuleRepository';
 import { AMLAlertRepository } from './amlAlertRepository';
 import { RuleEvaluator } from './ruleEvaluator';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
-import { CreateRuleInput, UpdateRuleInput, CreateCaseInput, UpdateCaseInput, SemVer } from './types';
+import {
+  CreateOFACReviewInput,
+  CreateRuleInput,
+  OFACReview,
+  UpdateRuleInput,
+  CreateCaseInput,
+  UpdateCaseInput,
+  SemVer,
+} from './types';
 
 // Mock repositories
 class MockRuleRepository {
@@ -197,6 +205,93 @@ class MockAuditRepository {
   }
 }
 
+class MockOFACReviewRepository {
+  private reviews: OFACReview[] = [];
+
+  async create(input: CreateOFACReviewInput, creatorId: string): Promise<OFACReview> {
+    const review: OFACReview = {
+      id: `ofac_${Date.now()}_${this.reviews.length}`,
+      alert_id: input.alert_id,
+      case_id: input.case_id,
+      investor_id: input.investor_id,
+      matched_name: input.matched_name,
+      list_entry_id: input.list_entry_id,
+      status: 'pending_first_approval',
+      created_by: creatorId,
+      created_at: new Date(),
+      clearance_rationale: input.rationale,
+      expires_at: input.expires_at || new Date(Date.now() + 86400000),
+      updated_at: new Date(),
+    };
+    this.reviews.push(review);
+    return review;
+  }
+
+  async findQueue(now = new Date()): Promise<OFACReview[]> {
+    await this.reopenExpired(now);
+    return this.reviews.filter(review =>
+      review.status === 'pending_first_approval' || review.status === 'pending_second_approval'
+    );
+  }
+
+  async findById(reviewId: string): Promise<OFACReview | null> {
+    return this.reviews.find(review => review.id === reviewId) || null;
+  }
+
+  async approve(reviewId: string, approverId: string, rationale: string, now = new Date()): Promise<OFACReview> {
+    const review = await this.findById(reviewId);
+    if (!review) throw new Error(`OFAC review ${reviewId} not found`);
+
+    if (review.expires_at.getTime() <= now.getTime() && review.status !== 'cleared') {
+      review.status = 'pending_first_approval';
+      review.first_approver_id = undefined;
+      review.first_approval_rationale = undefined;
+      review.first_approved_at = undefined;
+    }
+
+    if (review.created_by === approverId) {
+      throw new Error('Review creator cannot approve their own OFAC clearance');
+    }
+    if (review.first_approver_id === approverId) {
+      throw new Error('Same compliance officer cannot approve an OFAC review twice');
+    }
+
+    if (review.status === 'pending_first_approval') {
+      review.status = 'pending_second_approval';
+      review.first_approver_id = approverId;
+      review.first_approval_rationale = rationale;
+      review.first_approved_at = now;
+      review.updated_at = now;
+      return review;
+    }
+
+    review.status = 'cleared';
+    review.second_approver_id = approverId;
+    review.second_approval_rationale = rationale;
+    review.second_approved_at = now;
+    review.cleared_at = now;
+    review.clearance_rationale = [
+      review.clearance_rationale,
+      `first approver ${review.first_approver_id}: ${review.first_approval_rationale}`,
+      `second approver ${approverId}: ${rationale}`,
+    ].join('\n');
+    review.updated_at = now;
+    return review;
+  }
+
+  async reopenExpired(now = new Date()): Promise<void> {
+    for (const review of this.reviews) {
+      if (review.status === 'pending_second_approval' && review.expires_at.getTime() <= now.getTime()) {
+        review.status = 'pending_first_approval';
+        review.first_approver_id = undefined;
+        review.first_approval_rationale = undefined;
+        review.first_approved_at = undefined;
+        review.updated_at = now;
+      }
+    }
+  }
+}
+
 class MockRuleEvaluator {
   async evaluate(context: any, rules: any[]): Promise<any[]> {
     return rules.map(rule => ({
@@ -216,13 +311,15 @@ describe('AMLService', () => {
   let alertRepo: MockAlertRepository;
   let evaluator: MockRuleEvaluator;
   let auditRepo: MockAuditRepository;
+  let ofacReviewRepo: MockOFACReviewRepository;
 
   beforeEach(() => {
     ruleRepo = new MockRuleRepository();
     alertRepo = new MockAlertRepository();
     evaluator = new MockRuleEvaluator();
     auditRepo = new MockAuditRepository();
-    service = new AMLService(ruleRepo as any, alertRepo as any, evaluator as any, auditRepo, 'test_user');
+    ofacReviewRepo = new MockOFACReviewRepository();
+    service = new AMLService(ruleRepo as any, alertRepo as any, evaluator as any, auditRepo, 'test_user', ofacReviewRepo as any);
   });
 
   describe('Transaction Evaluation', () => {
@@ -570,6 +667,65 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_alert_dismissed');
+    });
+  });
+
+  describe('OFAC Review Queue', () => {
+    const createReview = async (expires_at?: Date) => service.createOFACReview({
+      alert_id: 'alert_ofac_1',
+      investor_id: 'investor_1',
+      matched_name: 'John Smith',
+      list_entry_id: 'ofac_sdn_123',
+      rationale: 'Documented legal name collision with verified date of birth mismatch.',
+      expires_at,
+    }, 'case_creator');
+
+    it('should require two independent approvals before clearing a review', async () => {
+      const review = await createReview();
+
+      const first = await service.approveOFACReview(review.id, 'officer_1', 'Government ID and DOB do not match SDN entry.');
+      expect(first.status).toBe('pending_second_approval');
+
+      const cleared = await service.approveOFACReview(review.id, 'officer_2', 'Second review confirms false positive.');
+      expect(cleared.status).toBe('cleared');
+      expect(cleared.first_approver_id).toBe('officer_1');
+      expect(cleared.second_approver_id).toBe('officer_2');
+
+      const events = auditRepo.getEvents();
+      expect(events.map(event => event.action)).toEqual([
+        'ofac_review_created',
+        'ofac_review_first_approved',
+        'ofac_review_cleared',
+      ]);
+    });
+
+    it('should reject same-user double approval', async () => {
+      const review = await createReview();
+      await service.approveOFACReview(review.id, 'officer_1', 'First review rationale is complete.');
+
+      await expect(
+        service.approveOFACReview(review.id, 'officer_1', 'Trying to approve twice.')
+      ).rejects.toThrow('Same compliance officer cannot approve an OFAC review twice');
+    });
+
+    it('should reject approval from the case creator', async () => {
+      const review = await createReview();
+
+      await expect(
+        service.approveOFACReview(review.id, 'case_creator', 'Creator attempts clearance.')
+      ).rejects.toThrow('Review creator cannot approve their own OFAC clearance');
+    });
+
+    it('should re-enter expired pending reviews into the first-approval queue', async () => {
+      const expiresAt = new Date(Date.now() + 1000);
+      const review = await createReview(expiresAt);
+      await service.approveOFACReview(review.id, 'officer_1', 'Initial review before timeout.');
+
+      const queue = await service.getOFACReviewQueue(new Date(expiresAt.getTime() + 1000));
+
+      expect(queue).toHaveLength(1);
+      expect(queue[0].status).toBe('pending_first_approval');
+      expect(queue[0].first_approver_id).toBeUndefined();
     });
   });
 });
