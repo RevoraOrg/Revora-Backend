@@ -523,6 +523,135 @@ describe('RuleEvaluator', () => {
     });
   });
 
+  describe('Sanctions Screening Rule Evaluation', () => {
+    const sanctionsRule: AMLRule = {
+      id: 'sanctions_rule_1',
+      name: 'Sanctions Screening',
+      description: 'Screens investor against sanctions watchlist with Jaro-Winkler fuzzy matching',
+      type: 'sanctions_screening',
+      version: { major: 1, minor: 0, patch: 0 },
+      severity: 'critical',
+      enabled: true,
+      config: {
+        sanctions_list: ['Alexander Petrov', 'John Smith', 'Vladimir Putin'],
+        jaro_winkler_threshold: 0.85,
+        fuzzy_enabled: true,
+      },
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    it('triggers exact match with auto_deny: true', async () => {
+      const context: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'John Smith',
+      };
+
+      const results = await evaluator.evaluate(context, [sanctionsRule]);
+      expect(results).toHaveLength(1);
+      expect(results[0].triggered).toBe(true);
+      expect(results[0].details.match_type).toBe('exact');
+      expect(results[0].details.action).toBe('auto_deny');
+      expect(results[0].details.auto_deny).toBe(true);
+    });
+
+    it('triggers fuzzy match with action: pending_review and auto_deny: false', async () => {
+      const context: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'Aleksander Petrov', // Transliteration / spelling variation of Alexander Petrov
+      };
+
+      const results = await evaluator.evaluate(context, [sanctionsRule]);
+      expect(results).toHaveLength(1);
+      expect(results[0].triggered).toBe(true);
+      expect(results[0].details.match_type).toBe('fuzzy');
+      expect(results[0].details.action).toBe('pending_review');
+      expect(results[0].details.auto_deny).toBe(false);
+      expect(results[0].details.review_status).toBe('pending_review');
+    });
+
+    it('detects Cyrillic-to-Latin transliterations', async () => {
+      const context: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'Александр Петров', // Cyrillic for Alexander Petrov
+      };
+
+      const results = await evaluator.evaluate(context, [sanctionsRule]);
+      expect(results).toHaveLength(1);
+      expect(results[0].triggered).toBe(true);
+      expect(results[0].details.matched_candidate).toBe('Alexander Petrov');
+      expect(results[0].details.action).toBe('pending_review');
+      expect(results[0].details.auto_deny).toBe(false);
+    });
+
+    it('respects per-tenant threshold overrides in context.tenant_settings', async () => {
+      const contextStrict: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'Jon Smithy',
+        tenant_settings: {
+          sanctions_threshold: 0.95, // Very strict threshold
+        },
+      };
+
+      const resultsStrict = await evaluator.evaluate(contextStrict, [sanctionsRule]);
+      expect(resultsStrict[0].triggered).toBe(false);
+
+      const contextPermissive: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'Jon Smithy',
+        tenant_settings: {
+          sanctions_threshold: 0.75, // Lower threshold
+        },
+      };
+
+      const resultsPermissive = await evaluator.evaluate(contextPermissive, [sanctionsRule]);
+      expect(resultsPermissive[0].triggered).toBe(true);
+      expect(resultsPermissive[0].details.match_type).toBe('fuzzy');
+      expect(resultsPermissive[0].details.action).toBe('pending_review');
+    });
+
+    it('does not trigger for unrelated names below threshold', async () => {
+      const context: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '1000',
+        asset: 'USD',
+        timestamp: new Date(),
+        investor_name: 'Robert Johnson',
+      };
+
+      const results = await evaluator.evaluate(context, [sanctionsRule]);
+      expect(results).toHaveLength(1);
+      expect(results[0].triggered).toBe(false);
+    });
+  });
+
   describe('Multiple Rule Evaluation', () => {
     it('should evaluate multiple rules and return all results', async () => {
       const rules: AMLRule[] = [
