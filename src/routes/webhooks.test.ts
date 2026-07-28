@@ -57,7 +57,7 @@ describe('createWebhookRouter', () => {
     const response = await request(app).post('/webhooks').send(event);
 
     expect(response.status).toBe(401);
-    expect(response.body.error).toContain('Webhook verification failed');
+    expect(response.body.code).toBe('UNAUTHORIZED');
   });
 
   it('should reject webhook with invalid signature', async () => {
@@ -71,7 +71,7 @@ describe('createWebhookRouter', () => {
       .send(event);
 
     expect(response.status).toBe(403);
-    expect(response.body.error).toContain('Webhook verification failed');
+    expect(response.body.code).toBe('FORBIDDEN');
   });
 
   it('should reject webhook with wrong secret', async () => {
@@ -281,6 +281,52 @@ describe('createWebhookRouter', () => {
         .send(event);
 
       expect(response.status).toBe(403);
+    });
+
+    it('should accept a slightly future timestamp within the clock skew window', async () => {
+      const event = createTestEvent();
+      const signature = signWebhookPayload(TEST_SECRET, JSON.stringify(event));
+
+      app.use(
+        '/webhooks',
+        createWebhookRouter({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          clockSkewMs: 30_000, // 30-second clock drift tolerance
+        })
+      );
+
+      const response = await request(app)
+        .post('/webhooks')
+        .set('X-Revora-Signature', signature)
+        .set('X-Webhook-Timestamp', String(Date.now() + 15_000)) // 15 s ahead — within skew
+        .send(event);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+    });
+
+    it('should reject a future timestamp that exceeds the clock skew window', async () => {
+      const event = createTestEvent();
+      const signature = signWebhookPayload(TEST_SECRET, JSON.stringify(event));
+
+      app.use(
+        '/webhooks',
+        createWebhookRouter({
+          secret: TEST_SECRET,
+          requireTimestamp: true,
+          clockSkewMs: 30_000,
+        })
+      );
+
+      const response = await request(app)
+        .post('/webhooks')
+        .set('X-Revora-Signature', signature)
+        .set('X-Webhook-Timestamp', String(Date.now() + 60_000)) // 60 s ahead — beyond skew
+        .send(event);
+
+      expect(response.status).toBe(403);
+      expect(response.body.code).toBe('FORBIDDEN');
     });
 
     it('should accept webhook without timestamp when not required', async () => {

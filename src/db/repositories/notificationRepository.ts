@@ -43,16 +43,29 @@ export class NotificationRepository {
     return result.rows.map((row) => this.mapNotification(row));
   }
 
-  async markRead(notificationId: string): Promise<Notification> {
+  async markRead(notificationId: string, userId: string): Promise<boolean> {
     const query = `
       UPDATE notifications 
       SET read_at = NOW() 
-      WHERE id = $1 
-      RETURNING *
+      WHERE id = $1 AND user_id = $2 AND read_at IS NULL
     `;
-    const result: QueryResult = await this.db.query(query, [notificationId]);
-    if (result.rows.length === 0) throw new Error('Notification not found');
-    return this.mapNotification(result.rows[0]);
+    const result: QueryResult = await this.db.query(query, [notificationId, userId]);
+    return result.rowCount > 0;
+  }
+
+  async markReadBulk(notificationIds: string[], userId: string): Promise<number> {
+    if (!notificationIds || notificationIds.length === 0) return 0;
+    
+    // De-duplicate IDs to ensure accurate rowCount for the number of uniquely requested notifications
+    const uniqueIds = Array.from(new Set(notificationIds));
+    
+    const query = `
+      UPDATE notifications 
+      SET read_at = NOW() 
+      WHERE id = ANY($1) AND user_id = $2 AND read_at IS NULL
+    `;
+    const result: QueryResult = await this.db.query(query, [uniqueIds, userId]);
+    return result.rowCount;
   }
 
   private mapNotification(row: any): Notification {

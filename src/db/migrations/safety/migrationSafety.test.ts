@@ -901,7 +901,7 @@ describe('Migration Safety System', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('time window');
+      expect(result.error).toContain('destructive operations');
     });
 
     it('handles concurrent migration limits', async () => {

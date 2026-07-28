@@ -1,9 +1,10 @@
 import { Pool, PoolClient } from 'pg';
+import { globalLogger } from '../lib/logger';
 
 /**
  * Transaction options for controlling transaction behavior
  */
-export interface TransactionOptions {
+export interface TransactionOptions<T = unknown> {
   /**
    * Isolation level for the transaction
    * @default 'READ COMMITTED'
@@ -21,6 +22,13 @@ export interface TransactionOptions {
    * @default true
    */
   useSavepoint?: boolean;
+
+  /**
+   * Optional callback invoked after a successful commit.
+   * Use this for external side effects such as Stellar/Horizon or Soroban calls that
+   * should only occur once the database transaction is durable.
+   */
+  afterCommit?: (result: T) => Promise<void> | void;
 }
 
 /**
@@ -91,10 +99,12 @@ const transactionContexts = new WeakMap<PoolClient, TransactionContext>();
  * });
  * ```
  */
+const logger = globalLogger.child({ service: 'db-transaction' });
+
 export async function withTransaction<T>(
   pool: Pool,
   callback: (client: PoolClient) => Promise<T>,
-  options: TransactionOptions = {}
+  options: TransactionOptions<T> = {}
 ): Promise<T> {
   // Validate inputs before acquiring connection
   if (!pool) {
@@ -108,6 +118,7 @@ export async function withTransaction<T>(
     isolationLevel = 'READ COMMITTED',
     readOnly = false,
     useSavepoint = true,
+    afterCommit,
   } = options;
 
   let client: PoolClient | null = null;
@@ -115,18 +126,14 @@ export async function withTransaction<T>(
   let savepointName: string | null = null;
 
   try {
-    // For now, always create a new transaction
-    // Nested transaction support via savepoints can be added later with proper context management
     client = await pool.connect();
     
-    // Initialize transaction context
     transactionContexts.set(client, {
       client,
       depth: 0,
       savepointCounter: 0,
     });
 
-    // Build transaction start command
     let beginCommand = 'BEGIN';
     if (isolationLevel !== 'READ COMMITTED') {
       beginCommand += ` ISOLATION LEVEL ${isolationLevel}`;
@@ -135,43 +142,57 @@ export async function withTransaction<T>(
       beginCommand += ' READ ONLY';
     }
 
+    logger.info('Beginning transaction', {
+      isolationLevel,
+      readOnly,
+      useSavepoint,
+    });
+
     await client.query(beginCommand);
 
-    // Execute callback
     const result = await callback(client);
 
-    // Commit transaction
     await client.query('COMMIT');
     transactionContexts.delete(client);
+    logger.info('Transaction committed');
+
+    if (afterCommit) {
+      try {
+        await afterCommit(result);
+      } catch (afterCommitError) {
+        const sanitizedMessage = sanitizeError(afterCommitError);
+        logger.error('Post-commit action failed', { error: sanitizedMessage });
+        throw new TransactionError(
+          `Transaction committed but post-commit action failed: ${sanitizedMessage}`,
+          afterCommitError
+        );
+      }
+    }
 
     return result;
   } catch (error) {
-    // Rollback transaction
     let rollbackSucceeded = true;
     
     if (client) {
       try {
         await client.query('ROLLBACK');
         transactionContexts.delete(client);
+        logger.warn('Transaction rolled back successfully');
       } catch (rollbackError) {
         rollbackSucceeded = false;
         // Log rollback failure but throw original error
-        // Using process.stderr instead of console for Node.js compatibility
-        if (typeof process !== 'undefined' && process.stderr) {
-          process.stderr.write(`[transaction] Rollback failed: ${sanitizeError(rollbackError)}\n`);
-        }
+        console.error('[transaction] Rollback failed:', sanitizeError(rollbackError));
       }
     }
 
-    // Sanitize error message to prevent sensitive data leakage
     const sanitizedMessage = sanitizeError(error);
+    logger.error('Transaction failed', { error: sanitizedMessage, rollbackSucceeded });
     throw new TransactionError(
       `Transaction failed: ${sanitizedMessage}`,
       error,
       rollbackSucceeded
     );
   } finally {
-    // Release connection back to pool
     if (client && !isNestedTransaction) {
       client.release();
     }
@@ -223,7 +244,7 @@ function sanitizeError(error: unknown): string {
 export async function transactional<T extends unknown[]>(
   pool: Pool,
   operations: Array<(client: PoolClient) => Promise<unknown>>,
-  options: TransactionOptions = {}
+  options: TransactionOptions<T> = {}
 ): Promise<T> {
   return withTransaction(pool, async (client) => {
     const results: unknown[] = [];

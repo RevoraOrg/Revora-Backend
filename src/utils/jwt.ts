@@ -18,14 +18,41 @@ function base64UrlDecode(input: string): string {
   return Buffer.from(pad ? padded + '='.repeat(4 - pad) : padded, 'base64').toString('utf8');
 }
 
+function getCurrentKeyId(): string {
+  return process.env.JWT_KEY_ID || 'current';
+}
+
+function getPreviousKeyId(): string | undefined {
+  return process.env.JWT_PREVIOUS_KEY_ID;
+}
+
 function getSecret(): string {
   const secret = process.env.JWT_SECRET;
   if (!secret) throw new Error('JWT_SECRET environment variable is not set');
   return secret;
 }
 
+function getPreviousSecret(): string | undefined {
+  const secret = process.env.JWT_SECRET_PREVIOUS;
+  if (!secret || secret.length < 32) return undefined;
+  return secret;
+}
+
+function getSecretByKid(kid: string): string | undefined {
+  const currentKid = getCurrentKeyId();
+  const previousKid = getPreviousKeyId();
+
+  if (kid === currentKid) {
+    return getSecret();
+  }
+  if (kid === previousKid) {
+    return getPreviousSecret();
+  }
+  return undefined;
+}
+
 /**
- * Sign a JWT using HMAC-SHA256. No external dependency.
+ * Sign a JWT using HMAC-SHA256 with kid header. No external dependency.
  */
 export function signJwt(
   payload: Omit<JwtPayload, 'iat' | 'exp'>,
@@ -34,7 +61,7 @@ export function signJwt(
   const now = Math.floor(Date.now() / 1000);
   const fullPayload: JwtPayload = { ...payload, iat: now, exp: now + expiresInSeconds };
 
-  const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: getCurrentKeyId() }));
   const body = base64UrlEncode(JSON.stringify(fullPayload));
   const signingInput = `${header}.${body}`;
   const signature = base64UrlEncode(
@@ -45,7 +72,7 @@ export function signJwt(
 }
 
 /**
- * Verify and decode a JWT.
+ * Verify and decode a JWT with kid-based key selection.
  * Returns the payload if valid, null otherwise.
  */
 export function verifyJwt(token: string): JwtPayload | null {
@@ -55,8 +82,26 @@ export function verifyJwt(token: string): JwtPayload | null {
   const [header, body, signature] = parts;
   const signingInput = `${header}.${body}`;
 
+  // Decode header to extract kid
+  let headerObj: { alg?: string; typ?: string; kid?: string };
+  try {
+    headerObj = JSON.parse(base64UrlDecode(header));
+  } catch {
+    return null;
+  }
+
+  const kid = headerObj.kid;
+  if (!kid || typeof kid !== 'string') {
+    return null; // Missing or invalid kid
+  }
+
+  const secret = getSecretByKid(kid);
+  if (!secret) {
+    return null; // Unknown kid
+  }
+
   const expectedSig = base64UrlEncode(
-    createHmac('sha256', getSecret()).update(signingInput).digest()
+    createHmac('sha256', secret).update(signingInput).digest()
   );
 
   // Timing-safe signature comparison

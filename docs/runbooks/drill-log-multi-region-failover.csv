@@ -1,0 +1,3 @@
+Date,Tester,RTO (min),RPO (min),Pass/Fail,Notes
+2026-03-15,jsmith,12,3,PASS,Clean cutover; idempotency warm-up completed in 2m
+2026-06-20,adoe,18,7,FAIL,RTO exceeded due to slow DNS propagation (TTL was 300s); reduced TTL to 60s

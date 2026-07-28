@@ -1,5 +1,6 @@
 import { ErrorRequestHandler, NextFunction, Request, Response } from 'express';
 import { AppError, ErrorCode, ErrorResponse, Errors } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 interface StructuredErrorLogEntry {
   type: 'error';
@@ -15,21 +16,13 @@ interface StructuredErrorLogEntry {
 const isProduction = (): boolean => process.env.NODE_ENV === 'production';
 
 function getRequestId(req: Request): string | undefined {
-  return (req as Request & { requestId?: string }).requestId;
+  return req.requestId;
 }
 
-/**
- * Maps arbitrary thrown values to a structured application error.
- *
- * Security boundary:
- * - AppError instances are trusted to carry client-visible messages/details.
- * - Unknown values are always downgraded to a generic INTERNAL_ERROR.
- */
 export function mapUnknownErrorToAppError(err: unknown): AppError {
   if (err instanceof AppError) {
     return err;
   }
-
   return Errors.internal();
 }
 
@@ -69,13 +62,36 @@ export const errorHandler: ErrorRequestHandler = (
 ): void => {
   const requestId = getRequestId(req);
   const mapped = mapUnknownErrorToAppError(err);
-  const logEntry = createStructuredErrorLogEntry(err, requestId);
+  
+  // REQUIREMENT: Route through the contextual request-scoped logger if present
+  const activeLogger = req.logger ?? globalLogger;
+  
+  if (mapped.statusCode >= 500) {
+    activeLogger.error(mapped.message, {
+      requestId,
+      code: mapped.code,
+      statusCode: mapped.statusCode,
+      details: mapped.details,
+      error: err,
+      path: req.path,
+      method: req.method,
+    });
+  } else {
+    activeLogger.warn(mapped.message, {
+      requestId,
+      code: mapped.code,
+      statusCode: mapped.statusCode,
+      details: mapped.details,
+      path: req.path,
+      method: req.method,
+    });
+  }
 
-  console.error(JSON.stringify(logEntry));
+  // REQUIREMENT: Include validation tracking parameters inside headers and responses
+  if (requestId) {
+    res.setHeader('X-Request-Id', requestId);
+  }
 
-  const body: ErrorResponse = mapped.expose
-    ? mapped.toResponse(requestId)
-    : Errors.internal().toResponse(requestId);
-
-  res.status(mapped.statusCode).json(body);
+  const finalError = mapped.expose ? mapped : Errors.internal();
+  res.status(finalError.statusCode).json(finalError.toResponse(requestId));
 };

@@ -3,6 +3,96 @@ const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
 
+/**
+ * Resolves, filters, sorts, and validates migration filenames.
+ *
+ * Enforces the following rules:
+ * - Hidden files (starting with '.') are ignored.
+ * - Missing '.sql' extension is rejected (unless strictExtensions is false).
+ * - Files must start with a numeric prefix (e.g. '001_').
+ * - Duplicate prefixes are rejected (unless allowDuplicates is true).
+ * - Prefix '999' is flagged/rejected as out-of-band (unless allowOutOfBand is true).
+ * - The sequence of numeric prefixes must be monotonic (strictly increasing, or non-decreasing if duplicates are allowed).
+ *
+ * @param {string[]} filenames
+ * @param {object} [options]
+ * @param {boolean} [options.allowDuplicates=false]
+ * @param {boolean} [options.allowOutOfBand=false]
+ * @param {boolean} [options.strictExtensions=true]
+ * @returns {string[]} Resolved and sorted list of valid migration filenames
+ */
+function resolveMigrations(filenames, options = {}) {
+    const {
+        allowDuplicates = false,
+        allowOutOfBand = false,
+        strictExtensions = true,
+    } = options;
+
+    const resolved = [];
+    const seenPrefixes = new Set();
+
+    for (const filename of filenames) {
+        // 1. Hidden files are ignored
+        if (filename.startsWith('.')) {
+            continue;
+        }
+
+        // 2. Missing .sql extension rejected
+        if (!filename.endsWith('.sql')) {
+            if (strictExtensions) {
+                throw new Error(`Migration file lacks .sql extension: ${filename}`);
+            }
+            continue;
+        }
+
+        // 3. Must start with numeric prefix
+        const match = filename.match(/^(\d+)_(.*)\.sql$/);
+        if (!match) {
+            throw new Error(`Migration file name does not start with a numeric prefix: ${filename}`);
+        }
+
+        const prefixStr = match[1];
+        const prefixNum = parseInt(prefixStr, 10);
+
+        // 4. Duplicate prefix rejected
+        if (seenPrefixes.has(prefixStr) && !allowDuplicates) {
+            throw new Error(`Duplicate migration prefix detected: ${prefixStr} (found in ${filename})`);
+        }
+        seenPrefixes.add(prefixStr);
+
+        // 5. 999_* flagged as out-of-band
+        if (prefixStr === '999' && !allowOutOfBand) {
+            throw new Error(`Out-of-band migration prefix 999 detected: ${filename}`);
+        }
+
+        resolved.push({
+            filename,
+            prefixStr,
+            prefixNum
+        });
+    }
+
+    // Sort lexicographically by filename to match database migration resolution order
+    resolved.sort((a, b) => a.filename.localeCompare(b.filename));
+
+    // 6. Monotonicity check
+    let lastPrefixNum = -1;
+    for (const item of resolved) {
+        if (allowDuplicates) {
+            if (item.prefixNum < lastPrefixNum) {
+                throw new Error(`Non-monotonic migration ordering detected: ${item.filename} has prefix ${item.prefixStr} which is less than preceding prefix`);
+            }
+        } else {
+            if (item.prefixNum <= lastPrefixNum) {
+                throw new Error(`Non-monotonic migration ordering detected: ${item.filename} has prefix ${item.prefixStr} which is less than or equal to preceding prefix`);
+            }
+        }
+        lastPrefixNum = item.prefixNum;
+    }
+
+    return resolved.map(item => item.filename);
+}
+
 async function runMigrations() {
     const databaseUrl = process.env.DATABASE_URL;
     if (!databaseUrl) {
@@ -38,8 +128,9 @@ async function runMigrations() {
                 return;
             }
 
-            const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql'));
-            files.sort();
+            // Load and resolve migrations with relaxed options for the pre-existing production folder
+            const allFiles = fs.readdirSync(migrationsDir);
+            const files = resolveMigrations(allFiles, { allowDuplicates: true, allowOutOfBand: true, strictExtensions: false });
 
             let appliedCount = 0;
 
@@ -85,4 +176,11 @@ async function runMigrations() {
     }
 }
 
-runMigrations();
+if (require.main === module) {
+    runMigrations();
+}
+
+module.exports = {
+    runMigrations,
+    resolveMigrations,
+};

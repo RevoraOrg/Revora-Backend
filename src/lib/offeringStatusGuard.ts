@@ -1,62 +1,95 @@
-// src/lib/offeringStatusGuard.ts
+import { AppError, Errors } from './errors';
 
 export type OfferingStatus =
-  | "draft"
-  | "pending_review"
-  | "approved"
-  | "rejected"
-  | "published"
-  | "archived";
+  | 'draft'
+  | 'active'
+  | 'open'
+  | 'paused'
+  | 'closed'
+  | 'completed'
+  | 'cancelled';
 
-/**
- * @notice Allowed status transitions map
- * @dev Acts as single source of truth for all transitions
- */
-export const ALLOWED_TRANSITIONS: Record<
-  OfferingStatus,
-  OfferingStatus[]
-> = {
-  draft: ["pending_review"],
-  pending_review: ["approved", "rejected"],
-  approved: ["published"],
-  rejected: ["draft"],
-  published: ["archived"],
-  archived: [],
+export const OFFERING_STATUS_ALIASES: Record<string, OfferingStatus> = {
+  draft: 'draft',
+  active: 'active',
+  open: 'open',
+  paused: 'paused',
+  closed: 'closed',
+  completed: 'completed',
+  cancelled: 'cancelled',
+  published: 'open',
+  archived: 'completed',
 };
 
 /**
- * @notice Checks if a transition is valid
+ * Allowed lifecycle transitions for catalog/offering reconciliation.
+ * `active` and `open` are both preserved because both appear in the current codebase.
  */
-export function canTransition(
-  from: OfferingStatus,
-  to: OfferingStatus
-): boolean {
-  return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false;
+export const ALLOWED_TRANSITIONS: Record<OfferingStatus, readonly OfferingStatus[]> = {
+  draft: ['active', 'open', 'cancelled'],
+  active: ['open', 'paused', 'closed', 'completed', 'cancelled'],
+  open: ['paused', 'closed', 'completed', 'cancelled'],
+  paused: ['open', 'closed', 'cancelled'],
+  closed: ['completed'],
+  completed: [],
+  cancelled: [],
+};
+
+export function normalizeOfferingStatus(status: unknown): OfferingStatus | null {
+  if (typeof status !== 'string') {
+    return null;
+  }
+
+  const normalized = OFFERING_STATUS_ALIASES[status.trim().toLowerCase()];
+  return normalized ?? null;
 }
 
-/**
- * @notice Enforces transition validity
- * @throws Error if invalid
- */
-export function enforceTransition(
-  from: OfferingStatus,
-  to: OfferingStatus
-) {
-  if (!from || !to) {
-    throw new Error("Invalid status input");
+export function isKnownOfferingStatus(status: unknown): status is OfferingStatus {
+  return normalizeOfferingStatus(status) !== null;
+}
+
+export function canTransition(from: OfferingStatus, to: OfferingStatus): boolean {
+  if (from === to) {
+    return true;
   }
 
-  if (!ALLOWED_TRANSITIONS[from]) {
-    throw new Error("Unknown current status");
+  return ALLOWED_TRANSITIONS[from].includes(to);
+}
+
+export function buildInvalidStatusInputError(): AppError {
+  return Errors.badRequest('Offering status is invalid');
+}
+
+export function buildUnknownStatusError(role: 'current' | 'target', status: unknown): AppError {
+  return Errors.badRequest(`Offering ${role} status is invalid`, {
+    status: typeof status === 'string' ? status : null,
+  });
+}
+
+export function buildInvalidTransitionError(from: OfferingStatus, to: OfferingStatus): AppError {
+  return Errors.conflict('Offering status transition is not allowed', {
+    from,
+    to,
+  });
+}
+
+export function enforceTransition(from: unknown, to: unknown): void {
+  const normalizedFrom = normalizeOfferingStatus(from);
+  const normalizedTo = normalizeOfferingStatus(to);
+
+  if (!normalizedFrom && !normalizedTo) {
+    throw buildInvalidStatusInputError();
   }
 
-  if (!ALLOWED_TRANSITIONS[to] && to !== undefined) {
-    throw new Error("Unknown target status");
+  if (!normalizedFrom) {
+    throw buildUnknownStatusError('current', from);
   }
 
-  if (!canTransition(from, to)) {
-    throw new Error(
-      `Invalid transition from ${from} to ${to}`
-    );
+  if (!normalizedTo) {
+    throw buildUnknownStatusError('target', to);
+  }
+
+  if (!canTransition(normalizedFrom, normalizedTo)) {
+    throw buildInvalidTransitionError(normalizedFrom, normalizedTo);
   }
 }

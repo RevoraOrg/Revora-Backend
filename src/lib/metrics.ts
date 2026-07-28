@@ -141,6 +141,10 @@ export interface MetricsConfig {
   maxPoints: number;
   /** Histogram bucket boundaries (in milliseconds for duration) */
   histogramBuckets: number[];
+  /** Maximum number of unique metric combinations (cardinality limit) */
+  maxCardinality: number;
+  /** Enable PII detection and filtering in labels */
+  enablePIIDetection: boolean;
 }
 
 /**
@@ -171,12 +175,15 @@ export class MetricsCollector {
   private metricMetadata: Map<string, { type: MetricType; help?: string }> = new Map();
   private activeConnections = 0;
   private startTime: number;
+  private cardinalityCount = 0;
 
   constructor(config: Partial<MetricsConfig> = {}) {
     this.config = {
       enabled: config.enabled ?? true,
       maxPoints: config.maxPoints ?? 10000,
       histogramBuckets: config.histogramBuckets ?? DEFAULT_HISTOGRAM_BUCKETS,
+      maxCardinality: config.maxCardinality ?? 1000,
+      enablePIIDetection: config.enablePIIDetection ?? true,
     };
     this.startTime = Date.now();
   }
@@ -191,20 +198,60 @@ export class MetricsCollector {
   }
 
   /**
-   * Sanitize label values to prevent injection
+   * Sanitize label values to prevent injection and PII exposure
    * @param labels Raw labels
    * @returns Sanitized labels
    */
   private sanitizeLabels(labels?: Record<string, string>): Record<string, string> {
     if (!labels) return {};
     const sanitized: Record<string, string> = {};
+    
     for (const [key, value] of Object.entries(labels)) {
       const sanitizedKey = key.replace(/[^a-zA-Z0-9_]/g, '_');
-      // Remove any potential control characters or quotes
-      const sanitizedValue = String(value).replace(/[\x00-\x1F\x7F"\\]/g, '');
+      let sanitizedValue = String(value).replace(/[\x00-\x1F\x7F"\\]/g, '');
+      
+      // PII detection and filtering
+      if (this.config.enablePIIDetection) {
+        sanitizedValue = this.filterPII(sanitizedValue);
+      }
+      
       sanitized[sanitizedKey] = sanitizedValue;
     }
     return sanitized;
+  }
+
+  /**
+   * Filter potential personally identifiable information from metric labels
+   * @param value Label value to filter
+   * @returns Filtered value or placeholder
+   */
+  private filterPII(value: string): string {
+    // Long numeric strings that might be IDs (check first, most specific)
+    if (/^\d{10,}$/.test(value)) {
+      return '[REDACTED_NUMERIC_ID]';
+    }
+    
+    // Email pattern
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      return '[REDACTED_EMAIL]';
+    }
+    
+    // Phone number patterns (basic detection)
+    if (/^\+?[\d\s\-\(\)]{10,}$/.test(value.replace(/\s/g, ''))) {
+      return '[REDACTED_PHONE]';
+    }
+    
+    // IP address patterns
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) || /^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/.test(value)) {
+      return '[REDACTED_IP]';
+    }
+    
+    // UUID patterns (may contain user/session identifiers)
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+      return '[REDACTED_ID]';
+    }
+    
+    return value;
   }
 
   /**
@@ -227,6 +274,22 @@ export class MetricsCollector {
   }
 
   /**
+   * Check and enforce cardinality limits
+   * @param key Metric key to add
+   * @returns true if key can be added, false if cardinality limit exceeded
+   */
+  private checkCardinality(key: string): boolean {
+    // If this is a new key and we're at the limit, don't add it
+    if (!this.counters.has(key) && !this.gauges.has(key) && !this.histograms.has(key)) {
+      if (this.cardinalityCount >= this.config.maxCardinality) {
+        return false;
+      }
+      this.cardinalityCount++;
+    }
+    return true;
+  }
+
+  /**
    * Increment a counter metric
    * @param name Counter name
    * @param labels Optional dimensional labels
@@ -237,6 +300,11 @@ export class MetricsCollector {
     if (!this.config.enabled) return;
     
     const key = this.getMetricKey(name, labels);
+    if (!this.checkCardinality(key)) {
+      // Cardinality limit exceeded, silently drop
+      return;
+    }
+    
     const current = this.counters.get(key) ?? 0;
     this.counters.set(key, current + value);
     
@@ -256,6 +324,11 @@ export class MetricsCollector {
     if (!this.config.enabled) return;
     
     const key = this.getMetricKey(name, labels);
+    if (!this.checkCardinality(key)) {
+      // Cardinality limit exceeded, silently drop
+      return;
+    }
+    
     this.gauges.set(key, value);
     
     if (!this.metricMetadata.has(name)) {
@@ -274,6 +347,11 @@ export class MetricsCollector {
     if (!this.config.enabled) return;
     
     const key = this.getMetricKey(name, labels);
+    if (!this.checkCardinality(key)) {
+      // Cardinality limit exceeded, silently drop
+      return;
+    }
+    
     const observations = this.histograms.get(key) ?? [];
     observations.push(value);
     
@@ -462,6 +540,23 @@ export class MetricsCollector {
       });
     }
 
+    // Export histograms (as summary points for JSON)
+    for (const [key, observations] of this.histograms.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      const metadata = this.metricMetadata.get(name);
+      const data = this.calculateHistogram(observations);
+      
+      // We export the sum as the primary value for the MetricPoint
+      points.push({
+        name,
+        type: MetricType.HISTOGRAM,
+        value: data.sum,
+        timestamp,
+        labels,
+        help: metadata?.help,
+      });
+    }
+
     return points;
   }
 
@@ -505,6 +600,7 @@ export class MetricsCollector {
     this.histograms.clear();
     this.metricMetadata.clear();
     this.activeConnections = 0;
+    this.cardinalityCount = 0;
   }
 
   /**

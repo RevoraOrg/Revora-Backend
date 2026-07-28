@@ -17,53 +17,92 @@
  * - Empty/null passwords: rejected.
  */
 
+export enum PasswordStrengthErrorCode {
+  PASSWORD_REQUIRED = 'PASSWORD_REQUIRED',
+  PASSWORD_TOO_SHORT = 'PASSWORD_TOO_SHORT',
+  PASSWORD_TOO_LONG = 'PASSWORD_TOO_LONG',
+  PASSWORD_MISSING_UPPERCASE = 'PASSWORD_MISSING_UPPERCASE',
+  PASSWORD_MISSING_LOWERCASE = 'PASSWORD_MISSING_LOWERCASE',
+  PASSWORD_MISSING_NUMBER = 'PASSWORD_MISSING_NUMBER',
+  PASSWORD_MISSING_SPECIAL = 'PASSWORD_MISSING_SPECIAL',
+  PASSWORD_TOO_COMMON = 'PASSWORD_TOO_COMMON',
+  PASSWORD_EXCESSIVE_REPEATED = 'PASSWORD_EXCESSIVE_REPEATED',
+  PASSWORD_SEQUENTIAL_CHARACTERS = 'PASSWORD_SEQUENTIAL_CHARACTERS',
+}
+
+export interface PasswordStrengthError {
+  code: PasswordStrengthErrorCode;
+  message: string;
+}
+
 export interface PasswordStrengthResult {
   isValid: boolean;
-  errors: string[];
+  errors: PasswordStrengthError[];
 }
 
 /**
  * Validates password strength against security policies.
  *
  * @param password - Plain text password to validate
- * @returns Validation result with boolean and error messages
+ * @returns Validation result with boolean and structured error codes
  */
 export function validatePasswordStrength(password: string): PasswordStrengthResult {
-  const errors: string[] = [];
+  const errors: PasswordStrengthError[] = [];
 
   if (!password || typeof password !== 'string') {
-    errors.push('Password is required');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_REQUIRED,
+      message: 'Password is required'
+    });
     return { isValid: false, errors };
   }
 
   // Minimum length: 12 characters (NIST recommends 8+, but 12 for better security)
   if (password.length < 12) {
-    errors.push('Password must be at least 12 characters long');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_TOO_SHORT,
+      message: 'Password must be at least 12 characters long'
+    });
   }
 
   // Maximum length: prevent DoS via extremely long passwords
   if (password.length > 128) {
-    errors.push('Password must be no more than 128 characters long');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_TOO_LONG,
+      message: 'Password must be no more than 128 characters long'
+    });
   }
 
   // Require at least one uppercase letter
   if (!/[A-Z]/.test(password)) {
-    errors.push('Password must contain at least one uppercase letter');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_MISSING_UPPERCASE,
+      message: 'Password must contain at least one uppercase letter'
+    });
   }
 
   // Require at least one lowercase letter
   if (!/[a-z]/.test(password)) {
-    errors.push('Password must contain at least one lowercase letter');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_MISSING_LOWERCASE,
+      message: 'Password must contain at least one lowercase letter'
+    });
   }
 
   // Require at least one digit
   if (!/\d/.test(password)) {
-    errors.push('Password must contain at least one number');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_MISSING_NUMBER,
+      message: 'Password must contain at least one number'
+    });
   }
 
   // Require at least one special character
   if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
-    errors.push('Password must contain at least one special character');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_MISSING_SPECIAL,
+      message: 'Password must contain at least one special character'
+    });
   }
 
   // Check against common passwords (basic list; in production, use a larger dataset)
@@ -75,21 +114,30 @@ export function validatePasswordStrength(password: string): PasswordStrengthResu
   ];
 
   if (commonPasswords.includes(password.toLowerCase())) {
-    errors.push('Password is too common; please choose a stronger password');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_TOO_COMMON,
+      message: 'Password is too common; please choose a stronger password'
+    });
   }
 
   // Check for repeated characters (e.g., 'aaaaa')
   if (/(.)\1{4,}/.test(password)) {
-    errors.push('Password must not contain excessive repeated characters');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_EXCESSIVE_REPEATED,
+      message: 'Password must not contain excessive repeated characters'
+    });
   }
 
   // Check for sequential characters (e.g., 'abcde' or '12345')
   if (/(.)\1{4,}|(?:012|123|234|345|456|567|678|789|890|abc|bcd|cde|def|efg|fgh|ghi|hij|ijk|jkl|klm|lmn|mno|nop|opq|pqr|qrs|rst|stu|tuv|uvw|vwx|wxy|xyz)/i.test(password)) {
-    errors.push('Password must not contain sequential characters');
+    errors.push({
+      code: PasswordStrengthErrorCode.PASSWORD_SEQUENTIAL_CHARACTERS,
+      message: 'Password must not contain sequential characters'
+    });
   }
 
   return {
     isValid: errors.length === 0,
     errors
   };
-}
+}

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { validatePasswordStrength } from '../../lib/passwordStrength';
+import { Errors } from '../../lib/errors';
+import { globalLogger } from '../../lib/logger';
 import { IUserRepository, RegisteredUser } from './types';
 
 /**
@@ -50,7 +52,13 @@ export class RegisterService {
     // Validate password strength
     const strength = validatePasswordStrength(password);
     if (!strength.isValid) {
-      throw new Error(`Password does not meet strength requirements: ${strength.errors.join(', ')}`);
+      globalLogger.warn('Registration failed: weak password', {
+        email,
+        errorCodes: strength.errors.map((e) => e.code),
+      });
+      throw Errors.validationError('Password does not meet strength requirements', {
+        errors: strength.errors,
+      });
     }
 
     const existing = await this.userRepository.findByEmail(email);

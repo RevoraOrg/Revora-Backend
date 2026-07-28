@@ -1,13 +1,15 @@
-import { NextFunction, Response } from 'express';
-import { createNotificationPreferencesRouter } from './notificationPreferences';
+import { NextFunction, Response } from "express";
 import {
-  NotificationPreferencesRepository,
   NotificationPreferences,
+  NotificationPreferencesRepository,
   UpdateNotificationPreferencesInput,
-} from '../db/repositories/notificationPreferencesRepository';
+} from "../db/repositories/notificationPreferencesRepository";
+import { createNotificationPreferencesRouter } from "./notificationPreferences";
 
 class InMemoryNotificationPreferencesRepository {
-  constructor(private preferences = new Map<string, NotificationPreferences>()) {}
+  constructor(
+    private preferences = new Map<string, NotificationPreferences>(),
+  ) {}
 
   async getByUserId(userId: string): Promise<NotificationPreferences | null> {
     return this.preferences.get(userId) ?? null;
@@ -41,10 +43,20 @@ function makeRes() {
   let statusCode = 200;
   let jsonData: unknown = null;
   return {
-    status(code: number) { statusCode = code; return this; },
-    json(obj: unknown) { jsonData = obj; return this; },
-    _get() { return { statusCode, jsonData }; }
-  } as unknown as Response & { _get(): { statusCode: number; jsonData: unknown } };
+    status(code: number) {
+      statusCode = code;
+      return this;
+    },
+    json(obj: unknown) {
+      jsonData = obj;
+      return this;
+    },
+    _get() {
+      return { statusCode, jsonData };
+    },
+  } as unknown as Response & {
+    _get(): { statusCode: number; jsonData: unknown };
+  };
 }
 
 const createAuthMiddleware =
@@ -56,7 +68,7 @@ const createAuthMiddleware =
     next();
   };
 
-function findRouteHandler(router: any, path: string, method: 'get' | 'patch') {
+function findRouteHandler(router: any, path: string, method: "get" | "patch") {
   const layer = router.stack.find(
     (l: any) => l.route?.path === path && l.route?.methods?.[method],
   );
@@ -68,23 +80,23 @@ function findRouteHandler(router: any, path: string, method: 'get' | 'patch') {
   return routeStack[1]?.handle as (req: any, res: any) => Promise<void>;
 }
 
-describe('notification preferences routes', () => {
-  it('GET /api/users/me/notification-preferences returns defaults when none exist', async () => {
+describe("notification preferences routes", () => {
+  it("GET /api/users/me/notification-preferences returns defaults when none exist", async () => {
     const repo = new InMemoryNotificationPreferencesRepository();
-    const requireAuth = createAuthMiddleware('user-123');
+    const requireAuth = createAuthMiddleware("user-123");
     const router = createNotificationPreferencesRouter({
       requireAuth,
       notificationPreferencesRepository:
         repo as unknown as NotificationPreferencesRepository,
     });
 
-    const req = { user: { id: 'user-123' } } as any;
+    const req = { user: { id: "user-123" } } as any;
     const res = makeRes() as any;
 
     const handler = findRouteHandler(
       router,
-      '/api/users/me/notification-preferences',
-      'get',
+      "/api/users/me/notification-preferences",
+      "get",
     );
     await handler(req, res);
 
@@ -96,28 +108,28 @@ describe('notification preferences routes', () => {
     });
   });
 
-  it('GET /api/users/me/notification-preferences returns existing preferences', async () => {
+  it("GET /api/users/me/notification-preferences returns existing preferences", async () => {
     const repo = new InMemoryNotificationPreferencesRepository();
-    await repo.upsert('user-123', {
+    await repo.upsert("user-123", {
       email_notifications: false,
       push_notifications: true,
       sms_notifications: true,
     });
 
-    const requireAuth = createAuthMiddleware('user-123');
+    const requireAuth = createAuthMiddleware("user-123");
     const router = createNotificationPreferencesRouter({
       requireAuth,
       notificationPreferencesRepository:
         repo as unknown as NotificationPreferencesRepository,
     });
 
-    const req = { user: { id: 'user-123' } } as any;
+    const req = { user: { id: "user-123" } } as any;
     const res = makeRes() as any;
 
     const handler = findRouteHandler(
       router,
-      '/api/users/me/notification-preferences',
-      'get',
+      "/api/users/me/notification-preferences",
+      "get",
     );
     await handler(req, res);
 
@@ -127,9 +139,9 @@ describe('notification preferences routes', () => {
     expect((res._get().jsonData as any).sms_notifications).toBe(true);
   });
 
-  it('PATCH /api/users/me/notification-preferences updates preferences', async () => {
+  it("PATCH /api/users/me/notification-preferences updates preferences", async () => {
     const repo = new InMemoryNotificationPreferencesRepository();
-    const requireAuth = createAuthMiddleware('user-123');
+    const requireAuth = createAuthMiddleware("user-123");
     const router = createNotificationPreferencesRouter({
       requireAuth,
       notificationPreferencesRepository:
@@ -137,15 +149,15 @@ describe('notification preferences routes', () => {
     });
 
     const req = {
-      user: { id: 'user-123' },
+      user: { id: "user-123" },
       body: { email_notifications: false, push_notifications: false },
     } as any;
     const res = makeRes() as any;
 
     const handler = findRouteHandler(
       router,
-      '/api/users/me/notification-preferences',
-      'patch',
+      "/api/users/me/notification-preferences",
+      "patch",
     );
     await handler(req, res);
 
@@ -154,7 +166,7 @@ describe('notification preferences routes', () => {
     expect((res._get().jsonData as any).push_notifications).toBe(false);
   });
 
-  it('GET /api/users/me/notification-preferences returns 401 when not authenticated', async () => {
+  it("GET /api/users/me/notification-preferences returns 401 when not authenticated", async () => {
     const repo = new InMemoryNotificationPreferencesRepository();
     const requireAuth = createAuthMiddleware();
     const router = createNotificationPreferencesRouter({
@@ -168,16 +180,19 @@ describe('notification preferences routes', () => {
 
     const handler = findRouteHandler(
       router,
-      '/api/users/me/notification-preferences',
-      'get',
+      "/api/users/me/notification-preferences",
+      "get",
     );
-    await handler(req, res);
+    let capturedError: any;
+    await handler(req, res, (e: any) => {
+      capturedError = e;
+    });
 
-    expect(res._get().statusCode).toBe(401);
-    expect(res._get().jsonData).toEqual({ error: 'Unauthorized' });
+    expect(capturedError).toBeDefined();
+    expect(capturedError.httpCode).toBe(401);
   });
 
-  it('PATCH /api/users/me/notification-preferences returns 401 when not authenticated', async () => {
+  it("PATCH /api/users/me/notification-preferences returns 401 when not authenticated", async () => {
     const repo = new InMemoryNotificationPreferencesRepository();
     const requireAuth = createAuthMiddleware();
     const router = createNotificationPreferencesRouter({
@@ -191,12 +206,73 @@ describe('notification preferences routes', () => {
 
     const handler = findRouteHandler(
       router,
-      '/api/users/me/notification-preferences',
-      'patch',
+      "/api/users/me/notification-preferences",
+      "patch",
     );
-    await handler(req, res);
+    let capturedError: any;
+    await handler(req, res, (e: any) => {
+      capturedError = e;
+    });
 
-    expect(res._get().statusCode).toBe(401);
-    expect(res._get().jsonData).toEqual({ error: 'Unauthorized' });
+    expect(capturedError).toBeDefined();
+    expect(capturedError.httpCode).toBe(401);
+  });
+
+  it("PATCH /api/users/me/notification-preferences returns 400 for invalid input", async () => {
+    const repo = new InMemoryNotificationPreferencesRepository();
+    const requireAuth = createAuthMiddleware("user-123");
+    const router = createNotificationPreferencesRouter({
+      requireAuth,
+      notificationPreferencesRepository:
+        repo as unknown as NotificationPreferencesRepository,
+    });
+
+    const req = {
+      user: { id: "user-123" },
+      body: { invalid_field: true },
+    } as any;
+    const res = makeRes() as any;
+
+    const handler = findRouteHandler(
+      router,
+      "/api/users/me/notification-preferences",
+      "patch",
+    );
+    let capturedError: any;
+    await handler(req, res, (e: any) => {
+      capturedError = e;
+    });
+
+    expect(capturedError).toBeDefined();
+    expect(capturedError.httpCode).toBe(400);
+  });
+
+  it("PATCH /api/users/me/notification-preferences returns 400 for non-boolean values", async () => {
+    const repo = new InMemoryNotificationPreferencesRepository();
+    const requireAuth = createAuthMiddleware("user-123");
+    const router = createNotificationPreferencesRouter({
+      requireAuth,
+      notificationPreferencesRepository:
+        repo as unknown as NotificationPreferencesRepository,
+    });
+
+    const req = {
+      user: { id: "user-123" },
+      body: { email_notifications: "true" },
+    } as any;
+    const res = makeRes() as any;
+
+    const handler = findRouteHandler(
+      router,
+      "/api/users/me/notification-preferences",
+      "patch",
+    );
+    let capturedError: any;
+    await handler(req, res, (e: any) => {
+      capturedError = e;
+    });
+
+    expect(capturedError).toBeDefined();
+    expect(capturedError.httpCode).toBe(400);
   });
 });

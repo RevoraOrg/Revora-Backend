@@ -1,8 +1,10 @@
 import { Router, RequestHandler } from 'express';
 import { Pool } from 'pg';
 import { UserRepository } from '../../db/repositories/userRepository';
+import { SessionRepository } from '../../db/repositories/sessionRepository';
 import { ChangePasswordService, ChangePasswordUserRepo } from './changePasswordService';
 import { createChangePasswordHandler } from './changePasswordHandler';
+import { Logger } from '../../lib/logger';
 
 // ── Adapter ──────────────────────────────────────────��────────────────────────
 // Bridges the port interface to the concrete UserRepository without modifying it.
@@ -27,8 +29,10 @@ export function createChangePasswordRouter(opts: {
   const router = Router();
 
   const userRepo = new UserRepository(opts.db);
+  const sessionRepo = new SessionRepository(opts.db);
+  const logger = new Logger({ serviceName: 'change-password' });
   const repoAdapter = new UserRepoAdapter(userRepo);
-  const service = new ChangePasswordService(repoAdapter);
+  const service = new ChangePasswordService(repoAdapter, sessionRepo, opts.db, logger);
   const handler = createChangePasswordHandler(service) as RequestHandler;
 
   /**

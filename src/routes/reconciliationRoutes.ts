@@ -9,6 +9,9 @@ import { Router, Request, Response, NextFunction, RequestHandler } from 'express
 import { Pool } from 'pg';
 import { RevenueReconciliationService } from '../services/revenueReconciliationService';
 import { AppError, Errors } from '../lib/errors';
+import { AuditLogRepository } from '../db/repositories/auditLogRepository';
+import { Logger, LogLevel } from '../lib/logger';
+import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 
 export interface ReconciliationRequest extends Request {
   user?: {
@@ -16,6 +19,7 @@ export interface ReconciliationRequest extends Request {
     role: string;
     sessionToken: string;
   };
+  requestId?: string;
 }
 
 export interface OfferingRepository {
@@ -25,7 +29,9 @@ export interface OfferingRepository {
 
 export function createReconciliationHandlers(
   reconciliationService: RevenueReconciliationService,
-  offeringRepo?: OfferingRepository
+  offeringRepo?: OfferingRepository,
+  auditLogRepo?: AuditLogRepository,
+  logger?: Logger
 ) {
   /**
    * POST /api/reconciliation/reconcile
@@ -36,6 +42,9 @@ export function createReconciliationHandlers(
     res: Response,
     next: NextFunction
   ): Promise<void> => {
+    const startTime = Date.now();
+    const requestId = req.requestId || 'unknown';
+    
     try {
       const user = req.user;
       if (!user?.id) {
@@ -63,6 +72,7 @@ export function createReconciliationHandlers(
         throw Errors.validationError('periodEnd must be after periodStart');
       }
 
+      // Authorization check
       if (user.role !== 'admin' && offeringRepo) {
         const offering = await (offeringRepo.findById ?? offeringRepo.getById)(offeringId);
         if (!offering) {
@@ -74,6 +84,19 @@ export function createReconciliationHandlers(
         }
       }
 
+      logger?.info(
+        'Starting reconciliation process',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          periodStart,
+          periodEnd,
+          options,
+        },
+        LogLevel.INFO
+      );
+
       const result = await reconciliationService.reconcile(
         offeringId,
         startDate,
@@ -81,11 +104,86 @@ export function createReconciliationHandlers(
         options || {}
       );
 
+      // Create audit log entry
+      if (auditLogRepo) {
+        try {
+          await auditLogRepo.createAuditLog({
+            user_id: user.id,
+            action: 'RECONCILIATION_PERFORMED',
+            resource: `offering:${offeringId}`,
+            details: JSON.stringify({
+              periodStart,
+              periodEnd,
+              discrepanciesFound: result.discrepancies.length,
+              isBalanced: result.isBalanced,
+              totalRevenue: result.summary.totalRevenueReported,
+              totalPayouts: result.summary.totalPayouts,
+            }),
+            ip_address: req.ip,
+            user_agent: req.get('User-Agent'),
+          });
+        } catch (auditError) {
+          logger?.error(
+            'Failed to create audit log',
+            {
+              requestId,
+              userId: user.id,
+              offeringId,
+              error: auditError instanceof Error ? auditError.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      logger?.info(
+        'Reconciliation completed successfully',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          duration,
+          isBalanced: result.isBalanced,
+          discrepanciesCount: result.discrepancies.length,
+        },
+        LogLevel.INFO
+      );
+
       res.status(200).json({
         success: true,
         data: result,
       });
     } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      // Log Stellar RPC failures if applicable
+      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+        logger?.warn(
+          'Stellar RPC failure in reconciliation',
+          {
+            requestId,
+            userId: req.user?.id,
+            offeringId: req.body?.offeringId,
+            failureClass: classifyStellarRPCFailure(error),
+            duration,
+          },
+          LogLevel.WARN
+        );
+      }
+
+      logger?.error(
+        'Reconciliation failed',
+        {
+          requestId,
+          userId: req.user?.id,
+          offeringId: req.body?.offeringId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          duration,
+        },
+        LogLevel.ERROR
+      );
+      
       next(error);
     }
   };
@@ -99,6 +197,9 @@ export function createReconciliationHandlers(
     res: Response,
     next: NextFunction
   ): Promise<void> => {
+    const startTime = Date.now();
+    const requestId = req.requestId || 'unknown';
+    
     try {
       const user = req.user;
       if (!user?.id) {
@@ -123,6 +224,7 @@ export function createReconciliationHandlers(
         throw Errors.validationError('Invalid date format');
       }
 
+      // Authorization check
       if (user.role !== 'admin' && offeringRepo) {
         const offering = await (offeringRepo.findById ?? offeringRepo.getById)(offeringId);
         if (!offering) {
@@ -134,10 +236,66 @@ export function createReconciliationHandlers(
         }
       }
 
+      logger?.info(
+        'Starting quick balance check',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          periodStart: startDate,
+          periodEnd: endDate,
+        },
+        LogLevel.INFO
+      );
+
       const result = await reconciliationService.quickBalanceCheck(
         offeringId,
         startDate,
         endDate
+      );
+
+      // Create audit log entry
+      if (auditLogRepo) {
+        try {
+          await auditLogRepo.createAuditLog({
+            user_id: user.id,
+            action: 'BALANCE_CHECK_PERFORMED',
+            resource: `offering:${offeringId}`,
+            details: JSON.stringify({
+              periodStart: startDate,
+              periodEnd: endDate,
+              isBalanced: result.isBalanced,
+              difference: result.difference,
+            }),
+            ip_address: req.ip,
+            user_agent: req.get('User-Agent'),
+          });
+        } catch (auditError) {
+          logger?.error(
+            'Failed to create audit log for balance check',
+            {
+              requestId,
+              userId: user.id,
+              offeringId,
+              error: auditError instanceof Error ? auditError.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      logger?.info(
+        'Balance check completed successfully',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          duration,
+          isBalanced: result.isBalanced,
+          difference: result.difference,
+        },
+        LogLevel.INFO
       );
 
       res.status(200).json({
@@ -145,6 +303,35 @@ export function createReconciliationHandlers(
         data: result,
       });
     } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      // Log Stellar RPC failures if applicable
+      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+        logger?.warn(
+          'Stellar RPC failure in balance check',
+          {
+            requestId,
+            userId: req.user?.id,
+            offeringId: req.params?.offeringId,
+            failureClass: classifyStellarRPCFailure(error),
+            duration,
+          },
+          LogLevel.WARN
+        );
+      }
+
+      logger?.error(
+        'Balance check failed',
+        {
+          requestId,
+          userId: req.user?.id,
+          offeringId: req.params?.offeringId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          duration,
+        },
+        LogLevel.ERROR
+      );
+      
       next(error);
     }
   };
@@ -158,6 +345,9 @@ export function createReconciliationHandlers(
     res: Response,
     next: NextFunction
   ): Promise<void> => {
+    const startTime = Date.now();
+    const requestId = req.requestId || 'unknown';
+    
     try {
       const user = req.user;
       if (!user?.id) {
@@ -174,13 +364,95 @@ export function createReconciliationHandlers(
         throw Errors.forbidden('Admin role required to verify distribution runs');
       }
 
+      logger?.info(
+        'Starting distribution verification',
+        {
+          requestId,
+          userId: user.id,
+          runId,
+        },
+        LogLevel.INFO
+      );
+
       const result = await reconciliationService.verifyDistributionRun(runId);
+
+      // Create audit log entry
+      if (auditLogRepo) {
+        try {
+          await auditLogRepo.createAuditLog({
+            user_id: user.id,
+            action: 'DISTRIBUTION_VERIFIED',
+            resource: `distribution_run:${runId}`,
+            details: JSON.stringify({
+              runId,
+              isValid: result.isValid,
+              errorsFound: result.errors.length,
+            }),
+            ip_address: req.ip,
+            user_agent: req.get('User-Agent'),
+          });
+        } catch (auditError) {
+          logger?.error(
+            'Failed to create audit log for distribution verification',
+            {
+              requestId,
+              userId: user.id,
+              runId,
+              error: auditError instanceof Error ? auditError.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      logger?.info(
+        'Distribution verification completed',
+        {
+          requestId,
+          userId: user.id,
+          runId,
+          duration,
+          isValid: result.isValid,
+          errorsCount: result.errors.length,
+        },
+        LogLevel.INFO
+      );
 
       res.status(200).json({
         success: true,
         data: result,
       });
     } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      // Log Stellar RPC failures if applicable
+      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+        logger?.warn(
+          'Stellar RPC failure in distribution verification',
+          {
+            requestId,
+            userId: req.user?.id,
+            runId: req.params?.runId,
+            failureClass: classifyStellarRPCFailure(error),
+            duration,
+          },
+          LogLevel.WARN
+        );
+      }
+
+      logger?.error(
+        'Distribution verification failed',
+        {
+          requestId,
+          userId: req.user?.id,
+          runId: req.params?.runId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          duration,
+        },
+        LogLevel.ERROR
+      );
+      
       next(error);
     }
   };
@@ -194,6 +466,9 @@ export function createReconciliationHandlers(
     res: Response,
     next: NextFunction
   ): Promise<void> => {
+    const startTime = Date.now();
+    const requestId = req.requestId || 'unknown';
+    
     try {
       const user = req.user;
       if (!user?.id) {
@@ -226,6 +501,7 @@ export function createReconciliationHandlers(
         throw Errors.validationError('Invalid date format');
       }
 
+      // Authorization check
       if (user.role !== 'admin' && offeringRepo) {
         const offering = await (offeringRepo.findById ?? offeringRepo.getById)(offeringId);
         if (!offering) {
@@ -237,6 +513,19 @@ export function createReconciliationHandlers(
         }
       }
 
+      logger?.info(
+        'Starting revenue report validation',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          amount,
+          periodStart: startDate,
+          periodEnd: endDate,
+        },
+        LogLevel.INFO
+      );
+
       const result = await reconciliationService.validateRevenueReport(
         offeringId,
         amount,
@@ -244,11 +533,86 @@ export function createReconciliationHandlers(
         endDate
       );
 
+      // Create audit log entry
+      if (auditLogRepo) {
+        try {
+          await auditLogRepo.createAuditLog({
+            user_id: user.id,
+            action: 'REVENUE_REPORT_VALIDATED',
+            resource: `offering:${offeringId}`,
+            details: JSON.stringify({
+              offeringId,
+              amount,
+              periodStart: startDate,
+              periodEnd: endDate,
+              isValid: result.isValid,
+              errorsFound: result.errors.length,
+            }),
+            ip_address: req.ip,
+            user_agent: req.get('User-Agent'),
+          });
+        } catch (auditError) {
+          logger?.error(
+            'Failed to create audit log for revenue report validation',
+            {
+              requestId,
+              userId: user.id,
+              offeringId,
+              error: auditError instanceof Error ? auditError.message : 'Unknown error',
+            },
+            LogLevel.ERROR
+          );
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      logger?.info(
+        'Revenue report validation completed',
+        {
+          requestId,
+          userId: user.id,
+          offeringId,
+          duration,
+          isValid: result.isValid,
+          errorsCount: result.errors.length,
+        },
+        LogLevel.INFO
+      );
+
       res.status(200).json({
         success: true,
         data: result,
       });
     } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      // Log Stellar RPC failures if applicable
+      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+        logger?.warn(
+          'Stellar RPC failure in revenue report validation',
+          {
+            requestId,
+            userId: req.user?.id,
+            offeringId: req.body?.offeringId,
+            failureClass: classifyStellarRPCFailure(error),
+            duration,
+          },
+          LogLevel.WARN
+        );
+      }
+
+      logger?.error(
+        'Revenue report validation failed',
+        {
+          requestId,
+          userId: req.user?.id,
+          offeringId: req.body?.offeringId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          duration,
+        },
+        LogLevel.ERROR
+      );
+      
       next(error);
     }
   };
@@ -264,6 +628,8 @@ export function createReconciliationHandlers(
 export interface CreateReconciliationRouterOptions {
   db: Pool;
   offeringRepo?: OfferingRepository;
+  auditLogRepo?: AuditLogRepository;
+  logger?: Logger;
   requireAuth: RequestHandler;
 }
 
@@ -274,7 +640,9 @@ export function createReconciliationRouter(
   const reconciliationService = new RevenueReconciliationService(options.db);
   const handlers = createReconciliationHandlers(
     reconciliationService,
-    options.offeringRepo
+    options.offeringRepo,
+    options.auditLogRepo,
+    options.logger
   );
 
   router.post('/reconcile', options.requireAuth as any, handlers.reconcile);

@@ -18,6 +18,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { MetricsCollector } from '../lib/metrics';
 import { Logger } from '../lib/logger';
+import { AppError, Errors } from '../lib/errors';
 
 /**
  * Middleware configuration
@@ -91,16 +92,30 @@ export function metricsMiddleware(config: MetricsMiddlewareConfig) {
       // Decrement active connections
       metrics.decrementActiveConnections();
 
-      // Normalize route for consistent labeling
+      // Normalize route for consistent labeling (removes IDs to prevent cardinality explosion)
       const route = detailedRoutes ? normalizeRoutePath(req.path) : req.path;
       const method = req.method;
       const status = res.statusCode.toString();
       const statusClass = `${Math.floor(res.statusCode / 100)}xx`;
 
+      // Additional PII-safe labels (avoid user IDs, emails, etc.)
+      const safeLabels: Record<string, string> = {
+        method,
+        route,
+        status,
+        status_class: statusClass,
+      };
+
+      // Add user role if available (not PII as it's a controlled enum)
+      const userRole = (req as any).user?.role;
+      if (userRole && typeof userRole === 'string') {
+        safeLabels.user_role = userRole;
+      }
+
       // Record request count
       metrics.incrementCounter(
         'http_requests_total',
-        { method, route, status, status_class: statusClass },
+        safeLabels,
         1,
         'Total HTTP requests'
       );
@@ -118,20 +133,22 @@ export function metricsMiddleware(config: MetricsMiddlewareConfig) {
         const errorType = res.statusCode >= 500 ? 'server_error' : 'client_error';
         metrics.incrementCounter(
           'errors_total',
-          { type: errorType, status },
+          { type: errorType, status, route },
           1,
           'Total errors by type'
         );
       }
 
-      // Log slow requests (> 1 second)
+      // Log slow requests (> 1 second) with structured logging
       if (logger && durationMs > 1000) {
         logger.warn('Slow request detected', {
           method,
-          path: req.path,
+          route, // Already normalized
           durationMs: Math.round(durationMs),
           status: res.statusCode,
+          statusClass,
           requestId: (req as any).requestId,
+          userAgent: req.get('User-Agent')?.substring(0, 100), // Truncate for safety
         });
       }
 
@@ -162,15 +179,13 @@ export function metricsMiddleware(config: MetricsMiddlewareConfig) {
  * @returns Express route handler
  */
 export function createMetricsHandler(metrics: MetricsCollector, pool?: any) {
-  return async (_req: Request, res: Response): Promise<void> => {
+  return async (_req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const snapshot = await metrics.getSnapshot(pool);
       res.status(200).json(snapshot);
     } catch (error) {
-      res.status(500).json({
-        error: 'Failed to collect metrics',
-        message: error instanceof Error ? error.message : String(error),
-      });
+      const appError = Errors.internal('Failed to collect metrics', error instanceof Error ? error.message : String(error));
+      next(appError);
     }
   };
 }
@@ -189,13 +204,14 @@ export function createMetricsHandler(metrics: MetricsCollector, pool?: any) {
  * @returns Express route handler
  */
 export function createPrometheusHandler(metrics: MetricsCollector) {
-  return (_req: Request, res: Response): void => {
+  return (_req: Request, res: Response, next: NextFunction): void => {
     try {
       const output = metrics.exportPrometheus();
       res.set('Content-Type', 'text/plain; version=0.0.4');
       res.status(200).send(output);
     } catch (error) {
-      res.status(500).send(`# Error exporting metrics: ${error instanceof Error ? error.message : String(error)}\n`);
+      const appError = Errors.internal('Failed to export Prometheus metrics', error instanceof Error ? error.message : String(error));
+      next(appError);
     }
   };
 }

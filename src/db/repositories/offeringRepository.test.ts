@@ -43,6 +43,30 @@ describe('OfferingRepository', () => {
     expect(result.issuer_user_id).toBe('issuer-123');
   });
 
+  it('sanitizes HTML in offering fields during creation', async () => {
+    const input: CreateOfferingInput = {
+      title: '<b>Bold Title</b>',
+      description: '<p>Desc</p><script>alert(1)</script>',
+    };
+
+    const mockResult = {
+      rows: [{ id: 'off-x', title: 'Bold Title', description: '<p>Desc</p>' }],
+      rowCount: 1,
+      command: 'INSERT',
+      oid: 0,
+      fields: [],
+    } as QueryResult<Offering>;
+
+    mockPool.query.mockResolvedValueOnce(mockResult as never);
+
+    await repository.create(input);
+
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO offerings'),
+      ['Bold Title', '<p>Desc</p>']
+    );
+  });
+
   it('returns offering by id when found', async () => {
     const mockResult = {
       rows: [{ id: 'off-2', issuer_user_id: 'issuer-999', status: 'open' }],

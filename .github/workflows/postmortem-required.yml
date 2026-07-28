@@ -1,0 +1,72 @@
+name: Postmortem Required
+
+# Enforces that any pull request labeled SEV-1 adds a matching reconciliation
+# postmortem document (docs/postmortems/pr-<number>[-<slug>].md, based on
+# docs/postmortems/_template.md) before it can be merged.
+#
+# Security notes:
+#   - Runs on pull_request_target (not pull_request) so the check also fires
+#     for PRs opened from forks and can be made a required status check.
+#   - Workflow-level `permissions` grant only `contents: read` and
+#     `pull-requests: read` -- the GITHUB_TOKEN can never write to the repo,
+#     comment, or push.
+#   - The job NEVER checks out or executes the pull request's own code. It
+#     checks out the base branch (trusted) to install dependencies and run
+#     this repo's own check-postmortem script, and reads the PR's changed
+#     files / labels only as data via the read-only GitHub API
+#     (github.rest.pulls.listFiles). This avoids the classic
+#     pull_request_target pitfall of running untrusted fork code with a
+#     privileged token.
+#   - Because merges happen at the moment the "closed" event fires, this
+#     workflow instead re-evaluates on every label change and push while the
+#     PR is open, so a repo admin can mark it as a required status check and
+#     have it actually block the merge button.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-postmortem:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: List PR changed files
+        id: files
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            return JSON.stringify(files.map((f) => f.filename));
+
+      - name: Check postmortem requirement
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          PR_CHANGED_FILES: ${{ steps.files.outputs.result }}
+        run: npx ts-node scripts/check-postmortem.ts

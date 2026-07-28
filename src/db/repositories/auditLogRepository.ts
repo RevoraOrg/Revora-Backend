@@ -12,6 +12,10 @@ export interface AuditLog {
   ip_address?: string | null;
   user_agent?: string | null;
   created_at: Date;
+  /** Hash of the previous row in the tamper-evident chain (genesis for first row). */
+  prev_hash?: string;
+  /** SHA-256 hash of canonical row payload linked to prev_hash. */
+  row_hash?: string;
 }
 
 /**
@@ -131,6 +135,38 @@ export class AuditLogRepository {
       ip_address: row.ip_address,
       user_agent: row.user_agent,
       created_at: row.created_at,
+      prev_hash: row.prev_hash,
+      row_hash: row.row_hash,
     };
+  }
+
+  /**
+   * Purge audit logs created before a specific date
+   * @param cutoffDate The cutoff date
+   * @returns Number of rows deleted
+   */
+  async purgeBefore(cutoffDate: Date): Promise<number> {
+    const query = `
+      DELETE FROM audit_logs
+      WHERE created_at < $1
+    `;
+    const result = await this.db.query(query, [cutoffDate]);
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Get audit logs for CSV export (paginated)
+   * @param limit Number of rows to return
+   * @param offset Offset to start from
+   * @returns Array of audit logs
+   */
+  async getAuditLogsForExport(limit: number, offset: number): Promise<AuditLog[]> {
+    const query = `
+      SELECT * FROM audit_logs
+      ORDER BY created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+    const result = await this.db.query(query, [limit, offset]);
+    return result.rows.map((row) => this.mapAuditLog(row));
   }
 }

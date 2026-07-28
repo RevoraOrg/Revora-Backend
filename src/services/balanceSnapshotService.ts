@@ -43,7 +43,19 @@ export interface SnapshotBalancesInput {
    */
   periodId: string;
   /**
-   * Optional timestamp for the snapshot. Defaults to `new Date()`.
+   * The inclusive end timestamp of the business period (i.e. the period boundary).
+   * When `snapshotAt` is omitted, this value is used as the canonical `snapshot_at`
+   * so that re-runs for the same (offeringId, periodId) produce identical timestamps
+   * and remain safe to replay without overwriting committed distribution data.
+   *
+   * Either `periodEnd` or an explicit `snapshotAt` must be supplied when calling
+   * in idempotent mode (`skipIfExists = true`, the default); omitting both causes
+   * the service to fall back to `new Date()`, which breaks re-run determinism.
+   */
+  periodEnd?: Date;
+  /**
+   * Explicit snapshot timestamp override.
+   * When provided it takes precedence over `periodEnd`.
    * All rows in a single run share the same `snapshot_at` value.
    */
   snapshotAt?: Date;
@@ -112,6 +124,7 @@ export class BalanceSnapshotService {
     const {
       offeringId,
       periodId,
+      periodEnd,
       snapshotAt,
       source = 'auto',
       skipIfExists = true,
@@ -130,12 +143,45 @@ export class BalanceSnapshotService {
       throw new Error(`Offering ${offeringId} not found`);
     }
 
+    /**
+     * Canonical snapshot timestamp resolution:
+     * 1. Explicit `snapshotAt` from caller takes highest precedence.
+     * 2. `periodEnd` (the period boundary) is the idempotent default — this
+     *    guarantees that two callers that both omit `snapshotAt` but supply
+     *    the same `periodEnd` will always produce the same `snapshot_at` value.
+     * 3. Fallback to `new Date()` only when neither is supplied (non-idempotent).
+     */
+    const resolvedSnapshotAt: Date = snapshotAt ?? periodEnd ?? new Date();
+
     if (skipIfExists) {
       const existing = await this.balanceSnapshotRepository.findByOfferingAndPeriod(
         offeringId,
         periodId
       );
       if (existing.length > 0) {
+        /**
+         * Mismatch guard: if the caller supplied an explicit `snapshotAt` (or
+         * a `periodEnd` that we derived one from), reject re-runs that disagree
+         * with the already-committed timestamp. Silently returning a mismatched
+         * snapshot would corrupt downstream distribution determinism.
+         *
+         * We only enforce the check when the caller supplied a concrete boundary
+         * (i.e. they opted in to idempotent mode with a known timestamp). When
+         * neither `snapshotAt` nor `periodEnd` was supplied the fallback
+         * `new Date()` is intentionally non-deterministic, so we skip the guard.
+         */
+        const callerSuppliedTimestamp = snapshotAt ?? periodEnd;
+        if (callerSuppliedTimestamp !== undefined) {
+          const committedAt = existing[0].snapshot_at;
+          if (committedAt.getTime() !== resolvedSnapshotAt.getTime()) {
+            throw new Error(
+              `snapshot_at mismatch for offering ${offeringId} period ${periodId}: ` +
+              `committed=${committedAt.toISOString()}, requested=${resolvedSnapshotAt.toISOString()}. ` +
+              `Re-running a snapshot with a different timestamp is not allowed in idempotent mode.`
+            );
+          }
+        }
+
         return {
           offeringId,
           periodId,
@@ -157,14 +203,12 @@ export class BalanceSnapshotService {
       );
     }
 
-    const normalizedSnapshotAt = snapshotAt ?? new Date();
-
     const inputs: CreateSnapshotInput[] = balances.map((b) => ({
       offering_id: offering.id,
       period_id: periodId,
       holder_address_or_id: b.holderAddressOrId,
       balance: b.balance,
-      snapshot_at: normalizedSnapshotAt,
+      snapshot_at: resolvedSnapshotAt,
     }));
 
     const snapshots = await this.balanceSnapshotRepository.insertMany(inputs);

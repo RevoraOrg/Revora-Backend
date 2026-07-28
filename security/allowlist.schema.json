@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "vulnerabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "expiry": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ticket": {
+            "type": "string"
+          },
+          "justification": {
+            "type": "string"
+          }
+        },
+        "required": ["expiry", "ticket"]
+      }
+    },
+    "outdated": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "expiry": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ticket": {
+            "type": "string"
+          },
+          "justification": {
+            "type": "string"
+          }
+        },
+        "required": ["expiry"]
+      }
+    }
+  },
+  "additionalProperties": false
+}

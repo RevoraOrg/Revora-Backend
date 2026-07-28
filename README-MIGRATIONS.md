@@ -11,10 +11,15 @@ This project uses a custom raw SQL migration script to manage database schema ch
 
 To add a new migration, create a new `.sql` file in `src/db/migrations/`. 
 
-**Naming Convention:** 
-Use a sequential prefix followed by a descriptive name: `XXX_description.sql` (e.g., `003_add_user_status.sql`). 
+**Naming Convention & Safety Rules:** 
+Use a sequential, zero-padded numeric prefix followed by a descriptive name: `XXX_description.sql` (e.g., `003_add_user_status.sql`). 
 
-All `.sql` files are sorted alphabetically when applied, so the prefix ensures they run in the correct order. The migration script uses a `schema_version` table to track which files have already been applied based on their filename.
+To ensure safety and execution predictability, the following strict rules are enforced:
+1. **Unique Prefixes**: Every migration file must have a unique sequential prefix. Duplicate prefixes (e.g., two `001_*` files) are strictly rejected to prevent execution order ambiguity and collisions.
+2. **Strict Monotonicity**: Alphabetic ordering of the filenames must match their numeric prefix sequence. Non-padded or incorrectly ordered prefixes that violate monotonic progression are caught and rejected.
+3. **Out-of-band Prefix (`999_`)**: Filenames starting with `999_*` are flagged as "out-of-band" migrations (used for temporary/development purposes) and will be rejected unless explicit relaxed options are enabled.
+4. **Valid File Extension**: Every migration file must end with `.sql`. Files with incorrect extensions (e.g., `.sql.bak` or `.txt`) will be rejected.
+5. **Hidden Files**: Any hidden files starting with a dot (e.g., `.DS_Store` or `.gitkeep`) are automatically ignored during migration resolution.
 
 ## Running Migrations
 

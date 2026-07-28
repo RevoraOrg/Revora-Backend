@@ -66,6 +66,47 @@ describe('MetricsCollector', () => {
       expect(key).not.toContain('"value"with"quotes"');
     });
 
+    it('should filter PII from email addresses', () => {
+      metrics.incrementCounter('test', { email: 'user@example.com' });
+      
+      const snapshot = metrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('[REDACTED_EMAIL]');
+      expect(key).not.toContain('user@example.com');
+    });
+
+    it('should filter PII from phone numbers', () => {
+      metrics.incrementCounter('test', { phone: '+1-555-123-4567' });
+      
+      const snapshot = metrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('[REDACTED_PHONE]');
+    });
+
+    it('should filter PII from IP addresses', () => {
+      metrics.incrementCounter('test', { ip: '192.168.1.1' });
+      
+      const snapshot = metrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('[REDACTED_IP]');
+    });
+
+    it('should filter PII from UUIDs', () => {
+      metrics.incrementCounter('test', { id: '123e4567-e89b-12d3-a456-426614174000' });
+      
+      const snapshot = metrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('[REDACTED_ID]');
+    });
+
+    it('should filter PII from long numeric IDs', () => {
+      metrics.incrementCounter('test', { userId: '123456789012345' });
+      
+      const snapshot = metrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('[REDACTED_NUMERIC_ID]');
+    });
+
     it('should not collect metrics when disabled', () => {
       const disabledMetrics = new MetricsCollector({ enabled: false });
       disabledMetrics.incrementCounter('test');
@@ -324,6 +365,29 @@ describe('MetricsCollector', () => {
       // Should still work but be aware of memory usage
       expect(metrics['counters'].size).toBe(1000);
     });
+
+    it('should enforce cardinality limits', () => {
+      const limitedMetrics = new MetricsCollector({ enabled: true, maxCardinality: 3 });
+      
+      limitedMetrics.incrementCounter('metric1', { label: 'a' });
+      limitedMetrics.incrementCounter('metric2', { label: 'b' });
+      limitedMetrics.incrementCounter('metric3', { label: 'c' });
+      limitedMetrics.incrementCounter('metric4', { label: 'd' }); // Should be dropped
+      
+      expect(limitedMetrics['cardinalityCount']).toBe(3);
+      expect(limitedMetrics['counters'].size).toBe(3);
+    });
+
+    it('should allow updating existing metrics within cardinality limits', () => {
+      const limitedMetrics = new MetricsCollector({ enabled: true, maxCardinality: 2 });
+      
+      limitedMetrics.incrementCounter('metric1', { label: 'a' });
+      limitedMetrics.incrementCounter('metric2', { label: 'b' });
+      limitedMetrics.incrementCounter('metric1', { label: 'a' }); // Update existing
+      
+      expect(limitedMetrics['cardinalityCount']).toBe(2);
+      expect(limitedMetrics['counters'].get('metric1{label="a"}')).toBe(2);
+    });
   });
 
   describe('Performance', () => {
@@ -517,6 +581,8 @@ describe('MetricsCollector', () => {
       expect(defaultMetrics['config'].enabled).toBe(true);
       expect(defaultMetrics['config'].maxPoints).toBe(10000);
       expect(defaultMetrics['config'].histogramBuckets).toBeDefined();
+      expect(defaultMetrics['config'].maxCardinality).toBe(1000);
+      expect(defaultMetrics['config'].enablePIIDetection).toBe(true);
     });
 
     it('should accept custom histogram buckets', () => {
@@ -537,6 +603,16 @@ describe('MetricsCollector', () => {
       expect(disabledMetrics['counters'].size).toBe(0);
       expect(disabledMetrics['gauges'].size).toBe(0);
       expect(disabledMetrics['histograms'].size).toBe(0);
+    });
+
+    it('should disable PII detection when configured', () => {
+      const noPIIMetrics = new MetricsCollector({ enablePIIDetection: false });
+      
+      noPIIMetrics.incrementCounter('test', { email: 'user@example.com' });
+      
+      const snapshot = noPIIMetrics['counters'];
+      const key = Array.from(snapshot.keys())[0];
+      expect(key).toContain('user@example.com'); // PII not filtered
     });
   });
 });

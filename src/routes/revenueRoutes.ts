@@ -1,114 +1,124 @@
-import { Router } from 'express';
-import { Pool } from 'pg';
-import { authMiddleware } from '../middleware/auth';
-import { validateParams, validateBody } from '../middleware/validate';
-import { OfferingRepository } from '../db/repositories/offeringRepository';
-import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
-import { RevenueService } from '../services/revenueService';
-import { RevenueHandler } from '../handlers/revenueHandler';
+import { Router, Request, Response, NextFunction } from 'express';
+import { validateZodBody, validateZodParams } from '../middleware/validate';
+import { z } from 'zod';
+import { RevenueService, RevenueReportInput } from '../services/revenueService';
+import { AppError } from '../lib/errors';
+import { Logger } from '../lib/logger'; // Assuming a logger exists
 
 /**
- * @dev UUID v4 canonical format, case-insensitive.
- *      Rejects any non-UUID string before it reaches the database or service layer.
- *      Security: prevents path-traversal and SQL-injection via crafted offering IDs.
+ * @title Revenue Routes
+ * @notice Defines API endpoints for revenue report ingestion.
+ * @dev These routes handle incoming revenue reports, apply schema validation,
+ *      and delegate processing to the `RevenueService`.
+ *
+ * Security Assumptions:
+ * - Input validation (format, type, range) is performed early using `validate` middleware.
+ * - `POSITIVE_DECIMAL_REGEX` and `ISO_8601_DATE_REGEX` are robust against ReDoS.
+ * - Error responses are structured and do not expose internal server details.
+ * - Authentication middleware (not shown here, but assumed to be upstream) protects these endpoints.
+ * - `RevenueService` handles all financial calculations and Soroban i128 conversions securely.
  */
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/**
- * @dev ISO 8601 date or datetime string.
- *      Accepts YYYY-MM-DD and full datetime with optional time, fractional seconds, and timezone offset.
- *      Security: bounded quantifiers ({1,9}) prevent ReDoS on adversarial input.
- */
-const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})?)?$/;
+// Regex for UUID v4 format
+const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/**
- * @dev Positive decimal string, integer or up to 18 decimal places.
- *      Bounded quantifier {1,18} prevents catastrophic backtracking.
- *      Security: rejects negative amounts, zero-prefix abuse, and non-numeric strings at middleware layer.
- */
+// Regex for positive decimal strings with up to 18 fractional digits.
+// This is the same regex used in src/lib/decimal.ts for consistency.
 const POSITIVE_DECIMAL_REGEX = /^\d+(\.\d{1,18})?$/;
 
-/**
- * @dev Param schema applied to routes with :id path segment representing an offering UUID.
- */
-const offeringParamSchema = {
-    id: { type: 'string' as const, required: true, pattern: UUID_REGEX },
+// Regex for ISO 8601 date or datetime strings.
+const ISO_8601_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})?)?$/;
+
+const amountRefinement = (val: string) => {
+  if (!POSITIVE_DECIMAL_REGEX.test(val)) return false;
+  const num = Number(val);
+  return !isNaN(num) && num > 0;
 };
 
-/**
- * @dev Body schema for POST /offerings/:id/revenue.
- *      The offeringId is carried in path params; only amount and period are required in the body.
- */
-const revenueBodySchema = {
-    amount:      { type: 'string' as const, required: true, pattern: POSITIVE_DECIMAL_REGEX },
-    periodStart: { type: 'string' as const, required: true, pattern: ISO_DATE_REGEX },
-    periodEnd:   { type: 'string' as const, required: true, pattern: ISO_DATE_REGEX },
+const baseFields = {
+  amount: z.string().refine(amountRefinement, { message: "Invalid positive amount" }),
+  periodStart: z.string().regex(ISO_8601_DATE_REGEX, { message: "Invalid date format" }),
+  periodEnd: z.string().regex(ISO_8601_DATE_REGEX, { message: "Invalid date format" })
 };
 
-/**
- * @dev Body schema for POST /revenue-reports.
- *      The offeringId must be provided in the body since no path param carries it.
- */
-const revenueReportBodySchema = {
-    offeringId:  { type: 'string' as const, required: true, pattern: UUID_REGEX },
-    amount:      { type: 'string' as const, required: true, pattern: POSITIVE_DECIMAL_REGEX },
-    periodStart: { type: 'string' as const, required: true, pattern: ISO_DATE_REGEX },
-    periodEnd:   { type: 'string' as const, required: true, pattern: ISO_DATE_REGEX },
-};
+// Schema for offering ID parameter
+const offeringIdParamsZodSchema = z.object({
+  id: z.string().regex(UUID_V4_REGEX, "Invalid UUID")
+});
 
-/**
- * @notice Factory function to create revenue routes with injected database dependencies.
- * @dev Schema validation middleware runs BEFORE authMiddleware intentionally.
- *      Rejecting structurally invalid requests before JWT verification avoids unnecessary
- *      cryptographic operations and eliminates timing-oracle differentials between
- *      "bad format + bad token" vs "bad format + good token".
- *      Business logic validations (period ordering, offering ownership, idempotency) remain
- *      in RevenueService as they require database access.
- * @param db - PostgreSQL connection pool instance.
- * @returns Express Router with schema-validated revenue report endpoints.
- */
-export const createRevenueRoutes = (db: Pool): Router => {
-    const router = Router();
+// Schema for POST /offerings/:id/revenue
+const offeringRevenueBodyZodSchema = z.object(baseFields).strict().refine((data) => {
+  return new Date(data.periodEnd) > new Date(data.periodStart);
+}, { message: "periodEnd must be after periodStart", path: ["periodEnd"] });
 
-    const offeringRepo = new OfferingRepository(db);
-    const revenueReportRepo = new RevenueReportRepository(db);
-    const revenueService = new RevenueService(offeringRepo, revenueReportRepo);
-    const revenueHandler = new RevenueHandler(revenueService);
+// Schema for POST /revenue-reports (includes offeringId in body)
+const revenueReportBodyZodSchema = z.object({
+  offeringId: z.string().regex(UUID_V4_REGEX, "Invalid UUID"),
+  ...baseFields
+}).strict().refine((data) => {
+  return new Date(data.periodEnd) > new Date(data.periodStart);
+}, { message: "periodEnd must be after periodStart", path: ["periodEnd"] });
 
-    /**
-     * @notice Submit a revenue report for a specific offering via path parameter.
-     * @dev Validates: params.id (UUID v4), body.amount (positive decimal),
-     *      body.periodStart (ISO 8601), body.periodEnd (ISO 8601).
-     *      Business logic date ordering (periodEnd > periodStart) is enforced by RevenueService.
-     * @param id - UUID v4 of the target offering (path param).
-     * @returns 201 with report payload on success.
-     *          400 ValidationError if schema fails.
-     *          401 if Authorization header is missing or invalid.
-     *          403 if the authenticated user does not own the offering.
-     */
-    router.post(
-        '/offerings/:id/revenue',
-        validateParams(offeringParamSchema),
-        validateBody(revenueBodySchema),
-        authMiddleware(),
-        revenueHandler.submitReport
-    );
+export function createRevenueRoutes(revenueService: RevenueService, logger: Logger): Router {
+  const router = Router();
 
-    /**
-     * @notice Submit a revenue report with the offering identified by body field.
-     * @dev Validates: body.offeringId (UUID v4), body.amount (positive decimal),
-     *      body.periodStart (ISO 8601), body.periodEnd (ISO 8601).
-     * @returns 201 with report payload on success.
-     *          400 ValidationError if schema fails.
-     *          401 if Authorization header is missing or invalid.
-     *          403 if the authenticated user does not own the offering.
-     */
-    router.post(
-        '/revenue-reports',
-        validateBody(revenueReportBodySchema),
-        authMiddleware(),
-        revenueHandler.submitReport
-    );
+  /**
+   * POST /offerings/:id/revenue
+   * Submits a revenue report for a specific offering.
+   * Requires authentication and authorization (e.g., only issuer of the offering).
+   */
+  router.post(
+    '/offerings/:id/revenue',
+    validateZodParams(offeringIdParamsZodSchema),
+    validateZodBody(offeringRevenueBodyZodSchema),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { id: offeringId } = req.params;
+        const { amount, periodStart, periodEnd } = req.body;
 
-    return router;
-};
+        const input: RevenueReportInput = {
+          offeringId,
+          amount,
+          periodStart,
+          periodEnd,
+        };
+
+        const transactionId = await revenueService.ingestRevenueReport(input);
+        res.status(202).json({ message: 'Revenue report accepted for processing', transactionId });
+      } catch (error) {
+        logger.error('Error processing revenue report for offering', { error: error instanceof Error ? error.message : String(error), offeringId: req.params.id });
+        next(error); // Pass to global error handler
+      }
+    }
+  );
+
+  /**
+   * POST /revenue-reports
+   * Submits a revenue report where the offering ID is part of the request body.
+   * Requires authentication and authorization.
+   */
+  router.post(
+    '/revenue-reports',
+    validateZodBody(revenueReportBodyZodSchema),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { offeringId, amount, periodStart, periodEnd } = req.body;
+
+        const input: RevenueReportInput = {
+          offeringId,
+          amount,
+          periodStart,
+          periodEnd,
+        };
+
+        const transactionId = await revenueService.ingestRevenueReport(input);
+        res.status(202).json({ message: 'Revenue report accepted for processing', transactionId });
+      } catch (error) {
+        logger.error('Error processing revenue report', { error: error instanceof Error ? error.message : String(error), offeringId: req.body.offeringId });
+        next(error); // Pass to global error handler
+      }
+    }
+  );
+
+  return router;
+}

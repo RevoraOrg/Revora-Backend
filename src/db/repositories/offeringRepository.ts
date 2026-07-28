@@ -1,4 +1,5 @@
 import { Pool, QueryResult } from 'pg';
+import { sanitizeObject } from '../../lib/sanitize';
 
 export type OfferingStatus =
   | 'draft'
@@ -47,13 +48,21 @@ export interface ListOfferingsFilters {
 export interface UpdateOfferingStateInput {
   status?: 'draft' | 'active' | 'closed' | 'completed';
   total_raised?: string;
+  /** Basis points (0–10000) from on-chain config. NULL clears any existing cap. */
+  max_investor_share_bps?: number | null;
 }
 
 export class OfferingRepository {
   constructor(private db: Pool) {}
 
   async create(offering: CreateOfferingInput): Promise<Offering> {
-    const entries = this.getDefinedEntries(offering);
+    const sanitized = sanitizeObject(offering, {
+      name: true,
+      symbol: true,
+      title: true,
+      description: { safeHTML: true, allowNewlines: true, maxLength: 5000 },
+    });
+    const entries = this.getDefinedEntries(sanitized);
     if (entries.length === 0) {
       throw new Error('create requires at least one offering field');
     }
@@ -141,7 +150,7 @@ export class OfferingRepository {
       SELECT id, name, symbol, title, contract_address, status, total_raised, target_amount, created_at, updated_at
       FROM offerings
       WHERE status IN (${statusPlaceholders})
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, id ASC
       LIMIT $${statuses.length + 1} OFFSET $${statuses.length + 2}
     `;
 
@@ -187,7 +196,13 @@ export class OfferingRepository {
   }
 
   async update(id: string, partial: UpdateOfferingInput): Promise<Offering | null> {
-    const entries = this.getDefinedEntries(partial);
+    const sanitized = sanitizeObject(partial, {
+      name: true,
+      symbol: true,
+      title: true,
+      description: { safeHTML: true, allowNewlines: true, maxLength: 5000 },
+    });
+    const entries = this.getDefinedEntries(sanitized);
     if (entries.length === 0) {
       return this.getById(id);
     }
@@ -231,12 +246,13 @@ export class OfferingRepository {
   }
 
   /**
-   * Update offering state (status and/or total_raised)
+   * Update offering state (status and/or total_raised and/or max_investor_share_bps)
    */
   async updateState(id: string, input: UpdateOfferingStateInput): Promise<Offering | null> {
     const partial: UpdateOfferingInput = {};
     if (input.status !== undefined) partial['status'] = input.status;
     if (input.total_raised !== undefined) partial['total_raised'] = input.total_raised;
+    if (input.max_investor_share_bps !== undefined) partial['max_investor_share_bps'] = input.max_investor_share_bps;
     return this.update(id, partial);
   }
 

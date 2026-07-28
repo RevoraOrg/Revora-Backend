@@ -385,3 +385,4 @@ export class Logger {
  * Singleton pattern for application-wide logging
  */
 export const globalLogger = new Logger();
+export const logger = globalLogger;

@@ -31,6 +31,8 @@ import {
   createRateLimitStore,
   createValidationRateLimit,
 } from '../security/rateLimit';
+import { logger } from '../lib/logger';
+import { Errors } from '../lib/errors';
 
 // Import existing milestone interfaces
 export type MilestoneStatus = 'pending' | 'validated';
@@ -39,8 +41,14 @@ export interface Milestone {
   id: string;
   vault_id: string;
   status: MilestoneStatus;
+  created_at: Date; // Added for sequential validation
   validated_at?: Date;
   validated_by?: string;
+}
+
+export interface Vault {
+  id: string;
+  status: 'active' | 'closed' | 'paused';
 }
 
 export interface MilestoneValidationEvent {
@@ -53,12 +61,17 @@ export interface MilestoneValidationEvent {
 
 export interface MilestoneRepository {
   getByVaultAndId(vaultId: string, milestoneId: string): Promise<Milestone | null>;
+  listByVault(vaultId: string): Promise<Milestone[]>; // Added for sequential validation
   markValidated(input: {
     vaultId: string;
     milestoneId: string;
     verifierId: string;
     validatedAt: Date;
   }): Promise<Milestone>;
+}
+
+export interface VaultRepository {
+  getById(id: string): Promise<Vault | null>;
 }
 
 export interface VerifierAssignmentRepository {
@@ -83,6 +96,7 @@ export interface DomainEventPublisher {
  */
 export interface HardenedMilestoneValidationDeps {
   milestoneRepository: MilestoneRepository;
+  vaultRepository: VaultRepository; // Added
   verifierAssignmentRepository: VerifierAssignmentRepository;
   milestoneValidationEventRepository: MilestoneValidationEventRepository;
   domainEventPublisher: DomainEventPublisher;
@@ -92,6 +106,74 @@ export interface HardenedMilestoneValidationDeps {
 }
 
 /**
+ * Validates vault invariants
+ */
+export const validateVaultInvariants = async (
+  vaultId: string,
+  vaultRepository: VaultRepository
+): Promise<Vault> => {
+  const vault = await vaultRepository.getById(vaultId);
+  if (!vault) {
+    logger.warn('Vault not found during validation', { vaultId });
+    throw Errors.notFound('Vault not found');
+  }
+
+  if (vault.status !== 'active') {
+    logger.warn('Attempted to validate milestone for non-active vault', {
+      vaultId,
+      vaultStatus: vault.status,
+    });
+    throw Errors.badRequest(`Vault is ${vault.status}, only active vaults can have milestones validated`);
+  }
+
+  return vault;
+};
+
+/**
+ * Validates milestone invariants including sequential validation
+ */
+export const validateMilestoneInvariants = async (
+  milestone: Milestone,
+  milestoneRepository: MilestoneRepository
+): Promise<void> => {
+  // Check if milestone is already validated
+  if (milestone.status === 'validated') {
+    logger.warn('Milestone already validated', {
+      vaultId: milestone.vault_id,
+      milestoneId: milestone.id,
+    });
+    throw Errors.conflict('Milestone already validated');
+  }
+
+  // Check sequential validation: must be the first pending milestone
+  const allMilestones = await milestoneRepository.listByVault(milestone.vault_id);
+  const sortedMilestones = [...allMilestones].sort(
+    (a, b) => a.created_at.getTime() - b.created_at.getTime()
+  );
+
+  const pendingMilestones = sortedMilestones.filter((m) => m.status === 'pending');
+  if (pendingMilestones.length === 0) {
+    logger.error('No pending milestones found in vault', {
+      vaultId: milestone.vault_id,
+      milestoneId: milestone.id,
+    });
+    throw Errors.notFound('No pending milestones found in vault');
+  }
+
+  const firstPending = pendingMilestones[0];
+  if (firstPending.id !== milestone.id) {
+    logger.warn('Sequential validation invariant violated: not the first pending milestone', {
+      vaultId: milestone.vault_id,
+      milestoneId: milestone.id,
+      expectedMilestoneId: firstPending.id,
+    });
+    throw Errors.badRequest(
+      `Milestone ${firstPending.id} must be validated before ${milestone.id}`
+    );
+  }
+};
+
+/**
  * Validates that a milestone can be validated (business logic validation)
  */
 export const validateMilestoneBusinessRules = async (
@@ -99,36 +181,29 @@ export const validateMilestoneBusinessRules = async (
   vaultId: string,
   milestoneId: string,
   verifierId: string,
-  verifierAssignmentRepository: VerifierAssignmentRepository
+  deps: Pick<HardenedMilestoneValidationDeps, 'milestoneRepository' | 'vaultRepository' | 'verifierAssignmentRepository'>
 ): Promise<void> => {
+  // 1. Vault Invariants
+  await validateVaultInvariants(vaultId, deps.vaultRepository);
+
+  // 2. Milestone Existence
   if (!milestone) {
-    throw new ValidationError('Milestone not found', {
-      vaultId,
-      milestoneId,
-    });
+    logger.warn('Milestone not found', { vaultId, milestoneId });
+    throw Errors.notFound('Milestone not found');
   }
 
-  if (milestone.status === 'validated') {
-    throw new ValidationError('Milestone already validated', {
-      vaultId,
-      milestoneId,
-      currentStatus: milestone.status,
-      validatedAt: milestone.validated_at,
-      validatedBy: milestone.validated_by,
-    });
-  }
+  // 3. Milestone Invariants
+  await validateMilestoneInvariants(milestone, deps.milestoneRepository);
 
-  // Check if verifier is assigned to this vault
-  const isAssigned = await verifierAssignmentRepository.isVerifierAssignedToVault(
+  // 4. Verifier Authorization (Business Rule)
+  const isAssigned = await deps.verifierAssignmentRepository.isVerifierAssignedToVault(
     vaultId,
     verifierId
   );
 
   if (!isAssigned) {
-    throw new AuthorizationError('Verifier not assigned to vault', {
-      vaultId,
-      verifierId,
-    });
+    logger.warn('Verifier not assigned to vault', { vaultId, verifierId });
+    throw Errors.forbidden('Verifier not assigned to vault');
   }
 };
 
@@ -144,6 +219,13 @@ export const executeMilestoneValidation = async (
 ): Promise<{ milestone: Milestone; validationEvent: MilestoneValidationEvent }> => {
   const now = new Date();
   const startTime = Date.now();
+
+  logger.info('Starting milestone validation execution', {
+    vaultId,
+    milestoneId,
+    verifierId,
+    requestId: securityContext.requestId,
+  });
 
   try {
     // Create validation event first (for audit trail)
@@ -172,7 +254,7 @@ export const executeMilestoneValidation = async (
       requestId: securityContext.requestId,
     });
 
-    // Record successful validation
+    // Record successful validation in audit log
     await recordAuditEvent(
       deps.auditRepository,
       'VALIDATION',
@@ -187,12 +269,28 @@ export const executeMilestoneValidation = async (
       }
     );
 
+    logger.info('Milestone validation completed successfully', {
+      vaultId,
+      milestoneId,
+      validationEventId: validationEvent.id,
+      duration: Date.now() - startTime,
+    });
+
     return {
       milestone: updatedMilestone,
       validationEvent,
     };
   } catch (error) {
-    // Record failed validation
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    
+    logger.error('Milestone validation execution failed', {
+      vaultId,
+      milestoneId,
+      error: errorMessage,
+      duration: Date.now() - startTime,
+    });
+
+    // Record failed validation in audit log
     await recordAuditEvent(
       deps.auditRepository,
       'VALIDATION',
@@ -201,7 +299,7 @@ export const executeMilestoneValidation = async (
       'FAILURE',
       securityContext,
       {
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorMessage,
         validationTime: Date.now() - startTime,
       }
     );
@@ -262,7 +360,7 @@ export const createHardenedMilestoneValidationHandler = (
           vaultId,
           milestoneId,
           securityContext.user.id,
-          deps.verifierAssignmentRepository
+          deps
         );
 
         // Execute validation
@@ -293,14 +391,24 @@ export const createHardenedMilestoneValidationHandler = (
           await validationLimiter.releaseValidation(vaultId, securityContext.user.id);
         }
 
-        if (error instanceof ValidationError || error instanceof AuthorizationError) {
-          res.status(error instanceof ValidationError ? 400 : 403).json({
-            error: error.message,
-            code: error.code,
-            details: error.details,
+        // Handle structured errors
+        const isAppError = (err: any): err is any => 'statusCode' in err;
+        const isSecurityError = (err: any): err is any => 'code' in err && 'details' in err;
+
+        if (isAppError(error) || isSecurityError(error)) {
+          const status = (error as any).statusCode || (error instanceof ValidationError ? 400 : 403);
+          res.status(status).json({
+            error: error instanceof Error ? error.message : 'Unknown error',
+            code: (error as any).code || (error as any).name || 'INTERNAL_ERROR',
+            details: (error as any).details,
             requestId: securityContext?.requestId,
           });
         } else {
+          logger.error('Unhandled error in milestone validation', {
+            error: error instanceof Error ? error.message : 'Unknown error',
+            stack: error instanceof Error ? error.stack : undefined,
+            requestId: securityContext?.requestId,
+          });
           next(error);
         }
       }
@@ -350,6 +458,12 @@ export const createSecurityMonitoringRouter = (
     const limit = parseInt(req.query.limit as string) || 100;
 
     try {
+      logger.info('Retrieving user audit events', {
+        userId: securityContext.user.id,
+        limit,
+        requestId: securityContext.requestId,
+      });
+
       const events = await auditRepository.findByUserId(securityContext.user.id, limit);
       
       res.json({
@@ -361,6 +475,12 @@ export const createSecurityMonitoringRouter = (
         },
       });
     } catch (error) {
+      logger.error('Failed to retrieve audit events', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        userId: securityContext.user.id,
+        requestId: securityContext.requestId,
+      });
+
       res.status(500).json({
         error: 'Failed to retrieve audit events',
         requestId: securityContext.requestId,
@@ -373,6 +493,12 @@ export const createSecurityMonitoringRouter = (
     const securityContext = (req as any).securityContext as SecurityContext;
     
     if (securityContext.user.role !== 'admin') {
+      logger.warn('Unauthorized access attempt to security violations', {
+        userId: securityContext.user.id,
+        role: securityContext.user.role,
+        requestId: securityContext.requestId,
+      });
+
       return res.status(403).json({
         error: 'Admin access required',
         requestId: securityContext.requestId,
@@ -385,6 +511,13 @@ export const createSecurityMonitoringRouter = (
     const limit = parseInt(req.query.limit as string) || 100;
 
     try {
+      logger.info('Retrieving security violations', {
+        adminId: securityContext.user.id,
+        since: since.toISOString(),
+        limit,
+        requestId: securityContext.requestId,
+      });
+
       const violations = await auditRepository.findSecurityViolations(since, limit);
       
       res.json({
@@ -396,6 +529,12 @@ export const createSecurityMonitoringRouter = (
         },
       });
     } catch (error) {
+      logger.error('Failed to retrieve security violations', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        adminId: securityContext.user.id,
+        requestId: securityContext.requestId,
+      });
+
       res.status(500).json({
         error: 'Failed to retrieve security violations',
         requestId: securityContext.requestId,

@@ -12,9 +12,20 @@ import {
   errorHandler,
   mapUnknownErrorToAppError,
 } from './errorHandler';
+import { globalLogger } from '../lib/logger';
 
-function makeReq(requestId?: string): Request {
-  return { requestId } as Request;
+// Mock the global logger
+jest.mock('../lib/logger', () => ({
+  globalLogger: {
+    warn: jest.fn(),
+    error: jest.fn(),
+    critical: jest.fn(),
+    info: jest.fn(),
+  },
+}));
+
+function makeReq(requestId?: string, path: string = '/test', method: string = 'GET'): Request {
+  return { requestId, path, method } as Request;
 }
 
 function makeRes(): jest.Mocked<Pick<Response, 'status' | 'json'>> {
@@ -121,16 +132,10 @@ describe('createStructuredErrorLogEntry', () => {
 });
 
 describe('errorHandler', () => {
-  let consoleErrorSpy: jest.SpyInstance;
   const next = jest.fn() as unknown as NextFunction;
 
   beforeEach(() => {
-    consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     jest.clearAllMocks();
-  });
-
-  afterEach(() => {
-    consoleErrorSpy.mockRestore();
   });
 
   it('responds with structured AppError bodies', () => {
@@ -168,24 +173,40 @@ describe('errorHandler', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
-  it('writes a structured JSON log entry', () => {
+  it('writes a structured log entry via globalLogger', () => {
     const res = makeRes();
+    const error = Errors.serviceUnavailable('Dependency unavailable', { dependency: 'db' });
     errorHandler(
-      Errors.serviceUnavailable('Dependency unavailable', { dependency: 'db' }),
-      makeReq('rid-2'),
+      error,
+      makeReq('rid-2', '/ready', 'GET'),
       res as unknown as Response,
       next,
     );
 
-    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
-    const logged = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
-    expect(logged).toMatchObject({
-      type: 'error',
+    expect(globalLogger.error).toHaveBeenCalledWith('Dependency unavailable', expect.objectContaining({
       requestId: 'rid-2',
       code: ErrorCode.SERVICE_UNAVAILABLE,
       statusCode: 503,
-      message: 'Dependency unavailable',
       details: { dependency: 'db' },
-    });
+      path: '/ready',
+      method: 'GET',
+    }));
+  });
+
+  it('logs 500 errors as error level', () => {
+    const res = makeRes();
+    const error = new Error('boom');
+    errorHandler(
+      error,
+      makeReq('rid-3'),
+      res as unknown as Response,
+      next,
+    );
+
+    expect(globalLogger.error).toHaveBeenCalledWith('Internal server error', expect.objectContaining({
+      requestId: 'rid-3',
+      code: ErrorCode.INTERNAL_ERROR,
+      statusCode: 500,
+    }));
   });
 });

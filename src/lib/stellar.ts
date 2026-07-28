@@ -5,6 +5,11 @@
  * balances, and transaction history. No signing capabilities.
  */
 
+import { env } from '../config/env';
+import { globalLogger } from './logger';
+import { Errors } from './errors';
+import { classifyStellarRPCFailure } from './stellarRpcFailure';
+
 export interface StellarAccount {
   account_id: string;
   sequence: string;
@@ -85,6 +90,8 @@ export interface StellarTransactionsResponse {
 export interface HorizonClientConfig {
   serverUrl?: string;
   timeout?: number;
+  maxFee?: number;
+  networkPassphrase?: string;
 }
 
 /**
@@ -93,22 +100,67 @@ export interface HorizonClientConfig {
 export class HorizonClient {
   private readonly serverUrl: string;
   private readonly timeout: number;
+  private readonly maxFee: number;
+  private readonly networkPassphrase: string;
+  private readonly logger = globalLogger.child({ service: 'stellar-client' });
 
   constructor(config: HorizonClientConfig = {}) {
-    this.serverUrl = config.serverUrl || 'https://horizon.stellar.org';
-    this.timeout = config.timeout || 30000;
+    // Fail closed: require explicit configuration, no defaults that could be insecure
+    this.serverUrl = config.serverUrl || env.STELLAR_HORIZON_URL || this.getDefaultServerUrl();
+    this.timeout = config.timeout || env.STELLAR_TIMEOUT;
+    this.maxFee = config.maxFee || env.STELLAR_MAX_FEE;
+    this.networkPassphrase = config.networkPassphrase || env.STELLAR_NETWORK_PASSPHRASE || this.getDefaultNetworkPassphrase();
+
+    // Validate configuration on construction
+    this.validateConfiguration();
+
+    this.logger.info('Stellar Horizon client initialized', {
+      serverUrl: this.serverUrl,
+      timeout: this.timeout,
+      maxFee: this.maxFee,
+      network: env.STELLAR_NETWORK,
+    });
+  }
+
+  private getDefaultServerUrl(): string {
+    return env.STELLAR_NETWORK === 'public'
+      ? 'https://horizon.stellar.org'
+      : 'https://horizon-testnet.stellar.org';
+  }
+
+  private getDefaultNetworkPassphrase(): string {
+    return env.STELLAR_NETWORK === 'public'
+      ? 'Public Global Stellar Network ; September 2015'
+      : 'Test SDF Network ; September 2015';
+  }
+
+  private validateConfiguration(): void {
+    if (!this.serverUrl) {
+      throw Errors.internal('Stellar server URL is required');
+    }
+    if (!this.networkPassphrase) {
+      throw Errors.internal('Stellar network passphrase is required');
+    }
+    if (this.timeout <= 0 || this.timeout > 300000) {
+      throw Errors.internal('Stellar timeout must be between 1 and 300000 milliseconds');
+    }
+    if (this.maxFee <= 0 || this.maxFee > 10000000) {
+      throw Errors.internal('Stellar max fee must be between 1 and 10000000 stroops');
+    }
   }
 
   /**
    * Fetches account information for a given public key
    * @param publicKey - Stellar account public key
    * @returns Account information including balances, signers, and flags
-   * @throws Error if account not found or request fails
+   * @throws AppError if account not found or request fails
    */
   async getAccount(publicKey: string): Promise<StellarAccount> {
     if (!publicKey || typeof publicKey !== 'string') {
-      throw new Error('Public key must be a non-empty string');
+      throw Errors.validationError('Public key must be a non-empty string');
     }
+
+    this.logger.debug('Fetching account information', { publicKey });
 
     try {
       const response = await this.fetchWithTimeout(
@@ -117,19 +169,37 @@ export class HorizonClient {
 
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error(`Account not found: ${publicKey}`);
+          this.logger.warn('Account not found', { publicKey, status: response.status });
+          throw Errors.notFound(`Account not found: ${publicKey}`);
         }
-        throw new Error(
-          `Failed to fetch account: ${response.status} ${response.statusText}`
-        );
+        this.logger.error('Failed to fetch account', {
+          publicKey,
+          status: response.status,
+          statusText: response.statusText,
+        });
+        throw Errors.serviceUnavailable('Failed to fetch account information');
       }
 
-      return (await response.json()) as StellarAccount;
+      const account = (await response.json()) as StellarAccount;
+      this.logger.debug('Account information fetched successfully', {
+        publicKey,
+        sequence: account.sequence,
+        balanceCount: account.balances.length,
+      });
+      return account;
     } catch (error) {
-      if (error instanceof Error) {
-        throw error;
+      const failureClass = classifyStellarRPCFailure(error);
+      this.logger.error('Account fetch failed', {
+        publicKey,
+        error: error,
+        failureClass,
+      });
+
+      if (error instanceof Error && error.name === 'AppError') {
+        throw error; // Re-throw our own errors
       }
-      throw new Error(`Failed to fetch account: ${String(error)}`);
+
+      throw Errors.serviceUnavailable('Failed to fetch account information');
     }
   }
 
@@ -137,7 +207,7 @@ export class HorizonClient {
    * Fetches balances for a given public key
    * @param publicKey - Stellar account public key
    * @returns Array of account balances
-   * @throws Error if account not found or request fails
+   * @throws AppError if account not found or request fails
    */
   async getBalances(publicKey: string): Promise<StellarBalance[]> {
     const account = await this.getAccount(publicKey);
@@ -149,19 +219,21 @@ export class HorizonClient {
    * @param accountId - Stellar account ID
    * @param limit - Maximum number of transactions to return (default: 10, max: 200)
    * @returns Transaction history response with records and pagination links
-   * @throws Error if account not found or request fails
+   * @throws AppError if account not found or request fails
    */
   async getTransactions(
     accountId: string,
     limit: number = 10
   ): Promise<StellarTransactionsResponse> {
     if (!accountId || typeof accountId !== 'string') {
-      throw new Error('Account ID must be a non-empty string');
+      throw Errors.validationError('Account ID must be a non-empty string');
     }
 
     if (limit < 1 || limit > 200) {
-      throw new Error('Limit must be between 1 and 200');
+      throw Errors.validationError('Limit must be between 1 and 200');
     }
+
+    this.logger.debug('Fetching transaction history', { accountId, limit });
 
     try {
       const url = new URL(
@@ -174,19 +246,37 @@ export class HorizonClient {
 
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error(`Account not found: ${accountId}`);
+          this.logger.warn('Account not found for transactions', { accountId, status: response.status });
+          throw Errors.notFound(`Account not found: ${accountId}`);
         }
-        throw new Error(
-          `Failed to fetch transactions: ${response.status} ${response.statusText}`
-        );
+        this.logger.error('Failed to fetch transactions', {
+          accountId,
+          status: response.status,
+          statusText: response.statusText,
+        });
+        throw Errors.serviceUnavailable('Failed to fetch transaction history');
       }
 
-      return (await response.json()) as StellarTransactionsResponse;
+      const transactionsResponse = (await response.json()) as StellarTransactionsResponse;
+      this.logger.debug('Transaction history fetched successfully', {
+        accountId,
+        transactionCount: transactionsResponse._embedded.records.length,
+      });
+      return transactionsResponse;
     } catch (error) {
-      if (error instanceof Error) {
-        throw error;
+      const failureClass = classifyStellarRPCFailure(error);
+      this.logger.error('Transaction fetch failed', {
+        accountId,
+        limit,
+        error: error,
+        failureClass,
+      });
+
+      if (error instanceof Error && error.name === 'AppError') {
+        throw error; // Re-throw our own errors
       }
-      throw new Error(`Failed to fetch transactions: ${String(error)}`);
+
+      throw Errors.serviceUnavailable('Failed to fetch transaction history');
     }
   }
 
@@ -198,7 +288,10 @@ export class HorizonClient {
     options: RequestInit = {}
   ): Promise<Response> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+      this.logger.warn('Request timed out', { url, timeout: this.timeout });
+    }, this.timeout);
 
     try {
       const response = await fetch(url, {
@@ -213,6 +306,34 @@ export class HorizonClient {
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  /**
+   * Get the configured server URL
+   */
+  getServerUrl(): string {
+    return this.serverUrl;
+  }
+
+  /**
+   * Get the configured timeout
+   */
+  getTimeout(): number {
+    return this.timeout;
+  }
+
+  /**
+   * Get the configured max fee
+   */
+  getMaxFee(): number {
+    return this.maxFee;
+  }
+
+  /**
+   * Get the configured network passphrase
+   */
+  getNetworkPassphrase(): string {
+    return this.networkPassphrase;
   }
 }
 

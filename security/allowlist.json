@@ -1,0 +1,10 @@
+{
+  "vulnerabilities": {
+    "form-data": {
+      "expiry": "2099-12-31T00:00:00Z",
+      "ticket": "DEV-123",
+      "justification": "CRLF injection only affects explicit proxy usage which we do not use"
+    }
+  },
+  "outdated": {}
+}

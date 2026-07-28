@@ -128,6 +128,24 @@ await withTransaction(pool, async (client) => {
 }, { readOnly: true });
 ```
 
+### After Commit Hooks for External Side Effects
+
+Use `afterCommit` for external calls that should happen only once the database transaction is durable.
+This is important for cross-system workflows such as Stellar/Horizon submissions or other blockchain interactions.
+
+```typescript
+await withTransaction(pool, async (client) => {
+  await client.query('INSERT INTO transactions (amount, user_id) VALUES ($1, $2)', [amount, userId]);
+  return { transactionId };
+}, {
+  afterCommit: async (result) => {
+    await submitStellarPayment(result.transactionId);
+  },
+});
+```
+
+If the `afterCommit` callback fails, the DB transaction has already committed, so compensation logic must be handled explicitly.
+
 ## Error Handling
 
 Transactions automatically rollback on error:

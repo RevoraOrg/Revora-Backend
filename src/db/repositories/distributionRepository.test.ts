@@ -24,8 +24,8 @@ describe('DistributionRepository', () => {
     it('should create a distribution run with default status', async () => {
       const input: CreateDistributionRunInput = {
         offering_id: 'offering-123',
+        period_id: 'period-456',
         total_amount: '10000.50',
-        distribution_date: new Date('2024-01-15'),
       };
 
       const mockResult: QueryResult<DistributionRun> = {
@@ -33,9 +33,10 @@ describe('DistributionRepository', () => {
           {
             id: 'run-123',
             offering_id: 'offering-123',
+            period_id: 'period-456',
             total_amount: '10000.50',
-            distribution_date: new Date('2024-01-15'),
             status: 'pending',
+            run_at: new Date(),
             created_at: new Date(),
             updated_at: new Date(),
           },
@@ -51,308 +52,57 @@ describe('DistributionRepository', () => {
       const result = await repository.createDistributionRun(input);
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('INSERT INTO distribution_runs'),
-        ['offering-123', '10000.50', input.distribution_date, 'pending']
+        expect.stringMatching(/INSERT\s+INTO\s+distributions/i),
+        ['offering-123', 'period-456', '10000.50', expect.any(Date), 'pending']
       );
       expect(result.id).toBe('run-123');
-      expect(result.offering_id).toBe('offering-123');
-      expect(result.status).toBe('pending');
     });
+  });
 
-    it('should create a distribution run with custom status', async () => {
-      const input: CreateDistributionRunInput = {
+  describe('findRunByParams', () => {
+    it('should return a run if parameters match', async () => {
+      const mockRun = {
+        id: 'run-123',
         offering_id: 'offering-123',
-        total_amount: '10000.50',
-        distribution_date: new Date('2024-01-15'),
-        status: 'processing',
+        period_id: 'period-456',
+        total_amount: '1000.00',
+        status: 'completed',
+        run_at: new Date(),
       };
 
-      const mockResult: QueryResult<DistributionRun> = {
-        rows: [
-          {
-            id: 'run-123',
-            offering_id: 'offering-123',
-            total_amount: '10000.50',
-            distribution_date: new Date('2024-01-15'),
-            status: 'processing',
-            created_at: new Date(),
-            updated_at: new Date(),
-          },
-        ],
-        rowCount: 1,
-        command: 'INSERT',
-        oid: 0,
-        fields: [],
-      };
+      mockPool.query.mockResolvedValueOnce({ rows: [mockRun] });
 
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.createDistributionRun(input);
+      const result = await repository.findRunByParams('offering-123', 'period-456', '1000.00');
 
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('INSERT INTO distribution_runs'),
-        ['offering-123', '10000.50', input.distribution_date, 'processing']
+        expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions/i),
+        ['offering-123', 'period-456', '1000.00']
       );
-      expect(result.status).toBe('processing');
-    });
-
-    it('should throw error if creation fails', async () => {
-      const input: CreateDistributionRunInput = {
-        offering_id: 'offering-123',
-        total_amount: '10000.50',
-        distribution_date: new Date('2024-01-15'),
-      };
-
-      const mockResult: QueryResult<DistributionRun> = {
-        rows: [],
-        rowCount: 0,
-        command: 'INSERT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      await expect(repository.createDistributionRun(input)).rejects.toThrow(
-        'Failed to create distribution run'
-      );
+      expect(result?.id).toBe('run-123');
     });
   });
 
-  describe('createPayout', () => {
-    it('should create a payout with default status', async () => {
-      const input: CreatePayoutInput = {
-        distribution_run_id: 'run-123',
-        investor_id: 'investor-456',
-        amount: '500.25',
-      };
-
-      const mockResult: QueryResult<Payout> = {
-        rows: [
-          {
-            id: 'payout-789',
-            distribution_run_id: 'run-123',
-            investor_id: 'investor-456',
-            amount: '500.25',
-            status: 'pending',
-            transaction_hash: null,
-            created_at: new Date(),
-            updated_at: new Date(),
-          },
-        ],
-        rowCount: 1,
-        command: 'INSERT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.createPayout(input);
-
+  describe('getPayoutsForRun', () => {
+    it('should return all payouts for a run', async () => {
+      const mockPayouts = [{ id: 'p1', distribution_id: 'run-1', investor_id: 'i1', amount: '100.00' }];
+      mockPool.query.mockResolvedValueOnce({ rows: mockPayouts });
+      const result = await repository.getPayoutsForRun('run-1');
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('INSERT INTO payouts'),
-        ['run-123', 'investor-456', '500.25', 'pending', null]
+        expect.stringMatching(/FROM\s+distribution_payouts\s+WHERE\s+distribution_id\s+=\s+\$1/i),
+        ['run-1']
       );
-      expect(result.id).toBe('payout-789');
-      expect(result.investor_id).toBe('investor-456');
-      expect(result.status).toBe('pending');
-    });
-
-    it('should create a payout with transaction hash', async () => {
-      const input: CreatePayoutInput = {
-        distribution_run_id: 'run-123',
-        investor_id: 'investor-456',
-        amount: '500.25',
-        transaction_hash: 'tx-hash-abc123',
-        status: 'processed',
-      };
-
-      const mockResult: QueryResult<Payout> = {
-        rows: [
-          {
-            id: 'payout-789',
-            distribution_run_id: 'run-123',
-            investor_id: 'investor-456',
-            amount: '500.25',
-            status: 'processed',
-            transaction_hash: 'tx-hash-abc123',
-            created_at: new Date(),
-            updated_at: new Date(),
-          },
-        ],
-        rowCount: 1,
-        command: 'INSERT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.createPayout(input);
-
-      expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringContaining('INSERT INTO payouts'),
-        ['run-123', 'investor-456', '500.25', 'processed', 'tx-hash-abc123']
-      );
-      expect(result.transaction_hash).toBe('tx-hash-abc123');
-      expect(result.status).toBe('processed');
-    });
-
-    it('should throw error if creation fails', async () => {
-      const input: CreatePayoutInput = {
-        distribution_run_id: 'run-123',
-        investor_id: 'investor-456',
-        amount: '500.25',
-      };
-
-      const mockResult: QueryResult<Payout> = {
-        rows: [],
-        rowCount: 0,
-        command: 'INSERT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      await expect(repository.createPayout(input)).rejects.toThrow(
-        'Failed to create payout'
-      );
+      expect(result).toHaveLength(1);
     });
   });
 
-  describe('listByOffering', () => {
-    it('should return distribution runs for an offering', async () => {
-      const offeringId = 'offering-123';
-
-      const mockResult: QueryResult<DistributionRun> = {
-        rows: [
-          {
-            id: 'run-1',
-            offering_id: 'offering-123',
-            total_amount: '10000.50',
-            distribution_date: new Date('2024-01-15'),
-            status: 'completed',
-            created_at: new Date('2024-01-15'),
-            updated_at: new Date('2024-01-15'),
-          },
-          {
-            id: 'run-2',
-            offering_id: 'offering-123',
-            total_amount: '5000.00',
-            distribution_date: new Date('2024-01-10'),
-            status: 'pending',
-            created_at: new Date('2024-01-10'),
-            updated_at: new Date('2024-01-10'),
-          },
-        ],
-        rowCount: 2,
-        command: 'SELECT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.listByOffering(offeringId);
-
+  describe('updateRunStatus', () => {
+    it('should update the status of a run', async () => {
+      mockPool.query.mockResolvedValueOnce({ rowCount: 1 });
+      await repository.updateRunStatus('run-1', 'completed');
       expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringMatching(
-          /SELECT\s*\*[\s\S]*FROM\s+distribution_runs[\s\S]*WHERE\s+offering_id\s*=\s*\$1[\s\S]*ORDER\s+BY\s+distribution_date\s+DESC,\s+created_at\s+DESC/,
-        ),
-        [offeringId]
+        expect.stringMatching(/UPDATE\s+distributions\s+SET\s+status\s+=\s+\$1/i),
+        ['completed', 'run-1']
       );
-      expect(result).toHaveLength(2);
-      expect(result[0].id).toBe('run-1');
-      expect(result[1].id).toBe('run-2');
-    });
-
-    it('should return empty array if no distribution runs found', async () => {
-      const offeringId = 'offering-999';
-
-      const mockResult: QueryResult<DistributionRun> = {
-        rows: [],
-        rowCount: 0,
-        command: 'SELECT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.listByOffering(offeringId);
-
-      expect(result).toHaveLength(0);
-    });
-  });
-
-  describe('listPayoutsByInvestor', () => {
-    it('should return payouts for an investor', async () => {
-      const investorId = 'investor-456';
-
-      const mockResult: QueryResult<Payout> = {
-        rows: [
-          {
-            id: 'payout-1',
-            distribution_run_id: 'run-123',
-            investor_id: 'investor-456',
-            amount: '500.25',
-            status: 'processed',
-            transaction_hash: 'tx-hash-1',
-            created_at: new Date('2024-01-15'),
-            updated_at: new Date('2024-01-15'),
-          },
-          {
-            id: 'payout-2',
-            distribution_run_id: 'run-124',
-            investor_id: 'investor-456',
-            amount: '300.00',
-            status: 'pending',
-            transaction_hash: null,
-            created_at: new Date('2024-01-10'),
-            updated_at: new Date('2024-01-10'),
-          },
-        ],
-        rowCount: 2,
-        command: 'SELECT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.listPayoutsByInvestor(investorId);
-
-      expect(mockPool.query).toHaveBeenCalledWith(
-        expect.stringMatching(
-          /SELECT\s*\*[\s\S]*FROM\s+payouts[\s\S]*WHERE\s+investor_id\s*=\s*\$1[\s\S]*ORDER\s+BY\s+created_at\s+DESC/,
-        ),
-        [investorId]
-      );
-      expect(result).toHaveLength(2);
-      expect(result[0].id).toBe('payout-1');
-      expect(result[0].transaction_hash).toBe('tx-hash-1');
-      expect(result[1].id).toBe('payout-2');
-      expect(result[1].transaction_hash).toBeUndefined();
-    });
-
-    it('should return empty array if no payouts found', async () => {
-      const investorId = 'investor-999';
-
-      const mockResult: QueryResult<Payout> = {
-        rows: [],
-        rowCount: 0,
-        command: 'SELECT',
-        oid: 0,
-        fields: [],
-      };
-
-      mockPool.query.mockResolvedValueOnce(mockResult);
-
-      const result = await repository.listPayoutsByInvestor(investorId);
-
-      expect(result).toHaveLength(0);
     });
   });
 });

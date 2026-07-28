@@ -9,7 +9,7 @@
  *  - Req 5.1: missing / null / undefined request body returns HTTP 400.
  */
 
-import { UniqueConstraintError } from '../../../lib/errors';
+import { AppError, ErrorCode, UniqueConstraintError } from '../../../lib/errors';
 import { createRegisterHandler } from '../registerHandler';
 import { RegisterService, DuplicateEmailError } from '../registerService';
 import { IUserRepository, RegisteredUser } from '../types';
@@ -78,26 +78,29 @@ describe('Round-trip registration (Req 7.7)', () => {
 
     // First registration – should succeed with 201
     const res1 = makeRes();
+    const next1 = makeNext();
     await handler(
       makeReq({ email: 'Alice@Example.COM', password: 'ValidPass!934X' }),
       res1,
-      makeNext(),
+      next1,
     );
     expect(res1._get().statusCode).toBe(201);
     expect((res1._get().jsonData as any).user.email).toBe('alice@example.com');
+    expect(next1).not.toHaveBeenCalled();
 
-    // Second registration with the same email (different casing) – should return 409
+    // Second registration with the same email (different casing) – should return 409 via next(AppError)
     const res2 = makeRes();
+    const next2 = makeNext();
     await handler(
       makeReq({ email: 'alice@example.com', password: 'Different!Pass55' }),
       res2,
-      makeNext(),
+      next2,
     );
-    expect(res2._get().statusCode).toBe(409);
-    expect(res2._get().jsonData).toEqual({
-      error: 'Conflict',
-      message: 'Email already registered',
-    });
+    expect(next2).toHaveBeenCalledWith(expect.any(AppError));
+    const err = next2.mock.calls[0][0] as AppError;
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe(ErrorCode.CONFLICT);
+    expect(err.message).toBe('Email already registered');
   });
 
   it('treats mixed-case variants of the same email as duplicates', async () => {
@@ -106,20 +109,23 @@ describe('Round-trip registration (Req 7.7)', () => {
     const handler = createRegisterHandler(svc);
 
     const res1 = makeRes();
+    const next1 = makeNext();
     await handler(
       makeReq({ email: 'USER@DOMAIN.COM', password: 'ValidPass!934X' }),
       res1,
-      makeNext(),
+      next1,
     );
     expect(res1._get().statusCode).toBe(201);
 
     const res2 = makeRes();
+    const next2 = makeNext();
     await handler(
       makeReq({ email: 'user@domain.com', password: 'Another!Pass77' }),
       res2,
-      makeNext(),
+      next2,
     );
-    expect(res2._get().statusCode).toBe(409);
+    expect(next2).toHaveBeenCalledWith(expect.any(AppError));
+    expect((next2.mock.calls[0][0] as AppError).statusCode).toBe(409);
   });
 });
 
@@ -178,9 +184,9 @@ describe('RegisterHandler – null/undefined body returns 400 (Req 5.1)', () => 
 
     await handler(makeReq(null), res, next);
 
-    expect(res._get().statusCode).toBe(400);
-    expect((res._get().jsonData as any).error).toBe('Bad Request');
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.any(AppError));
+    expect((next.mock.calls[0][0] as AppError).statusCode).toBe(400);
+    expect((next.mock.calls[0][0] as AppError).code).toBe(ErrorCode.BAD_REQUEST);
   });
 
   it('returns 400 when req.body is undefined', async () => {
@@ -190,8 +196,9 @@ describe('RegisterHandler – null/undefined body returns 400 (Req 5.1)', () => 
 
     await handler(makeReq(undefined), res, next);
 
-    expect(res._get().statusCode).toBe(400);
-    expect((res._get().jsonData as any).error).toBe('Bad Request');
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledWith(expect.any(AppError));
+    expect((next.mock.calls[0][0] as AppError).statusCode).toBe(400);
+    expect((next.mock.calls[0][0] as AppError).code).toBe(ErrorCode.BAD_REQUEST);
   });
 });
+

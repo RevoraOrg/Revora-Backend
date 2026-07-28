@@ -469,6 +469,83 @@ describe('verifyWebhook', () => {
 
       expect(result.valid).toBe(true);
     });
+
+    it('should accept a slightly future timestamp within the default clock skew window', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      // 15 seconds into the future — within the 30 s default clockSkewMs
+      const slightlyFuture = Date.now() + 15_000;
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(slightlyFuture),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject a future timestamp that exceeds the default clock skew window', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      // 45 seconds into the future — beyond the 30 s default clockSkewMs
+      const farFuture = Date.now() + 45_000;
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(farFuture),
+      };
+      const result = verifyWebhook(configWithTimestamp, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('VERIFICATION_FAILED');
+    });
+
+    it('should accept a future timestamp within a custom clockSkewMs', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const config: WebhookVerificationConfig = {
+        ...configWithTimestamp,
+        clockSkewMs: 60_000, // 60-second tolerance
+      };
+      const nearFuture = Date.now() + 50_000; // within 60 s tolerance
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(nearFuture),
+      };
+      const result = verifyWebhook(config, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(true);
+    });
+
+    it('should reject all future timestamps when clockSkewMs is 0', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const config: WebhookVerificationConfig = {
+        ...configWithTimestamp,
+        clockSkewMs: 0,
+      };
+      const justFuture = Date.now() + 1_000; // 1 second ahead
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(justFuture),
+      };
+      const result = verifyWebhook(config, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.code).toBe('VERIFICATION_FAILED');
+    });
+
+    it('should include clockSkewMs in the rejection error message', () => {
+      const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD);
+      const config: WebhookVerificationConfig = {
+        ...configWithTimestamp,
+        clockSkewMs: 5_000,
+      };
+      const farFuture = Date.now() + 30_000;
+      const headers = {
+        'x-revora-signature': signature,
+        'x-webhook-timestamp': String(farFuture),
+      };
+      const result = verifyWebhook(config, TEST_PAYLOAD, headers);
+
+      expect(result.valid).toBe(false);
+      expect(result.error?.message).toContain('clock skew');
+    });
   });
 
   it('should handle array header values', () => {

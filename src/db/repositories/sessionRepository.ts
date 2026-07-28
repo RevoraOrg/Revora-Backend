@@ -9,6 +9,9 @@ export interface Session {
   created_at: Date;
   parent_id?: string;
   revoked_at?: Date;
+  token_consumed_at?: Date | null;
+  /** Authorization role carried by the session (web/browser sessions). */
+  role?: string | null;
 }
 
 export interface CreateSessionInput {
@@ -17,6 +20,14 @@ export interface CreateSessionInput {
   token_hash: string;
   expires_at: Date;
   parent_id?: string;
+}
+
+export interface CreateWebSessionInput {
+  id?: string;
+  user_id: string;
+  role: string;
+  token_hash: string;
+  expires_at: Date;
 }
 
 /**
@@ -28,19 +39,21 @@ export interface CreateSessionInput {
 export class SessionRepository {
   constructor(private db: Pool) {}
 
-  async createSession(input: CreateSessionInput): Promise<Session> {
+  async createSession(input: CreateSessionInput, client?: Pool): Promise<Session> {
+    const db = client || this.db;
     // allow explicit session id (for upstream session id generation) or default DB uuid.
     if (input.id) {
       const query = `
-        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at)
-        VALUES ($1, $2, $3, $4, NOW())
+        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, parent_id)
+        VALUES ($1, $2, $3, $4, NOW(), $5)
         RETURNING *
       `;
-      const result: QueryResult<Session> = await this.db.query(query, [
+      const result: QueryResult<Session> = await db.query(query, [
         input.id,
         input.user_id,
         input.token_hash,
         input.expires_at,
+        input.parent_id || null,
       ]);
       if (result.rows.length === 0) throw new Error('Failed to create session');
       return this.mapSession(result.rows[0]);
@@ -51,8 +64,8 @@ export class SessionRepository {
       VALUES ($1, $2, $3, $4, $5, NOW())
       RETURNING *
     `;
-    const result: QueryResult<Session> = await this.db.query(query, [
-      input.id || crypto.randomUUID(),
+    const result: QueryResult<Session> = await db.query(query, [
+      crypto.randomUUID(),
       input.user_id,
       input.token_hash,
       input.expires_at,
@@ -67,6 +80,11 @@ export class SessionRepository {
       `UPDATE sessions SET token_hash = $1, expires_at = $2 WHERE id = $3`,
       [tokenHash, expiresAt, sessionId],
     );
+  }
+
+  async setSessionConsumed(sessionId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(`UPDATE sessions SET token_consumed_at = NOW() WHERE id = $1`, [sessionId]);
   }
 
   /**
@@ -98,22 +116,31 @@ export class SessionRepository {
     return session.id;
   }
 
-  async findById(id: string): Promise<Session | null> {
+  async findById(id: string, client?: Pool): Promise<Session | null> {
+    const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1`;
-    const result: QueryResult<Session> = await this.db.query(query, [id]);
+    const result: QueryResult<Session> = await db.query(query, [id]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
-  async findByParentId(parentId: string): Promise<Session | null> {
+  async findByIdForUpdate(id: string, client: Pool): Promise<Session | null> {
+    const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1 FOR UPDATE`;
+    const result: QueryResult<Session> = await client.query(query, [id]);
+    return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
+  }
+
+  async findByParentId(parentId: string, client?: Pool): Promise<Session | null> {
+    const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE parent_id = $1 LIMIT 1`;
-    const result: QueryResult<Session> = await this.db.query(query, [parentId]);
+    const result: QueryResult<Session> = await db.query(query, [parentId]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
   /**
    * Revoke a session and all its descendants.
    */
-  async revokeSessionAndDescendants(sessionId: string): Promise<void> {
+  async revokeSessionAndDescendants(sessionId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
     const query = `
       WITH RECURSIVE descendants AS (
         SELECT id FROM sessions WHERE id = $1
@@ -126,7 +153,7 @@ export class SessionRepository {
       WHERE id IN (SELECT id FROM descendants)
         AND revoked_at IS NULL;
     `;
-    await this.db.query(query, [sessionId]);
+    await db.query(query, [sessionId]);
   }
 
   /**
@@ -140,8 +167,85 @@ export class SessionRepository {
   /**
    * Delete all sessions belonging to a user (e.g. on password change).
    */
-  async deleteAllSessionsByUserId(userId: string): Promise<void> {
-    await this.db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+  async deleteAllSessionsByUserId(userId: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+  }
+
+  // ─── Web/browser session helpers (used by PostgresSessionStore) ────────────
+  //
+  // These methods back the SessionStore interface consumed by the HTTP session
+  // middleware.  They always operate on the SHA-256 `token_hash` of an opaque,
+  // high-entropy token — the raw token is never stored or queried.
+
+  /**
+   * Create a browser session row carrying an authorization `role`.
+   * The caller is responsible for hashing the token before it reaches here.
+   */
+  async createWebSession(input: CreateWebSessionInput, client?: Pool): Promise<Session> {
+    const db = client || this.db;
+    const query = `
+      INSERT INTO sessions (id, user_id, role, token_hash, expires_at, created_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      RETURNING *
+    `;
+    const result: QueryResult<Session> = await db.query(query, [
+      input.id || crypto.randomUUID(),
+      input.user_id,
+      input.role,
+      input.token_hash,
+      input.expires_at,
+    ]);
+    if (result.rows.length === 0) throw new Error('Failed to create session');
+    return this.mapSession(result.rows[0]);
+  }
+
+  /**
+   * Look up a session by its token hash. Returns the row regardless of
+   * expiry/revocation state — the caller (PostgresSessionStore) performs the
+   * constant-time hash comparison and the expiry/revocation checks so those
+   * decisions live in one auditable place.
+   */
+  async findByTokenHash(tokenHash: string, client?: Pool): Promise<Session | null> {
+    const db = client || this.db;
+    const query = `SELECT * FROM sessions WHERE token_hash = $1 LIMIT 1`;
+    const result: QueryResult<Session> = await db.query(query, [tokenHash]);
+    return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
+  }
+
+  /** Delete a single session by its token hash (used for logout). Idempotent. */
+  async deleteByTokenHash(tokenHash: string, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(`DELETE FROM sessions WHERE token_hash = $1`, [tokenHash]);
+  }
+
+  /** Extend a session's expiry (sliding window) by token hash. */
+  async touchExpiryByTokenHash(tokenHash: string, expiresAt: Date, client?: Pool): Promise<void> {
+    const db = client || this.db;
+    await db.query(
+      `UPDATE sessions SET expires_at = $1 WHERE token_hash = $2`,
+      [expiresAt, tokenHash],
+    );
+  }
+
+  /**
+   * Delete all sessions whose expiry has passed. Returns the number removed.
+   * Backs the periodic cleanupExpired job.
+   */
+  async deleteExpired(client?: Pool): Promise<number> {
+    const db = client || this.db;
+    const result = await db.query(`DELETE FROM sessions WHERE expires_at <= NOW()`);
+    return result.rowCount ?? 0;
+  }
+
+  /** Count sessions that are neither expired nor revoked. */
+  async countActive(client?: Pool): Promise<number> {
+    const db = client || this.db;
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count FROM sessions
+        WHERE expires_at > NOW() AND revoked_at IS NULL`,
+    );
+    return result.rows[0]?.count ?? 0;
   }
 
   private mapSession(row: any): Session {
@@ -153,6 +257,8 @@ export class SessionRepository {
       created_at: row.created_at,
       parent_id: row.parent_id,
       revoked_at: row.revoked_at,
+      token_consumed_at: row.token_consumed_at,
+      role: row.role ?? null,
     };
   }
 }
