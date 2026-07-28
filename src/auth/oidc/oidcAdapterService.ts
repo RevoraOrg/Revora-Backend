@@ -18,6 +18,7 @@ const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
 export class OidcAdapterService {
   private readonly discoveryCache = new Map<string, OidcDiscoveryDocument>();
   private readonly flowStates = new Map<string, OidcFlowState>();
+  private readonly consumedJtis = new Map<string, number>();
 
   constructor(private readonly jwksCache: JwksCacheService) {}
 
@@ -200,6 +201,81 @@ export class OidcAdapterService {
     }
 
     if (claims.nonce !== expectedNonce) throw new Error('ID token nonce mismatch');
+    return claims;
+  }
+
+  async validateLogoutToken(
+    logoutToken: string,
+    provider: OidcProviderRow,
+    discovery: OidcDiscoveryDocument,
+  ): Promise<OidcIdTokenClaims> {
+    let header: { alg?: string; kid?: string };
+    try {
+      const [h] = logoutToken.split('.');
+      header = JSON.parse(Buffer.from(h, 'base64url').toString());
+    } catch {
+      throw new Error('Malformed logout token header');
+    }
+
+    if (!header.alg) throw new Error('Logout token missing alg header');
+    if ((BLOCKED_ID_TOKEN_ALGORITHMS as readonly string[]).includes(header.alg)) {
+      throw new Error(`Insecure algorithm rejected: ${header.alg}`);
+    }
+    if (!(ALLOWED_ID_TOKEN_ALGORITHMS as readonly string[]).includes(header.alg)) {
+      throw new Error(`Unknown or disallowed algorithm: ${header.alg}`);
+    }
+    if (!header.kid) throw new Error('Logout token missing kid header');
+
+    let publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
+
+    const verifyOpts: jwt.VerifyOptions = {
+      algorithms: [...ALLOWED_ID_TOKEN_ALGORITHMS] as jwt.Algorithm[],
+      issuer: provider.issuer_url,
+      audience: provider.client_id,
+      clockTolerance: CLOCK_SKEW_SECONDS,
+    };
+
+    let claims: OidcIdTokenClaims;
+    try {
+      claims = jwt.verify(logoutToken, publicKey as unknown as string, verifyOpts) as OidcIdTokenClaims;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('invalid signature') || msg.includes('unable to verify')) {
+        this.jwksCache.evict(discovery.jwks_uri);
+        publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
+        try {
+          claims = jwt.verify(logoutToken, publicKey as unknown as string, verifyOpts) as OidcIdTokenClaims;
+        } catch {
+          throw new Error('Logout token signature invalid after JWKS rotation');
+        }
+      } else {
+        throw new Error(`Logout token validation failed: ${msg}`);
+      }
+    }
+
+    if (!claims.events || typeof claims.events !== 'object' || !('http://schemas.openid.net/event/backchannel-logout' in claims.events)) {
+      throw new Error('Logout token missing backchannel-logout event');
+    }
+    
+    if (claims.nonce !== undefined) {
+      throw new Error('Logout token must not contain a nonce');
+    }
+
+    if (typeof claims.jti === 'string') {
+      if (this.consumedJtis.has(claims.jti)) {
+        throw new Error('Logout token replayed');
+      }
+      this.consumedJtis.set(claims.jti, claims.exp * 1000);
+      
+      // Lazy cleanup
+      const now = Date.now();
+      for (const [jti, exp] of this.consumedJtis.entries()) {
+        if (now > exp) {
+          this.consumedJtis.delete(jti);
+        }
+      }
+    }
+
     return claims;
   }
 }

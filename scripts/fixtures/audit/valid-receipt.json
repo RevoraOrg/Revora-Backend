@@ -1,0 +1,10 @@
+{
+  "version": "revora-audit-receipt-v1",
+  "published_at": "2026-01-15T10:15:00.000Z",
+  "start_prev_hash": "bee58147dc813f93e3b43277b5da53c1a1620f2258f953b75a25fe5774f999be",
+  "expected_head_hash": "75da7a8205ab1cb890612851d7ae5ca2da6a390cca5df14754b75597ff8d1f7e",
+  "total_rows": 3,
+  "start_id": "00000000-0000-4000-8000-000000000001",
+  "end_id": "00000000-0000-4000-8000-000000000003",
+  "signature": "ed25519:abcdef1234567890"
+}

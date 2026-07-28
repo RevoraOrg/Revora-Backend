@@ -1,10 +1,18 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Keypair } from '@stellar/stellar-sdk';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
-import { requireAdmin } from '../middleware/auth';
+import { requireAdmin, AuthenticatedRequest } from '../middleware/auth';
 import { env } from '../config/env';
+import {
+  RetentionLabelError,
+  RetentionLabelService,
+} from '../services/retentionLabelService';
+import { Errors } from '../lib/errors';
 
-export function createAdminRouter(auditLogRepo: AuditLogRepository): Router {
+export function createAdminRouter(
+  auditLogRepo: AuditLogRepository,
+  retentionLabelService?: RetentionLabelService,
+): Router {
   const router = Router();
 
   // Secure all routes in this router with requireAdmin
@@ -67,5 +75,129 @@ export function createAdminRouter(auditLogRepo: AuditLogRepository): Router {
     }
   });
 
+  if (retentionLabelService) {
+    router.get(
+      '/retention-labels/active',
+      async (_req: Request, res: Response, next: NextFunction) => {
+        try {
+          const labels = await retentionLabelService.listActiveHolds();
+          res.status(200).json({ labels });
+        } catch (error) {
+          next(error);
+        }
+      },
+    );
+
+    router.get(
+      '/retention-labels/:periodId',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const label = await retentionLabelService.get(req.params.periodId);
+          if (!label) {
+            next(Errors.notFound('Retention label not found'));
+            return;
+          }
+          res.status(200).json({ label });
+        } catch (error) {
+          next(mapRetentionError(error));
+        }
+      },
+    );
+
+    router.post(
+      '/retention-labels/:periodId/legal-hold/propose',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const actorId = requireActorId(req);
+          const label = await retentionLabelService.proposeLegalHold({
+            periodId: req.params.periodId,
+            actorId,
+            reason: typeof req.body?.reason === 'string' ? req.body.reason : undefined,
+          });
+          res.status(202).json({ label });
+        } catch (error) {
+          next(mapRetentionError(error));
+        }
+      },
+    );
+
+    router.post(
+      '/retention-labels/:periodId/legal-hold/approve',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const actorId = requireActorId(req);
+          const label = await retentionLabelService.approveLegalHold({
+            periodId: req.params.periodId,
+            actorId,
+          });
+          res.status(200).json({ label });
+        } catch (error) {
+          next(mapRetentionError(error));
+        }
+      },
+    );
+
+    router.post(
+      '/retention-labels/:periodId/legal-hold/propose-release',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const actorId = requireActorId(req);
+          const label = await retentionLabelService.proposeLegalHoldRelease({
+            periodId: req.params.periodId,
+            actorId,
+          });
+          res.status(202).json({ label });
+        } catch (error) {
+          next(mapRetentionError(error));
+        }
+      },
+    );
+
+    router.post(
+      '/retention-labels/:periodId/legal-hold/approve-release',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const actorId = requireActorId(req);
+          const label = await retentionLabelService.approveLegalHoldRelease({
+            periodId: req.params.periodId,
+            actorId,
+          });
+          res.status(200).json({ label });
+        } catch (error) {
+          next(mapRetentionError(error));
+        }
+      },
+    );
+  }
+
   return router;
+}
+
+function requireActorId(req: Request): string {
+  const user = (req as AuthenticatedRequest).user;
+  const actorId = user?.id || user?.sub;
+  if (!actorId || typeof actorId !== 'string') {
+    throw Errors.unauthorized('Authenticated admin identity required');
+  }
+  return actorId;
+}
+
+function mapRetentionError(error: unknown): unknown {
+  if (!(error instanceof RetentionLabelError)) {
+    return error;
+  }
+  switch (error.code) {
+    case 'INVALID_PERIOD':
+      return Errors.badRequest(error.message);
+    case 'DUAL_CONTROL':
+    case 'ALREADY_ACTIVE':
+    case 'NOT_ACTIVE':
+    case 'PENDING_REQUIRED':
+    case 'WRONG_PENDING':
+      return Errors.conflict(error.message);
+    case 'NOT_FOUND':
+      return Errors.notFound(error.message);
+    default:
+      return error;
+  }
 }

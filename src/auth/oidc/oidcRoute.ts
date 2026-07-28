@@ -2,6 +2,8 @@ import { NextFunction, Request, Response, Router } from 'express';
 import { AuthenticatedRequest } from '../../middleware/auth';
 import { OidcAdapterService } from './oidcAdapterService';
 import { OidcProviderRepository, CreateOidcProviderInput } from '../../db/repositories/oidcProviderRepository';
+import { sessionStore } from '../../lib/sessionStore';
+import { globalMetrics } from '../../lib/metrics';
 
 export interface OidcRouterDependencies {
   oidcAdapter: OidcAdapterService;
@@ -129,6 +131,60 @@ export function createOidcRouter(deps: OidcRouterDependencies): Router {
 
   router.post('/api/auth/oidc/jwks/refresh', requireAdmin, handleRefreshRequest);
   router.post('/auth/oidc/jwks/refresh', requireAdmin, handleRefreshRequest);
+
+  // ── Logout flow ──────────────────────────────────────────────────────────
+  const handleLogoutRequest = async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const logoutToken = (req.method === 'POST' ? req.body.logout_token : req.query.logout_token) as string | undefined;
+      
+      if (!logoutToken) {
+        res.status(400).json({ error: 'Bad Request', message: 'logout_token is required' });
+        return;
+      }
+
+      let header: { alg?: string; kid?: string };
+      let payload: { iss?: string };
+      try {
+        const [h, p] = logoutToken.split('.');
+        header = JSON.parse(Buffer.from(h, 'base64url').toString());
+        payload = JSON.parse(Buffer.from(p, 'base64url').toString());
+      } catch {
+        res.status(400).json({ error: 'Bad Request', message: 'Malformed logout token' });
+        return;
+      }
+
+      if (!payload.iss) {
+        res.status(400).json({ error: 'Bad Request', message: 'Logout token missing issuer' });
+        return;
+      }
+
+      const provider = await oidcProviderRepo.findByIssuerUrl(payload.iss);
+      if (!provider) {
+        res.status(400).json({ error: 'Bad Request', message: 'Provider not found for issuer' });
+        return;
+      }
+
+      const discovery = await oidcAdapter.getDiscovery(provider.issuer_url);
+      const claims = await oidcAdapter.validateLogoutToken(logoutToken, provider, discovery);
+      
+      await sessionStore.deleteAllForUser(claims.sub);
+      globalMetrics.incrementCounter('oidc.logout.processed', { status: 'success' });
+      
+      res.status(200).json({ ok: true, message: 'Logged out successfully' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('expired') || msg.includes('Invalid') || msg.includes('mismatch') || msg.includes('replayed')) {
+        res.status(400).json({ error: 'Bad Request', message: msg });
+        return;
+      }
+      next(err);
+    }
+  };
+
+  router.get('/api/auth/oidc/logout', handleLogoutRequest);
+  router.post('/api/auth/oidc/logout', handleLogoutRequest);
+  router.get('/auth/oidc/logout', handleLogoutRequest);
+  router.post('/auth/oidc/logout', handleLogoutRequest);
 
   // ── Admin: register provider ─────────────────────────────────────────────
   router.post('/api/auth/oidc/providers', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
