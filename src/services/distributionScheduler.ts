@@ -1,3 +1,12 @@
+/**
+ * DistributionScheduler — claims approved revenue reports and runs them
+ * through the DistributionEngine. See architecture map for the full sequence.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ * @see ../docs/distribution-scheduler-idempotency.md
+ * @see ../docs/holiday-calendar-service.md
+ * @see ../docs/distribution-advisory-lock.md
+ */
 import { Logger, globalLogger } from '../lib/logger';
 import DistributionEngine from './distributionEngine';
 import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
