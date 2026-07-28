@@ -140,6 +140,11 @@ export class OidcAdapterService {
     return res.json() as Promise<OidcTokenResponse>;
   }
 
+  async refreshJwks(issuerUrl: string): Promise<void> {
+    const discovery = await this.getDiscovery(issuerUrl);
+    await this.jwksCache.refresh(discovery.jwks_uri, issuerUrl);
+  }
+
   // ── ID Token validation ───────────────────────────────────────────────
 
   async validateIdToken(
@@ -166,7 +171,7 @@ export class OidcAdapterService {
     }
     if (!header.kid) throw new Error('ID token missing kid header');
 
-    let publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid);
+    let publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
 
     const verifyOpts: jwt.VerifyOptions = {
       algorithms: [...ALLOWED_ID_TOKEN_ALGORITHMS] as jwt.Algorithm[],
@@ -183,7 +188,7 @@ export class OidcAdapterService {
       if (msg.includes('invalid signature') || msg.includes('unable to verify')) {
         // Signature failure — rotate JWKS and retry once
         this.jwksCache.evict(discovery.jwks_uri);
-        publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid);
+        publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
         try {
           claims = jwt.verify(idToken, publicKey as unknown as string, verifyOpts) as OidcIdTokenClaims;
         } catch {

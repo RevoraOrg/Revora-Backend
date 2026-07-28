@@ -50,6 +50,8 @@ import { MetricsCollector } from "./lib/metrics";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
+import { createMobileCompanionRouter } from "./routes/mobileCompanion";
+import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
 
 const port = env.PORT;
@@ -690,6 +692,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Initialize AML service and routes
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
+
+  // Mobile companion API with per-device Ed25519 request signatures
+  const deviceKeyStore = new InMemoryDeviceKeyStore();
+  apiRouter.use("/mobile", createMobileCompanionRouter({ keyStore: deviceKeyStore }));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));

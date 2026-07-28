@@ -3,20 +3,12 @@ import DistributionEngine from './distributionEngine';
 import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
 import { AppError, Errors } from '../lib/errors';
 import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
-import { MetricsCollector } from '../lib/metrics';
+import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
 
 export interface DistributionSchedulerOptions {
   logger?: Logger;
-  metrics?: MetricsCollector;
-  /**
-   * Maximum number of missed distribution windows to enqueue during startup
-   * catch-up. Overrides the SCHEDULER_CATCHUP_MAX env var when set.
-   */
-  catchupMax?: number;
-  /**
-   * Backlog count beyond which a red-alert is emitted. Defaults to 2x catchupMax.
-   */
-  catchupBacklogAlertThreshold?: number;
+  holidayCalendarService?: HolidayCalendarService;
+  resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
 }
 
 export interface CatchUpResult {
@@ -265,11 +257,8 @@ export function findNextCronWindow(
  */
 export class DistributionScheduler {
   private readonly logger: Logger;
-  private readonly metrics: MetricsCollector | undefined;
-  private readonly catchupMax: number;
-  private readonly catchupBacklogAlertThreshold: number;
-
-  private static ENV_CATCHUP_MAX = 'SCHEDULER_CATCHUP_MAX';
+  private readonly holidayCalendarService?: HolidayCalendarService;
+  private readonly resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
@@ -277,71 +266,8 @@ export class DistributionScheduler {
     options: DistributionSchedulerOptions = {}
   ) {
     this.logger = options.logger ?? globalLogger;
-    this.metrics = options.metrics;
-    this.catchupMax = this.resolveCatchupMax(options.catchupMax);
-    this.catchupBacklogAlertThreshold =
-      options.catchupBacklogAlertThreshold ?? this.catchupMax * 2;
-  }
-
-  /**
-   * Resolve and validate catchupMax from options or env var.
-   * Fail-fast: throws on missing or invalid value.
-   */
-  private resolveCatchupMax(explicit?: number): number {
-    if (explicit !== undefined) {
-      if (!Number.isInteger(explicit) || explicit < 1) {
-        throw Errors.badRequest(
-          `catchupMax must be a positive integer, got ${explicit}`
-        );
-      }
-      return explicit;
-    }
-
-    const envRaw = process.env[DistributionScheduler.ENV_CATCHUP_MAX];
-    if (envRaw !== undefined && envRaw !== '') {
-      const parsed = Number(envRaw);
-      if (!Number.isInteger(parsed) || parsed < 1) {
-        throw Errors.badRequest(
-          `${DistributionScheduler.ENV_CATCHUP_MAX} must be a positive integer, got "${envRaw}"`
-        );
-      }
-      return parsed;
-    }
-
-    return 50;
-  }
-
-  /**
-   * Resolve the timezone for a given offering.
-   * Defaults to UTC when no timezone is configured.
-   */
-  resolveOfferingTimezone(offeringTimezone: string | null | undefined): string {
-    return normalizeScheduleTimezone(offeringTimezone);
-  }
-
-  /**
-   * Evaluate a cron expression at a given UTC instant in the specified timezone.
-   * Returns true if the expression matches the wall-clock time in that zone.
-   */
-  evaluateCron(cron: string, date: Date, tz: string): boolean {
-    return evaluateCronAt(cron, date, tz);
-  }
-
-  /**
-   * Check whether a window has already been processed (idempotency guard
-   * for DST edge cases).
-   */
-  isWindowAlreadyCompleted(window: TimezoneWindow): boolean {
-    const key = deduplicateWindowKey(window);
-    return this.completedWindows.has(key);
-  }
-
-  /**
-   * Mark a window as completed in the in-memory deduplication map.
-   */
-  markWindowCompleted(window: TimezoneWindow): void {
-    const key = deduplicateWindowKey(window);
-    this.completedWindows.set(key, true);
+    this.holidayCalendarService = options.holidayCalendarService;
+    this.resolveJurisdiction = options.resolveJurisdiction;
   }
 
   /**
@@ -410,12 +336,32 @@ export class DistributionScheduler {
           window: formatWindowForAudit(window),
         });
 
+        let periodEnd = claim.period_end;
+        const jurisdiction = await this.resolveOfferingJurisdiction(claim.offering_id);
+
+        if (this.holidayCalendarService && jurisdiction) {
+          const shiftDecision = this.holidayCalendarService.getShiftedDate(claim.period_end, [jurisdiction]);
+
+          if (shiftDecision.shifted) {
+            periodEnd = shiftDecision.shiftedDate;
+            this.logger.info('Distribution window shifted due to blackout', {
+              reportId: claim.id,
+              offeringId: claim.offering_id,
+              originalDate: shiftDecision.originalDate.toISOString(),
+              shiftedDate: shiftDecision.shiftedDate.toISOString(),
+              direction: shiftDecision.direction,
+              jurisdictions: shiftDecision.jurisdictions,
+              reason: shiftDecision.reason,
+            });
+          }
+        }
+
         await this.distributionEngine.distribute(
           claim.offering_id,
           {
             id: claim.id,
-            start: window.wallClockStart,
-            end: window.wallClockEnd,
+            start: claim.period_start,
+            end: periodEnd,
           },
           Number(claim.amount)
         );
@@ -472,80 +418,13 @@ export class DistributionScheduler {
     return summary;
   }
 
-  /**
-   * Startup catch-up: compute missed distribution windows, emit a backlog gauge,
-   * and enqueue up to catchupMax reports via the existing claim flow.
-   *
-   * Concurrency safety:
-   *   claimApprovedReportForDistribution uses an UPDATE ... WHERE with status
-   *   guards, so concurrent restarts cannot double-enqueue the same report.
-   *
-   * Pagination:
-   *   Only the first catchupMax reports are processed per call. Callers may
-   *   invoke this method repeatedly to paginate through a large backlog.
-   *
-   * Backlog alert:
-   *   If totalMissed exceeds catchupBacklogAlertThreshold, a red-alert is
-   *   emitted via logger.error.
-   */
-  async catchUpMissedWindows(): Promise<CatchUpResult> {
-    this.logger.info('Starting catch-up for missed distribution windows');
-
-    const pendingReports = await this.revenueReportRepo.findApprovedWithoutDistribution();
-
-    const totalMissed = pendingReports.length;
-    this.logger.info(`Found ${totalMissed} missed distribution window(s)`);
-
-    if (this.metrics) {
-      this.metrics.setGauge(
-        'scheduler_catchup_backlog',
-        totalMissed,
-        undefined,
-        'Number of missed distribution windows awaiting catch-up'
-      );
+  private async resolveOfferingJurisdiction(offeringId: string): Promise<string | null> {
+    if (!this.resolveJurisdiction) return null;
+    try {
+      const result = this.resolveJurisdiction(offeringId);
+      return result instanceof Promise ? await result : result;
+    } catch {
+      return null;
     }
-
-    const backlogExceededCeiling = totalMissed > this.catchupBacklogAlertThreshold;
-    if (backlogExceededCeiling) {
-      this.logger.error(
-        `[RED-ALERT] Catch-up backlog ${totalMissed} exceeds ceiling ${this.catchupBacklogAlertThreshold}`
-      );
-    }
-
-    const toProcess = pendingReports.slice(0, this.catchupMax);
-    const skipped = Math.max(0, totalMissed - this.catchupMax);
-    const errors: CatchUpResult['errors'] = [];
-    let enqueued = 0;
-
-    for (const report of toProcess) {
-      try {
-        const claimed = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
-        if (claimed) {
-          enqueued++;
-          this.logger.info('Enqueued missed window for distribution', {
-            reportId: report.id,
-            offeringId: report.offering_id,
-          });
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.logger.error('Failed to enqueue missed window', {
-          reportId: report.id,
-          error: message,
-        });
-        errors.push({ reportId: report.id, error: message });
-      }
-    }
-
-    const result: CatchUpResult = {
-      totalMissed,
-      enqueued,
-      skipped,
-      errors,
-      backlogExceededCeiling,
-    };
-
-    this.logger.info('Catch-up complete', result);
-    return result;
   }
 }
