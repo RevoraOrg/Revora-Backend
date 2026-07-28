@@ -36,6 +36,10 @@ case "$1" in
     echo "🌀 Running chaos tests only..."
     npm run test:chaos
     ;;
+  gap)
+    echo "🔍 Running Horizon transaction-history gap-injection chaos..."
+    npx jest --testPathPattern="horizonGapChaos" --runInBand --coverage
+    ;;
   *)
     echo "Running all tests..."
     npm test
@@ -43,3 +47,9 @@ case "$1" in
 esac
 
 echo "✅ Tests completed!"
+echo ""
+echo "Available scenarios:"
+echo "  ./run-chaos-tests.sh gap      – Horizon transaction-history gap-injection"
+echo "  ./run-chaos-tests.sh chaos    – All chaos tests"
+echo "  ./run-chaos-tests.sh coverage – Full suite with coverage report"
+echo "  ./run-chaos-tests.sh ci       – CI mode (coverage + fail-fast)"

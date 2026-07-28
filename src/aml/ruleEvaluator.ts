@@ -5,6 +5,7 @@
 
 import { AMLRule, TransactionContext, RuleEvaluationResult } from './types';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
+import { jaroWinkler, normalizeName } from '../lib/jaroWinkler';
 
 interface VelocityRuleConfig {
   window_minutes: number;
@@ -26,6 +27,12 @@ interface GeoMismatchRuleConfig {
 
 interface AmountThresholdConfig {
   threshold: number;
+}
+
+interface SanctionsRuleConfig {
+  sanctions_list: string[];
+  jaro_winkler_threshold?: number;
+  fuzzy_enabled?: boolean;
 }
 
 export class RuleEvaluator {
@@ -63,6 +70,9 @@ export class RuleEvaluator {
         break;
       case 'amount_threshold':
         ({ triggered, details } = this.evaluateAmountThresholdRule(context, rule));
+        break;
+      case 'sanctions_screening':
+        ({ triggered, details } = this.evaluateSanctionsRule(context, rule));
         break;
       default:
         return { rule_id: rule.id, rule_version: rule.version, triggered: false, severity: rule.severity, details: { error: 'Unknown rule type' }, timestamp: new Date() };
@@ -113,6 +123,72 @@ export class RuleEvaluator {
     const currentAmount = parseFloat(context.amount);
     const triggered = currentAmount > config.threshold;
     return { triggered, details: { amount: currentAmount, threshold: config.threshold } };
+  }
+
+  private evaluateSanctionsRule(context: TransactionContext, rule: AMLRule): { triggered: boolean; details: Record<string, unknown> } {
+    const config = rule.config as unknown as SanctionsRuleConfig;
+    const sanctionsList = config.sanctions_list || [];
+    const nameToScreen = context.investor_name || context.investor_id;
+
+    if (!nameToScreen || sanctionsList.length === 0) {
+      return { triggered: false, details: { reason: 'Missing investor name or sanctions list' } };
+    }
+
+    // Per-tenant threshold > rule config threshold > default 0.85
+    const tenantThreshold = context.tenant_settings?.sanctions_threshold;
+    const threshold = typeof tenantThreshold === 'number'
+      ? tenantThreshold
+      : (typeof config.jaro_winkler_threshold === 'number' ? config.jaro_winkler_threshold : 0.85);
+
+    const normName = normalizeName(nameToScreen);
+    let bestMatch: { candidate: string; score: number; matchType: 'exact' | 'fuzzy' } | null = null;
+
+    for (const candidate of sanctionsList) {
+      const normCandidate = normalizeName(candidate);
+      if (normName === normCandidate) {
+        bestMatch = { candidate, score: 1.0, matchType: 'exact' };
+        break;
+      }
+
+      if (config.fuzzy_enabled !== false) {
+        const score = jaroWinkler(nameToScreen, candidate, { transliterate: true });
+        if (score >= threshold) {
+          if (!bestMatch || score > bestMatch.score) {
+            bestMatch = { candidate, score, matchType: 'fuzzy' };
+          }
+        }
+      }
+    }
+
+    if (!bestMatch) {
+      return {
+        triggered: false,
+        details: {
+          screened_name: nameToScreen,
+          threshold,
+          matched: false,
+        },
+      };
+    }
+
+    // Every fuzzy hit is treated as a pending review, never an auto-deny.
+    const isFuzzy = bestMatch.matchType === 'fuzzy';
+    const action = isFuzzy ? 'pending_review' : 'auto_deny';
+    const autoDeny = !isFuzzy;
+
+    return {
+      triggered: true,
+      details: {
+        screened_name: nameToScreen,
+        matched_candidate: bestMatch.candidate,
+        match_type: bestMatch.matchType,
+        similarity_score: bestMatch.score,
+        threshold,
+        action,
+        auto_deny: autoDeny,
+        review_status: isFuzzy ? 'pending_review' : 'confirmed_deny',
+      },
+    };
   }
 
   private async getPreviousTransactions(investorId: string, offeringId: string, daysBack: number): Promise<TransactionContext[]> {

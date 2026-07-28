@@ -9,6 +9,7 @@ export interface Offering {
   amount: string;
   status: 'draft' | 'active' | 'closed';
   version: number; // Used for optimistic concurrency control
+  timezone?: string; // IANA timezone for distribution scheduling (e.g. "America/New_York")
   created_at: Date;
   updated_at: Date;
 }
