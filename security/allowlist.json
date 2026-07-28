@@ -4,7 +4,53 @@
       "expiry": "2099-12-31T00:00:00Z",
       "ticket": "DEV-123",
       "justification": "CRLF injection only affects explicit proxy usage which we do not use"
+    },
+    "axios": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-601",
+      "justification": "Axios is a transitive dependency of @stellar/stellar-sdk and stellar-sdk. The DoS/prototype-pollution advisories require an attacker-controlled request body or config — axios is not used directly in request handlers. Will be resolved when stellar-sdk upgrades axios."
+    },
+    "body-parser": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-602",
+      "justification": "Low-severity DoS only triggers when an invalid limit string is passed. Our Express configuration uses only numeric byte limits (e.g. '1mb') which are validated at startup. Upgrading express@5 would resolve this; tracked under DEV-603."
+    },
+    "morgan": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-604",
+      "justification": "Log-forging via :remote-user token. We do not use the :remote-user token in our morgan format string. Mitigated by input sanitisation in requestLog middleware. Will upgrade to morgan@1.11.0 in the next dependency maintenance sprint."
     }
   },
-  "outdated": {}
+  "outdated": {
+    "@stellar/stellar-sdk": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-605",
+      "justification": "Major version upgrade from 14.x to 16.x requires coordinated migration of Stellar transaction signing APIs. Tracked for Q4 2026 maintenance sprint."
+    },
+    "dotenv": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-606",
+      "justification": "dotenv 17.x drops Node 14/16 support and changes config API. Requires testing across environments. Scheduled for Q4 2026 maintenance sprint."
+    },
+    "express": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-603",
+      "justification": "Express 5.x has breaking changes in error handling and router API. Requires full regression testing. Scheduled for Q4 2026 major-dependency upgrade sprint."
+    },
+    "has-flag": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-607",
+      "justification": "has-flag 5.x is ESM-only. Our build currently uses CJS. Upgrading requires ESM migration. Scheduled for Q4 2026 maintenance sprint."
+    },
+    "morgan": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-604",
+      "justification": "Upgrading to morgan@1.11.0 to resolve log-forging CVE. Minor version bump, low risk. Included in next dependency patch window."
+    },
+    "pg": {
+      "expiry": "2026-10-31T00:00:00Z",
+      "ticket": "DEV-608",
+      "justification": "pg 8.22.0 is the latest in the 8.x line. npm outdated is comparing against a pre-release/unstable tag. Current version is up-to-date within the 8.x stable series."
+    }
+  }
 }
