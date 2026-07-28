@@ -55,19 +55,20 @@ export class ColumnEncryptionRotator {
     let state = await this.getJobState(jobId);
 
     if (!state) {
+      const totalRows = await this.countRowsToRotate(targetTable, targetColumn, targetKeyGeneration);
       state = {
         id: jobId,
         targetTable,
         targetColumn,
         targetKeyGeneration,
         lastProcessedId: null,
-        status: 'pending',
-        totalRows: await this.countRowsToRotate(targetTable, targetColumn, targetKeyGeneration),
+        status: totalRows === 0 ? 'completed' : 'pending',
+        totalRows,
         reencryptedRows: 0,
         failedRows: 0,
         createdAt: new Date(),
         updatedAt: new Date(),
-        completedAt: null,
+        completedAt: totalRows === 0 ? new Date() : null,
       };
 
       await this.saveJobState(state);
@@ -194,6 +195,18 @@ export class ColumnEncryptionRotator {
     if (remaining === 0) {
       state.status = 'completed';
       state.completedAt = new Date();
+      await this.saveJobState(state);
+
+      await this.recordAudit('KMS_KEY_ROTATION_COMPLETED', 'SUCCESS', {
+        jobId,
+        targetTable: state.targetTable,
+        targetColumn: state.targetColumn,
+        targetKeyGeneration: state.targetKeyGeneration,
+        totalReencrypted: state.reencryptedRows,
+        totalFailed: state.failedRows,
+      });
+
+      return { processed: processedCount, completed: true };
     }
 
     await this.saveJobState(state);
@@ -205,7 +218,7 @@ export class ColumnEncryptionRotator {
       remainingRows: remaining,
     });
 
-    return { processed: processedCount, completed: state.status === 'completed' };
+    return { processed: processedCount, completed: false };
   }
 
   /**
