@@ -173,6 +173,7 @@ export class MetricsCollector {
   private gauges: Map<string, number> = new Map();
   private histograms: Map<string, number[]> = new Map();
   private metricMetadata: Map<string, { type: MetricType; help?: string }> = new Map();
+  private metricCreated: Map<string, number> = new Map();
   private activeConnections = 0;
   private startTime: number;
   private cardinalityCount = 0;
@@ -308,6 +309,10 @@ export class MetricsCollector {
     const current = this.counters.get(key) ?? 0;
     this.counters.set(key, current + value);
     
+    if (!this.metricCreated.has(key)) {
+      this.metricCreated.set(key, Date.now());
+    }
+    
     if (!this.metricMetadata.has(name)) {
       this.metricMetadata.set(name, { type: MetricType.COUNTER, help });
     }
@@ -330,6 +335,10 @@ export class MetricsCollector {
     }
     
     this.gauges.set(key, value);
+    
+    if (!this.metricCreated.has(key)) {
+      this.metricCreated.set(key, Date.now());
+    }
     
     if (!this.metricMetadata.has(name)) {
       this.metricMetadata.set(name, { type: MetricType.GAUGE, help });
@@ -361,6 +370,10 @@ export class MetricsCollector {
     }
     
     this.histograms.set(key, observations);
+    
+    if (!this.metricCreated.has(key)) {
+      this.metricCreated.set(key, Date.now());
+    }
     
     if (!this.metricMetadata.has(name)) {
       this.metricMetadata.set(name, { type: MetricType.HISTOGRAM, help });
@@ -599,6 +612,7 @@ export class MetricsCollector {
     this.gauges.clear();
     this.histograms.clear();
     this.metricMetadata.clear();
+    this.metricCreated.clear();
     this.activeConnections = 0;
     this.cardinalityCount = 0;
   }
@@ -643,6 +657,104 @@ export class MetricsCollector {
       lines.push(`${name}${labelStr} ${value} ${timestamp}`);
     }
 
+    return lines.join('\n') + '\n';
+  }
+
+  /**
+   * Export metrics in OpenMetrics text format (v1.0.0).
+   *
+   * Complies with the OpenMetrics specification:
+   * - Includes _created epoch-second timestamps for counters, gauges, and histograms
+   * - Trailing `# EOF` marker
+   * - Proper histogram bucket format (le, +Inf)
+   *
+   * @param namePrefix Optional prefix filter — only metrics whose name starts with this value are included
+   * @returns OpenMetrics-formatted metrics string
+   */
+  exportOpenMetrics(namePrefix?: string): string {
+    const lines: string[] = [];
+    const now = Math.floor(Date.now() / 1000);
+
+    const formatLabels = (labels?: Record<string, string>): string => {
+      if (!labels || Object.keys(labels).length === 0) return '';
+      return `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`;
+    };
+
+    const matchesPrefix = (name: string): boolean => {
+      if (!namePrefix) return true;
+      return name.startsWith(namePrefix);
+    };
+
+    // Group metric entries by name for family-level HELP/TYPE lines
+    const families = new Map<string, Array<{ key: string; labels?: Record<string, string>; value: number; created?: number }>>();
+
+    // Collect counters
+    for (const [key, value] of this.counters.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      if (!matchesPrefix(name)) continue;
+      if (!families.has(name)) families.set(name, []);
+      families.get(name)!.push({ key, labels, value, created: this.metricCreated.get(key) });
+    }
+
+    // Collect gauges
+    for (const [key, value] of this.gauges.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      if (!matchesPrefix(name)) continue;
+      if (!families.has(name)) families.set(name, []);
+      families.get(name)!.push({ key, labels, value, created: this.metricCreated.get(key) });
+    }
+
+    // Collect histograms — each key becomes a bucket family
+    for (const [key, observations] of this.histograms.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      if (!matchesPrefix(name)) continue;
+      if (!families.has(name)) families.set(name, []);
+      const data = this.calculateHistogram(observations);
+      // Store the count as our base value; we'll expand buckets during output
+      families.get(name)!.push({ key, labels, value: data.count, created: this.metricCreated.get(key) });
+    }
+
+    for (const [name, entries] of families.entries()) {
+      const metadata = this.metricMetadata.get(name);
+      const metricType = metadata?.type;
+
+      if (metadata?.help) {
+        lines.push(`# HELP ${name} ${metadata.help}`);
+      }
+      if (metricType) {
+        lines.push(`# TYPE ${name} ${metricType}`);
+      }
+
+      for (const entry of entries) {
+        const labelStr = formatLabels(entry.labels);
+
+        if (metricType === MetricType.HISTOGRAM) {
+          // Recalculate histogram for this entry's key
+          const key = entry.key;
+          const obs = this.histograms.get(key);
+          if (obs) {
+            const data = this.calculateHistogram(obs);
+            for (const bucket of data.buckets) {
+              const le = bucket.le === Infinity ? '+Inf' : bucket.le;
+              lines.push(`${name}_bucket{${labelStr ? labelStr.slice(1, -1) : ''}${labelStr ? ',' : ''}le="${le}"} ${bucket.count} ${now}`);
+            }
+            lines.push(`${name}_count${labelStr} ${data.count} ${now}`);
+            lines.push(`${name}_sum${labelStr} ${data.sum} ${now}`);
+            if (entry.created) {
+              lines.push(`${name}_created${labelStr} ${Math.floor(entry.created / 1000)}`);
+            }
+          }
+        } else {
+          lines.push(`${name}${labelStr} ${entry.value} ${now}`);
+          // _created for counters and gauges per OpenMetrics spec
+          if (entry.created) {
+            lines.push(`${name}_created${labelStr} ${Math.floor(entry.created / 1000)}`);
+          }
+        }
+      }
+    }
+
+    lines.push('# EOF');
     return lines.join('\n') + '\n';
   }
 }

@@ -11,6 +11,7 @@ import { RevenueReconciliationService } from '../services/revenueReconciliationS
 import { AppError, Errors } from '../lib/errors';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Logger, LogLevel } from '../lib/logger';
+import { MetricsCollector } from '../lib/metrics';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 
 export interface ReconciliationRequest extends Request {
@@ -25,6 +26,36 @@ export interface ReconciliationRequest extends Request {
 export interface OfferingRepository {
   getById?: (id: string) => Promise<{ id: string; issuer_id?: string; issuer_user_id?: string } | null>;
   findById: (id: string) => Promise<{ id: string; issuer_id?: string; issuer_user_id?: string } | null>;
+}
+
+/**
+ * GET /metrics/reconciliation
+ *
+ * Exposes reconciliation drift metrics in OpenMetrics text format (v1.0.0).
+ * The response is filtered to metrics with the `reconciliation_` and
+ * `payout_drift_` prefixes so Grafana / Prometheus scrapers receive only
+ * the relevant time-series.
+ *
+ * Security:
+ * - This handler MUST be mounted behind createMetricsAuthMiddleware() which
+ *   validates a METRICS_TOKEN bearer token before reaching this code.
+ * - Metric labels are sanitized by MetricsCollector (PII filtered, cardinality
+ *   bounded).
+ *
+ * Usage (production):
+ *   curl -H "Authorization: Bearer $METRICS_TOKEN" \
+ *        http://localhost:4000/metrics/reconciliation
+ */
+export function createReconciliationMetricsHandler(metrics: MetricsCollector) {
+  return (_req: Request, res: Response, next: NextFunction): void => {
+    try {
+      const output = metrics.exportOpenMetrics('reconciliation_');
+      res.set('Content-Type', 'application/openmetrics-text; version=1.0.0; charset=utf-8');
+      res.status(200).send(output);
+    } catch (error) {
+      next(Errors.internal('Failed to export reconciliation metrics', error instanceof Error ? error.message : String(error)));
+    }
+  };
 }
 
 export function createReconciliationHandlers(

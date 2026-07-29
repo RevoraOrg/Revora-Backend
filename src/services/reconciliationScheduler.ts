@@ -97,6 +97,9 @@ const ACTIVE_STATUSES = new Set(['open', 'active', 'processing', 'closed']);
 // ─── Metric names ─────────────────────────────────────────────────────────────
 const METRIC_DISCREPANCY_TOTAL = 'reconciliation_discrepancy_total';
 const METRIC_ALARM_OPEN = 'reconciliation_alarm_open';
+const METRIC_DRIFT_AMOUNT = 'reconciliation_drift_amount';
+const METRIC_LAST_RUN_TIMESTAMP = 'reconciliation_last_run_timestamp';
+const METRIC_ERRORS_TOTAL = 'reconciliation_errors_total';
 
 // ─── ReconciliationScheduler ──────────────────────────────────────────────────
 
@@ -200,6 +203,14 @@ export class ReconciliationScheduler {
         result.failed++;
         result.errors.push({ offeringId: offering.id, error: message });
 
+        // Increment per-offering error counter
+        this.metrics.incrementCounter(
+          METRIC_ERRORS_TOTAL,
+          { offering_id: metricLabel },
+          1,
+          'Cumulative count of failed reconciliation runs'
+        );
+
         // Keep alarm open (or raise it) if this run errored — treat an error as
         // an unresolved discrepancy so the dead-letter alarm fires.
         this.metrics.setGauge(
@@ -236,7 +247,13 @@ export class ReconciliationScheduler {
     return { periodStart, periodEnd };
   }
 
-  /** Emit reconciliation_discrepancy_total and reconciliation_alarm_open. */
+  /**
+   * Emit reconciliation metrics including:
+   * - reconciliation_discrepancy_total (counter)
+   * - reconciliation_alarm_open (gauge)
+   * - reconciliation_drift_amount (gauge)
+   * - reconciliation_last_run_timestamp (gauge)
+   */
   private emitMetrics(
     label: string,
     reconcileResult: ReconciliationResult,
@@ -252,6 +269,23 @@ export class ReconciliationScheduler {
         'Total reconciliation discrepancies detected by the scheduled job'
       );
     }
+
+    // Per-offering drift amount gauge — parsed from the decimal string
+    const driftAmount = parseFloat(reconcileResult.summary.discrepancyAmount ?? '0');
+    this.metrics.setGauge(
+      METRIC_DRIFT_AMOUNT,
+      driftAmount,
+      labels,
+      'Monetary drift amount for the offering (in settlement currency)'
+    );
+
+    // Last-run Unix epoch timestamp
+    this.metrics.setGauge(
+      METRIC_LAST_RUN_TIMESTAMP,
+      Math.floor(Date.now() / 1000),
+      labels,
+      'Unix epoch seconds of the last completed reconciliation run'
+    );
 
     if (!reconcileResult.isBalanced) {
       // Open (or keep open) the dead-letter alarm.
