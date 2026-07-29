@@ -25,6 +25,7 @@ import { z } from "zod";
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
+ * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
  * | SENDGRID_API_KEY            | SendGrid | (empty)                 | SendGrid API key                                 |
@@ -32,6 +33,7 @@ import { z } from "zod";
  * | SMTP_PORT                   | SMTP     | 587                     | SMTP relay port                                  |
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
+ * | CURSOR_SIGNING_SECRET       | No       | dev-cursor-secret...    | Secret for HMAC-signed opaque pagination cursors |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
  * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
@@ -67,8 +69,10 @@ const envSchema = z.object({
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
+  CURSOR_SIGNING_SECRET: z.string().min(16).optional(),
   REGION: z.string().default("us-east-1"),
   FAILOVER_ACTIVE_REGION: z.string().optional(),
   SENDGRID_API_KEY: z.string().optional(),
@@ -81,11 +85,7 @@ const envSchema = z.object({
   SES_SNS_TOPIC_ARN: z.string().optional(),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  OFAC_LIST_URL: z.string().optional(),
-  OFAC_SIG_URL: z.string().optional(),
-  OFAC_TRUST_ANCHOR_BASE64: z.string().optional(),
-  OFAC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-  SCIM_TOKEN: z.string().optional(),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

@@ -4,7 +4,7 @@
  * Tests for the hardened session cookie issuer.
  *
  * Security invariants verified:
- *  - Every issued cookie carries HttpOnly, SameSite=Strict, and Path=/.
+ *  - Every issued cookie carries HttpOnly, SameSite=Lax (or Strict), and Path=/.
  *  - In production the Secure attribute is mandatory; a non-Secure cookie is
  *    refused (throws).
  *  - The clear cookie expires the session immediately (Max-Age=0).
@@ -20,14 +20,19 @@ import {
 const FUTURE = Date.now() + 60_000;
 
 describe("buildSessionCookie", () => {
-  it("always sets HttpOnly, SameSite=Strict and Path=/", () => {
+  it("always sets HttpOnly, SameSite=Lax by default and Path=/", () => {
     const cookie = buildSessionCookie("tok123", FUTURE, { isProduction: false });
 
     expect(cookie).toContain(`${SESSION_COOKIE_NAME}=tok123`);
     expect(cookie).toContain("HttpOnly");
-    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).toContain("SameSite=Lax");
     expect(cookie).toContain("Path=/");
     expect(cookie).toMatch(/Max-Age=\d+/);
+  });
+
+  it("can be configured to SameSite=Strict", () => {
+    const cookie = buildSessionCookie("tok123", FUTURE, { isProduction: false, sameSite: 'Strict' });
+    expect(cookie).toContain("SameSite=Strict");
   });
 
   it("sets the Secure attribute in production", () => {
@@ -84,12 +89,17 @@ describe("issueSessionCookie", () => {
 });
 
 describe("clearSessionCookie", () => {
-  it("expires the cookie immediately and keeps it HttpOnly + SameSite=Strict", () => {
+  it("expires the cookie immediately and keeps it HttpOnly + SameSite=Lax by default", () => {
     const cookie = clearSessionCookie();
     expect(cookie).toContain(`${SESSION_COOKIE_NAME}=;`);
     expect(cookie).toContain("Max-Age=0");
     expect(cookie).toContain("HttpOnly");
-    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).toContain("SameSite=Lax");
     expect(cookie).toContain("Path=/");
+  });
+
+  it("can clear cookie with SameSite=Strict", () => {
+    const cookie = clearSessionCookie({ sameSite: 'Strict' });
+    expect(cookie).toContain("SameSite=Strict");
   });
 });

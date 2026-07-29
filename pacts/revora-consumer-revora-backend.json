@@ -1,0 +1,165 @@
+{
+  "consumer": {
+    "name": "revora-consumer"
+  },
+  "provider": {
+    "name": "revora-backend"
+  },
+  "interactions": [
+    {
+      "description": "a request to trigger distribution for an offering",
+      "providerState": "an offering exists for distribution",
+      "request": {
+        "method": "POST",
+        "path": "/offerings/off-1/distribute",
+        "headers": {
+          "Authorization": "Bearer test-token",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "revenue_amount": 100,
+          "period": {
+            "start": "2026-01-01",
+            "end": "2026-01-31"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "run_id": "run-dist-1",
+          "payouts": [
+            {
+              "investor_id": "inv-1",
+              "amount": "75.00"
+            },
+            {
+              "investor_id": "inv-2",
+              "amount": "25.00"
+            }
+          ],
+          "total_payouts": 2
+        }
+      }
+    },
+    {
+      "description": "a request to list payouts for an investor",
+      "providerState": "an investor exists with payouts",
+      "request": {
+        "method": "GET",
+        "path": "/api/investments/payouts",
+        "headers": {
+          "Authorization": "Bearer test-token"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "payouts": [
+            {
+              "id": "pay-2",
+              "distribution_run_id": "run-1",
+              "investor_id": "inv-1",
+              "amount": "200.00",
+              "status": "pending",
+              "transaction_hash": null,
+              "created_at": "2024-01-11T00:00:00.000Z",
+              "updated_at": "2024-01-11T00:00:00.000Z"
+            },
+            {
+              "id": "pay-1",
+              "distribution_run_id": "run-1",
+              "investor_id": "inv-1",
+              "amount": "100.00",
+              "status": "processed",
+              "transaction_hash": "0xabc",
+              "created_at": "2024-01-10T00:00:00.000Z",
+              "updated_at": "2024-01-10T00:00:00.000Z"
+            }
+          ],
+          "total": 2,
+          "limit": 20,
+          "offset": 0,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "description": "a request to list payouts when investor has no payouts",
+      "providerState": "an investor has no payouts",
+      "request": {
+        "method": "GET",
+        "path": "/api/investments/payouts",
+        "headers": {
+          "Authorization": "Bearer test-token"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "payouts": [],
+          "total": 0,
+          "limit": 20,
+          "offset": 0,
+          "hasMore": false
+        }
+      }
+    },
+    {
+      "description": "an unauthorized request to trigger distribution",
+      "request": {
+        "method": "POST",
+        "path": "/offerings/off-1/distribute",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "revenue_amount": 100,
+          "period": {
+            "start": "2026-01-01",
+            "end": "2026-01-31"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "error": "Unauthorized"
+        }
+      }
+    },
+    {
+      "description": "an unauthorized request to list payouts",
+      "request": {
+        "method": "GET",
+        "path": "/api/investments/payouts"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "error": "Unauthorized"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "pactSpecification": {
+      "version": "2.0.0"
+    }
+  }
+}
