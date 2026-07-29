@@ -1,3 +1,12 @@
+/**
+ * OutboxDispatcher — drains webhook_outbox rows and delivers them to subscribers.
+ * See architecture map for how the outbox participates in the producer transaction.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ * @see ../docs/transactional-outbox.md
+ * @see ../docs/webhook-queue-backpressure.md
+ * @see ../docs/webhook-dead-letters.md
+ */
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 import { WebhookEventType } from './webhookService';
 import { PressureGauge, PressureTier, PressureGaugeConfig, PressureStateChangeCallback, PressureState } from '../lib/pressureGauge';

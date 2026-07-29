@@ -44,6 +44,8 @@ export interface SessionCookieOptions {
   secure?: boolean;
   /** Whether we're running in production. @default NODE_ENV === "production" */
   isProduction?: boolean;
+  /** SameSite policy. @default "Lax" */
+  sameSite?: 'Lax' | 'Strict' | 'None';
 }
 
 /**
@@ -68,6 +70,8 @@ export function buildSessionCookie(
   const name         = opts.name ?? SESSION_COOKIE_NAME;
   const path         = opts.path ?? "/";
 
+  const sameSite     = opts.sameSite ?? "Lax";
+
   if (isProduction && !secure) {
     throw new Error(
       "Refusing to issue a session cookie without the Secure attribute in production.",
@@ -80,7 +84,7 @@ export function buildSessionCookie(
     `${name}=${token}`,
     `Path=${path}`,
     "HttpOnly",
-    "SameSite=Strict",
+    `SameSite=${sameSite}`,
     `Max-Age=${maxAgeSeconds}`,
     `Expires=${new Date(expiresAt).toUTCString()}`,
   ];
@@ -106,7 +110,8 @@ export function issueSessionCookie(
 export function clearSessionCookie(opts: SessionCookieOptions = {}): string {
   const name = opts.name ?? SESSION_COOKIE_NAME;
   const path = opts.path ?? "/";
-  return `${name}=; Path=${path}; HttpOnly; SameSite=Strict; Max-Age=0`;
+  const sameSite = opts.sameSite ?? "Lax";
+  return `${name}=; Path=${path}; HttpOnly; SameSite=${sameSite}; Max-Age=0`;
 }
 
 // ─── Middleware factory ───────────────────────────────────────────────────────
@@ -170,7 +175,7 @@ export function createSessionAuth(store: ISessionStore) {
  *  - The session token returned by login is the ONLY credential for subsequent
  *    requests.  Headers are not re-read after login.
  */
-export function createSessionRouter(store: ISessionStore): Router {
+export function createSessionRouter(store: ISessionStore, getPolicy?: (tenantId: string) => Promise<'Lax' | 'Strict'>): Router {
   const router = Router();
   const auth   = createSessionAuth(store);
 
@@ -192,9 +197,15 @@ export function createSessionRouter(store: ISessionStore): Router {
 
     const session = await store.create(userId, role);
 
+    const tenantId = req.header("x-tenant-id");
+    let sameSite: 'Lax' | 'Strict' = 'Lax';
+    if (tenantId && getPolicy) {
+      sameSite = await getPolicy(tenantId);
+    }
+
     // Issue a hardened cookie for browser clients (Secure/HttpOnly/SameSite=Strict).
     // In production a non-Secure cookie is refused by buildSessionCookie.
-    issueSessionCookie(res, session.token, session.expiresAt);
+    issueSessionCookie(res, session.token, session.expiresAt, { sameSite });
 
     res.status(201).json({
       token:     session.token,

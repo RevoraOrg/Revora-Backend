@@ -1,3 +1,10 @@
+/**
+ * OutboxRepository — persistence for webhook_outbox.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      Architecture map (see §5 — Database tables and ownership).
+ * @see ../docs/transactional-outbox.md
+ */
 import { Pool, PoolClient, QueryResult } from 'pg';
 import { randomUUID } from 'crypto';
 import { WebhookEventType } from '../../services/webhookService';

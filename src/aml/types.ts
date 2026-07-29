@@ -200,6 +200,62 @@ export interface UpdateCaseInput {
 }
 
 /**
+ * Configuration for the sliding-window investment velocity rule.
+ * Stored in AMLRule.config for rules of type 'velocity'.
+ */
+export interface VelocityRuleConfig {
+  /** Rolling window length in minutes. */
+  window_minutes: number;
+  /** Maximum aggregate invested amount in the window before triggering. */
+  max_amount: number;
+  /** Maximum number of investments in the window before triggering. */
+  max_count: number;
+}
+
+/**
+ * A single row persisted to aml_investment_velocity for audit purposes.
+ */
+export interface InvestmentVelocityRecord {
+  id: string;
+  investor_id: string;
+  window_start: Date;
+  window_end: Date;
+  window_minutes: number;
+  tx_count: number;
+  total_amount: number;
+  investment_ids: string[];
+  amount_exceeded: boolean;
+  count_exceeded: boolean;
+  threshold_amount: number | null;
+  threshold_count: number | null;
+  rule_id: string;
+  rule_version: SemVer;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * Repository interface for persisting velocity aggregate rows.
+ * The in-process evaluator uses an InMemoryVelocityRepository; production
+ * code wires in a PgVelocityRepository backed by aml_investment_velocity.
+ */
+export interface VelocityRepository {
+  /**
+   * Upsert a velocity aggregate row.
+   * On conflict (investor_id, window_start, window_end, rule_id) the row is
+   * updated in-place so late-arriving events shift the window without
+   * duplicating records.
+   */
+  upsert(record: Omit<InvestmentVelocityRecord, 'id' | 'created_at' | 'updated_at'>): Promise<InvestmentVelocityRecord>;
+
+  /**
+   * Return all velocity records for an investor within the given time range,
+   * ordered by window_end descending.
+   */
+  findByInvestor(investorId: string, from: Date, to: Date): Promise<InvestmentVelocityRecord[]>;
+}
+
+/**
  * Reviewer profile for load-balancer capacity tracking
  */
 export interface ReviewerProfile {

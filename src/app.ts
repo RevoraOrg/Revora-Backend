@@ -32,6 +32,7 @@ import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryA
 import { SocialAuthService } from './auth/social/socialAuthService';
 import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
 import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
+import { createReconciliationMetricsHandler } from './routes/reconciliationRoutes';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -229,6 +230,13 @@ export function createApp() {
 
   // Metrics endpoint (Prometheus format) - secured with internal token
   app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics));
+
+  // Reconciliation metrics endpoint (OpenMetrics format) - same auth guard
+  app.get(
+    '/metrics/reconciliation',
+    createMetricsAuthMiddleware(),
+    createReconciliationMetricsHandler(metrics)
+  );
 
   // Offering sync routes
   app.use('/api/v1/offerings', createOfferingSyncRouter());
