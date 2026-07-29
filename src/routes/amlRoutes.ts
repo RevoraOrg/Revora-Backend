@@ -120,7 +120,7 @@ export function createAMLRoutes(
   assignmentService?: CaseAssignmentService,
 ): Router {
   const router = Router();
-  const reviewQueueGuards = options.reviewQueueGuards || [requireReviewQueueRole];
+  const reviewQueueGuards = [requireReviewQueueRole];
   const reviewQueueMutationGuards = [...reviewQueueGuards, requireCsrfToken];
 
   /**

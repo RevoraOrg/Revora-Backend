@@ -154,3 +154,5 @@ export class DefaultStatementDataProvider implements StatementDataProvider {
       revenueSummary,
     };
   }
+}
+

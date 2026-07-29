@@ -748,6 +748,48 @@ LIMIT 10;
 sha256sum export.jsonl  # Should match export_hash
 ```
 
+## Chunked Streaming JSON-Lines Export
+
+To support full-year or large-volume exports (which can exceed 50 MB and time out under standard buffer/JSON serialization), Revora provides a high-performance streaming endpoint:
+
+```
+GET /ledger/export.jsonl
+```
+
+### Query Parameters
+- `offeringId` (UUID, required): The offering UUID to export journal entries for.
+- `year` (YYYY, optional): Filter entries by a specific year.
+- `periodId` (string, optional): Filter entries by a specific period ID.
+
+### Stream Format & Manifest
+The endpoint streams data in `application/x-jsonlines` chunk-by-chunk. To allow client applications to track progress and allocate buffers, the **first line** of the stream is always a metadata manifest containing the estimated row count:
+
+```json
+{"type":"manifest","offeringId":"...","year":"2024","periodId":null,"estimatedRowCount":152430,"exportedAt":"2026-07-29T00:00:00.000Z"}
+```
+
+Subsequent lines are canonical JSON representations of individual journal entries:
+
+```json
+{"id":"row-0","offering_id":"...","period_id":"2024-01","amount":"100.00","issuer_id":"issuer-1","reported_at":"2024-01-01T00:00:00.000Z","created_at":"2024-01-02T00:00:00.000Z"}
+```
+
+### Keepalive Comments
+To prevent reverse proxies (e.g. Nginx, Cloudflare) and load balancers from dropping the socket connection during quiet database cursor periods, a keepalive comment is written to the stream every **100 rows**:
+
+```
+# keepalive
+```
+
+### Performance & Resource Safety
+- **Back-pressure enforcement:** The route uses `pg-cursor` under the hood to pull database rows in batches of 100 rather than buffering all rows in memory.
+- **Resource cleanup:** If the client disconnects prematurely (aborted socket connection), a `_destroy` and pipeline callback release the cursor (`cursor.close()`) and the database client (`client.release()`) back to the pool safely to prevent pool exhaustion.
+
+### Metrics Collection
+The streaming operation registers telemetry:
+- `export.stream.rows`: Counter incremented for every row successfully streamed.
+- `export.stream.duration`: Histogram recording the total duration of the stream in milliseconds.
+
 ---
 
 ## References
@@ -756,6 +798,7 @@ sha256sum export.jsonl  # Should match export_hash
 - Database Migrations: `src/db/migrations/017_create_ledger_period_locks.sql`
 - Service: `src/services/ledgerService.ts`
 - Routes: `src/routes/ledgerRoutes.ts`
-- Tests: `src/routes/ledgerRoutes.test.ts`
+- Tests: `src/routes/ledgerRoutes.test.ts`, `src/routes/ledgerExportStream.test.ts`
 - Audit Logging: `src/db/repositories/auditLogRepository.ts`
 - Metrics: `src/lib/metrics.ts`
+

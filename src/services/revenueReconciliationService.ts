@@ -1,9 +1,15 @@
 /**
  * Revenue Reconciliation Checks Service
- * 
+ *
  * Provides deterministic validation of revenue distribution integrity.
  * Checks verify that reported revenue matches payouts, investor allocations
  * are correct, and no discrepancies exist in the distribution ledger.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      End-to-end architecture map (sequence diagram + state machine).
+ * @see ../docs/revenue-reconciliation.md
+ * @see ../docs/revenue-reconciliation-checks.md
+ * @see ../docs/stellar-rpc-failure-classification.md
  */
 
 import { Pool } from 'pg';

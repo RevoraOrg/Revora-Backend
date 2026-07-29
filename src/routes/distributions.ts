@@ -1,3 +1,10 @@
+/**
+ * /distributions HTTP routes — see architecture map for the request lifecycle.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ * @see ../docs/distribution-engine-safety.md
+ * @see ../docs/distribution-advisory-lock.md
+ */
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
 import { globalLogger as logger } from '../lib/logger';

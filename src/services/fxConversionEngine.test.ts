@@ -2,6 +2,7 @@ import {
   FxConversionEngine,
   InMemoryRateProvider,
   ExchangeRate,
+  FxHop,
 } from './fxConversionEngine';
 import { Decimal } from '../lib/decimal';
 import { MetricsCollector } from '../lib/metrics';
@@ -225,9 +226,19 @@ describe('FxConversionEngine', () => {
       const prom = metrics.exportPrometheus();
       expect(prom).toContain('fx_triangulations_total');
     });
-  });
 
-  // ── Asymmetric bid/ask paths ──────────────────────────────────────────────
+    it('direct conversion result has empty hops array', async () => {
+      const engine = makeEngine();
+      const result = await engine.convert(new Decimal('100'), 'USD', 'EUR');
+      expect(result.hops).toEqual([]);
+    });
+
+    it('identity conversion result has empty hops array', async () => {
+      const engine = makeEngine();
+      const result = await engine.convert(new Decimal('100'), 'USD', 'USD');
+      expect(result.hops).toEqual([]);
+    });
+  });
 
   describe('asymmetric bid/ask paths', () => {
     it('bid is always lower than ask for a given pair', async () => {
@@ -545,5 +556,301 @@ describe('FxConversionEngine', () => {
       const prom = metrics.exportPrometheus();
       expect(prom).not.toContain('fx_stale_rate_rejected_total');
     });
+  });
+});
+
+// ─── FxHop audit trail ────────────────────────────────────────────────────────
+
+describe('FxHop per-hop provenance', () => {
+  function makeProvider() {
+    const p = new InMemoryRateProvider();
+    p.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    p.setRateFromValues('EUR/GBP', '0.85', '0.87', '0.86', 300000);
+    p.setRateFromValues('USD/GBP', '0.78', '0.80', '0.79', 300000);
+    p.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+    p.setRateFromValues('EUR/JPY', '161.50', '162.50', '162.00', 300000);
+    return p;
+  }
+
+  it('returns exactly 2 hops for a single-via triangulation', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    expect(result.hops).toHaveLength(2);
+  });
+
+  it('hop[0] records the first leg (from → via)', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    const hop0 = result.hops[0] as FxHop;
+    expect(hop0.from).toBe('EUR');
+    expect(hop0.to).toBe('USD');
+    expect(hop0.hopIndex).toBe(0);
+    expect(hop0.inputAmount.toString()).toBe('100');
+    expect(hop0.side).toBe('mid');
+  });
+
+  it('hop[1] records the second leg (via → to)', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    const hop1 = result.hops[1] as FxHop;
+    expect(hop1.from).toBe('USD');
+    expect(hop1.to).toBe('JPY');
+    expect(hop1.hopIndex).toBe(1);
+  });
+
+  it('hop[0].outputAmount equals hop[1].inputAmount (chain continuity)', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    expect(result.hops[0]!.outputAmount.toString())
+      .toBe(result.hops[1]!.inputAmount.toString());
+  });
+
+  it('each hop records the raw ExchangeRate returned by the provider', async () => {
+    const provider = makeProvider();
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    // hop0 rate pair should be EUR/USD (via inversion of USD/EUR)
+    expect(result.hops[0]!.rawRate).toBeDefined();
+    expect(result.hops[0]!.rawRate.pair).toContain('USD');
+    expect(result.hops[1]!.rawRate.pair).toContain('JPY');
+  });
+
+  it('effectiveRate matches the chosen side (bid)', async () => {
+    const provider = makeProvider();
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD', { side: 'bid' });
+    // Every hop should record side=bid
+    for (const hop of result.hops) {
+      expect(hop.side).toBe('bid');
+    }
+  });
+
+  it('effectiveRate matches the chosen side (ask)', async () => {
+    const provider = makeProvider();
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD', { side: 'ask' });
+    for (const hop of result.hops) {
+      expect(hop.side).toBe('ask');
+    }
+  });
+
+  it('hop effectiveRate equals resolveSide(rawRate, side)', async () => {
+    const provider = makeProvider();
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD', { side: 'mid' });
+    const hop0 = result.hops[0]!;
+    expect(hop0.effectiveRate.toString()).toBe(hop0.rawRate.mid.toString());
+  });
+
+  it('hops are in ascending hopIndex order', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    result.hops.forEach((hop, i) => expect(hop.hopIndex).toBe(i));
+  });
+
+  it('skips-to-direct when from equals via: hops is empty', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'USD', 'EUR', 'USD');
+    expect(result.path.type).toBe('direct');
+    expect(result.hops).toEqual([]);
+  });
+
+  it('skips-to-direct when to equals via: hops is empty', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'USD', 'USD');
+    expect(result.path.type).toBe('direct');
+    expect(result.hops).toEqual([]);
+  });
+});
+
+// ─── max-hop enforcement ──────────────────────────────────────────────────────
+
+describe('max-hop enforcement', () => {
+  function makeProvider() {
+    const p = new InMemoryRateProvider();
+    p.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    p.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+    p.setRateFromValues('EUR/GBP', '0.85', '0.87', '0.86', 300000);
+    p.setRateFromValues('USD/GBP', '0.78', '0.80', '0.79', 300000);
+    return p;
+  }
+
+  it('throws on construction when maxHops < 1', () => {
+    expect(() => new FxConversionEngine(makeProvider(), { maxHops: 0 }))
+      .toThrow('maxHops must be a positive integer');
+  });
+
+  it('throws on construction when maxHops is not an integer', () => {
+    expect(() => new FxConversionEngine(makeProvider(), { maxHops: 1.5 }))
+      .toThrow('maxHops must be a positive integer');
+  });
+
+  it('defaults maxHops to 2 (no error for single-via triangulation)', async () => {
+    const engine = new FxConversionEngine(makeProvider());
+    // single-via = 2 hops = within default limit
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    expect(result.path.type).toBe('triangulated');
+  });
+
+  it('throws actionable error when hop count exceeds maxHops', async () => {
+    // maxHops=1 means only 1-leg conversions allowed (no triangulation)
+    const engine = new FxConversionEngine(makeProvider(), { maxHops: 1 });
+    await expect(
+      engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD')
+    ).rejects.toThrow(/maxHops/);
+  });
+
+  it('error message includes hop count, maxHops, and actionable guidance', async () => {
+    const engine = new FxConversionEngine(makeProvider(), { maxHops: 1 });
+    let msg = '';
+    try {
+      await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toMatch(/maxHops is 1/);
+    expect(msg).toMatch(/EUR\/JPY/);
+  });
+
+  it('accepts maxHops=2 for a two-hop chain', async () => {
+    const engine = new FxConversionEngine(makeProvider(), { maxHops: 2 });
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    expect(result.hops).toHaveLength(2);
+  });
+});
+
+// ─── alternate reference currency fallback ────────────────────────────────────
+
+describe('alternate reference currency fallback', () => {
+  it('falls back to second via when first via leg1 is missing', async () => {
+    const provider = new InMemoryRateProvider();
+    // No EUR/CHF or CHF/JPY — first via (CHF) will fail leg1
+    // But EUR/USD and USD/JPY exist
+    provider.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    provider.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(
+      new Decimal('100'), 'EUR', 'JPY',
+      ['CHF', 'USD']   // CHF has no rates → falls back to USD
+    );
+    expect(result.path.type).toBe('triangulated');
+    expect(result.path.description).toBe('EUR→USD→JPY');
+  });
+
+  it('falls back to second via when first via leg2 is missing', async () => {
+    const provider = new InMemoryRateProvider();
+    // EUR/CHF exists but CHF/JPY does not
+    provider.setRateFromValues('EUR/CHF', '0.95', '0.97', '0.96', 300000);
+    // USD path works
+    provider.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    provider.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(
+      new Decimal('100'), 'EUR', 'JPY',
+      ['CHF', 'USD']
+    );
+    expect(result.path.description).toBe('EUR→USD→JPY');
+  });
+
+  it('throws when all candidate vias are exhausted', async () => {
+    const provider = new InMemoryRateProvider();
+    // No rates at all
+    const engine = new FxConversionEngine(provider);
+    await expect(
+      engine.triangulate(new Decimal('100'), 'EUR', 'JPY', ['CHF', 'USD'])
+    ).rejects.toThrow(/No triangulation path found/);
+  });
+
+  it('error message lists all tried vias and missing pairs', async () => {
+    const provider = new InMemoryRateProvider();
+    const engine = new FxConversionEngine(provider);
+    let msg = '';
+    try {
+      await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', ['CHF', 'USD']);
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toMatch(/CHF/);
+    expect(msg).toMatch(/USD/);
+    expect(msg).toMatch(/alternate reference currency/);
+  });
+
+  it('uses the first successful via and records its label in hops', async () => {
+    const provider = new InMemoryRateProvider();
+    provider.setRateFromValues('EUR/CHF', '0.95', '0.97', '0.96', 300000);
+    provider.setRateFromValues('CHF/JPY', '155.00', '156.00', '155.50', 300000);
+    provider.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    provider.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+
+    const engine = new FxConversionEngine(provider);
+    const result = await engine.triangulate(
+      new Decimal('100'), 'EUR', 'JPY',
+      ['CHF', 'USD']   // CHF is complete → should win
+    );
+    expect(result.path.description).toBe('EUR→CHF→JPY');
+    expect(result.hops[0]!.to).toBe('CHF');
+    expect(result.hops[1]!.from).toBe('CHF');
+  });
+
+  it('does not retry a via whose leg1 returned a stale-rate error', async () => {
+    const provider = new InMemoryRateProvider();
+    const old = new Date(Date.now() - 600_000);
+    // Stale EUR/CHF rate — should propagate, not silently skip
+    provider.setRateWithTimestamp('EUR/CHF', '0.95', '0.97', '0.96', old, 300000);
+
+    const engine = new FxConversionEngine(provider);
+    await expect(
+      engine.triangulate(new Decimal('100'), 'EUR', 'JPY', ['CHF'], { maxRateAgeMs: 300000 })
+    ).rejects.toThrow(/stale/);
+  });
+});
+
+// ─── fx_triangulation_hops histogram ─────────────────────────────────────────
+
+describe('fx_triangulation_hops histogram', () => {
+  function makeProvider() {
+    const p = new InMemoryRateProvider();
+    p.setRateFromValues('USD/EUR', '0.91', '0.93', '0.92', 300000);
+    p.setRateFromValues('USD/JPY', '148.50', '149.50', '149.00', 300000);
+    return p;
+  }
+
+  it('emits fx_triangulation_hops histogram after triangulation', async () => {
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const engine = new FxConversionEngine(makeProvider(), { metrics });
+    await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    const prom = metrics.exportPrometheus();
+    expect(prom).toContain('fx_triangulation_hops');
+  });
+
+  it('does not emit fx_triangulation_hops for a direct conversion', async () => {
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const engine = new FxConversionEngine(makeProvider(), { metrics });
+    await engine.convert(new Decimal('100'), 'EUR', 'USD');
+    const prom = metrics.exportPrometheus();
+    expect(prom).not.toContain('fx_triangulation_hops');
+  });
+
+  it('emits fx_triangulations_total alongside fx_triangulation_hops', async () => {
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const engine = new FxConversionEngine(makeProvider(), { metrics });
+    await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    const prom = metrics.exportPrometheus();
+    expect(prom).toContain('fx_triangulations_total');
+    expect(prom).toContain('fx_triangulation_hops');
+  });
+
+  it('histogram value equals the number of hops in the result', async () => {
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const engine = new FxConversionEngine(makeProvider(), { metrics });
+    const result = await engine.triangulate(new Decimal('100'), 'EUR', 'JPY', 'USD');
+    // The histogram records the hop count — confirm hops match
+    expect(result.hops.length).toBe(2);
+    const snap = await metrics.getSnapshot();
+    const hist = snap.custom.find((p: any) => p.name === 'fx_triangulation_hops');
+    expect(hist).toBeDefined();
+    expect(hist!.value).toBe(2);
   });
 });
