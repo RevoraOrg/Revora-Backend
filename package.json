@@ -20,7 +20,8 @@
     "test:chaos": "jest --testPathPattern=chaos",
     "test:ci": "jest --coverage --ci",
     "stryker": "stryker run --concurrency 4",
-    "stryker:quick": "stryker run --concurrency 4 --timeoutMS 120000"
+    "stryker:quick": "stryker run --concurrency 4 --timeoutMS 120000",
+    "pact:verify": "jest --testPathPatterns='\\.pact\\.test\\.ts$' --runInBand --forceExit"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.5.0",
