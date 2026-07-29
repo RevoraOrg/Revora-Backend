@@ -1,3 +1,11 @@
+/**
+ * RevenueReportRepository — persistence for revenue_reports.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      Architecture map (see §5 — Database tables and ownership).
+ * @see ../docs/revenue-report-ingestion-validation.md
+ * @see ../docs/revenue-route-schema-validation.md
+ */
 import { Pool, QueryResult } from 'pg';
 
 export type DistributionStatus = 'in_progress' | 'completed' | 'failed';
