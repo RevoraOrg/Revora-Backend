@@ -18,6 +18,7 @@ export interface User {
   role: 'startup' | 'investor';
   /** KYC risk tier used to scale per-offering investment caps. */
   kyc_risk_tier: KycRiskTier;
+  last_oidc_groups?: string[] | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -40,6 +41,7 @@ export interface UpdateUserInput {
   password_hash?: string;
   role?: 'startup' | 'investor';
   kyc_risk_tier?: KycRiskTier;
+  last_oidc_groups?: string[] | null;
 }
 
 /**
@@ -64,7 +66,7 @@ export class UserRepository {
    */
   async findById(id: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -83,7 +85,7 @@ export class UserRepository {
    */
   async findByEmail(email: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE email = $1
       LIMIT 1
@@ -170,6 +172,10 @@ export class UserRepository {
       sets.push(`kyc_risk_tier = $${idx++}`);
       values.push(input.kyc_risk_tier);
     }
+    if (input.last_oidc_groups !== undefined) {
+      sets.push(`last_oidc_groups = $${idx++}`);
+      values.push(input.last_oidc_groups === null ? null : JSON.stringify(input.last_oidc_groups));
+    }
 
     if (sets.length === 0) {
       const existing = await this.findById(input.id);
@@ -224,6 +230,7 @@ export class UserRepository {
       name: row.name ?? undefined,
       role: row.role as 'startup' | 'investor',
       kyc_risk_tier: parseKycRiskTier(row.kyc_risk_tier),
+      last_oidc_groups: row.last_oidc_groups ?? null,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };

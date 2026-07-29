@@ -1,3 +1,13 @@
+/**
+ * DistributionEngine — prorates revenue across investors and persists payouts.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      End-to-end architecture map (sequence diagram + state machine).
+ * @see ../docs/distribution-engine-retry-strategy.md
+ * @see ../docs/distribution-advisory-lock.md
+ * @see ../docs/distribution-engine-atomic-transactions.md
+ * @see ../docs/distribution-engine-safety.md
+ */
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors, AppError } from '../lib/errors';
 import { Decimal } from '../lib/decimal';
