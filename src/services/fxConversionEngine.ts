@@ -1,6 +1,7 @@
 import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
+import { SecurityAuditRepository } from '../security/types';
 
 export type ConversionPathType = 'direct' | 'inverse' | 'triangulated';
 
@@ -10,6 +11,7 @@ export interface ConversionPath {
 }
 
 export interface ExchangeRate {
+  id?: string;
   pair: string;
   bid: Decimal;
   ask: Decimal;
@@ -32,23 +34,35 @@ export interface RateProvider {
   getRate(from: string, to: string): Promise<ExchangeRate | null>;
 }
 
+export enum FxFallbackReason {
+  STALE_RATE_TOLERATED = 'STALE_RATE_TOLERATED',
+  SUBSTITUTE_PROVIDER_USED = 'SUBSTITUTE_PROVIDER_USED'
+}
+
 const METRIC_STALE_RATE_REJECTED = 'fx_stale_rate_rejected_total';
 const METRIC_CONVERSIONS_TOTAL = 'fx_conversions_total';
 const METRIC_TRIANGULATIONS_TOTAL = 'fx_triangulations_total';
+const METRIC_STALE_FALLBACK_STALENESS = 'fx_stale_fallback_staleness_ms';
 
 export class FxConversionEngine {
   private readonly defaultBucketIncrement: Decimal;
   private readonly metrics?: MetricsCollector;
+  private readonly auditRepository?: SecurityAuditRepository;
+  private readonly fallbackRateProvider?: RateProvider;
 
   constructor(
     private readonly rateProvider: RateProvider,
     options?: {
       defaultBucketIncrement?: string;
       metrics?: MetricsCollector;
+      auditRepository?: SecurityAuditRepository;
+      fallbackRateProvider?: RateProvider;
     }
   ) {
     this.defaultBucketIncrement = new Decimal(options?.defaultBucketIncrement ?? '0.01');
     this.metrics = options?.metrics;
+    this.auditRepository = options?.auditRepository;
+    this.fallbackRateProvider = options?.fallbackRateProvider;
   }
 
   async convert(
@@ -59,6 +73,9 @@ export class FxConversionEngine {
       bucketIncrement?: Decimal;
       side?: 'bid' | 'ask' | 'mid';
       maxRateAgeMs?: number;
+      allowStaleFallback?: boolean;
+      auditUserId?: string;
+      auditSessionId?: string;
     }
   ): Promise<FxConversionResult> {
     if (amount.isZero()) {
@@ -106,12 +123,71 @@ export class FxConversionEngine {
     }
 
     const maxAge = options?.maxRateAgeMs ?? 300000;
-    if (this.isRateStale(rate, maxAge)) {
+    
+    let isStale = this.isRateStale(rate, maxAge);
+    let fallbackUsed = false;
+    let fallbackReason: FxFallbackReason | undefined;
+    
+    // First, try fallback provider if rate is stale and a fallback provider is configured
+    if (isStale && this.fallbackRateProvider) {
+      let fRate = await this.fallbackRateProvider.getRate(from, to);
+      if (!fRate) {
+        fRate = await this.fallbackRateProvider.getRate(to, from);
+        if (fRate) {
+          fRate = this.invertRate(fRate);
+        }
+      }
+      if (fRate && !this.isRateStale(fRate, maxAge)) {
+        rate = fRate;
+        isStale = false;
+        fallbackUsed = true;
+        fallbackReason = FxFallbackReason.SUBSTITUTE_PROVIDER_USED;
+      }
+    }
+    
+    // Next, if still stale, but we allow stale fallbacks on the primary rate
+    if (isStale && options?.allowStaleFallback) {
+      fallbackUsed = true;
+      fallbackReason = FxFallbackReason.STALE_RATE_TOLERATED;
+    } else if (isStale) {
       this.metrics?.incrementCounter(METRIC_STALE_RATE_REJECTED, { pair: rate.pair });
       throw Errors.serviceUnavailable(
         `Exchange rate for ${rate.pair} is stale (age: ${this.rateAgeMs(rate)}ms, max: ${maxAge}ms)`,
         { pair: rate.pair, ageMs: this.rateAgeMs(rate), maxAgeMs: maxAge }
       );
+    }
+
+    if (fallbackUsed && fallbackReason) {
+      const maxStalenessObserved = this.rateAgeMs(rate);
+      
+      // Emit gauge
+      this.metrics?.recordGauge(METRIC_STALE_FALLBACK_STALENESS, maxStalenessObserved, { reason: fallbackReason });
+      
+      // Append to audit chain
+      if (this.auditRepository) {
+        await this.auditRepository.record({
+          id: `fx_fallback_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          type: 'VALIDATION',
+          userId: options?.auditUserId,
+          sessionId: options?.auditSessionId,
+          action: 'FX_STALE_RATE_FALLBACK',
+          resource: 'FxConversionEngine',
+          outcome: 'SUCCESS',
+          details: {
+            reason: fallbackReason,
+            substituteRateId: rate.id || rate.pair,
+            maxStalenessObserved,
+            pair: rate.pair
+          },
+          securityContext: {
+            requestId: 'fx-conversion',
+            ipAddress: 'internal',
+            userAgent: 'fxConversionEngine',
+            timestamp: new Date()
+          },
+          timestamp: new Date()
+        });
+      }
     }
 
     const effectiveRate = this.resolveSide(rate, options?.side ?? 'mid');
@@ -216,6 +292,7 @@ export class FxConversionEngine {
   private invertRate(rate: ExchangeRate): ExchangeRate {
     const one = new Decimal('1');
     return {
+      id: rate.id ? `${rate.id}_inv` : undefined,
       pair: this.invertPair(rate.pair),
       bid: one.divide(rate.ask),
       ask: one.divide(rate.bid),
@@ -252,10 +329,12 @@ export class InMemoryRateProvider implements RateProvider {
     bid: string,
     ask: string,
     mid: string,
-    ttlMs: number = 300000
+    ttlMs: number = 300000,
+    id?: string
   ): void {
     const now = new Date();
     this.rates.set(pair, {
+      id,
       pair,
       bid: new Decimal(bid),
       ask: new Decimal(ask),
@@ -271,9 +350,11 @@ export class InMemoryRateProvider implements RateProvider {
     ask: string,
     mid: string,
     timestamp: Date,
-    ttlMs: number = 300000
+    ttlMs: number = 300000,
+    id?: string
   ): void {
     this.rates.set(pair, {
+      id,
       pair,
       bid: new Decimal(bid),
       ask: new Decimal(ask),
