@@ -271,6 +271,43 @@ describe("jwt utilities", () => {
       expect(payload?.iss).toBeUndefined();
       expect(payload?.aud).toBeUndefined();
     });
+
+    it("should handle email in additionalPayload overriding email param", () => {
+      const options: TokenOptions = {
+        subject: "user-1",
+        additionalPayload: { email: "from-additional@example.com" },
+      };
+      const token = issueToken(options);
+      const payload = decodePayload(token);
+      expect(payload?.email).toBe("from-additional@example.com");
+    });
+
+    it("should handle empty additionalPayload", () => {
+      const token = issueToken({
+        subject: "user-1",
+        additionalPayload: {},
+      });
+      const payload = decodePayload(token);
+      expect(payload?.sub).toBe("user-1");
+    });
+
+    it("should handle TokenOptions with all fields", () => {
+      const token = issueToken({
+        subject: "user-complete",
+        expiresIn: "2h",
+        issuer: "test-issuer",
+        audience: "test-audience",
+        email: "complete@example.com",
+        additionalPayload: { role: "admin", department: "engineering" },
+      });
+      const payload = decodePayload(token);
+      expect(payload?.sub).toBe("user-complete");
+      expect(payload?.email).toBe("complete@example.com");
+      expect(payload?.iss).toBe("test-issuer");
+      expect(payload?.aud).toBe("test-audience");
+      expect(payload?.role).toBe("admin");
+      expect(payload?.department).toBe("engineering");
+    });
   });
 
   // ── verifyToken ─────────────────────────────────────────────────────────────
@@ -312,6 +349,22 @@ describe("jwt utilities", () => {
       const modifiedToken = `${parts[0]}.${modifiedPayload}.${parts[2]}`;
 
       expect(() => verifyToken(modifiedToken)).toThrow();
+    });
+
+    it("should throw on token with malformed header", () => {
+      // Token that decodes but has no header
+      const malformedToken = "not-a-valid-base64.eyJzdWIiOiAidXNlci0xIn0=.signature";
+      expect(() => verifyToken(malformedToken)).toThrow();
+    });
+
+    it("should throw on signature verification failure with custom error", () => {
+      const token = issueToken({ subject: "user-1" });
+      // Tamper the signature by changing a character
+      const parts = token.split(".");
+      const tamperedSig = parts[2].slice(0, -1) + (parts[2].slice(-1) === 'a' ? 'b' : 'a');
+      const tamperedToken = `${parts[0]}.${parts[1]}.${tamperedSig}`;
+
+      expect(() => verifyToken(tamperedToken)).toThrow();
     });
 
     // ── Key rotation ──────────────────────────────────────────────────────────
