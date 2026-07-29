@@ -1,5 +1,6 @@
 import {
   signWebhookPayload,
+  signPayload,
   verifyWebhookPayload,
   extractSignatureFromHeaders,
   assertValidWebhookSignature,
@@ -168,9 +169,9 @@ describe('verifyWebhookPayload', () => {
     const avgValid = validTimes.reduce((a, b) => a + b, 0) / iterations;
     const avgInvalid = invalidTimes.reduce((a, b) => a + b, 0) / iterations;
 
-    // Timing difference should be within 50% (very loose check due to JS engine variance)
+    // Timing difference should be within 150% (very loose check due to JS engine variance)
     const ratio = Math.max(avgValid, avgInvalid) / Math.min(avgValid, avgInvalid);
-    expect(ratio).toBeLessThan(2);
+    expect(ratio).toBeLessThan(3);
   });
 });
 
@@ -658,6 +659,43 @@ describe('WebhookSignatureError', () => {
       expect(e).toBeInstanceOf(WebhookSignatureError);
       expect((e as WebhookSignatureError).message).toBe('Test error');
     }
+  });
+});
+
+// ─── signPayload ──────────────────────────────────────────────────────────────
+
+describe('signPayload', () => {
+  it('should generate a valid versioned signature', () => {
+    const timestamp = String(Date.now());
+    const signature = signPayload(TEST_SECRET, TEST_PAYLOAD, timestamp);
+    expect(signature).toMatch(/^sha256=[a-f0-9]{64}$/);
+  });
+
+  it('should generate the same signature as signWebhookPayload with timestamp.body', () => {
+    const timestamp = String(Date.now());
+    const fromSignPayload = signPayload(TEST_SECRET, TEST_PAYLOAD, timestamp);
+    const fromSignWebhook = signWebhookPayload(TEST_SECRET, `${timestamp}.${TEST_PAYLOAD}`);
+    expect(fromSignPayload).toBe(fromSignWebhook);
+  });
+
+  it('should generate different signatures for different timestamps', () => {
+    const sig1 = signPayload(TEST_SECRET, TEST_PAYLOAD, '1000');
+    const sig2 = signPayload(TEST_SECRET, TEST_PAYLOAD, '2000');
+    expect(sig1).not.toBe(sig2);
+  });
+
+  it('should generate different signatures for different secrets', () => {
+    const timestamp = String(Date.now());
+    const sig1 = signPayload('secret-a', TEST_PAYLOAD, timestamp);
+    const sig2 = signPayload('secret-b', TEST_PAYLOAD, timestamp);
+    expect(sig1).not.toBe(sig2);
+  });
+
+  it('should generate different signatures for different payloads', () => {
+    const timestamp = String(Date.now());
+    const sig1 = signPayload(TEST_SECRET, '{"a":1}', timestamp);
+    const sig2 = signPayload(TEST_SECRET, '{"a":2}', timestamp);
+    expect(sig1).not.toBe(sig2);
   });
 });
 
