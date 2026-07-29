@@ -8,12 +8,65 @@
 /**
  * AML Rule Types - supported detection patterns
  */
-export type AMLRuleType = 
-  | 'velocity'           // High transaction frequency/amount in time window
-  | 'structuring'        // Breaking large transactions into smaller ones
-  | 'geo_mismatch'       // Geographic inconsistency in transactions
-  | 'amount_threshold'   // Single transaction exceeds threshold
-  | 'sanctions_screening'; // Sanctions list screening (exact & Jaro-Winkler fuzzy)
+export type AMLRuleType =
+  | 'velocity'                   // High transaction frequency/amount in time window
+  | 'structuring'                // Breaking large transactions into smaller ones
+  | 'geo_mismatch'               // Geographic inconsistency in transactions
+  | 'amount_threshold'           // Single transaction exceeds threshold
+  | 'sanctions_screening'        // Sanctions list screening — person queue (exact & Jaro-Winkler fuzzy)
+  | 'ofac_counterparty_screening'; // OFAC screening for non-person counterparty metadata (vessels, aircraft, organisations)
+
+/**
+ * OFAC entity taxonomy — covers the four entity classes that appear on the
+ * OFAC SDN list as counterparty metadata on investment offerings.
+ *
+ * @see https://ofac.treasury.gov/faqs/topic/1521
+ */
+export type OfacEntityType = 'person' | 'vessel' | 'aircraft' | 'organisation';
+
+/**
+ * A single counterparty attached to an offering that must be screened against
+ * the OFAC SDN / vessel / aircraft lists.
+ *
+ * @property name        - Legal or registered name of the counterparty.
+ * @property type        - Entity class; controls which OFAC sub-list is searched.
+ * @property imo_number  - IMO vessel/ship identification number (format: `IMO` + 7 digits).
+ *                         Only applicable when type === 'vessel'. Validated by the evaluator;
+ *                         forged or malformed values are silently dropped from alert details.
+ */
+export interface OfacCounterparty {
+  name: string;
+  type: OfacEntityType;
+  imo_number?: string;
+}
+
+/**
+ * Structured match evidence recorded per counterparty hit in the alert details.
+ * An array of these (`matches`) is emitted under `RuleEvaluationResult.details`
+ * so analysts can trace exactly which counterparty triggered the rule and why.
+ */
+export interface OfacScreeningMatch {
+  /** Name that was screened. */
+  screened_name: string;
+  /** Entity class of the counterparty. */
+  entity_type: OfacEntityType;
+  /** Validated IMO number, present only for vessels with a valid format. */
+  imo_number?: string;
+  /** Best-matching OFAC list entry. */
+  matched_candidate: string;
+  /** Jaro-Winkler similarity or 1.0 for exact matches. */
+  similarity_score: number;
+  /** 'exact' = normalised string equality; 'fuzzy' = Jaro-Winkler above threshold. */
+  match_type: 'exact' | 'fuzzy';
+  /**
+   * Human-readable match reason recorded on the alert, e.g.
+   * 'ofac_vessel_exact', 'ofac_aircraft_fuzzy', 'ofac_organisation_exact'.
+   * Format: `ofac_<entity_type>_<match_type>`.
+   */
+  match_reason: string;
+  /** Analyst action: 'auto_deny' (exact match) or 'pending_review' (fuzzy). */
+  action: 'auto_deny' | 'pending_review';
+}
 
 /**
  * Rule severity levels for prioritization
@@ -75,6 +128,13 @@ export interface TransactionContext {
     sanctions_threshold?: number;
     [key: string]: unknown;
   };
+  /**
+   * Non-person counterparties attached to the offering being invested in.
+   * Each entry is independently screened by the `ofac_counterparty_screening` rule.
+   * Person-type entries in this array do NOT feed the person-queue sanctions rule
+   * to prevent cross-type false-positive noise.
+   */
+  counterparties?: OfacCounterparty[];
 }
 
 /**
@@ -84,6 +144,22 @@ export interface SanctionsRuleConfig {
   sanctions_list: string[];
   jaro_winkler_threshold?: number;
   fuzzy_enabled?: boolean;
+}
+
+/**
+ * Configuration for the `ofac_counterparty_screening` rule.
+ * Extends the base sanctions config with an optional entity-type filter so a
+ * single rule can be scoped to, e.g., vessels only.
+ *
+ * @property entity_types - When supplied, only counterparties whose `type` is
+ *                          in this array are screened. Defaults to all types.
+ */
+export interface OfacVesselAircraftRuleConfig extends SanctionsRuleConfig {
+  /**
+   * Restrict screening to these entity types.
+   * Omit (or set to undefined) to screen all entity types.
+   */
+  entity_types?: OfacEntityType[];
 }
 
 /**

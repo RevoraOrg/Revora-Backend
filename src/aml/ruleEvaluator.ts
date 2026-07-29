@@ -3,7 +3,18 @@
  * Evaluates transactions against AML rules to detect suspicious patterns.
  */
 
-import { AMLRule, TransactionContext, RuleEvaluationResult, VelocityRuleConfig, VelocityRepository, InvestmentVelocityRecord } from './types';
+import {
+  AMLRule,
+  TransactionContext,
+  RuleEvaluationResult,
+  VelocityRuleConfig,
+  VelocityRepository,
+  InvestmentVelocityRecord,
+  OfacCounterparty,
+  OfacScreeningMatch,
+  OfacVesselAircraftRuleConfig,
+  OfacEntityType,
+} from './types';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { jaroWinkler, normalizeName } from '../lib/jaroWinkler';
 import { MetricsCollector } from '../lib/metrics';
@@ -151,6 +162,9 @@ export class RuleEvaluator {
         break;
       case 'sanctions_screening':
         ({ triggered, details } = this.evaluateSanctionsRule(context, rule));
+        break;
+      case 'ofac_counterparty_screening':
+        ({ triggered, details } = this.evaluateOfacCounterpartyRule(context, rule));
         break;
       default:
         return { rule_id: rule.id, rule_version: rule.version, triggered: false, severity: rule.severity, details: { error: 'Unknown rule type' }, timestamp: new Date() };
@@ -360,5 +374,155 @@ export class RuleEvaluator {
         timestamp: inv.created_at,
         status: inv.status,
       }));
+  }
+
+  // ─── OFAC Counterparty Screening ────────────────────────────────────────────
+
+  /**
+   * IMO vessel identification number pattern: the letters "IMO" followed by
+   * exactly 7 digits, as defined by IMO resolution A.600(15).
+   * @see https://www.imo.org/en/OurWork/MSAS/Pages/IMO-identification-number-scheme.aspx
+   */
+  private static readonly IMO_PATTERN = /^IMO\d{7}$/;
+
+  /**
+   * @notice Screens each counterparty in `context.counterparties` against the
+   *         configured OFAC SDN list using exact + optional Jaro-Winkler fuzzy
+   *         matching, with per-entity-type filtering and validated IMO surfacing.
+   *
+   * @dev    Security assumptions:
+   *         1. **Isolation** — This method is completely separate from
+   *            `evaluateSanctionsRule` (person queue). A counterparty named the
+   *            same as an SDN person does NOT trigger the person alert queue.
+   *         2. **IMO validation** — `imo_number` values that do not match
+   *            `/^IMO\d{7}$/` are dropped from alert details before emission.
+   *            The counterparty is still screened by name.
+   *         3. **Type-filtered matching** — When `config.entity_types` is set,
+   *            counterparties whose `type` is not in the filter are skipped
+   *            entirely, preventing cross-type false-positive noise.
+   *         4. **No early return on first hit** — All counterparties are
+   *            screened so analysts see the full match set per evaluation.
+   *
+   * @param context - Transaction context carrying `counterparties[]`.
+   * @param rule    - AML rule with `OfacVesselAircraftRuleConfig` config.
+   * @returns `triggered=true` with `details.matches[]` if any counterparty hit.
+   */
+  private evaluateOfacCounterpartyRule(
+    context: TransactionContext,
+    rule: AMLRule
+  ): { triggered: boolean; details: Record<string, unknown> } {
+    const config = rule.config as unknown as OfacVesselAircraftRuleConfig;
+    const sanctionsList = config.sanctions_list ?? [];
+    const counterparties: OfacCounterparty[] = context.counterparties ?? [];
+    const allowedTypes: OfacEntityType[] | undefined = config.entity_types;
+
+    // Per-tenant threshold > rule config threshold > default 0.85
+    const tenantThreshold = context.tenant_settings?.sanctions_threshold;
+    const threshold =
+      typeof tenantThreshold === 'number'
+        ? tenantThreshold
+        : typeof config.jaro_winkler_threshold === 'number'
+        ? config.jaro_winkler_threshold
+        : 0.85;
+
+    if (counterparties.length === 0 || sanctionsList.length === 0) {
+      return {
+        triggered: false,
+        details: {
+          screened_count: 0,
+          reason: counterparties.length === 0
+            ? 'No counterparties to screen'
+            : 'No sanctions list configured',
+        },
+      };
+    }
+
+    const matches: OfacScreeningMatch[] = [];
+
+    for (const cp of counterparties) {
+      // Skip if entity type is not in the configured filter.
+      if (allowedTypes !== undefined && !allowedTypes.includes(cp.type)) {
+        continue;
+      }
+
+      // Validate and conditionally surface IMO number.
+      // An invalid IMO is NOT a screening error — the counterparty is still
+      // screened by name. The malformed value is simply not echoed to details.
+      const validatedImo =
+        cp.type === 'vessel' &&
+        typeof cp.imo_number === 'string' &&
+        RuleEvaluator.IMO_PATTERN.test(cp.imo_number)
+          ? cp.imo_number
+          : undefined;
+
+      const normName = normalizeName(cp.name);
+      let bestMatch: {
+        candidate: string;
+        score: number;
+        matchType: 'exact' | 'fuzzy';
+      } | null = null;
+
+      for (const candidate of sanctionsList) {
+        const normCandidate = normalizeName(candidate);
+
+        if (normName === normCandidate) {
+          bestMatch = { candidate, score: 1.0, matchType: 'exact' };
+          break; // Exact match is definitive; skip remaining candidates.
+        }
+
+        if (config.fuzzy_enabled !== false) {
+          const score = jaroWinkler(cp.name, candidate, { transliterate: true });
+          if (score >= threshold) {
+            if (!bestMatch || score > bestMatch.score) {
+              bestMatch = { candidate, score, matchType: 'fuzzy' };
+            }
+          }
+        }
+      }
+
+      if (bestMatch) {
+        const isFuzzy = bestMatch.matchType === 'fuzzy';
+        const match: OfacScreeningMatch = {
+          screened_name: cp.name,
+          entity_type: cp.type,
+          matched_candidate: bestMatch.candidate,
+          similarity_score: bestMatch.score,
+          match_type: bestMatch.matchType,
+          // Format: ofac_<entity_type>_<match_type>
+          match_reason: `ofac_${cp.type}_${bestMatch.matchType}`,
+          action: isFuzzy ? 'pending_review' : 'auto_deny',
+          ...(validatedImo !== undefined ? { imo_number: validatedImo } : {}),
+        };
+        matches.push(match);
+      }
+    }
+
+    if (matches.length === 0) {
+      return {
+        triggered: false,
+        details: {
+          screened_count: counterparties.length,
+          matched: false,
+          threshold,
+        },
+      };
+    }
+
+    // Determine overall action: if any match is auto_deny, surface that.
+    const overallAction = matches.some(m => m.action === 'auto_deny')
+      ? 'auto_deny'
+      : 'pending_review';
+
+    return {
+      triggered: true,
+      details: {
+        screened_count: counterparties.length,
+        matched: true,
+        match_count: matches.length,
+        matches,
+        threshold,
+        action: overallAction,
+      },
+    };
   }
 }
