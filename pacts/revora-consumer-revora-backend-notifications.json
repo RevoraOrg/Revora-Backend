@@ -1,0 +1,155 @@
+{
+  "consumer": {
+    "name": "revora-consumer"
+  },
+  "provider": {
+    "name": "revora-backend"
+  },
+  "interactions": [
+    {
+      "description": "a request to list notifications for a user with notifications",
+      "providerState": "user has notifications",
+      "request": {
+        "method": "GET",
+        "path": "/notifications",
+        "headers": {
+          "Authorization": "Bearer test-token"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "notifications": [
+            {
+              "id": "550e8400-e29b-41d4-a716-446655440002",
+              "user_id": "550e8400-e29b-41d4-a716-446655440000",
+              "type": "info",
+              "message": "m1",
+              "read": false,
+              "created_at": "2024-01-10T00:00:00.000Z"
+            },
+            {
+              "id": "550e8400-e29b-41d4-a716-446655440003",
+              "user_id": "550e8400-e29b-41d4-a716-446655440000",
+              "type": "alert",
+              "message": "m2",
+              "read": false,
+              "created_at": "2024-01-11T00:00:00.000Z"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "description": "a request to list notifications when user has none",
+      "providerState": "user has no notifications",
+      "request": {
+        "method": "GET",
+        "path": "/notifications",
+        "headers": {
+          "Authorization": "Bearer test-token"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "notifications": []
+        }
+      }
+    },
+    {
+      "description": "an unauthorized request to list notifications",
+      "request": {
+        "method": "GET",
+        "path": "/notifications"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "code": "UNAUTHORIZED",
+          "message": "Unauthorized"
+        }
+      }
+    },
+    {
+      "description": "a request to mark a notification as read",
+      "providerState": "a notification exists",
+      "request": {
+        "method": "PATCH",
+        "path": "/notifications/550e8400-e29b-41d4-a716-446655440002/read",
+        "headers": {
+          "Authorization": "Bearer test-token",
+          "Content-Type": "application/json"
+        },
+        "body": {}
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "marked": 1
+        }
+      }
+    },
+    {
+      "description": "a request to mark a notification that does not exist",
+      "providerState": "notification does not exist",
+      "request": {
+        "method": "PATCH",
+        "path": "/notifications/550e8400-e29b-41d4-a716-446655440005/read",
+        "headers": {
+          "Authorization": "Bearer test-token",
+          "Content-Type": "application/json"
+        },
+        "body": {}
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "code": "NOT_FOUND",
+          "message": "Notification not found"
+        }
+      }
+    },
+    {
+      "description": "an unauthorized request to mark a notification as read",
+      "request": {
+        "method": "PATCH",
+        "path": "/notifications/550e8400-e29b-41d4-a716-446655440002/read",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {}
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "body": {
+          "code": "UNAUTHORIZED",
+          "message": "Unauthorized"
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "pactSpecification": {
+      "version": "2.0.0"
+    }
+  }
+}
