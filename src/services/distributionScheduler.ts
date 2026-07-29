@@ -871,3 +871,86 @@ export class DistributionScheduler {
     return normalizeScheduleTimezone(tz);
   }
 }
+
+// ─── DistributionStateManager ─────────────────────────────────────────────────
+
+export type DistributionState = 'active' | 'paused' | 'resumed';
+
+export interface DistributionPauseRecord {
+  state: DistributionState;
+  reason: string;
+  pausedAt: Date;
+  pausedBy: string;
+  resumedAt?: Date;
+  resumedBy?: string;
+}
+
+/**
+ * @title DistributionStateManager
+ * @notice Tracks pause/resume state for scheduled distributions.
+ * @dev In-memory state map.  When persistence is needed, swap the Map for a
+ *      repository-backed implementation.  The interface remains the same.
+ */
+export class DistributionStateManager {
+  private readonly states = new Map<string, DistributionPauseRecord>();
+  private readonly metrics?: MetricsCollector;
+  private readonly logger: Logger;
+
+  constructor(options?: { metrics?: MetricsCollector; logger?: Logger }) {
+    this.metrics = options?.metrics;
+    this.logger = options?.logger ?? globalLogger;
+  }
+
+  pause(distributionId: string, reason: string, actor: string): void {
+    if (!reason || reason.trim().length === 0) {
+      throw Errors.badRequest('Reason is required to pause a distribution');
+    }
+    const existing = this.states.get(distributionId);
+    if (existing && existing.state === 'paused') {
+      throw Errors.conflict(`Distribution ${distributionId} is already paused`);
+    }
+    this.states.set(distributionId, {
+      state: 'paused',
+      reason,
+      pausedAt: new Date(),
+      pausedBy: actor,
+    });
+    this.logger.info('Distribution paused', { distributionId, reason, actor });
+  }
+
+  resume(distributionId: string, actor: string): DistributionPauseRecord | undefined {
+    const record = this.states.get(distributionId);
+    if (!record || record.state !== 'paused') {
+      return undefined;
+    }
+    const pausedMs = Date.now() - record.pausedAt.getTime();
+    try {
+      this.metrics?.recordHistogram('distribution.paused_seconds', pausedMs / 1000, {
+        distribution_id: distributionId,
+      });
+    } catch (metricsErr) {
+      this.logger.warn('Failed to emit distribution.paused_seconds metric', {
+        distributionId,
+        error: metricsErr instanceof Error ? metricsErr.message : String(metricsErr),
+      });
+    }
+    record.state = 'resumed';
+    record.resumedAt = new Date();
+    record.resumedBy = actor;
+    this.logger.info('Distribution resumed', {
+      distributionId,
+      pausedMs,
+      actor,
+    });
+    return record;
+  }
+
+  getState(distributionId: string): DistributionPauseRecord | undefined {
+    return this.states.get(distributionId);
+  }
+
+  isPaused(distributionId: string): boolean {
+    const record = this.states.get(distributionId);
+    return record?.state === 'paused';
+  }
+}

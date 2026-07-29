@@ -5,10 +5,13 @@
  * @see ../docs/distribution-engine-safety.md
  * @see ../docs/distribution-advisory-lock.md
  */
+import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
 import { globalLogger as logger } from '../lib/logger';
 import { globalMetrics } from '../lib/metrics';
+import { DistributionStateManager } from '../services/distributionScheduler';
+import { SecurityAuditRepository, AuditEvent } from '../security/types';
 
 export interface OfferingRepo {
   getById: (id: string) => Promise<Offering | null>;
@@ -27,7 +30,12 @@ export interface ScheduleConfig {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-export function createDistributionHandlers(distributionEngine: any, offeringRepo?: OfferingRepo) {
+export function createDistributionHandlers(
+  distributionEngine: any,
+  offeringRepo?: OfferingRepo,
+  distributionStateManager?: DistributionStateManager,
+  auditRepository?: SecurityAuditRepository,
+) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
     const requestId = (req as any).id;
     try {
@@ -215,19 +223,197 @@ export function createDistributionHandlers(distributionEngine: any, offeringRepo
     }
   }
 
-  return { triggerDistribution, previewDistribution };
+  async function pauseDistribution(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      if (!user || !user.id) {
+        throw Errors.unauthorized();
+      }
+      if (user.role !== 'admin') {
+        throw Errors.forbidden('Forbidden: admin role required');
+      }
+
+      const distributionId = String(req.params.id || '');
+      if (!distributionId) {
+        throw Errors.badRequest('Missing distribution id');
+      }
+
+      const reason = req.body?.reason;
+      if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
+        throw Errors.badRequest('Reason is required to pause a distribution');
+      }
+
+      if (!distributionStateManager) {
+        throw Errors.internal('Distribution state manager not available');
+      }
+
+      distributionStateManager.pause(distributionId, reason, user.id);
+
+      // Emit audit event
+      if (auditRepository) {
+        try {
+          const auditEvent: AuditEvent = {
+            id: crypto.randomUUID(),
+            type: 'AUTHORIZATION',
+            userId: user.id,
+            action: 'distribution.pause',
+            resource: `distribution:${distributionId}`,
+            outcome: 'SUCCESS',
+            details: { reason, distributionId } as Record<string, unknown>,
+            securityContext: {
+              requestId,
+              ipAddress: req.ip || '',
+              userAgent: req.headers['user-agent'] || '',
+              timestamp: new Date(),
+            },
+            timestamp: new Date(),
+          };
+          await auditRepository.record(auditEvent);
+        } catch (auditErr) {
+          logger.warn('Failed to record audit event for distribution pause', {
+            distributionId,
+            error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+          });
+        }
+      }
+
+      logger.info('Distribution paused', {
+        distributionId,
+        reason,
+        userId: user.id,
+        requestId,
+      });
+
+      return res.status(200).json({
+        distribution_id: distributionId,
+        status: 'paused',
+        reason,
+        paused_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('Distribution pause failed', {
+        distributionId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  async function resumeDistribution(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      if (!user || !user.id) {
+        throw Errors.unauthorized();
+      }
+      if (user.role !== 'admin') {
+        throw Errors.forbidden('Forbidden: admin role required');
+      }
+
+      const distributionId = String(req.params.id || '');
+      if (!distributionId) {
+        throw Errors.badRequest('Missing distribution id');
+      }
+
+      if (!distributionStateManager) {
+        throw Errors.internal('Distribution state manager not available');
+      }
+
+      const record = distributionStateManager.resume(distributionId, user.id);
+
+      if (!record) {
+        logger.info('Resume called on non-paused distribution (idempotent)', {
+          distributionId,
+          userId: user.id,
+          requestId,
+        });
+        return res.status(200).json({
+          distribution_id: distributionId,
+          status: 'active',
+          message: 'Distribution was not paused; no action needed',
+        });
+      }
+
+      // Emit audit event
+      if (auditRepository) {
+        try {
+          const auditEvent: AuditEvent = {
+            id: crypto.randomUUID(),
+            type: 'AUTHORIZATION',
+            userId: user.id,
+            action: 'distribution.resume',
+            resource: `distribution:${distributionId}`,
+            outcome: 'SUCCESS',
+            details: {
+              distributionId,
+              pausedAt: record.pausedAt.toISOString(),
+              pausedBy: record.pausedBy,
+              reason: record.reason,
+            } as Record<string, unknown>,
+            securityContext: {
+              requestId,
+              ipAddress: req.ip || '',
+              userAgent: req.headers['user-agent'] || '',
+              timestamp: new Date(),
+            },
+            timestamp: new Date(),
+          };
+          await auditRepository.record(auditEvent);
+        } catch (auditErr) {
+          logger.warn('Failed to record audit event for distribution resume', {
+            distributionId,
+            error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+          });
+        }
+      }
+
+      logger.info('Distribution resumed', {
+        distributionId,
+        userId: user.id,
+        requestId,
+      });
+
+      return res.status(200).json({
+        distribution_id: distributionId,
+        status: 'resumed',
+        reason: record.reason,
+        paused_at: record.pausedAt.toISOString(),
+        resumed_at: record.resumedAt?.toISOString(),
+      });
+    } catch (err) {
+      logger.error('Distribution resume failed', {
+        distributionId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  return { triggerDistribution, previewDistribution, pauseDistribution, resumeDistribution };
 }
 
 export default function createDistributionsRouter(opts: {
   distributionEngine: any;
   offeringRepo?: OfferingRepo;
   verifyJWT: express.RequestHandler;
+  distributionStateManager?: DistributionStateManager;
+  auditRepository?: SecurityAuditRepository;
 }) {
   const router = express.Router();
-  const handlers = createDistributionHandlers(opts.distributionEngine, opts.offeringRepo);
+  const handlers = createDistributionHandlers(
+    opts.distributionEngine,
+    opts.offeringRepo,
+    opts.distributionStateManager,
+    opts.auditRepository,
+  );
 
   router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
   router.post('/offerings/:id/distribute/preview', opts.verifyJWT, handlers.previewDistribution);
+  router.post('/distributions/:id/pause', opts.verifyJWT, handlers.pauseDistribution);
+  router.post('/distributions/:id/resume', opts.verifyJWT, handlers.resumeDistribution);
 
   return router;
 }
