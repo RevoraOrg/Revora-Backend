@@ -428,6 +428,38 @@ export class FxConversionEngine {
       case 'mid': return rate.mid;
     }
   }
+
+  /** Frozen-rate store: context -> ExchangeRate remap. */
+  private readonly frozenRates = new Map<string, ExchangeRate>();
+
+  async freezeRate(
+    context: string,
+    from: string,
+    to: string,
+    side?: 'bid' | 'ask' | 'mid'
+  ): Promise<ExchangeRate> {
+    const existing = this.frozenRates.get(context);
+    if (existing) {
+      this.metrics?.incrementCounter('fx_rate_frozen_reused', { context });
+      return existing;
+    }
+    const result = await this.convert(new Decimal('1'), from, to, { side: side ?? 'mid' });
+    const frozen: ExchangeRate = {
+      ...result.rate,
+      id: result.rate.id ?? 'frozen-' + context + '-' + Date.now(),
+    };
+    this.frozenRates.set(context, frozen);
+    this.metrics?.incrementCounter('fx_rate_frozen_total', { context, from, to, side: side ?? 'mid' });
+    return frozen;
+  }
+
+  getFrozenRate(context: string): ExchangeRate | null {
+    return this.frozenRates.get(context) ?? null;
+  }
+
+  clearFrozenRate(context: string): void {
+    this.frozenRates.delete(context);
+  }
 }
 
 export class InMemoryRateProvider implements RateProvider {
