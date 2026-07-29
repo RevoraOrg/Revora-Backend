@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "plugins": [
+    "@stryker-mutator/jest-runner"
+  ],
+  "testRunner": "jest",
+  "jest": {
+    "projectType": "custom",
+    "configFile": "jest.stryker.config.js",
+    "enableFindRelatedTests": false
+  },
+  "concurrency": 4,
+  "mutate": [
+    "src/lib/jwt.ts",
+    "src/lib/webhookSignature.ts",
+    "src/middleware/webhookAuth.ts"
+  ],
+  "reporters": ["html", "clear-text", "progress"],
+  "thresholds": {
+    "high": 95,
+    "low": 75,
+    "break": 70
+  },
+  "coverageAnalysis": "perTest",
+  "timeoutMS": 120000,
+  "tempDirName": ".stryker-tmp"
+}

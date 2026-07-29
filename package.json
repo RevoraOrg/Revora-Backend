@@ -16,7 +16,9 @@
     "audit:ci": "ts-node scripts/audit-gate.ts",
     "test:watch": "jest --watch",
     "test:chaos": "jest --testPathPattern=chaos",
-    "test:ci": "jest --coverage --ci"
+    "test:ci": "jest --coverage --ci",
+    "stryker": "stryker run --concurrency 4",
+    "stryker:quick": "stryker run --concurrency 4 --timeoutMS 120000"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.5.0",
@@ -36,6 +38,9 @@
   },
   "devDependencies": {
     "@apidevtools/swagger-parser": "^12.1.0",
+    "@stryker-mutator/core": "^9.6.1",
+    "@stryker-mutator/jest-runner": "^9.6.1",
+    "@stryker-mutator/typescript-checker": "^9.6.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/express-list-endpoints": "^6.0.3",

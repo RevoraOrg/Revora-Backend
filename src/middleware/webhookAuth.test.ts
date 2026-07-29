@@ -75,6 +75,7 @@ describe('webhookAuth middleware', () => {
     const authReq = mockReq as WebhookAuthenticatedRequest;
     expect(authReq.webhook).toEqual({
       verified: true,
+      verifiedByKey: 'current',
       timestamp: undefined,
     });
   });
@@ -611,6 +612,102 @@ describe('webhookVerify middleware', () => {
     const authReq = mockReq as WebhookAuthenticatedRequest;
     expect(authReq.webhook?.timestamp).toBeInstanceOf(Date);
   });
+
+  it('should return 403 for missing body with webhookVerify', () => {
+    mockReq.body = undefined;
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookVerify({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(400);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should handle Buffer body with webhookVerify', () => {
+    const bufferBody = Buffer.from(TEST_PAYLOAD_STRING);
+    mockReq.body = bufferBody;
+    const signature = signWebhookPayload(TEST_SECRET, bufferBody);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookVerify({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should handle string body with webhookVerify', () => {
+    mockReq.body = TEST_PAYLOAD_STRING;
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookVerify({ secret: TEST_SECRET });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should reject old timestamp with webhookVerify', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = String(Date.now() - 120_000);
+
+    const middleware = webhookVerify({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+      maxAgeMs: 60_000,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject future timestamp with webhookVerify', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 120_000);
+
+    const middleware = webhookVerify({
+      secret: TEST_SECRET,
+      requireTimestamp: true,
+      maxAgeMs: 60_000,
+      clockSkewMs: 30_000,
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should handle verifyWebhook returning INVALID_FORMAT payload too large', () => {
+    mockReq.body = TEST_PAYLOAD;
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const middleware = webhookVerify({
+      secret: TEST_SECRET,
+      maxPayloadSize: 1, // Force payload too large error
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should use custom header name with webhookVerify', () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-custom-sig'] = signature;
+
+    const middleware = webhookVerify({
+      secret: TEST_SECRET,
+      headerName: 'x-custom-sig',
+    });
+    middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
 });
 
 // ─── webhookAuthWithProvider ──────────────────────────────────────────────────
@@ -715,6 +812,164 @@ describe('webhookAuthWithProvider middleware', () => {
     expect(mockNext).toHaveBeenCalled();
     const authReq = mockReq as WebhookAuthenticatedRequest;
     expect(authReq.webhook?.timestamp).toBeInstanceOf(Date);
+  });
+
+  it('should handle Buffer body with provider', async () => {
+    const bufferBody = Buffer.from(TEST_PAYLOAD_STRING);
+    mockReq.body = bufferBody;
+    const signature = signWebhookPayload(TEST_SECRET, bufferBody);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should handle string body with provider', async () => {
+    mockReq.body = TEST_PAYLOAD_STRING;
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should return 401 for missing body with provider', async () => {
+    mockReq.body = undefined;
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(401);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should enforce max payload size with provider', async () => {
+    const largePayload = { data: 'x'.repeat(1024 * 1024) };
+    mockReq.body = largePayload;
+    const signature = signWebhookPayload(TEST_SECRET, JSON.stringify(largePayload));
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      maxPayloadSize: 100,
+    });
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should return 403 for signature mismatch with provider', async () => {
+    const signature = signWebhookPayload('wrong-secret', TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should handle custom header name with provider', async () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-custom'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      headerName: 'x-custom',
+    });
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should handle array signature header values with provider', async () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = [signature, 'ignored'];
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
+  });
+
+  it('should handle provider with missing endpointId and no custom extractor', async () => {
+    mockReq = createMockRequest({ params: {} });
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      endpointIdExtractor: (req) => (req as any).headers['x-id'] as string,
+    });
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject expired timestamp with provider', async () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = String(Date.now() - 120_000);
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      requireTimestamp: true,
+      maxAgeMs: 60_000,
+    });
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should reject future timestamp beyond clockSkew with provider', async () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+    mockReq.headers['x-webhook-timestamp'] = String(Date.now() + 120_000);
+
+    const secretProvider = jest.fn().mockResolvedValue(TEST_SECRET);
+
+    const middleware = webhookAuthWithProvider(secretProvider, {
+      requireTimestamp: true,
+    });
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockRes.status).toHaveBeenCalledWith(403);
+    expect(mockNext).not.toHaveBeenCalled();
+  });
+
+  it('should handle provider with secret returning object with only secret', async () => {
+    const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);
+    mockReq.headers['x-revora-signature'] = signature;
+
+    const secretProvider = jest.fn().mockResolvedValue({ secret: TEST_SECRET });
+
+    const middleware = webhookAuthWithProvider(secretProvider);
+    await middleware(mockReq, mockRes, mockNext);
+
+    expect(mockNext).toHaveBeenCalled();
   });
 });
 
