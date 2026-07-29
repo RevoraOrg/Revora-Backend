@@ -51,6 +51,8 @@ import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
 import { createAMLRoutes } from "./routes/amlRoutes";
+import { createLedgerExportRouter } from "./routes/ledgerExport";
+import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
@@ -679,6 +681,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
+  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
@@ -703,9 +706,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
 
-  const userRepo = new UserRepository(pool);
-  const scimToken = env.SCIM_TOKEN ?? '';
-  app.use('/scim/v2', createScimRouter(userRepo, scimToken, '/scim/v2'));
+  // Initialize ledger export with in-memory repository
+  // TODO: Replace with PgLedgerEntryRepository when ledger_entries table exists
+  const ledgerRepo = new InMemoryLedgerRepository();
+  const ledgerExportService = new LedgerExportService(ledgerRepo);
+  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
