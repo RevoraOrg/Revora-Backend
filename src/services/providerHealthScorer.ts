@@ -36,6 +36,7 @@
 import { MetricsCollector } from '../lib/metrics';
 import { Logger } from '../lib/logger';
 import { RateProvider, ExchangeRate } from './fxConversionEngine';
+import { FxQuorumEvaluator } from './fxQuorumEvaluator';
 
 // ─── Metric names ─────────────────────────────────────────────────────────────
 
@@ -538,28 +539,69 @@ export class ScoredRateProvider implements RateProvider {
  * This means demoted providers serve as a last-resort fallback so that the
  * engine degrades gracefully rather than hard-failing.
  *
+ * Variance guard (quorum)
+ * ───────────────────────
+ * When a third `quorum` argument ({@link FxQuorumEvaluator}) is supplied, the
+ * router switches into *quorum mode*: it gathers every provider's quote in
+ * parallel and enforces the variance guard before returning. If the providers
+ * diverge beyond the configured tolerance the run is blocked (a 503 is thrown)
+ * and ops are paged with the divergent rates. This prevents silently trusting a
+ * single misbehaving provider. When no `quorum` is supplied the legacy
+ * first-healthy-wins behaviour is preserved for backwards compatibility.
+ *
  * @example
  * ```typescript
  * const router = new FxProviderRouter(
  *   [
- *     new ScoredRateProvider('primary', primaryProvider, scorer),
+ *     new ScoredRateProvider('primary',   primaryProvider,   scorer),
  *     new ScoredRateProvider('secondary', secondaryProvider, scorer),
+ *     new ScoredRateProvider('fix',       fixProvider,       scorer),
  *   ],
- *   scorer
+ *   scorer,
+ *   new FxQuorumEvaluator(
+ *     { k: 2, tolerance: 0.005 },
+ *     { metrics, logger, pager: (f) => alerting.handle(f) },
+ *   ),
  * );
  * ```
  */
 export class FxProviderRouter implements RateProvider {
   constructor(
     private readonly providers: ScoredRateProvider[],
-    private readonly scorer: ProviderHealthScorer
+    private readonly scorer: ProviderHealthScorer,
+    private readonly quorum?: FxQuorumEvaluator
   ) {
     if (providers.length === 0) {
       throw new Error('FxProviderRouter requires at least one provider.');
     }
+    // Surface a misconfiguration up-front: quorum can never be reached if k > n.
+    if (quorum && quorum.getConfig().k > providers.length) {
+      throw new Error(
+        `FxProviderRouter: quorum requires k=${quorum.getConfig().k} but only ` +
+          `${providers.length} providers are configured. Reduce k or add providers.`
+      );
+    }
   }
 
   async getRate(from: string, to: string): Promise<ExchangeRate | null> {
+    // When a quorum evaluator is configured, the rate-fetch pipeline gathers
+    // every provider's quote and enforces the variance guard. A quorum failure
+    // throws (blocking the run); agreement returns the aggregated consensus rate.
+    if (this.quorum) {
+      const pair = `${from}/${to}`;
+      const inputs = await Promise.all(
+        this.providers.map(async (p) => {
+          try {
+            return { providerId: p.providerId, rate: await p.getRate(from, to) };
+          } catch {
+            // A throwing provider counts as an unavailable/outage provider.
+            return { providerId: p.providerId, rate: null as ExchangeRate | null };
+          }
+        })
+      );
+      return this.quorum.evaluate(pair, inputs);
+    }
+
     // Phase 1 – try healthy providers first
     for (const p of this.providers) {
       if (!this.scorer.isHealthy(p.providerId)) continue;

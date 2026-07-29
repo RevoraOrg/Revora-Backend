@@ -507,6 +507,56 @@ describe('ReconciliationScheduler', () => {
       expect(labels).toContain('overflow');
       expect(labels).not.toContain('cccc0000');
       expect(labels).not.toContain('dddd0000');
+
+      // Verify the new metrics also respect the cardinality cap
+      const driftPoints = snapshot.custom.filter(
+        (p) => p.name === 'reconciliation_drift_amount'
+      );
+      const driftLabels = driftPoints.map((p) => p.labels?.offering_id).sort();
+      expect(driftLabels).toContain('aaaa0000');
+      expect(driftLabels).toContain('bbbb0000');
+      expect(driftLabels).toContain('overflow');
+
+      const tsPoints = snapshot.custom.filter(
+        (p) => p.name === 'reconciliation_last_run_timestamp'
+      );
+      const tsLabels = tsPoints.map((p) => p.labels?.offering_id).sort();
+      expect(tsLabels).toContain('aaaa0000');
+      expect(tsLabels).toContain('bbbb0000');
+      expect(tsLabels).toContain('overflow');
+    });
+
+    it('labels error counter beyond the cap as "overflow"', async () => {
+      const cardinalityLimit = 1;
+      // 3 offerings — first gets individual label; last 2 go to "overflow"
+      const offerings: SchedulerOffering[] = [
+        { id: 'aaaa0000-0000-0000-0000-000000000001', status: 'active' },
+        { id: 'bbbb0000-0000-0000-0000-000000000002', status: 'active' },
+        { id: 'cccc0000-0000-0000-0000-000000000003', status: 'active' },
+      ];
+
+      const service = makeService(async () => {
+        throw new Error('RPC timeout');
+      });
+      const scheduler = new ReconciliationScheduler(
+        service,
+        makeOfferingRepo(offerings),
+        store,
+        metrics,
+        { cardinalityLimit }
+      );
+
+      await scheduler.runScheduledReconciliation();
+
+      const snapshot = await metrics.getSnapshot();
+      const errorPoints = snapshot.custom.filter(
+        (p) => p.name === 'reconciliation_errors_total'
+      );
+
+      const errorLabels = errorPoints.map((p) => p.labels?.offering_id).sort();
+      expect(errorLabels).toContain('aaaa0000');
+      expect(errorLabels).toContain('overflow');
+      expect(errorLabels).not.toContain('cccc0000');
     });
 
     it('correctly uses the first UUID segment as the short label', async () => {

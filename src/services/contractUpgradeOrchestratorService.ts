@@ -21,7 +21,15 @@ const logger = globalLogger.child({ service: 'contract-upgrade-orchestrator' });
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type UpgradeStatus = 'pending' | 'approved' | 'applied' | 'failed';
+export type UpgradeStatus =
+  | 'pending'
+  | 'approved'
+  | 'applied'
+  | 'failed'
+  | 'canary_active'
+  | 'hold_period'
+  | 'canary_passed'
+  | 'rolled_back';
 
 export interface ContractUpgrade {
   id: string;
@@ -39,6 +47,14 @@ export interface ContractUpgrade {
   approved_at: Date | null;
   applied_at: Date | null;
   updated_at: Date;
+  // Canary phase fields
+  canary_offering_id: string | null;
+  canary_started_at: Date | null;
+  hold_period_seconds: number | null;
+  hold_started_at: Date | null;
+  canary_metrics: CanaryMetrics | null;
+  canary_passed_at: Date | null;
+  rolled_back_at: Date | null;
 }
 
 export interface CreateUpgradeInput {
@@ -65,6 +81,38 @@ export interface RollbackPlan {
   approved: boolean;
 }
 
+/**
+ * Metrics snapshot collected during a canary window.
+ * All thresholds are checked at promote time to gate general rollout.
+ */
+export interface CanaryMetrics {
+  /** Error rate observed on the shadow offering (0–1). Threshold: < 0.01 */
+  error_rate: number;
+  /** p99 latency in milliseconds for the shadow offering. Threshold: < 2000 */
+  p99_latency_ms: number;
+  /** Number of failed transactions on the shadow offering. Threshold: 0 */
+  failed_tx_count: number;
+  /** Arbitrary extra key/value pairs recorded by the caller. */
+  extra?: Record<string, unknown>;
+}
+
+export interface StartCanaryInput {
+  /** ID of the shadow/canary offering to route traffic to. Configurable per network. */
+  canary_offering_id: string;
+  /**
+   * Minimum hold period in seconds before promotion is allowed.
+   * Defaults to 300 (5 minutes) if omitted.
+   */
+  hold_period_seconds?: number;
+  actor_id: string;
+}
+
+export interface CanaryMetricThresholds {
+  max_error_rate: number;
+  max_p99_latency_ms: number;
+  max_failed_tx_count: number;
+}
+
 // ── Repository helpers ────────────────────────────────────────────────────────
 
 function mapRow(row: any): ContractUpgrade {
@@ -84,8 +132,23 @@ function mapRow(row: any): ContractUpgrade {
     approved_at: row.approved_at ? new Date(row.approved_at) : null,
     applied_at: row.applied_at ? new Date(row.applied_at) : null,
     updated_at: new Date(row.updated_at),
+    // Canary fields
+    canary_offering_id: row.canary_offering_id ?? null,
+    canary_started_at: row.canary_started_at ? new Date(row.canary_started_at) : null,
+    hold_period_seconds: row.hold_period_seconds ?? null,
+    hold_started_at: row.hold_started_at ? new Date(row.hold_started_at) : null,
+    canary_metrics: row.canary_metrics ?? null,
+    canary_passed_at: row.canary_passed_at ? new Date(row.canary_passed_at) : null,
+    rolled_back_at: row.rolled_back_at ? new Date(row.rolled_back_at) : null,
   };
 }
+
+/** Default metric thresholds applied when promoting a canary. */
+const DEFAULT_CANARY_THRESHOLDS: CanaryMetricThresholds = {
+  max_error_rate: 0.01,        // 1 %
+  max_p99_latency_ms: 2000,    // 2 s
+  max_failed_tx_count: 0,      // zero tolerance
+};
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
@@ -510,6 +573,372 @@ export class ContractUpgradeOrchestratorService {
         { upgrade_id: upgradeId, error: String(err?.message ?? err) },
       );
     }
+  }
+
+  // ── Canary phase ──────────────────────────────────────────────────────────
+
+  /**
+   * Activates the canary phase for an approved upgrade.
+   *
+   * Pre-conditions:
+   *   - Upgrade must be in 'approved' state and have simulate_ok = true.
+   *   - canary_offering_id must be a non-empty string (configured per network).
+   *
+   * On success the upgrade transitions to 'canary_active'. The shadow offering
+   * starts receiving traffic against the new code-id.  The caller is responsible
+   * for actually routing traffic; this service records the intent and timestamps.
+   */
+  async startCanary(upgradeId: string, input: StartCanaryInput): Promise<ContractUpgrade> {
+    const { canary_offering_id, hold_period_seconds = 300, actor_id } = input;
+
+    if (!canary_offering_id || canary_offering_id.trim() === '') {
+      throw Errors.badRequest('canary_offering_id is required and must be non-empty');
+    }
+    if (hold_period_seconds < 0) {
+      throw Errors.badRequest('hold_period_seconds must be a non-negative integer');
+    }
+
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    if (upgrade.status !== 'approved') {
+      throw Errors.conflict(
+        `Cannot start canary for upgrade with status '${upgrade.status}' — must be 'approved'`,
+        { upgrade_id: upgradeId, status: upgrade.status },
+      );
+    }
+
+    if (!upgrade.simulate_ok) {
+      throw Errors.conflict(
+        'Cannot start canary before a successful dry-run simulation',
+        { upgrade_id: upgradeId },
+      );
+    }
+
+    const result = await this.db.query<ContractUpgrade>(
+      `UPDATE contract_upgrades
+          SET status             = 'canary_active',
+              canary_offering_id = $1,
+              canary_started_at  = NOW(),
+              hold_period_seconds = $2,
+              updated_at         = NOW()
+        WHERE id = $3
+        RETURNING *`,
+      [canary_offering_id.trim(), hold_period_seconds, upgradeId],
+    );
+
+    const updated = mapRow(result.rows[0]);
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'CONTRACT_UPGRADE_CANARY_STARTED',
+      resource: `contract_upgrades/${upgradeId}`,
+      details: JSON.stringify({
+        upgrade_id: upgradeId,
+        canary_offering_id,
+        hold_period_seconds,
+      }),
+    });
+
+    logger.info('Contract upgrade canary phase started', {
+      upgrade_id: upgradeId,
+      canary_offering_id,
+      hold_period_seconds,
+    });
+
+    return updated;
+  }
+
+  /**
+   * Records canary metrics and advances the state machine:
+   *
+   *   canary_active  ──(first metrics call)──▶  hold_period
+   *   hold_period    ──(subsequent calls)──────▶ hold_period  (metrics updated in place)
+   *
+   * If the metrics already breach thresholds this method delegates immediately
+   * to `rollbackCanary` and returns the rolled-back upgrade.
+   *
+   * The hold period timer starts on the first call that receives clean metrics.
+   */
+  async recordCanaryMetrics(
+    upgradeId: string,
+    metrics: CanaryMetrics,
+    actor_id: string,
+    thresholds: CanaryMetricThresholds = DEFAULT_CANARY_THRESHOLDS,
+  ): Promise<ContractUpgrade> {
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    if (upgrade.status !== 'canary_active' && upgrade.status !== 'hold_period') {
+      throw Errors.conflict(
+        `Cannot record canary metrics for upgrade with status '${upgrade.status}'`,
+        { upgrade_id: upgradeId, status: upgrade.status },
+      );
+    }
+
+    // Validate metric fields are non-negative numbers.
+    if (
+      typeof metrics.error_rate !== 'number' ||
+      typeof metrics.p99_latency_ms !== 'number' ||
+      typeof metrics.failed_tx_count !== 'number' ||
+      metrics.error_rate < 0 ||
+      metrics.p99_latency_ms < 0 ||
+      metrics.failed_tx_count < 0
+    ) {
+      throw Errors.badRequest(
+        'metrics.error_rate, p99_latency_ms, and failed_tx_count must be non-negative numbers',
+      );
+    }
+
+    const breachReasons: string[] = [];
+    if (metrics.error_rate > thresholds.max_error_rate) {
+      breachReasons.push(
+        `error_rate ${metrics.error_rate} exceeds threshold ${thresholds.max_error_rate}`,
+      );
+    }
+    if (metrics.p99_latency_ms > thresholds.max_p99_latency_ms) {
+      breachReasons.push(
+        `p99_latency_ms ${metrics.p99_latency_ms} exceeds threshold ${thresholds.max_p99_latency_ms}`,
+      );
+    }
+    if (metrics.failed_tx_count > thresholds.max_failed_tx_count) {
+      breachReasons.push(
+        `failed_tx_count ${metrics.failed_tx_count} exceeds threshold ${thresholds.max_failed_tx_count}`,
+      );
+    }
+
+    if (breachReasons.length > 0) {
+      const reason = `Canary metric threshold breached: ${breachReasons.join('; ')}`;
+      logger.warn('CONTRACT_UPGRADE_CANARY_METRICS_BREACHED', {
+        alarm: true,
+        upgrade_id: upgradeId,
+        metrics,
+        thresholds,
+        reasons: breachReasons,
+      });
+      // Automatically roll back on metric breach.
+      return this.rollbackCanary(upgradeId, actor_id, reason);
+    }
+
+    // Metrics are clean — start (or keep) hold period.
+    const newStatus = upgrade.status === 'canary_active' ? 'hold_period' : 'hold_period';
+    const holdStartedAt =
+      upgrade.status === 'canary_active' ? 'NOW()' : null; // only set on first transition
+
+    let updatedRow: ContractUpgrade;
+    if (upgrade.status === 'canary_active') {
+      const result = await this.db.query<ContractUpgrade>(
+        `UPDATE contract_upgrades
+            SET status          = $1,
+                canary_metrics  = $2,
+                hold_started_at = NOW(),
+                updated_at      = NOW()
+          WHERE id = $3
+          RETURNING *`,
+        [newStatus, JSON.stringify(metrics), upgradeId],
+      );
+      updatedRow = mapRow(result.rows[0]);
+    } else {
+      // Already in hold_period: update metrics without resetting hold_started_at.
+      const result = await this.db.query<ContractUpgrade>(
+        `UPDATE contract_upgrades
+            SET canary_metrics = $1,
+                updated_at     = NOW()
+          WHERE id = $2
+          RETURNING *`,
+        [JSON.stringify(metrics), upgradeId],
+      );
+      updatedRow = mapRow(result.rows[0]);
+    }
+
+    // Suppress unused-variable warning for holdStartedAt declared above.
+    void holdStartedAt;
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'CONTRACT_UPGRADE_CANARY_METRICS_RECORDED',
+      resource: `contract_upgrades/${upgradeId}`,
+      details: JSON.stringify({
+        upgrade_id: upgradeId,
+        status: updatedRow.status,
+        metrics,
+        thresholds,
+      }),
+    });
+
+    logger.info('Contract upgrade canary metrics recorded', {
+      upgrade_id: upgradeId,
+      status: updatedRow.status,
+      metrics,
+    });
+
+    return updatedRow;
+  }
+
+  /**
+   * Promotes a canary upgrade to `canary_passed` and authorises general rollout.
+   *
+   * Pre-conditions:
+   *   - Status must be 'hold_period'.
+   *   - The hold period must have elapsed (hold_started_at + hold_period_seconds ≤ now).
+   *   - canary_metrics must be present and within thresholds.
+   *
+   * After promotion the operator should call `applyUpgrade` (or an equivalent
+   * global-rollout step) to distribute the new code-id to all offerings.
+   */
+  async promoteCanary(
+    upgradeId: string,
+    actor_id: string,
+    thresholds: CanaryMetricThresholds = DEFAULT_CANARY_THRESHOLDS,
+  ): Promise<ContractUpgrade> {
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    if (upgrade.status !== 'hold_period') {
+      throw Errors.conflict(
+        `Cannot promote canary with status '${upgrade.status}' — must be 'hold_period'`,
+        { upgrade_id: upgradeId, status: upgrade.status },
+      );
+    }
+
+    // Guard: hold period must have elapsed.
+    if (!upgrade.hold_started_at) {
+      throw Errors.conflict(
+        'Hold period has not started — record metrics first',
+        { upgrade_id: upgradeId },
+      );
+    }
+
+    const holdSeconds = upgrade.hold_period_seconds ?? 300;
+    const elapsedMs = Date.now() - upgrade.hold_started_at.getTime();
+    const holdMs = holdSeconds * 1000;
+
+    if (elapsedMs < holdMs) {
+      const remainingSeconds = Math.ceil((holdMs - elapsedMs) / 1000);
+      throw Errors.conflict(
+        `Hold period has not elapsed — ${remainingSeconds}s remaining`,
+        { upgrade_id: upgradeId, remaining_seconds: remainingSeconds },
+      );
+    }
+
+    // Re-check latest metrics before allowing promotion.
+    if (!upgrade.canary_metrics) {
+      throw Errors.conflict(
+        'No canary metrics recorded — record metrics before promoting',
+        { upgrade_id: upgradeId },
+      );
+    }
+
+    const m = upgrade.canary_metrics;
+    const breachReasons: string[] = [];
+    if (m.error_rate > thresholds.max_error_rate) {
+      breachReasons.push(`error_rate ${m.error_rate} exceeds ${thresholds.max_error_rate}`);
+    }
+    if (m.p99_latency_ms > thresholds.max_p99_latency_ms) {
+      breachReasons.push(`p99_latency_ms ${m.p99_latency_ms} exceeds ${thresholds.max_p99_latency_ms}`);
+    }
+    if (m.failed_tx_count > thresholds.max_failed_tx_count) {
+      breachReasons.push(`failed_tx_count ${m.failed_tx_count} exceeds ${thresholds.max_failed_tx_count}`);
+    }
+
+    if (breachReasons.length > 0) {
+      const reason = `Promotion blocked — metric threshold breached: ${breachReasons.join('; ')}`;
+      return this.rollbackCanary(upgradeId, actor_id, reason);
+    }
+
+    const result = await this.db.query<ContractUpgrade>(
+      `UPDATE contract_upgrades
+          SET status          = 'canary_passed',
+              canary_passed_at = NOW(),
+              updated_at      = NOW()
+        WHERE id = $1
+        RETURNING *`,
+      [upgradeId],
+    );
+
+    const promoted = mapRow(result.rows[0]);
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'CONTRACT_UPGRADE_CANARY_PROMOTED',
+      resource: `contract_upgrades/${upgradeId}`,
+      details: JSON.stringify({
+        upgrade_id: upgradeId,
+        canary_offering_id: upgrade.canary_offering_id,
+        hold_period_seconds: holdSeconds,
+        elapsed_seconds: Math.floor(elapsedMs / 1000),
+        metrics: upgrade.canary_metrics,
+      }),
+    });
+
+    logger.info('Contract upgrade canary promoted — ready for general rollout', {
+      upgrade_id: upgradeId,
+    });
+
+    return promoted;
+  }
+
+  /**
+   * Rolls back a canary upgrade to `rolled_back`.
+   *
+   * Can be called:
+   *   - Explicitly by an operator at any canary stage (canary_active, hold_period).
+   *   - Automatically by `recordCanaryMetrics` when thresholds are breached.
+   *   - Automatically by `promoteCanary` when final metrics are still unhealthy.
+   *
+   * Idempotent: if the upgrade is already rolled_back or failed, returns current state.
+   */
+  async rollbackCanary(
+    upgradeId: string,
+    actor_id: string,
+    reason = 'Manual rollback requested',
+  ): Promise<ContractUpgrade> {
+    const upgrade = await this.getUpgradeOrThrow(upgradeId);
+
+    // Idempotent: already in a terminal canary-rollback state.
+    if (upgrade.status === 'rolled_back' || upgrade.status === 'failed') {
+      return upgrade;
+    }
+
+    const allowedStatuses: UpgradeStatus[] = ['canary_active', 'hold_period'];
+    if (!allowedStatuses.includes(upgrade.status)) {
+      throw Errors.conflict(
+        `Cannot rollback canary with status '${upgrade.status}' — must be 'canary_active' or 'hold_period'`,
+        { upgrade_id: upgradeId, status: upgrade.status },
+      );
+    }
+
+    const result = await this.db.query<ContractUpgrade>(
+      `UPDATE contract_upgrades
+          SET status         = 'rolled_back',
+              failure_reason = $1,
+              rolled_back_at = NOW(),
+              updated_at     = NOW()
+        WHERE id = $2
+        RETURNING *`,
+      [reason, upgradeId],
+    );
+
+    const rolledBack = mapRow(result.rows[0]);
+
+    await this.auditLog.createAuditLog({
+      user_id: actor_id,
+      action: 'CONTRACT_UPGRADE_CANARY_ROLLED_BACK',
+      resource: `contract_upgrades/${upgradeId}`,
+      details: JSON.stringify({
+        upgrade_id: upgradeId,
+        canary_offering_id: upgrade.canary_offering_id,
+        reason,
+        previous_status: upgrade.status,
+      }),
+    });
+
+    logger.warn('Contract upgrade canary rolled back', {
+      alarm: true,
+      upgrade_id: upgradeId,
+      canary_offering_id: upgrade.canary_offering_id,
+      reason,
+      previous_status: upgrade.status,
+    });
+
+    return rolledBack;
   }
 
   // ── Post-upgrade health monitoring ───────────────────────────────────────
