@@ -75,6 +75,7 @@ class FakeIdentities implements SocialIdentityRepository {
     providerSubject: string;
     providerEmail: string;
     emailVerified: boolean;
+    isPrivateRelay?: boolean;
   }): Promise<SocialIdentityRecord> {
     const identity: SocialIdentityRecord = {
       id: `identity-${this.identities.size + 1}`,
@@ -83,6 +84,7 @@ class FakeIdentities implements SocialIdentityRepository {
       providerSubject: input.providerSubject,
       providerEmail: input.providerEmail,
       emailVerified: input.emailVerified,
+      isPrivateRelay: input.isPrivateRelay ?? false,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -90,11 +92,14 @@ class FakeIdentities implements SocialIdentityRepository {
     return identity;
   }
 
-  async updateIdentityEmail(id: string, providerEmail: string): Promise<void> {
+  async updateIdentityEmail(id: string, providerEmail: string, isPrivateRelay?: boolean): Promise<void> {
     const identity = this.identities.get(id);
     if (identity) {
       identity.providerEmail = providerEmail;
       identity.emailVerified = true;
+      if (isPrivateRelay !== undefined) {
+        identity.isPrivateRelay = isPrivateRelay;
+      }
       identity.updatedAt = new Date();
     }
   }
@@ -529,5 +534,150 @@ describe('SocialAuthService', () => {
     const { createHash } = await import('node:crypto');
     const expectedHash = createHash('sha256').update(result.refreshToken).digest('hex');
     expect(sessions.sessions[0].tokenHash).toBe(expectedHash);
+  });
+
+  // ── Apple private-relay ("Hide My Email") tests ─────────────────────────
+
+  it('skips email collision check for Apple private-relay login with no identity', async () => {
+    const { users, verifier, service } = fixture();
+    // An existing password account happens to have the same email as the
+    // private-relay address.  Without the relay guard this would throw
+    // EMAIL_ACCOUNT_REQUIRES_LINK; with it the service skips the check.
+    users.add({
+      id: 'user-1',
+      email: 'privaterelay@example.com',
+      role: 'investor',
+      passwordHash: hashPassword('Password123!'),
+    });
+    verifier.claims = {
+      ...verifier.claims,
+      provider: 'apple',
+      email: 'privaterelay@example.com',
+      isPrivateRelay: true,
+    };
+
+    await expect(service.loginWithProvider('apple', 'token')).rejects.toMatchObject({
+      code: 'SOCIAL_IDENTITY_NOT_LINKED',
+    });
+  });
+
+  it('reinstalled Apple user logs in via stable sub and gets updated relay email', async () => {
+    const { users, identities, verifier, service } = fixture();
+    // First install: user links Apple with an initial private-relay email.
+    users.add({
+      id: 'user-1',
+      email: 'real@example.com',
+      role: 'investor',
+      passwordHash: hashPassword('Password123!'),
+    });
+    verifier.claims = {
+      ...verifier.claims,
+      provider: 'apple',
+      subject: 'apple-sub-stable-001',
+      email: 'first-relay@privaterelay.appleid.com',
+      isPrivateRelay: true,
+    };
+
+    await service.linkProvider({
+      userId: 'user-1',
+      provider: 'apple',
+      idToken: 'token',
+      currentPassword: 'Password123!',
+    });
+
+    // Re-install: Apple generates a new relay email but the sub stays the same.
+    verifier.claims = {
+      ...verifier.claims,
+      email: 'second-relay@privaterelay.appleid.com',
+      isPrivateRelay: true,
+    };
+
+    const result = await service.loginWithProvider('apple', 'token');
+
+    expect(result.user.id).toBe('user-1');
+
+    const stored = await identities.findByUserAndProvider('user-1', 'apple');
+    expect(stored?.providerEmail).toBe('second-relay@privaterelay.appleid.com');
+    expect(stored?.isPrivateRelay).toBe(true);
+  });
+
+  it('skips email collision check when linking an Apple private-relay identity', async () => {
+    const { users, verifier, service } = fixture();
+    // user-1 owns this email in password-account form.
+    users.add({
+      id: 'user-1',
+      email: 'collision@example.com',
+      role: 'investor',
+      passwordHash: hashPassword('Password123!'),
+    });
+    // user-2 tries to link the private-relay address that happens to
+    // match user-1's email.  The relay guard must skip the collision check.
+    users.add({
+      id: 'user-2',
+      email: 'other@example.com',
+      role: 'investor',
+      passwordHash: hashPassword('Password456!'),
+    });
+    verifier.claims = {
+      ...verifier.claims,
+      provider: 'apple',
+      email: 'collision@example.com',
+      isPrivateRelay: true,
+    };
+
+    const result = await service.linkProvider({
+      userId: 'user-2',
+      provider: 'apple',
+      idToken: 'token',
+      currentPassword: 'Password456!',
+    });
+
+    expect(result.linked).toBe(true);
+    expect(result.identity.isPrivateRelay).toBe(true);
+    expect(result.identity.providerEmail).toBe('collision@example.com');
+  });
+
+  it('preserves isPrivateRelay flag on re-link when email changes', async () => {
+    const { users, identities, verifier, service } = fixture();
+    users.add({
+      id: 'user-1',
+      email: 'real@example.com',
+      role: 'investor',
+      passwordHash: hashPassword('Password123!'),
+    });
+
+    // First link with private-relay email
+    verifier.claims = {
+      ...verifier.claims,
+      provider: 'apple',
+      subject: 'apple-sub-stable-002',
+      email: 'first-relay@privaterelay.appleid.com',
+      isPrivateRelay: true,
+    };
+
+    await service.linkProvider({
+      userId: 'user-1',
+      provider: 'apple',
+      idToken: 'token',
+      currentPassword: 'Password123!',
+    });
+
+    // Re-link with a different private-relay email
+    verifier.claims = {
+      ...verifier.claims,
+      email: 'second-relay@privaterelay.appleid.com',
+      isPrivateRelay: true,
+    };
+
+    const result = await service.linkProvider({
+      userId: 'user-1',
+      provider: 'apple',
+      idToken: 'token',
+      currentPassword: 'Password123!',
+    });
+
+    expect(result.linked).toBe(true);
+    expect(result.identity.providerEmail).toBe('second-relay@privaterelay.appleid.com');
+    expect(result.identity.isPrivateRelay).toBe(true);
   });
 });

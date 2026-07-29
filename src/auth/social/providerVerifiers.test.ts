@@ -660,6 +660,59 @@ describe('JwksSocialTokenVerifier', () => {
     });
   });
 
+  describe('Apple private relay handling', () => {
+    it('passes through isPrivateRelay=true when is_private_email is true in the token', async () => {
+      const jwk = publicKeyJwk('k1');
+      global.fetch = jest.fn().mockResolvedValue(mockJwksResponse([jwk]) as any);
+
+      const verifier = new JwksSocialTokenVerifier([appleConfig]);
+      const token = signToken(
+        validPayload({
+          iss: 'https://appleid.apple.com',
+          aud: 'apple-client-id',
+          email: 'relay@privaterelay.appleid.com',
+          is_private_email: true,
+        }),
+      );
+      const result = await verifier.verify('apple', token);
+      expect(result.isPrivateRelay).toBe(true);
+    });
+
+    it('passes through isPrivateRelay=false when is_private_email is absent', async () => {
+      const jwk = publicKeyJwk('k1');
+      global.fetch = jest.fn().mockResolvedValue(mockJwksResponse([jwk]) as any);
+
+      const verifier = new JwksSocialTokenVerifier([appleConfig]);
+      const token = signToken(
+        validPayload({
+          iss: 'https://appleid.apple.com',
+          aud: 'apple-client-id',
+          email: 'real@example.com',
+          // is_private_email intentionally omitted
+        }),
+      );
+      const result = await verifier.verify('apple', token);
+      expect(result.isPrivateRelay).toBe(false);
+    });
+
+    it('passes through isPrivateRelay=true when is_private_email is the string "true"', async () => {
+      const jwk = publicKeyJwk('k1');
+      global.fetch = jest.fn().mockResolvedValue(mockJwksResponse([jwk]) as any);
+
+      const verifier = new JwksSocialTokenVerifier([appleConfig]);
+      const token = signToken(
+        validPayload({
+          iss: 'https://appleid.apple.com',
+          aud: 'apple-client-id',
+          email: 'relay@privaterelay.appleid.com',
+          is_private_email: 'true',
+        }),
+      );
+      const result = await verifier.verify('apple', token);
+      expect(result.isPrivateRelay).toBe(true);
+    });
+  });
+
   describe('default verifier from env', () => {
     it('createDefaultSocialTokenVerifierFromEnv returns a verifier', () => {
       const originalGoogle = process.env.GOOGLE_OAUTH_CLIENT_ID;
