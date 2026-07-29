@@ -762,6 +762,291 @@ describe('RuleEvaluator', () => {
   });
 });
 
+// ─── OFAC Counterparty Screening — Vessel & Aircraft ─────────────────────────
+
+/**
+ * Test suite for rule type: 'ofac_counterparty_screening'
+ *
+ * Invariants verified:
+ *   - Person-queue (sanctions_screening) is unaffected by counterparty hits.
+ *   - IMO numbers are validated before being surfaced in alert details.
+ *   - entity_types filter prevents cross-type matches.
+ *   - All 13 scenarios are fully deterministic (no Date.now() variance).
+ */
+describe('OFAC Counterparty Screening — Vessel & Aircraft', () => {
+  let mockRepo: MockInvestmentRepository;
+  let evaluator: RuleEvaluator;
+
+  const baseRule = (configOverrides: Record<string, unknown> = {}): AMLRule => ({
+    id: 'ofac-cp-rule-1',
+    name: 'OFAC Counterparty Screening',
+    description: 'Screens vessel/aircraft/organisation counterparties against OFAC SDN list',
+    type: 'ofac_counterparty_screening',
+    version: { major: 1, minor: 0, patch: 0 },
+    severity: 'critical',
+    enabled: true,
+    config: {
+      sanctions_list: [
+        'Arktika Star',          // sanctioned vessel
+        'Petrov Cargo LLC',      // sanctioned organisation
+        'Firebird One',          // sanctioned aircraft
+        'Global Maritime Corp',  // vessel name variant
+      ],
+      jaro_winkler_threshold: 0.85,
+      fuzzy_enabled: true,
+      ...configOverrides,
+    },
+    created_at: new Date('2026-01-01T00:00:00Z'),
+    updated_at: new Date('2026-01-01T00:00:00Z'),
+  });
+
+  const baseContext = (counterparties: any[]): TransactionContext => ({
+    investment_id: 'inv-ofac-1',
+    investor_id: 'investor-1',
+    offering_id: 'offering-1',
+    amount: '5000',
+    asset: 'USD',
+    timestamp: new Date('2026-06-01T10:00:00Z'),
+    counterparties,
+  });
+
+  beforeEach(() => {
+    mockRepo = new MockInvestmentRepository();
+    evaluator = new RuleEvaluator(mockRepo as any);
+  });
+
+  // ── 1. Vessel exact name match ────────────────────────────────────────────
+
+  it('1: vessel exact name match → triggered=true, match_reason=ofac_vessel_exact', async () => {
+    const ctx = baseContext([
+      { name: 'Arktika Star', type: 'vessel', imo_number: 'IMO1234567' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(true);
+    const matches = result.details.matches as any[];
+    expect(matches).toHaveLength(1);
+    expect(matches[0].match_reason).toBe('ofac_vessel_exact');
+    expect(matches[0].entity_type).toBe('vessel');
+    expect(matches[0].action).toBe('auto_deny');
+  });
+
+  // ── 2. IMO number surfaced in match details ───────────────────────────────
+
+  it('2: valid IMO number is surfaced in details.matches[0].imo_number', async () => {
+    const ctx = baseContext([
+      { name: 'Arktika Star', type: 'vessel', imo_number: 'IMO9876543' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    const matches = result.details.matches as any[];
+    expect(matches[0].imo_number).toBe('IMO9876543');
+  });
+
+  // ── 3. Aircraft fuzzy name match ──────────────────────────────────────────
+
+  it('3: aircraft fuzzy name match → triggered=true, action=pending_review', async () => {
+    // 'Fireberd One' is a deliberate misspelling — Jaro-Winkler will score it
+    // above 0.85 relative to 'Firebird One' but normalizeName will NOT reduce
+    // it to an exact match, so it remains in the fuzzy code path.
+    const ctx = baseContext([
+      { name: 'Fireberd One', type: 'aircraft' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(true);
+    const matches = result.details.matches as any[];
+    expect(matches[0].match_type).toBe('fuzzy');
+    expect(matches[0].match_reason).toBe('ofac_aircraft_fuzzy');
+    expect(matches[0].action).toBe('pending_review');
+    expect(result.details.action).toBe('pending_review');
+  });
+
+  // ── 4. Organisation exact match ───────────────────────────────────────────
+
+  it('4: organisation exact name match → entity_type=organisation, triggered=true', async () => {
+    const ctx = baseContext([
+      { name: 'Petrov Cargo LLC', type: 'organisation' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(true);
+    const matches = result.details.matches as any[];
+    expect(matches[0].entity_type).toBe('organisation');
+    expect(matches[0].match_reason).toBe('ofac_organisation_exact');
+  });
+
+  // ── 5. entity_types filter — vessel rule must NOT match aircraft counterparty
+
+  it('5: entity_types=[vessel] filter skips aircraft counterparty', async () => {
+    const ctx = baseContext([
+      { name: 'Firebird One', type: 'aircraft' },  // exact match — but filtered out
+    ]);
+    const rule = baseRule({ entity_types: ['vessel'] });
+    const [result] = await evaluator.evaluate(ctx, [rule]);
+
+    // Aircraft is excluded by the type filter; should not trigger.
+    expect(result.triggered).toBe(false);
+  });
+
+  // ── 6. Person-queue isolation ─────────────────────────────────────────────
+
+  it('6: counterparty with same name as SDN person does NOT trigger person-queue (sanctions_screening)', async () => {
+    // Use a name that appears in both the counterparty list and a hypothetical
+    // sanctions_screening rule to prove the rules are isolated code paths.
+    const personRule: AMLRule = {
+      id: 'person-sanctions-rule',
+      name: 'Sanctions Screening — Persons',
+      description: 'Person-queue SDN screening',
+      type: 'sanctions_screening',
+      version: { major: 1, minor: 0, patch: 0 },
+      severity: 'critical',
+      enabled: true,
+      config: {
+        sanctions_list: ['Arktika Star'],  // same name as vessel counterparty
+        jaro_winkler_threshold: 0.85,
+        fuzzy_enabled: true,
+      },
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
+    // investor_name is not set — person-queue has nothing to screen.
+    const ctx: TransactionContext = {
+      investment_id: 'inv-x',
+      investor_id: 'inv-x',
+      offering_id: 'off-x',
+      amount: '100',
+      asset: 'USD',
+      timestamp: new Date(),
+      counterparties: [{ name: 'Arktika Star', type: 'vessel' }],
+      // investor_name intentionally absent
+    };
+
+    const [personResult] = await evaluator.evaluate(ctx, [personRule]);
+
+    // Person-queue must NOT trigger. The evaluator falls back to investor_id
+    // as the screened name when investor_name is absent; 'inv-x' does not
+    // match 'Arktika Star', so triggered remains false.
+    // Core invariant: the counterparties[] field on context is ignored by the
+    // sanctions_screening (person-queue) code path entirely.
+    expect(personResult.triggered).toBe(false);
+  });
+
+  // ── 7. Invalid IMO format — screened by name only, imo_number absent ──────
+
+  it('7: invalid IMO format is dropped; counterparty still screened by name', async () => {
+    const ctx = baseContext([
+      // 'VESSEL123' does not match /^IMO\d{7}$/ — should not appear in details.
+      { name: 'Arktika Star', type: 'vessel', imo_number: 'VESSEL123' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(true);  // still matched by name
+    const matches = result.details.matches as any[];
+    expect(matches[0].imo_number).toBeUndefined();
+  });
+
+  // ── 8. Empty counterparties array → not triggered ─────────────────────────
+
+  it('8: empty counterparties array → triggered=false, reason surfaced', async () => {
+    const ctx = baseContext([]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(false);
+    expect(result.details.screened_count).toBe(0);
+    expect(result.details.reason).toBe('No counterparties to screen');
+  });
+
+  // ── 9. Missing / undefined counterparties field → not triggered ───────────
+
+  it('9: undefined counterparties field → triggered=false gracefully', async () => {
+    const ctx: TransactionContext = {
+      investment_id: 'inv-2',
+      investor_id: 'investor-2',
+      offering_id: 'offering-2',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      // counterparties intentionally absent
+    };
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(false);
+  });
+
+  // ── 10. All counterparties clear → triggered=false ────────────────────────
+
+  it('10: counterparties with no SDN match → triggered=false, screened_count correct', async () => {
+    const ctx = baseContext([
+      { name: 'Clean Vessel Corp', type: 'vessel', imo_number: 'IMO0000001' },
+      { name: 'Legitimate Airways Ltd', type: 'aircraft' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(false);
+    expect(result.details.screened_count).toBe(2);
+    expect(result.details.matched).toBe(false);
+  });
+
+  // ── 11. Multiple counterparties with one hit ──────────────────────────────
+
+  it('11: one sanctioned counterparty among multiple clean ones → triggered, match_count=1', async () => {
+    const ctx = baseContext([
+      { name: 'Clean Ship A', type: 'vessel', imo_number: 'IMO1111111' },
+      { name: 'Arktika Star', type: 'vessel', imo_number: 'IMO2222222' }, // hit
+      { name: 'Honest Aircraft Co', type: 'aircraft' },
+    ]);
+    const [result] = await evaluator.evaluate(ctx, [baseRule()]);
+
+    expect(result.triggered).toBe(true);
+    expect(result.details.screened_count).toBe(3);
+    expect(result.details.match_count).toBe(1);
+    const matches = result.details.matches as any[];
+    expect(matches[0].screened_name).toBe('Arktika Star');
+  });
+
+  // ── 12. Per-tenant threshold applies to counterparty screening ────────────
+
+  it('12: per-tenant threshold overrides rule config for counterparty fuzzy matching', async () => {
+    // 'Arktika Ster' is a slight misspelling — fuzzy match at 0.85 threshold.
+    const ctxStrict: TransactionContext = {
+      ...baseContext([{ name: 'Arktika Ster', type: 'vessel' }]),
+      tenant_settings: { sanctions_threshold: 0.99 }, // far too strict to match
+    };
+    const ctxPermissive: TransactionContext = {
+      ...baseContext([{ name: 'Arktika Ster', type: 'vessel' }]),
+      tenant_settings: { sanctions_threshold: 0.70 }, // permissive — should match
+    };
+
+    const [strictResult] = await evaluator.evaluate(ctxStrict, [baseRule()]);
+    const [permissiveResult] = await evaluator.evaluate(ctxPermissive, [baseRule()]);
+
+    expect(strictResult.triggered).toBe(false);
+    expect(permissiveResult.triggered).toBe(true);
+    const matches = permissiveResult.details.matches as any[];
+    expect(matches[0].match_type).toBe('fuzzy');
+  });
+
+  // ── 13. fuzzy_enabled=false — only exact match triggers ───────────────────
+
+  it('13: fuzzy_enabled=false → only exact match triggers, near-miss does not', async () => {
+    const rule = baseRule({ fuzzy_enabled: false });
+
+    // Near-miss — would trigger with fuzzy enabled.
+    const nearMissCtx = baseContext([{ name: 'Arktika Ster', type: 'vessel' }]);
+    const [nearMissResult] = await evaluator.evaluate(nearMissCtx, [rule]);
+    expect(nearMissResult.triggered).toBe(false);
+
+    // Exact match — must still trigger even with fuzzy disabled.
+    const exactCtx = baseContext([{ name: 'Arktika Star', type: 'vessel' }]);
+    const [exactResult] = await evaluator.evaluate(exactCtx, [rule]);
+    expect(exactResult.triggered).toBe(true);
+    const matches = exactResult.details.matches as any[];
+    expect(matches[0].match_type).toBe('exact');
+  });
+});
+
 // ─── Velocity rule — sliding window aggregation (smurfing detection) ──────────
 
 describe('Velocity Rule — Sliding Window Aggregation', () => {
