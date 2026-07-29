@@ -4,6 +4,7 @@ import { DisputeSLAService } from '../services/disputeSLAService';
 import { NotificationRepository } from '../db/repositories/notificationRepository';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { DISPUTE_STATES, DISPUTE_JURISDICTIONS } from '../config/disputeSLAConfig';
+import { DisputeRefundService } from '../services/disputeRefundService';
 
 /**
  * Dispute SLA Routes
@@ -47,7 +48,10 @@ function validateDate(value: unknown, fieldName: string): Date | null {
 /**
  * Create dispute SLA route handlers.
  */
-export function createDisputeSLAHandlers(disputeSLAService: DisputeSLAService) {
+export function createDisputeSLAHandlers(
+  disputeSLAService: DisputeSLAService,
+  disputeRefundService?: DisputeRefundService
+) {
   /**
    * POST /api/v1/disputes/:disputeId/sla/start
    * Start an SLA timer for a dispute.
@@ -224,12 +228,52 @@ export function createDisputeSLAHandlers(disputeSLAService: DisputeSLAService) {
     }
   }
 
+  /**
+   * POST /api/v1/disputes/:disputeId/refund
+   * Process a partial refund for a dispute.
+   */
+  async function processRefund(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const { disputeId } = req.params;
+      const { amount, originalDisbursement, reason, ledgerEventId, distributionId } = req.body || {};
+
+      if (!disputeId) {
+        res.status(400).json({ error: 'disputeId path parameter is required' });
+        return;
+      }
+
+      if (!amount || !originalDisbursement) {
+        res.status(400).json({ error: 'amount and originalDisbursement are required in body' });
+        return;
+      }
+
+      if (!disputeRefundService) {
+        res.status(500).json({ error: 'DisputeRefundService is not initialized' });
+        return;
+      }
+
+      const refund = await disputeRefundService.processPartialRefund({
+        disputeId,
+        amount: String(amount),
+        originalDisbursement: String(originalDisbursement),
+        reason,
+        ledgerEventId,
+        distributionId,
+      });
+
+      res.status(201).json({ refund });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   return {
     startSLA,
     transitionSLA,
     pauseSLA,
     resumeSLA,
     exportBurnReport,
+    processRefund,
   };
 }
 
@@ -255,13 +299,18 @@ export function createDisputeSLARouter(deps: CreateDisputeSLARouterDeps): Router
     auditLogRepo: deps.auditLogRepo,
   });
 
-  const handlers = createDisputeSLAHandlers(disputeSLAService);
+  const disputeRefundService = new DisputeRefundService(deps.db);
+
+  const handlers = createDisputeSLAHandlers(disputeSLAService, disputeRefundService);
 
   // All dispute SLA endpoints require authentication
   router.post('/disputes/:disputeId/sla/start', deps.requireAuth, handlers.startSLA);
   router.post('/disputes/:disputeId/sla/transition', deps.requireAuth, handlers.transitionSLA);
   router.post('/disputes/:disputeId/sla/pause', deps.requireAuth, handlers.pauseSLA);
   router.post('/disputes/:disputeId/sla/resume', deps.requireAuth, handlers.resumeSLA);
+  
+  // Partial refund endpoint
+  router.post('/disputes/:disputeId/refund', deps.requireAuth, handlers.processRefund);
 
   // SLA burn report (auth required)
   router.get('/disputes/sla/report', deps.requireAuth, handlers.exportBurnReport);
