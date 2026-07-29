@@ -46,6 +46,9 @@ import { z } from "zod";
  * | OFAC_TRUST_ANCHOR_BASE64    | No       | (empty)                 | Base64-encoded Ed25519 public key for OFAC sig vfy |
  * | OFAC_FETCH_TIMEOUT_MS       | No       | 30000                   | Timeout in ms for OFAC list fetch                 |
  * | SCIM_TOKEN                  | No       | (empty)                 | Bearer token for SCIM 2.0 provisioning API       |
+ * | KYC_CIRCUIT_TRIP_ERRORS     | No       | 3                       | Consecutive failures before KYC circuit breaker trips |
+ * | KYC_CIRCUIT_CACHE_TTL_MS    | No       | 300000                  | KYC cache TTL in ms for cached decisions          |
+ * | KYC_CIRCUIT_HALF_OPEN_MS    | No       | 30000                   | Wait time in ms before half-open probe            |
  */
 
 const envSchema = z.object({
@@ -87,6 +90,9 @@ const envSchema = z.object({
   EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
   SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
   SES_SNS_TOPIC_ARN: z.string().optional(),
+  KYC_CIRCUIT_TRIP_ERRORS: z.coerce.number().int().positive().default(3),
+  KYC_CIRCUIT_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
+  KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
   WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
