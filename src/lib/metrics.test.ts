@@ -615,4 +615,86 @@ describe('MetricsCollector', () => {
       expect(key).toContain('user@example.com'); // PII not filtered
     });
   });
+
+  describe('exportOpenMetrics', () => {
+    let metrics: MetricsCollector;
+
+    beforeEach(() => {
+      metrics = new MetricsCollector({ enabled: true });
+    });
+
+    afterEach(() => {
+      metrics.reset();
+    });
+
+    it('should emit # EOF terminator', () => {
+      const output = metrics.exportOpenMetrics();
+      expect(output).toContain('# EOF\n');
+    });
+
+    it('should emit HELP and TYPE lines for counter metrics', () => {
+      metrics.incrementCounter('foo_total', undefined, 1, 'A test counter');
+      const output = metrics.exportOpenMetrics();
+      expect(output).toContain('# HELP foo_total A test counter');
+      expect(output).toContain('# TYPE foo_total counter');
+    });
+
+    it('should emit _created timestamp for counters', () => {
+      metrics.incrementCounter('baz_total', undefined, 5, 'Another counter');
+      const output = metrics.exportOpenMetrics();
+      expect(output).toMatch(/baz_total_created\s+\d+/);
+    });
+
+    it('should emit _created timestamp for gauges', () => {
+      metrics.setGauge('my_gauge', 42, { env: 'prod' }, 'A gauge');
+      const output = metrics.exportOpenMetrics();
+      expect(output).toMatch(/my_gauge_created\{env="prod"\}\s+\d+/);
+    });
+
+    it('should emit histogram bucket lines', () => {
+      metrics.recordHistogram('request_duration_ms', 50, undefined, 'duration');
+      const output = metrics.exportOpenMetrics();
+      expect(output).toContain('# TYPE request_duration_ms histogram');
+      expect(output).toContain('request_duration_ms_bucket{le="');
+      expect(output).toContain('request_duration_ms_count');
+      expect(output).toContain('request_duration_ms_sum');
+    });
+
+    it('should filter by namePrefix', () => {
+      metrics.incrementCounter('http_requests_total', undefined, 1, 'HTTP');
+      metrics.incrementCounter('grpc_calls_total', undefined, 1, 'gRPC');
+      metrics.incrementCounter('reconciliation_drift_amount', undefined, 1, 'Drift');
+
+      const filtered = metrics.exportOpenMetrics('reconciliation_');
+      expect(filtered).toContain('reconciliation_drift_amount');
+      expect(filtered).not.toContain('http_requests_total');
+      expect(filtered).not.toContain('grpc_calls_total');
+    });
+
+    it('should include label sets in the output', () => {
+      metrics.setGauge('reconciliation_drift_amount', 12.5, { offering_id: 'abc' }, 'Drift');
+      const output = metrics.exportOpenMetrics('reconciliation_');
+      expect(output).toContain('reconciliation_drift_amount{offering_id="abc"}');
+    });
+
+    it('should return only # EOF when no metrics match the prefix', () => {
+      metrics.incrementCounter('other_metric', undefined, 1);
+      const output = metrics.exportOpenMetrics('reconciliation_');
+      expect(output).toBe('# EOF\n');
+    });
+
+    it('should include _created for histogram families', () => {
+      metrics.recordHistogram('request_duration_ms', 100, undefined, 'duration');
+      const output = metrics.exportOpenMetrics();
+      expect(output).toMatch(/request_duration_ms_created\s+\d+/);
+    });
+
+    it('should export all metrics when no prefix is given', () => {
+      metrics.incrementCounter('alpha', undefined, 1);
+      metrics.setGauge('beta', 2);
+      const output = metrics.exportOpenMetrics();
+      expect(output).toContain('alpha');
+      expect(output).toContain('beta');
+    });
+  });
 });
