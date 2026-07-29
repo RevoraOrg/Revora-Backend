@@ -60,3 +60,68 @@ timing-based account enumeration by two complementary defences:
 
 See [`docs/social-anti-enumeration.md`](social-anti-enumeration.md) for full details.
 
+## Provider Key Rotation Handling
+
+Google and Apple periodically rotate their signing keys. The `JwksSocialTokenVerifier`
+handles key rotation transparently:
+
+### JWKS Caching
+
+Provider JWKS (JSON Web Key Sets) are fetched from the provider's published JWKS URL
+and cached in memory with a 10-minute TTL. Tokens whose signing keys are present in the
+cache are verified immediately without any outbound request.
+
+### Single-Flight Refresh on Unknown KID
+
+When a JWT references a `kid` (Key ID) not present in the cached key set:
+
+1. A JWKS refresh is triggered (subject to rate limits).
+2. Verification is retried once using the refreshed keys.
+3. If the KID is still unknown after refresh, the token is rejected with `INVALID_TOKEN`.
+4. Only one outbound JWKS request is made per provider for concurrent unknown-KID requests —
+   all waiters share the same in-flight refresh promise (single-flight).
+
+### Refresh Rate Limiting
+
+Refresh attempts are rate-limited per provider to prevent refresh storms during outages:
+
+- Configurable budget: `refreshBudgetPerMinute` (default: 10).
+- Separate budget per provider (Google and Apple are tracked independently).
+- When the budget is exhausted for the current 60-second window, refresh is skipped and the
+  existing cache is used, causing an `INVALID_TOKEN` rejection for unknown KIDs.
+- The budget resets automatically when the 60-second window expires.
+
+### Metrics
+
+The counter metric `social.keys.refresh.attempts` is emitted for every refresh attempt,
+with the following labels:
+
+- `provider` — `google` or `apple`
+- `outcome` — one of:
+  - `attempt` — a refresh is starting
+  - `success` — the refresh completed and keys were refreshed
+  - `failure` — the refresh failed (e.g., network error, provider outage)
+  - `skipped` — the caller joined an existing in-flight refresh (single-flight reuse)
+  - `rate_limited` — the refresh was skipped because the budget was exhausted
+
+### Security Guarantees
+
+- JWT validation behaviour is unchanged except for the refresh retry.
+- Verification is never skipped.
+- Signatures are always validated using the provider's public keys.
+- Issuer and audience validation remain intact.
+- Unknown keys never bypass authentication — if the refreshed keys also lack the KID,
+  the token is rejected.
+- Refresh failures do not authenticate users — errors return `INVALID_TOKEN`.
+- Provider outages cannot create refresh loops because the retry is bounded to exactly
+  one attempt and the rate limit caps outbound requests.
+
+### Configuration
+
+The verifier accepts an optional `refreshBudgetPerMinute` parameter (default 10) and an
+optional `metrics` object for emitting `social.keys.refresh.attempts`. The default verifier
+constructed by `createDefaultSocialTokenVerifierFromEnv()` uses environment variables:
+
+- `GOOGLE_OAUTH_CLIENT_ID` or `GOOGLE_CLIENT_ID` — Google audience/client ID
+- `APPLE_CLIENT_ID` or `APPLE_SERVICE_ID` — Apple audience/service ID
+
