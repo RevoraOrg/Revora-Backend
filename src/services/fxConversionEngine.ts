@@ -1,6 +1,7 @@
 import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
+import { SecurityAuditRepository } from '../security/types';
 
 export type ConversionPathType = 'direct' | 'inverse' | 'triangulated';
 
@@ -10,6 +11,7 @@ export interface ConversionPath {
 }
 
 export interface ExchangeRate {
+  id?: string;
   pair: string;
   bid: Decimal;
   ask: Decimal;
@@ -117,6 +119,9 @@ export class FxConversionEngine {
       bucketIncrement?: Decimal;
       side?: 'bid' | 'ask' | 'mid';
       maxRateAgeMs?: number;
+      allowStaleFallback?: boolean;
+      auditUserId?: string;
+      auditSessionId?: string;
     }
   ): Promise<FxConversionResult> {
     if (amount.isZero()) {
@@ -162,7 +167,33 @@ export class FxConversionEngine {
     }
 
     const maxAge = options?.maxRateAgeMs ?? 300000;
-    if (this.isRateStale(rate, maxAge)) {
+    
+    let isStale = this.isRateStale(rate, maxAge);
+    let fallbackUsed = false;
+    let fallbackReason: FxFallbackReason | undefined;
+    
+    // First, try fallback provider if rate is stale and a fallback provider is configured
+    if (isStale && this.fallbackRateProvider) {
+      let fRate = await this.fallbackRateProvider.getRate(from, to);
+      if (!fRate) {
+        fRate = await this.fallbackRateProvider.getRate(to, from);
+        if (fRate) {
+          fRate = this.invertRate(fRate);
+        }
+      }
+      if (fRate && !this.isRateStale(fRate, maxAge)) {
+        rate = fRate;
+        isStale = false;
+        fallbackUsed = true;
+        fallbackReason = FxFallbackReason.SUBSTITUTE_PROVIDER_USED;
+      }
+    }
+    
+    // Next, if still stale, but we allow stale fallbacks on the primary rate
+    if (isStale && options?.allowStaleFallback) {
+      fallbackUsed = true;
+      fallbackReason = FxFallbackReason.STALE_RATE_TOLERATED;
+    } else if (isStale) {
       this.metrics?.incrementCounter(METRIC_STALE_RATE_REJECTED, { pair: rate.pair });
       throw Errors.serviceUnavailable(
         `Exchange rate for ${rate.pair} is stale (age: ${this.rateAgeMs(rate)}ms, max: ${maxAge}ms)`,
@@ -374,6 +405,7 @@ export class FxConversionEngine {
   private invertRate(rate: ExchangeRate): ExchangeRate {
     const one = new Decimal('1');
     return {
+      id: rate.id ? `${rate.id}_inv` : undefined,
       pair: this.invertPair(rate.pair),
       bid: one.divide(rate.ask),
       ask: one.divide(rate.bid),
@@ -410,10 +442,12 @@ export class InMemoryRateProvider implements RateProvider {
     bid: string,
     ask: string,
     mid: string,
-    ttlMs: number = 300000
+    ttlMs: number = 300000,
+    id?: string
   ): void {
     const now = new Date();
     this.rates.set(pair, {
+      id,
       pair,
       bid: new Decimal(bid),
       ask: new Decimal(ask),
@@ -429,9 +463,11 @@ export class InMemoryRateProvider implements RateProvider {
     ask: string,
     mid: string,
     timestamp: Date,
-    ttlMs: number = 300000
+    ttlMs: number = 300000,
+    id?: string
   ): void {
     this.rates.set(pair, {
+      id,
       pair,
       bid: new Decimal(bid),
       ask: new Decimal(ask),
