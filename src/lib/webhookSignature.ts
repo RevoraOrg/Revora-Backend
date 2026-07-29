@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from 'crypto';
+import { globalMetrics } from './metrics';
 
 export const WEBHOOK_SIGNATURE_HEADER = 'x-revora-signature';
 export const WEBHOOK_TIMESTAMP_HEADER = 'x-revora-timestamp';
@@ -204,11 +205,102 @@ export function assertValidWebhookSignature(
 }
 
 /**
+ * @notice Parses an expiry value into epoch milliseconds.
+ * @param expiry Date, ISO string, numeric string, or number in seconds/ms
+ * @returns Timestamp in epoch milliseconds or undefined if invalid/unspecified
+ */
+export function parseExpiryTimestamp(expiry: Date | string | number | undefined): number | undefined {
+  if (expiry === undefined || expiry === null || expiry === '') {
+    return undefined;
+  }
+  if (expiry instanceof Date) {
+    const time = expiry.getTime();
+    return isNaN(time) ? undefined : time;
+  }
+  if (typeof expiry === 'number') {
+    if (isNaN(expiry)) return undefined;
+    return expiry < 1e11 ? expiry * 1000 : expiry;
+  }
+  if (typeof expiry === 'string') {
+    const trimmed = expiry.trim();
+    if (!trimmed) return undefined;
+    if (/^\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      return num < 1e11 ? num * 1000 : num;
+    }
+    const parsed = Date.parse(trimmed);
+    return isNaN(parsed) ? undefined : parsed;
+  }
+  return undefined;
+}
+
+/**
+ * @notice Configuration for dual-key signature verification.
+ */
+export interface DualKeyConfig {
+  /** Current primary secret key */
+  secret: string;
+  /** Secondary next secret key for key rotation window */
+  nextSecret?: string;
+  /** Expiry timestamp/date for secondary key acceptance window */
+  nextSecretExpiry?: Date | string | number;
+}
+
+/**
+ * @notice Result of dual-key signature verification.
+ */
+export interface DualKeyVerificationResult {
+  valid: boolean;
+  verifiedByKey?: 'current' | 'next';
+  expired?: boolean;
+}
+
+/**
+ * @notice Verifies an HMAC signature against payload with dual-key rotation support.
+ * @dev Tries primary secret first. If failed, tries nextSecret if not expired.
+ *
+ * @param config Secret configuration object containing primary and next key
+ * @param payload Raw request payload
+ * @param signature Signature string from headers
+ * @returns Verification result including which key verified the signature
+ */
+export function verifyWebhookPayloadDualKey(
+  config: DualKeyConfig,
+  payload: string | Buffer,
+  signature: string | string[]
+): DualKeyVerificationResult {
+  if (verifyWebhookPayload(config.secret, payload, signature)) {
+    return { valid: true, verifiedByKey: 'current' };
+  }
+
+  if (config.nextSecret) {
+    const expiryMs = parseExpiryTimestamp(config.nextSecretExpiry);
+    const isExpired = expiryMs !== undefined && Date.now() > expiryMs;
+
+    if (!isExpired && verifyWebhookPayload(config.nextSecret, payload, signature)) {
+      return { valid: true, verifiedByKey: 'next' };
+    }
+
+    if (isExpired && verifyWebhookPayload(config.nextSecret, payload, signature)) {
+      return { valid: false, expired: true };
+    }
+  }
+
+  return { valid: false };
+}
+
+/**
  * @notice Configuration options for webhook signature verification.
  */
 export interface WebhookVerificationConfig {
   /** The shared secret key */
   secret: string;
+  /** Next secret key for key rotation window */
+  nextSecret?: string;
+  /** Expiry timestamp/date for next key acceptance window */
+  nextSecretExpiry?: Date | string | number;
+  /** Optional metric counter name to emit on verification (e.g. 'kyc.webhook.verified_by_key') */
+  metricName?: string;
   /** Custom header name for the signature (default: 'x-revora-signature') */
   headerName?: string;
   /** Maximum payload size in bytes (default: 1MB) */
@@ -230,6 +322,7 @@ export interface WebhookVerificationConfig {
  */
 export interface WebhookVerificationResult {
   valid: boolean;
+  verifiedByKey?: 'current' | 'next';
   error?: WebhookSignatureError;
   /** Parsed timestamp if present and valid */
   timestamp?: Date;
@@ -248,6 +341,9 @@ export interface WebhookVerificationResult {
  * ```typescript
  * const result = verifyWebhook({
  *   secret: 'my-secret',
+ *   nextSecret: 'next-secret',
+ *   nextSecretExpiry: '2026-12-31T23:59:59Z',
+ *   metricName: 'kyc.webhook.verified_by_key',
  *   requireTimestamp: true,
  *   maxAgeMs: 300000 // 5 minutes
  * }, body, headers);
@@ -264,6 +360,9 @@ export function verifyWebhook(
 ): WebhookVerificationResult {
   const {
     secret,
+    nextSecret,
+    nextSecretExpiry,
+    metricName,
     headerName = 'x-revora-signature',
     maxPayloadSize = 1024 * 1024, // 1MB default
     requireTimestamp = false,
@@ -297,15 +396,32 @@ export function verifyWebhook(
     };
   }
 
-  // Verify signature
-  if (!verifyWebhookPayload(secret, payload, signature)) {
+  // Verify signature using dual-key check
+  const dualKeyResult = verifyWebhookPayloadDualKey(
+    { secret, nextSecret, nextSecretExpiry },
+    payload,
+    signature
+  );
+
+  if (!dualKeyResult.valid) {
+    const errorMsg = dualKeyResult.expired
+      ? 'Signature verification failed: secondary key expired'
+      : 'Signature verification failed';
     return {
       valid: false,
-      error: new WebhookSignatureError(
-        'Signature verification failed',
-        'VERIFICATION_FAILED'
-      ),
+      error: new WebhookSignatureError(errorMsg, 'VERIFICATION_FAILED'),
     };
+  }
+
+  const verifiedByKey = dualKeyResult.verifiedByKey ?? 'current';
+
+  // Emit metric if configured
+  if (metricName) {
+    try {
+      globalMetrics.incrementCounter(metricName, { key: verifiedByKey });
+    } catch {
+      // Ignore metric errors to not interrupt verification flow
+    }
   }
 
   // Optional timestamp/replay protection
@@ -352,5 +468,5 @@ export function verifyWebhook(
     }
   }
 
-  return { valid: true, timestamp };
+  return { valid: true, verifiedByKey, timestamp };
 }

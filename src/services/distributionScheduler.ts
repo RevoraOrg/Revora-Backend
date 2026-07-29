@@ -4,11 +4,17 @@ import { RevenueReportRepository } from '../db/repositories/revenueReportReposit
 import { AppError, Errors } from '../lib/errors';
 import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
 import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
+import { MetricsCollector } from '../lib/metrics';
 
 export interface DistributionSchedulerOptions {
   logger?: Logger;
   holidayCalendarService?: HolidayCalendarService;
   resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
+  /** Maximum reports to enqueue in a single catch-up pass (default: 50). */
+  catchupMax?: number;
+  /** Backlog size above which a red-alert is emitted (default: 2× catchupMax). */
+  catchupBacklogAlertThreshold?: number;
+  metrics?: MetricsCollector;
 }
 
 export interface CatchUpResult {
@@ -63,6 +69,41 @@ export interface TimezoneAuditRecord {
 //   for each completed distribution. Before firing, it checks for an existing
 //   triple whose UTC range overlaps — if found the tick is idempotently skipped.
 
+// ─── Cron Window Types ────────────────────────────────────────────────────────
+
+/**
+ * @notice A persisted cron-expression window definition attached to an offering.
+ * @dev    treasury operators set this to control when deferred distributions fire
+ *         without a code redeploy. Stored in the `offerings` table as
+ *         `cron_expression` + `distribution_timezone` columns.
+ */
+export interface CronWindowDefinition {
+  /** Standard 5-field cron expression (minute hour dom month dow). */
+  expression: string;
+  /** IANA timezone for wall-clock evaluation of the expression. */
+  timezone: string;
+  /** Offering this schedule belongs to. */
+  offeringId: string;
+}
+
+/** Per-field overlap record emitted when two windows collide. */
+export interface WindowOverlapDetail {
+  offeringIdA: string;
+  offeringIdB: string;
+  /** Next shared firing time (UTC ISO-8601) */
+  collisionAt: string;
+}
+
+export interface CronWindowValidationResult {
+  valid: boolean;
+  /** Human-readable reason(s) for rejection. */
+  reasons: string[];
+  /** Set when the expression overlaps a Stellar maintenance window. */
+  stellarConflict?: { windowLabel: string; conflictAt: string };
+  /** Set when two offering windows collide. */
+  overlapDetail?: WindowOverlapDetail;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEFAULT_TIMEZONE = 'UTC';
@@ -74,6 +115,293 @@ const FIELD_RANGES: Record<string, { min: number; max: number }> = {
   month: { min: 1, max: 12 },
   dayOfWeek: { min: 0, max: 6 },
 } as const;
+
+/**
+ * @notice Known Stellar network maintenance windows.
+ * @dev    Each entry describes a recurring UTC hour-range during which
+ *         the Stellar network may be unavailable for transaction submission.
+ *         The `cron` field is a 5-field expression matching the *start* minute
+ *         of the maintenance window; `durationMinutes` is its length.
+ *         Source: https://developers.stellar.org/docs/networks/maintenance
+ *
+ *         These are intentionally conservative — when in doubt, err toward a
+ *         wider window so distribution jobs are not submitted into a degraded
+ *         network.
+ */
+export const STELLAR_MAINTENANCE_WINDOWS = [
+  {
+    label: 'Stellar weekly maintenance (Sunday 06:00–07:00 UTC)',
+    /**  min  hr  dom  month  dow(0=Sun) */
+    cron: '0   6   *    *      0',
+    durationMinutes: 60,
+  },
+  {
+    label: 'Stellar monthly upgrade window (1st Monday 02:00–04:00 UTC)',
+    cron: '0   2   *    *      1',
+    durationMinutes: 120,
+  },
+] as const;
+
+// ─── Private timezone helpers ─────────────────────────────────────────────────
+
+/**
+ * Canonicalise common timezone aliases to IANA identifiers.
+ * For example "EST" → "America/New_York".
+ */
+function normalizeTimezone(tz: string): string {
+  const aliases: Record<string, string> = {
+    EST: 'America/New_York',
+    EDT: 'America/New_York',
+    CST: 'America/Chicago',
+    CDT: 'America/Chicago',
+    MST: 'America/Denver',
+    MDT: 'America/Denver',
+    PST: 'America/Los_Angeles',
+    PDT: 'America/Los_Angeles',
+    GMT: 'UTC',
+  };
+  return aliases[tz.trim()] ?? tz.trim();
+}
+
+/** Returns true when tz is a valid IANA timezone identifier. */
+function isValidTimezone(tz: string): boolean {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── CronWindowValidator ──────────────────────────────────────────────────────
+
+/**
+ * @title CronWindowValidator
+ * @notice Validates cron-expression window definitions before they are persisted
+ *         per offering. Rejects:
+ *           1. Syntactically invalid cron expressions.
+ *           2. Expressions that fire during known Stellar network maintenance.
+ *           3. Expressions that overlap an already-registered offering window
+ *              within the configured lookahead horizon (default 60 days).
+ * @dev    All time comparisons use UTC.  IANA timezone expressions are resolved
+ *         to UTC before comparison so DST transitions cannot create false negatives.
+ */
+export class CronWindowValidator {
+  /** Seconds of lookahead for overlap detection (default: 60 days). */
+  private readonly lookaheadMs: number;
+  private readonly metrics?: MetricsCollector;
+  private readonly logger: Logger;
+
+  constructor(options: {
+    lookaheadDays?: number;
+    metrics?: MetricsCollector;
+    logger?: Logger;
+  } = {}) {
+    this.lookaheadMs = (options.lookaheadDays ?? 60) * 24 * 60 * 60 * 1_000;
+    this.metrics = options.metrics;
+    this.logger = options.logger ?? globalLogger;
+  }
+
+  /**
+   * Validate a single CronWindowDefinition in isolation (syntax + Stellar maintenance).
+   */
+  validate(def: CronWindowDefinition): CronWindowValidationResult {
+    const reasons: string[] = [];
+
+    // 1. Structural validation
+    const syntaxError = validateCronSyntax(def.expression);
+    if (syntaxError) {
+      reasons.push(syntaxError);
+    }
+
+    const tzNorm = normalizeTimezone(def.timezone);
+    if (!isValidTimezone(tzNorm)) {
+      reasons.push(`Invalid timezone "${def.timezone}"`);
+    }
+
+    if (reasons.length > 0) {
+      this._emitRejected(def, reasons);
+      return { valid: false, reasons };
+    }
+
+    // 2. Stellar maintenance window conflict
+    const now = new Date();
+    const horizon = new Date(now.getTime() + this.lookaheadMs);
+    const stellarConflict = this._checkStellarConflict(def, now, horizon);
+    if (stellarConflict) {
+      reasons.push(
+        `Expression fires during Stellar maintenance: ${stellarConflict.windowLabel} at ${stellarConflict.conflictAt}`
+      );
+      this._emitRejected(def, reasons);
+      return { valid: false, reasons, stellarConflict };
+    }
+
+    return { valid: true, reasons: [] };
+  }
+
+  /**
+   * Validate a new window against an array of already-registered windows for
+   * *other* offerings. Returns a rejection result if any overlap is detected
+   * within the lookahead horizon.
+   */
+  validateAgainstExisting(
+    incoming: CronWindowDefinition,
+    existing: CronWindowDefinition[]
+  ): CronWindowValidationResult {
+    // First run base validation
+    const base = this.validate(incoming);
+    if (!base.valid) return base;
+
+    const now = new Date();
+    const horizon = new Date(now.getTime() + this.lookaheadMs);
+
+    for (const other of existing) {
+      if (other.offeringId === incoming.offeringId) continue;
+
+      const overlap = this._checkExpressionOverlap(incoming, other, now, horizon);
+      if (overlap) {
+        const reasons = [
+          `Window for offering "${incoming.offeringId}" overlaps with offering "${other.offeringId}" at ${overlap}`,
+        ];
+        const detail: WindowOverlapDetail = {
+          offeringIdA: incoming.offeringId,
+          offeringIdB: other.offeringId,
+          collisionAt: overlap,
+        };
+        this._emitRejected(incoming, reasons);
+        this.logger.warn('scheduler.window.rejected: overlap detected', {
+          offeringId: incoming.offeringId,
+          collidingOfferingId: other.offeringId,
+          collisionAt: overlap,
+          diff: {
+            incoming: incoming.expression,
+            existing: other.expression,
+          },
+        });
+        return { valid: false, reasons, overlapDetail: detail };
+      }
+    }
+
+    return { valid: true, reasons: [] };
+  }
+
+  // ── Private helpers ──────────────────────────────────────────────────────────
+
+  private _checkStellarConflict(
+    def: CronWindowDefinition,
+    from: Date,
+    to: Date
+  ): { windowLabel: string; conflictAt: string } | null {
+    const tz = normalizeScheduleTimezone(def.timezone);
+    let cursor = new Date(from);
+    while (cursor <= to) {
+      if (evaluateCronAt(def.expression, cursor, tz)) {
+        for (const maint of STELLAR_MAINTENANCE_WINDOWS) {
+          const maintCron = maint.cron.replace(/\s+/g, ' ').trim();
+          // Check if the firing minute falls inside the maintenance window
+          const maintStart = new Date(cursor);
+          if (evaluateCronAt(maintCron, cursor, 'UTC')) {
+            return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+          }
+          // Also check if cursor falls within an already-started maintenance window
+          // by scanning backwards up to durationMinutes
+          for (let back = 1; back <= maint.durationMinutes; back++) {
+            const candidate = new Date(cursor.getTime() - back * 60_000);
+            if (evaluateCronAt(maintCron, candidate, 'UTC')) {
+              return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+            }
+          }
+        }
+      }
+      cursor = new Date(cursor.getTime() + 60_000);
+    }
+    return null;
+  }
+
+  private _checkExpressionOverlap(
+    a: CronWindowDefinition,
+    b: CronWindowDefinition,
+    from: Date,
+    to: Date
+  ): string | null {
+    const tzA = normalizeScheduleTimezone(a.timezone);
+    const tzB = normalizeScheduleTimezone(b.timezone);
+    let cursor = new Date(from);
+    while (cursor <= to) {
+      if (
+        evaluateCronAt(a.expression, cursor, tzA) &&
+        evaluateCronAt(b.expression, cursor, tzB)
+      ) {
+        return cursor.toISOString();
+      }
+      cursor = new Date(cursor.getTime() + 60_000);
+    }
+    return null;
+  }
+
+  private _emitRejected(def: CronWindowDefinition, reasons: string[]): void {
+    this.metrics?.incrementCounter('scheduler_window_rejected_total', {
+      offering_id: def.offeringId,
+    });
+    this.logger.warn('scheduler.window.rejected', {
+      offeringId: def.offeringId,
+      expression: def.expression,
+      timezone: def.timezone,
+      reasons,
+    });
+  }
+}
+
+// ─── Cron syntax validator ────────────────────────────────────────────────────
+
+/**
+ * Returns an error string if `expr` is not a valid 5-field cron expression,
+ * or `null` if it passes.
+ */
+export function validateCronSyntax(expr: string): string | null {
+  if (!expr || typeof expr !== 'string') return 'Expression must be a non-empty string';
+  const fields = expr.trim().split(/\s+/);
+  if (fields.length !== 5) {
+    return `Expected 5 fields (minute hour dom month dow) but got ${fields.length}`;
+  }
+  const names = Object.keys(FIELD_RANGES);
+  const ranges = Object.values(FIELD_RANGES);
+  for (let i = 0; i < 5; i++) {
+    const field = fields[i]!;
+    const { min, max } = ranges[i]!;
+    const err = validateCronField(field, names[i]!, min, max);
+    if (err) return err;
+  }
+  return null;
+}
+
+function validateCronField(field: string, name: string, min: number, max: number): string | null {
+  if (field === '*') return null;
+
+  if (field.startsWith('*/')) {
+    const step = parseInt(field.slice(2), 10);
+    if (isNaN(step) || step <= 0) return `${name}: invalid step "${field}"`;
+    if (step > max - min + 1) return `${name}: step ${step} exceeds field range ${min}-${max}`;
+    return null;
+  }
+
+  for (const part of field.split(',')) {
+    if (part.includes('-')) {
+      const [rawS, rawE] = part.split('-');
+      const s = parseInt(rawS!, 10);
+      const e = parseInt(rawE!, 10);
+      if (isNaN(s) || isNaN(e)) return `${name}: invalid range "${part}"`;
+      if (s < min || e > max) return `${name}: range ${s}-${e} out of bounds [${min},${max}]`;
+      if (s > e) return `${name}: range start ${s} > end ${e}`;
+    } else {
+      const v = parseInt(part, 10);
+      if (isNaN(v) || v < min || v > max) {
+        return `${name}: value "${part}" out of bounds [${min},${max}]`;
+      }
+    }
+  }
+  return null;
+}
 
 // ─── Timezone Helpers ─────────────────────────────────────────────────────────
 
@@ -141,7 +469,9 @@ function evaluateCronAt(cron: string, date: Date, tz: string): boolean {
   if (fields.length !== 5) return false;
   const [minuteField, hourField, domField, monthField, dowField] = fields;
   const ld = ianaDate(date, tz);
-  const dow = ld.day === 0 ? 0 : ld.day; // 0=Sun .. 6=Sat, ISO order
+  // Compute day-of-week from the UTC date (0=Sun..6=Sat)
+  const localDateUtc = new Date(Date.UTC(ld.year, ld.month - 1, ld.day));
+  const dow = localDateUtc.getUTCDay();
   return (
     matchesCronField(ld.minute, minuteField) &&
     matchesCronField(ld.hour, hourField) &&
@@ -259,6 +589,11 @@ export class DistributionScheduler {
   private readonly logger: Logger;
   private readonly holidayCalendarService?: HolidayCalendarService;
   private readonly resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
+  private readonly catchupMax: number;
+  private readonly catchupBacklogAlertThreshold: number;
+  private readonly metrics?: MetricsCollector;
+  /** In-process de-duplication set: "utcStart:utcEnd" keys. */
+  private readonly completedWindows = new Set<string>();
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
@@ -268,6 +603,32 @@ export class DistributionScheduler {
     this.logger = options.logger ?? globalLogger;
     this.holidayCalendarService = options.holidayCalendarService;
     this.resolveJurisdiction = options.resolveJurisdiction;
+    this.metrics = options.metrics;
+
+    // ── catchupMax resolution ─────────────────────────────────────────────────
+    if (options.catchupMax !== undefined) {
+      if (
+        !Number.isInteger(options.catchupMax) ||
+        options.catchupMax <= 0
+      ) {
+        throw new Error('catchupMax must be a positive integer');
+      }
+      this.catchupMax = options.catchupMax;
+    } else {
+      const envVal = process.env['SCHEDULER_CATCHUP_MAX'];
+      if (envVal !== undefined && envVal !== '') {
+        const parsed = parseInt(envVal, 10);
+        if (isNaN(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+          throw new Error('SCHEDULER_CATCHUP_MAX must be a positive integer');
+        }
+        this.catchupMax = parsed;
+      } else {
+        this.catchupMax = 50;
+      }
+    }
+
+    this.catchupBacklogAlertThreshold =
+      options.catchupBacklogAlertThreshold ?? this.catchupMax * 2;
   }
 
   /**
@@ -426,5 +787,78 @@ export class DistributionScheduler {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * @notice Catch up on missed distribution windows.
+   * @dev    Scans for approved reports without a successful distribution,
+   *         emits a scheduler.catchup.backlog gauge, enqueues up to
+   *         catchupMax windows, and emits a red-alert if the backlog
+   *         exceeds the configured ceiling.
+   */
+  async catchUpMissedWindows(): Promise<CatchUpResult> {
+    const pending = await this.revenueReportRepo.findApprovedWithoutDistribution();
+    const totalMissed = pending.length;
+
+    this.metrics?.setGauge('scheduler_catchup_backlog', totalMissed);
+
+    const backlogExceededCeiling = totalMissed > this.catchupBacklogAlertThreshold;
+    if (backlogExceededCeiling) {
+      this.logger.error(
+        `[RED-ALERT] Distribution backlog ${totalMissed} exceeds threshold ${this.catchupBacklogAlertThreshold}`
+      );
+    }
+
+    const result: CatchUpResult = {
+      totalMissed,
+      enqueued: 0,
+      skipped: totalMissed > this.catchupMax ? totalMissed - this.catchupMax : 0,
+      errors: [],
+      backlogExceededCeiling,
+    };
+
+    const toProcess = pending.slice(0, this.catchupMax);
+
+    for (const report of toProcess) {
+      try {
+        const claim = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
+        if (!claim) {
+          // Another scheduler instance claimed it — counts as skipped
+          continue;
+        }
+        result.enqueued++;
+      } catch (err) {
+        result.errors.push({
+          reportId: report.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    this.logger.info('catch-up missed windows complete', {
+      totalMissed,
+      enqueued: result.enqueued,
+      skipped: result.skipped,
+      errors: result.errors.length,
+      backlogExceededCeiling,
+    });
+
+    return result;
+  }
+
+  // ── Window de-duplication ──────────────────────────────────────────────────
+
+  private isWindowAlreadyCompleted(window: TimezoneWindow): boolean {
+    return this.completedWindows.has(deduplicateWindowKey(window));
+  }
+
+  private markWindowCompleted(window: TimezoneWindow): void {
+    this.completedWindows.add(deduplicateWindowKey(window));
+  }
+
+  // ── Timezone resolution ────────────────────────────────────────────────────
+
+  private resolveOfferingTimezone(tz: string | undefined): string {
+    return normalizeScheduleTimezone(tz);
   }
 }

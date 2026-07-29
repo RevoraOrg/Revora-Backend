@@ -99,8 +99,9 @@ describe('Audit Log Retention and Export', () => {
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - 90);
 
-      const deletedCount = await auditLogRepo.purgeBefore(cutoffDate);
-      expect(deletedCount).toBe(1);
+      const deleted = await auditLogRepo.purgeBefore(cutoffDate);
+      expect(deleted.deletedCount).toBe(1);
+      expect(deleted.skippedHoldCount).toBe(0);
 
       const remaining = await pool.query('SELECT * FROM audit_logs');
       expect(remaining.rows.length).toBe(1);
