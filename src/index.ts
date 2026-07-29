@@ -45,12 +45,16 @@ import { TenantSettingsRepository } from "./db/repositories/tenantSettingsReposi
 import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
 import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { SessionCompactionService } from "./services/sessionCompactionService";
+import { SessionRepository } from "./db/repositories/sessionRepository";
 import { RetentionLabelRepository } from "./db/repositories/retentionLabelRepository";
 import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
 import { createAMLRoutes } from "./routes/amlRoutes";
+import { createLedgerExportRouter } from "./routes/ledgerExport";
+import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
@@ -675,11 +679,13 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
+  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
@@ -704,9 +710,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
 
-  const userRepo = new UserRepository(pool);
-  const scimToken = env.SCIM_TOKEN ?? '';
-  app.use('/scim/v2', createScimRouter(userRepo, scimToken, '/scim/v2'));
+  // Initialize ledger export with in-memory repository
+  // TODO: Replace with PgLedgerEntryRepository when ledger_entries table exists
+  const ledgerRepo = new InMemoryLedgerRepository();
+  const ledgerExportService = new LedgerExportService(ledgerRepo);
+  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
 
   // Mount taxation routes for per-lot cost-basis tax reporting
   app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
@@ -1017,6 +1025,8 @@ if (require.main === module && env.NODE_ENV !== "test") {
     void shutdown("SIGINT");
   });
 
+  const backgroundStopFns: (() => void)[] = [];
+
   // Resolve worker role — fail-fast on invalid value
   const { resolveWorkerRole, getRoleConfig } = require("./config/workerRole");
   const workerRole = resolveWorkerRole(env.ROLE, env.NODE_ENV);
@@ -1041,6 +1051,14 @@ if (require.main === module && env.NODE_ENV !== "test") {
     auditPurgeService.start();
     backgroundStopFns.push(() => auditPurgeService.stop());
     console.log("[server] AuditPurgeService started");
+  }
+
+  if (roleConfig.auditPurge) { // Reusing auditPurge role for general cleanup tasks
+    const sessionRepo = new SessionRepository(pool);
+    const sessionCompactionService = new SessionCompactionService(sessionRepo, metricsCollector);
+    sessionCompactionService.start();
+    backgroundStopFns.push(() => sessionCompactionService.stop());
+    console.log("[server] SessionCompactionService started");
   }
 
   if (roleConfig.payoutDrift) {

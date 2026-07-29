@@ -2,12 +2,18 @@ import { NextFunction, Request, Response, Router } from 'express';
 import { AuthenticatedRequest } from '../../middleware/auth';
 import { OidcAdapterService } from './oidcAdapterService';
 import { OidcProviderRepository, CreateOidcProviderInput } from '../../db/repositories/oidcProviderRepository';
+import { UserRepository } from '../../db/repositories/userRepository';
+import { OidcGroupMappingRepository } from '../../db/repositories/oidcGroupMappingRepository';
+import { AuditLogRepository } from '../../db/repositories/auditLogRepository';
 import { sessionStore } from '../../lib/sessionStore';
 import { globalMetrics } from '../../lib/metrics';
 
 export interface OidcRouterDependencies {
   oidcAdapter: OidcAdapterService;
   oidcProviderRepo: OidcProviderRepository;
+  userRepo?: UserRepository;
+  oidcGroupMappingRepo?: OidcGroupMappingRepository;
+  auditLogRepo?: AuditLogRepository;
   /** Express middleware that enforces admin role and attaches req.user */
   requireAdmin: (req: Request, res: Response, next: NextFunction) => void;
   /** Optional audit hook for JWKS refresh events */
@@ -24,7 +30,7 @@ export interface OidcRouterDependencies {
  *  GET  /api/auth/oidc/providers               — (admin) list providers
  */
 export function createOidcRouter(deps: OidcRouterDependencies): Router {
-  const { oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh } = deps;
+  const { oidcAdapter, oidcProviderRepo, userRepo, oidcGroupMappingRepo, auditLogRepo, requireAdmin, auditRefresh } = deps;
   const router = Router();
   const refreshCooldownMs = 60_000;
   const refreshAttempts = new Map<string, number>();
@@ -112,12 +118,66 @@ export function createOidcRouter(deps: OidcRouterDependencies): Router {
       const tokens = await (oidcAdapter as any).exchangeCode(code, flowState, provider, discovery);
       const claims = await oidcAdapter.validateIdToken(tokens.id_token, provider, discovery, flowState.nonce);
 
+      let mappedRole: 'startup' | 'investor' | undefined;
+      const incomingGroups = Array.isArray(claims.groups) ? claims.groups.map(String) : [];
+      
+      if (incomingGroups.length > 0 && oidcGroupMappingRepo) {
+        const mappings = await oidcGroupMappingRepo.findByTenantId(provider.tenant_id);
+        for (const group of incomingGroups) {
+          const match = mappings.find(m => m.claim_group === group);
+          if (match) {
+            mappedRole = match.revora_role;
+            break;
+          }
+        }
+      }
+
+      if (claims.email && userRepo && auditLogRepo) {
+        const user = await userRepo.findByEmail(claims.email);
+        if (user) {
+          let groupsChanged = false;
+          const lastGroups = user.last_oidc_groups || [];
+          
+          if (incomingGroups.length !== lastGroups.length || !incomingGroups.every(g => lastGroups.includes(g)) || !lastGroups.every((g: string) => incomingGroups.includes(g))) {
+            groupsChanged = true;
+          }
+
+          if (groupsChanged) {
+            await auditLogRepo.createAuditLog({
+              user_id: user.id,
+              action: 'oidc.claim.changed',
+              details: JSON.stringify({
+                old_groups: lastGroups,
+                new_groups: incomingGroups
+              })
+            });
+          }
+
+          const updates: any = { id: user.id };
+          let shouldUpdate = false;
+          
+          if (groupsChanged) {
+            updates.last_oidc_groups = incomingGroups;
+            shouldUpdate = true;
+          }
+          if (mappedRole) {
+            updates.role = mappedRole;
+            shouldUpdate = true;
+          }
+
+          if (shouldUpdate) {
+             await userRepo.updateUser(updates);
+          }
+        }
+      }
+
       res.status(200).json({
         sub: claims.sub,
         email: claims.email,
         name: claims.name,
         issuer: claims.iss,
         tenantId: provider.tenant_id,
+        mappedRole,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

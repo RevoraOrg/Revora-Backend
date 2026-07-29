@@ -1,7 +1,11 @@
 import express, { Request, Response, NextFunction, Router } from 'express';
 import { ZodError } from 'zod';
 import { Errors } from '../lib/errors';
-import { ContractUpgradeOrchestratorService } from '../services/contractUpgradeOrchestratorService';
+import {
+  ContractUpgradeOrchestratorService,
+  CanaryMetrics,
+  CanaryMetricThresholds,
+} from '../services/contractUpgradeOrchestratorService';
 import { StorageDriftReportService } from '../services/storageDriftReportService';
 import { requireAdmin } from '../middleware/auth';
 
@@ -11,6 +15,7 @@ export function createContractUpgradeRouter(
 ): Router {
   const router = express.Router();
 
+  // ── POST / — create upgrade proposal ──────────────────────────────────────
   router.post(
     '/',
     requireAdmin,
@@ -46,8 +51,146 @@ export function createContractUpgradeRouter(
     },
   );
 
-  // ── Storage-layout drift report (dry-run) ────────────────────────────────
+  // ── POST /:id/canary/start — activate canary phase ────────────────────────
+  router.post(
+    '/:id/canary/start',
+    requireAdmin,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const upgradeId = req.params.id;
+        const body = req.body as Record<string, unknown> | undefined;
+        const canary_offering_id = body?.canary_offering_id as string | undefined;
+        const actor_id = body?.actor_id as string | undefined;
+        const hold_period_seconds =
+          body?.hold_period_seconds !== undefined
+            ? Number(body.hold_period_seconds)
+            : undefined;
 
+        if (!canary_offering_id) {
+          return next(Errors.badRequest('canary_offering_id is required'));
+        }
+        if (!actor_id) {
+          return next(Errors.badRequest('actor_id is required'));
+        }
+        if (
+          hold_period_seconds !== undefined &&
+          (!Number.isInteger(hold_period_seconds) || hold_period_seconds < 0)
+        ) {
+          return next(Errors.badRequest('hold_period_seconds must be a non-negative integer'));
+        }
+
+        const upgrade = await contractUpgradeOrchestratorService.startCanary(upgradeId, {
+          canary_offering_id,
+          actor_id,
+          hold_period_seconds,
+        });
+
+        res.status(200).json({ upgrade });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // ── POST /:id/canary/metrics — record canary metrics ──────────────────────
+  router.post(
+    '/:id/canary/metrics',
+    requireAdmin,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const upgradeId = req.params.id;
+        const body = req.body as Record<string, unknown> | undefined;
+        const actor_id = body?.actor_id as string | undefined;
+        const metrics = body?.metrics as CanaryMetrics | undefined;
+        const thresholds = body?.thresholds as CanaryMetricThresholds | undefined;
+
+        if (!actor_id) {
+          return next(Errors.badRequest('actor_id is required'));
+        }
+        if (
+          !metrics ||
+          typeof metrics.error_rate !== 'number' ||
+          typeof metrics.p99_latency_ms !== 'number' ||
+          typeof metrics.failed_tx_count !== 'number'
+        ) {
+          return next(
+            Errors.badRequest(
+              'metrics with numeric error_rate, p99_latency_ms, and failed_tx_count are required',
+            ),
+          );
+        }
+
+        const upgrade = await contractUpgradeOrchestratorService.recordCanaryMetrics(
+          upgradeId,
+          metrics,
+          actor_id,
+          thresholds,
+        );
+
+        res.status(200).json({ upgrade });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // ── POST /:id/canary/promote — promote to canary_passed ───────────────────
+  router.post(
+    '/:id/canary/promote',
+    requireAdmin,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const upgradeId = req.params.id;
+        const body = req.body as Record<string, unknown> | undefined;
+        const actor_id = body?.actor_id as string | undefined;
+        const thresholds = body?.thresholds as CanaryMetricThresholds | undefined;
+
+        if (!actor_id) {
+          return next(Errors.badRequest('actor_id is required'));
+        }
+
+        const upgrade = await contractUpgradeOrchestratorService.promoteCanary(
+          upgradeId,
+          actor_id,
+          thresholds,
+        );
+
+        res.status(200).json({ upgrade });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // ── POST /:id/canary/rollback — explicit canary rollback ──────────────────
+  router.post(
+    '/:id/canary/rollback',
+    requireAdmin,
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const upgradeId = req.params.id;
+        const body = req.body as Record<string, unknown> | undefined;
+        const actor_id = body?.actor_id as string | undefined;
+        const reason = body?.reason as string | undefined;
+
+        if (!actor_id) {
+          return next(Errors.badRequest('actor_id is required'));
+        }
+
+        const upgrade = await contractUpgradeOrchestratorService.rollbackCanary(
+          upgradeId,
+          actor_id,
+          reason,
+        );
+
+        res.status(200).json({ upgrade });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+
+  // ── Storage-layout drift report (dry-run) ─────────────────────────────────
   router.post(
     '/drift-report',
     requireAdmin,

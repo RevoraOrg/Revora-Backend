@@ -1,4 +1,5 @@
 import { Request } from 'express';
+import { createHmac, timingSafeEqual } from 'crypto';
 
 /**
  * Interface for pagination parameters.
@@ -88,4 +89,68 @@ export function formatPage<T>(
       hasMore,
     },
   };
+}
+
+function getCursorSecret(): string {
+  return process.env.CURSOR_SIGNING_SECRET ?? 'dev-cursor-secret-change-in-prod';
+}
+
+function toBase64Url(input: string): string {
+  return Buffer.from(input, 'utf8')
+    .toString('base64url');
+}
+
+function fromBase64Url(input: string): string {
+  return Buffer.from(input, 'base64url').toString('utf8');
+}
+
+export interface CursorPayload {
+  id: string;
+  gl: string;
+  t: number;
+}
+
+export function signCursor(payload: CursorPayload): string {
+  const json = JSON.stringify(payload);
+  const encoded = toBase64Url(json);
+  const secret = getCursorSecret();
+  const sig = createHmac('sha256', secret)
+    .update(encoded)
+    .digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+export function verifyCursor(cursor: string, expectedGl?: string): CursorPayload | null {
+  const parts = cursor.split('.');
+  if (parts.length !== 2) return null;
+
+  const [encoded, sig] = parts;
+  if (!encoded || !sig) return null;
+
+  const secret = getCursorSecret();
+  const expectedSig = createHmac('sha256', secret)
+    .update(encoded)
+    .digest('base64url');
+
+  try {
+    const sigBuffer = Buffer.from(sig, 'base64url');
+    const expectedBuffer = Buffer.from(expectedSig, 'base64url');
+    if (sigBuffer.length !== expectedBuffer.length) return null;
+    if (!timingSafeEqual(sigBuffer, expectedBuffer)) return null;
+  } catch {
+    return null;
+  }
+
+  let payload: CursorPayload;
+  try {
+    payload = JSON.parse(fromBase64Url(encoded)) as CursorPayload;
+  } catch {
+    return null;
+  }
+
+  if (!payload.id || !payload.gl || typeof payload.t !== 'number') return null;
+
+  if (expectedGl !== undefined && payload.gl !== expectedGl) return null;
+
+  return payload;
 }
