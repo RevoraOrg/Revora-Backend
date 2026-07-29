@@ -3,7 +3,17 @@ import { HolidayCalendarService } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
 import { InMemorySecurityAuditRepository } from '../security/audit';
 import { Errors } from '../lib/errors';
-import { MetricsCollector } from '../lib/metrics';
+import {
+  CronWindowValidator,
+  CronWindowDefinition,
+  validateCronSyntax,
+  STELLAR_MAINTENANCE_WINDOWS,
+  findNextCronWindow,
+  normalizeScheduleTimezone,
+  assertValidScheduleTimezone,
+  computeTimezoneWindow,
+  deduplicateWindowKey,
+} from './distributionScheduler';
 
 const ENV_CATCHUP_MAX_BAK = process.env.SCHEDULER_CATCHUP_MAX;
 
@@ -758,5 +768,423 @@ describe('DistributionScheduler', () => {
       expect(overlapEngine.distribute).toHaveBeenNthCalledWith(2, 'off-GB', expect.objectContaining({ end: new Date('2026-01-30') }), 1000);
       expect(overlapEngine.distribute).toHaveBeenNthCalledWith(3, 'off-DE', expect.objectContaining({ end: new Date('2026-01-29') }), 1000);
     });
+  });
+});
+
+// ─── validateCronSyntax ───────────────────────────────────────────────────────
+
+describe('validateCronSyntax', () => {
+  it('returns null for a valid wildcard expression', () => {
+    expect(validateCronSyntax('* * * * *')).toBeNull();
+  });
+
+  it('returns null for a specific valid expression', () => {
+    expect(validateCronSyntax('0 3 * * 5')).toBeNull();
+  });
+
+  it('returns null for a range expression', () => {
+    expect(validateCronSyntax('0-30 2 1-15 1,6 0')).toBeNull();
+  });
+
+  it('returns null for a step expression', () => {
+    expect(validateCronSyntax('*/15 * * * *')).toBeNull();
+  });
+
+  it('returns error for fewer than 5 fields', () => {
+    expect(validateCronSyntax('0 3 *')).toMatch(/Expected 5 fields/);
+  });
+
+  it('returns error for more than 5 fields', () => {
+    expect(validateCronSyntax('0 3 * * * *')).toMatch(/Expected 5 fields/);
+  });
+
+  it('returns error for empty string', () => {
+    expect(validateCronSyntax('')).toMatch(/non-empty/);
+  });
+
+  it('returns error for minute out of range', () => {
+    expect(validateCronSyntax('60 * * * *')).toMatch(/minute/);
+  });
+
+  it('returns error for hour out of range', () => {
+    expect(validateCronSyntax('0 24 * * *')).toMatch(/hour/);
+  });
+
+  it('returns error for day-of-month out of range', () => {
+    expect(validateCronSyntax('0 0 32 * *')).toMatch(/dayOfMonth/);
+  });
+
+  it('returns error for month out of range', () => {
+    expect(validateCronSyntax('0 0 1 13 *')).toMatch(/month/);
+  });
+
+  it('returns error for day-of-week out of range', () => {
+    expect(validateCronSyntax('0 0 * * 7')).toMatch(/dayOfWeek/);
+  });
+
+  it('returns error for invalid step (zero)', () => {
+    expect(validateCronSyntax('*/0 * * * *')).toMatch(/step/);
+  });
+
+  it('returns error for invalid range (start > end)', () => {
+    expect(validateCronSyntax('30-10 * * * *')).toMatch(/range start/);
+  });
+
+  it('returns error for non-numeric value', () => {
+    expect(validateCronSyntax('abc * * * *')).toMatch(/minute/);
+  });
+});
+
+// ─── CronWindowValidator ──────────────────────────────────────────────────────
+
+describe('CronWindowValidator', () => {
+  let validator: CronWindowValidator;
+  let metrics: MetricsCollector;
+
+  beforeEach(() => {
+    metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    validator = new CronWindowValidator({ lookaheadDays: 90, metrics });
+  });
+
+  const validDef = (): CronWindowDefinition => ({
+    expression: '0 3 * * 2', // every Tuesday at 03:00 — avoids Sunday/Monday maintenance
+    timezone: 'UTC',
+    offeringId: 'off-A',
+  });
+
+  describe('validate — syntax errors', () => {
+    it('rejects an expression with wrong field count', () => {
+      const result = validator.validate({ ...validDef(), expression: '0 3 *' });
+      expect(result.valid).toBe(false);
+      expect(result.reasons[0]).toMatch(/Expected 5 fields/);
+    });
+
+    it('rejects an expression with an out-of-range minute', () => {
+      const result = validator.validate({ ...validDef(), expression: '61 3 * * 2' });
+      expect(result.valid).toBe(false);
+      expect(result.reasons[0]).toMatch(/minute/);
+    });
+
+    it('rejects an invalid timezone', () => {
+      const result = validator.validate({ ...validDef(), timezone: 'Not/ATimezone' });
+      expect(result.valid).toBe(false);
+      expect(result.reasons.some(r => r.includes('timezone'))).toBe(true);
+    });
+
+    it('accepts a valid timezone alias (EST)', () => {
+      // EST normalises to America/New_York which is valid
+      const result = validator.validate({ ...validDef(), timezone: 'EST' });
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('validate — Stellar maintenance conflict', () => {
+    it('rejects an expression that fires exactly at the weekly maintenance start (Sun 06:00 UTC)', () => {
+      // 0 6 * * 0 = every Sunday at 06:00 UTC — matches maintenance window exactly
+      const result = validator.validate({ ...validDef(), expression: '0 6 * * 0' });
+      expect(result.valid).toBe(false);
+      expect(result.stellarConflict).toBeDefined();
+      expect(result.stellarConflict!.windowLabel).toMatch(/weekly maintenance/);
+    });
+
+    it('rejects an expression that fires inside the weekly maintenance window (Sun 06:30 UTC)', () => {
+      // 30 6 * * 0 = every Sunday at 06:30 — within the 60-min window
+      const result = validator.validate({ ...validDef(), expression: '30 6 * * 0' });
+      expect(result.valid).toBe(false);
+      expect(result.stellarConflict).toBeDefined();
+    });
+
+    it('rejects an expression that fires at the monthly upgrade window (Mon 02:00 UTC)', () => {
+      const result = validator.validate({ ...validDef(), expression: '0 2 * * 1' });
+      expect(result.valid).toBe(false);
+      expect(result.stellarConflict).toBeDefined();
+      expect(result.stellarConflict!.windowLabel).toMatch(/monthly upgrade/);
+    });
+
+    it('accepts an expression that fires outside all maintenance windows (Tue 03:00 UTC)', () => {
+      const result = validator.validate({ ...validDef(), expression: '0 3 * * 2' });
+      expect(result.valid).toBe(true);
+    });
+
+    it('accepts a Wednesday midnight expression', () => {
+      const result = validator.validate({ ...validDef(), expression: '0 0 * * 3' });
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('validate — metrics emission', () => {
+    it('emits scheduler_window_rejected_total counter on rejection', async () => {
+      validator.validate({ ...validDef(), expression: '0 6 * * 0' }); // conflict
+      const snap = await metrics.getSnapshot();
+      const counter = snap.custom.find((p: any) => p.name === 'scheduler_window_rejected_total');
+      expect(counter).toBeDefined();
+      expect(counter!.value).toBeGreaterThanOrEqual(1);
+    });
+
+    it('does not emit rejection metric for a valid expression', async () => {
+      validator.validate(validDef());
+      const snap = await metrics.getSnapshot();
+      const counter = snap.custom.find((p: any) => p.name === 'scheduler_window_rejected_total');
+      expect(counter).toBeUndefined();
+    });
+  });
+
+  describe('validateAgainstExisting — overlap detection', () => {
+    it('accepts when no existing definitions are provided', () => {
+      const result = validator.validateAgainstExisting(validDef(), []);
+      expect(result.valid).toBe(true);
+    });
+
+    it('accepts when existing definition belongs to the same offering (self-update)', () => {
+      const result = validator.validateAgainstExisting(validDef(), [validDef()]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('rejects when two different offerings fire at the same minute', () => {
+      const defA: CronWindowDefinition = {
+        expression: '0 4 * * 3', // Wed 04:00 UTC
+        timezone: 'UTC',
+        offeringId: 'off-A',
+      };
+      const defB: CronWindowDefinition = {
+        expression: '0 4 * * 3', // same minute
+        timezone: 'UTC',
+        offeringId: 'off-B',
+      };
+      const result = validator.validateAgainstExisting(defA, [defB]);
+      expect(result.valid).toBe(false);
+      expect(result.overlapDetail).toBeDefined();
+      expect(result.overlapDetail!.offeringIdA).toBe('off-A');
+      expect(result.overlapDetail!.offeringIdB).toBe('off-B');
+    });
+
+    it('accepts when two offerings fire on different days of the week', () => {
+      const defA: CronWindowDefinition = {
+        expression: '0 4 * * 2', // Tue 04:00
+        timezone: 'UTC',
+        offeringId: 'off-A',
+      };
+      const defB: CronWindowDefinition = {
+        expression: '0 4 * * 4', // Thu 04:00
+        timezone: 'UTC',
+        offeringId: 'off-B',
+      };
+      const result = validator.validateAgainstExisting(defA, [defB]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('propagates syntax errors even when existing list is non-empty', () => {
+      const bad: CronWindowDefinition = {
+        expression: 'not-valid',
+        timezone: 'UTC',
+        offeringId: 'off-X',
+      };
+      const result = validator.validateAgainstExisting(bad, [validDef()]);
+      expect(result.valid).toBe(false);
+      expect(result.reasons.length).toBeGreaterThan(0);
+    });
+
+    it('logs the diff when overlap is detected', () => {
+      const mockLogger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+      const v = new CronWindowValidator({ lookaheadDays: 7, logger: mockLogger as any });
+      const defA: CronWindowDefinition = { expression: '0 5 * * 3', timezone: 'UTC', offeringId: 'off-A' };
+      const defB: CronWindowDefinition = { expression: '0 5 * * 3', timezone: 'UTC', offeringId: 'off-B' };
+      v.validateAgainstExisting(defA, [defB]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('scheduler.window.rejected'),
+        expect.objectContaining({ diff: expect.objectContaining({ incoming: defA.expression }) })
+      );
+    });
+  });
+
+  describe('edge cases', () => {
+    it('handles a leap-day expression (Feb 29) without throwing', () => {
+      // Feb 29 only exists in leap years; expression should parse as valid syntax
+      // and validator should scan the lookahead horizon gracefully
+      const result = validator.validate({ ...validDef(), expression: '0 3 29 2 *' });
+      // Result may be valid or invalid depending on whether Feb 29 lands in lookahead,
+      // but it must NOT throw
+      expect(typeof result.valid).toBe('boolean');
+    });
+
+    it('handles an expression that never fires in the 90-day horizon', () => {
+      // 30th of February never exists — no fire, no conflict
+      const result = validator.validate({ ...validDef(), expression: '0 3 30 2 *' });
+      expect(result.valid).toBe(true);
+    });
+
+    it('handles DST spring-forward without throwing', () => {
+      // America/New_York springs forward — evaluating 02:30 on the transition date
+      // may skip but must not throw
+      const result = validator.validate({
+        expression: '30 2 * * 2', // 02:30 every Tuesday
+        timezone: 'America/New_York',
+        offeringId: 'off-dst',
+      });
+      expect(typeof result.valid).toBe('boolean');
+    });
+
+    it('handles DST fall-back without throwing', () => {
+      const result = validator.validate({
+        expression: '0 1 * * 0', // 01:00 every Sunday — repeated during fall-back
+        timezone: 'America/New_York',
+        offeringId: 'off-fallback',
+      });
+      expect(typeof result.valid).toBe('boolean');
+    });
+
+    it('accepts a "last business day" style end-of-month expression', () => {
+      // 0 3 28-31 * 5 — Fridays from 28th–31st cover last-business-day-of-month
+      const result = validator.validate({
+        expression: '0 3 28-31 * 5',
+        timezone: 'UTC',
+        offeringId: 'off-eom',
+      });
+      // Must not crash; validity depends on whether it hits maintenance (it should not)
+      expect(typeof result.valid).toBe('boolean');
+    });
+
+    it('handles a comma-list of months', () => {
+      const result = validator.validate({ ...validDef(), expression: '0 3 1 1,3,6,9,12 2' });
+      expect(result.valid).toBe(true);
+    });
+
+    it('rejects a step-zero expression', () => {
+      const result = validator.validate({ ...validDef(), expression: '*/0 3 * * 2' });
+      expect(result.valid).toBe(false);
+    });
+  });
+});
+
+// ─── normalizeScheduleTimezone / assertValidScheduleTimezone ─────────────────
+
+describe('normalizeScheduleTimezone', () => {
+  it('returns UTC for null', () => {
+    expect(normalizeScheduleTimezone(null)).toBe('UTC');
+  });
+
+  it('returns UTC for undefined', () => {
+    expect(normalizeScheduleTimezone(undefined)).toBe('UTC');
+  });
+
+  it('returns UTC for empty string', () => {
+    expect(normalizeScheduleTimezone('')).toBe('UTC');
+  });
+
+  it('normalises EST alias', () => {
+    expect(normalizeScheduleTimezone('EST')).toBe('America/New_York');
+  });
+
+  it('passes through a valid IANA identifier unchanged', () => {
+    expect(normalizeScheduleTimezone('Europe/London')).toBe('Europe/London');
+  });
+
+  it('returns UTC for an invalid identifier', () => {
+    expect(normalizeScheduleTimezone('Fake/Zone')).toBe('UTC');
+  });
+});
+
+describe('assertValidScheduleTimezone', () => {
+  it('returns the normalised timezone for a valid input', () => {
+    expect(assertValidScheduleTimezone('America/Chicago')).toBe('America/Chicago');
+  });
+
+  it('normalises aliases', () => {
+    expect(assertValidScheduleTimezone('PST')).toBe('America/Los_Angeles');
+  });
+
+  it('throws for an invalid timezone', () => {
+    expect(() => assertValidScheduleTimezone('Not/Valid')).toThrow('Invalid timezone');
+  });
+});
+
+// ─── findNextCronWindow ───────────────────────────────────────────────────────
+
+describe('findNextCronWindow', () => {
+  it('returns the next matching window within the lookahead horizon', () => {
+    const after = new Date('2026-07-28T00:00:00Z'); // Tuesday
+    // Every Wednesday at 03:00 UTC
+    const result = findNextCronWindow({ expression: '0 3 * * 3', timezone: 'UTC' }, after);
+    expect(result).not.toBeNull();
+    expect(result!.start.getUTCHours()).toBe(3);
+    expect(result!.start.getUTCDay()).toBe(3); // Wednesday
+  });
+
+  it('returns null when the expression never fires in the horizon', () => {
+    const after = new Date('2026-07-28T00:00:00Z');
+    // Feb 30 never exists
+    const result = findNextCronWindow({ expression: '0 3 30 2 *', timezone: 'UTC' }, after);
+    expect(result).toBeNull();
+  });
+
+  it('evaluates expression in the provided IANA timezone', () => {
+    // 0 3 * * 3 in America/New_York = 07:00 or 08:00 UTC depending on DST
+    const after = new Date('2026-07-28T00:00:00Z');
+    const result = findNextCronWindow(
+      { expression: '0 3 * * 3', timezone: 'America/New_York' },
+      after
+    );
+    expect(result).not.toBeNull();
+    // UTC hour should be 3 + offset (EDT = UTC-4 in July, so 03:00 EDT = 07:00 UTC)
+    expect(result!.start.getUTCHours()).toBe(7);
+  });
+});
+
+// ─── computeTimezoneWindow / deduplicateWindowKey ────────────────────────────
+
+describe('computeTimezoneWindow', () => {
+  it('detects spring-forward DST transition', () => {
+    // America/New_York springs forward 2026-03-08 02:00 → 03:00
+    const start = new Date('2026-03-08T06:00:00Z'); // 01:00 EST
+    const end   = new Date('2026-03-08T08:00:00Z'); // 03:00 EDT (post-transition)
+    const { dstTransition } = computeTimezoneWindow('off-1', start, end, 'America/New_York');
+    expect(dstTransition).toBe('springForward');
+  });
+
+  it('detects fall-back DST transition', () => {
+    // America/New_York falls back 2026-11-01 02:00 → 01:00
+    const start = new Date('2026-11-01T05:00:00Z'); // 01:00 EDT
+    const end   = new Date('2026-11-01T07:00:00Z'); // 02:00 EST (post-transition)
+    const { dstTransition } = computeTimezoneWindow('off-1', start, end, 'America/New_York');
+    expect(dstTransition).toBe('fallback');
+  });
+
+  it('returns none for a UTC window with no DST', () => {
+    const start = new Date('2026-06-01T00:00:00Z');
+    const end   = new Date('2026-06-02T00:00:00Z');
+    const { dstTransition } = computeTimezoneWindow('off-1', start, end, 'UTC');
+    expect(dstTransition).toBe('none');
+  });
+});
+
+describe('deduplicateWindowKey', () => {
+  it('returns the same key for equal windows', () => {
+    const start = new Date('2026-01-01T00:00:00Z');
+    const end   = new Date('2026-01-31T00:00:00Z');
+    const win = { utcStart: start, utcEnd: end, wallClockStart: start, wallClockEnd: end, timezone: 'UTC' };
+    expect(deduplicateWindowKey(win)).toBe(deduplicateWindowKey(win));
+  });
+
+  it('returns different keys for different windows', () => {
+    const winA = { utcStart: new Date('2026-01-01T00:00:00Z'), utcEnd: new Date('2026-01-31T00:00:00Z'), wallClockStart: new Date(), wallClockEnd: new Date(), timezone: 'UTC' };
+    const winB = { ...winA, utcStart: new Date('2026-02-01T00:00:00Z') };
+    expect(deduplicateWindowKey(winA)).not.toBe(deduplicateWindowKey(winB));
+  });
+});
+
+// ─── STELLAR_MAINTENANCE_WINDOWS ─────────────────────────────────────────────
+
+describe('STELLAR_MAINTENANCE_WINDOWS', () => {
+  it('exports at least two maintenance windows', () => {
+    expect(STELLAR_MAINTENANCE_WINDOWS.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('each window has a label, cron, and durationMinutes', () => {
+    for (const w of STELLAR_MAINTENANCE_WINDOWS) {
+      expect(w.label).toBeTruthy();
+      expect(w.cron).toBeTruthy();
+      expect(w.durationMinutes).toBeGreaterThan(0);
+      expect(validateCronSyntax(w.cron.replace(/\s+/g, ' ').trim())).toBeNull();
+    }
   });
 });
