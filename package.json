@@ -15,6 +15,7 @@
     "test:coverage:backend-011": "jest --runInBand --coverage src/middleware/rateLimit.test.ts src/middleware/startupAuthRateTierPolicy.test.ts src/routes/health.test.ts --collectCoverageFrom='src/middleware/rateLimit.ts' --collectCoverageFrom='src/middleware/startupAuthRateTierPolicy.ts' --coverageThreshold='{\"global\":{\"statements\":95,\"lines\":95,\"functions\":95}}'",
     "audit:ci": "ts-node scripts/audit-gate.ts",
     "validate:alert-mappings": "ts-node scripts/validate-alert-mappings.ts",
+    "drill:ttl-check": "ts-node scripts/failover-drill/ttl-check.ts",
     "test:watch": "jest --watch",
     "test:chaos": "jest --testPathPattern=chaos",
     "test:ci": "jest --coverage --ci",

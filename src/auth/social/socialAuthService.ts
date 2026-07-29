@@ -130,12 +130,16 @@ export class SocialAuthService {
     );
 
     if (!identity) {
-      const emailUser = await this.userRepository.findByEmail(claims.email);
-      if (emailUser) {
-        throw new SocialAuthError(
-          'EMAIL_ACCOUNT_REQUIRES_LINK',
-          'A password account with this email exists. Sign in and link the provider first.',
-        );
+      // Apple private-relay emails are transient and cannot be used for
+      // account matching.  Skip the email-collision check entirely.
+      if (!claims.isPrivateRelay) {
+        const emailUser = await this.userRepository.findByEmail(claims.email);
+        if (emailUser) {
+          throw new SocialAuthError(
+            'EMAIL_ACCOUNT_REQUIRES_LINK',
+            'A password account with this email exists. Sign in and link the provider first.',
+          );
+        }
       }
       throw new SocialAuthError('SOCIAL_IDENTITY_NOT_LINKED', 'Social identity is not linked.');
     }
@@ -146,7 +150,7 @@ export class SocialAuthService {
     }
 
     if (identity.providerEmail !== claims.email) {
-      await this.identityRepository.updateIdentityEmail(identity.id, claims.email);
+      await this.identityRepository.updateIdentityEmail(identity.id, claims.email, claims.isPrivateRelay);
     }
 
     return this.issueSession(user);
@@ -198,12 +202,17 @@ export class SocialAuthService {
         );
       }
       if (existingUserProvider.providerEmail !== claims.email) {
-        await this.identityRepository.updateIdentityEmail(existingUserProvider.id, claims.email);
+        await this.identityRepository.updateIdentityEmail(
+          existingUserProvider.id,
+          claims.email,
+          claims.isPrivateRelay,
+        );
       }
       return { linked: true, identity: existingUserProvider };
     }
 
-    if (user.email !== claims.email) {
+    // Apple private-relay emails are transient — skip email-collision check.
+    if (!claims.isPrivateRelay && user.email !== claims.email) {
       const emailUser = await this.userRepository.findByEmail(claims.email);
       if (emailUser && emailUser.id !== input.userId) {
         throw new SocialAuthError(
@@ -219,6 +228,7 @@ export class SocialAuthService {
       providerSubject: claims.subject,
       providerEmail: claims.email,
       emailVerified: claims.emailVerified,
+      isPrivateRelay: claims.isPrivateRelay,
     });
 
     return { linked: true, identity };

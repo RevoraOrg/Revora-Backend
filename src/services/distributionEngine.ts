@@ -11,6 +11,7 @@
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors, AppError } from '../lib/errors';
 import { Decimal } from '../lib/decimal';
+import { FxConversionEngine } from './fxConversionEngine';
 import { Pool, PoolClient } from 'pg';
 import { withTransaction, TransactionError } from '../db/transaction';
 import {
@@ -212,7 +213,8 @@ class DistributionEngine {
     options: DistributionEngineOptions = {},
     private pool?: Pool,
     private notificationRepo?: any,
-    private notificationPreferencesRepo?: any
+    private notificationPreferencesRepo?: any,
+    private fxConversionEngine?: FxConversionEngine
   ) {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
@@ -353,6 +355,30 @@ class DistributionEngine {
     // 5. Ensure distribution run exists and is in 'processing' state
     if (!run) {
       try {
+        // Freeze the FX conversion rate before creating the run
+        let frozenFxRateId: string | undefined;
+        if (this.fxConversionEngine) {
+          try {
+            const frozenRate = await this.fxConversionEngine.freezeRate(
+              offeringId + '-' + period.id,
+              'USD',
+              'USD'
+            );
+            frozenFxRateId = frozenRate.id;
+            this.logger.info('FX rate frozen for distribution', {
+              offeringId,
+              periodId: period.id,
+              frozenFxRateId,
+            });
+          } catch (fxErr) {
+            this.logger.warn('Failed to freeze FX rate, continuing without freeze', {
+              offeringId,
+              periodId: period.id,
+              error: fxErr instanceof Error ? fxErr.message : String(fxErr),
+            });
+          }
+        }
+
         run = await this.withRetry(() =>
           this.distributionRepo.createDistributionRun({
             offering_id: offeringId,
@@ -360,6 +386,7 @@ class DistributionEngine {
             total_amount: amtStr,
             run_at: period.end,
             status: 'processing',
+            frozen_fx_rate_id: frozenFxRateId,
           })
         );
         this.logger.info('Created new distribution run', {
