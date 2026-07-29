@@ -59,6 +59,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
+import taxationRouter from './routes/taxation';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -706,6 +707,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const userRepo = new UserRepository(pool);
   const scimToken = env.SCIM_TOKEN ?? '';
   app.use('/scim/v2', createScimRouter(userRepo, scimToken, '/scim/v2'));
+
+  // Mount taxation routes for per-lot cost-basis tax reporting
+  app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
