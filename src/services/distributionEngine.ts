@@ -31,6 +31,33 @@ export interface DistributionEngineOptions {
 }
 
 /**
+ * Pure calculation result from distribution math.
+ * This is the output of the shared calculation logic used by both
+ * real distributions and previews.
+ */
+export interface DistributionCalculation {
+  rounded: Array<{ investor_id: string; amount: Decimal; rawShare: Decimal }>;
+  totalBalanceDecimal: Decimal;
+  revenueDecimal: Decimal;
+}
+
+/**
+ * Preview-specific response metadata.
+ * Includes the preview-id for referencing this computation,
+ * context for understanding when/what was previewed,
+ * and the projected per-investor payouts.
+ */
+export interface DistributionPreviewResult {
+  preview_id: string;
+  offering_id: string;
+  period_id: string;
+  revenue_amount: string;
+  computed_at: string;
+  investor_count: number;
+  projections: Array<{ investor_id: string; amount: string }>;
+}
+
+/**
  * Compute a stable 32-bit advisory lock key from (offeringId, periodId).
  *
  * pg_try_advisory_xact_lock takes a single bigint or two int4 values.
@@ -76,6 +103,88 @@ export async function tryAcquireDistributionLock(
     [classId, objectId]
   );
   return result.rows[0].acquired;
+}
+
+/**
+ * Core distribution calculation logic: prorate revenue across investors.
+ * 
+ * This is the SHARED pure calculation function used by both real distribution runs
+ * and preview operations. It contains the deterministic math that both paths must
+ * use identically to guarantee that "preview totals equal actual-run totals".
+ * 
+ * This function has NO side effects: no DB writes, no webhooks, no state mutations.
+ * It is purely functional — same inputs always yield same outputs.
+ * 
+ * @param balances Array of investor balances
+ * @param revenueAmount Total revenue to distribute
+ * @returns Calculation result with per-investor rounded amounts
+ */
+function calculateDistributionPayouts(
+  balances: BalanceRow[],
+  revenueAmount: number
+): DistributionCalculation {
+  if (!balances || balances.length === 0) {
+    throw Errors.badRequest('No investors or balances found for offering');
+  }
+
+  // 1. Sum balances and compute shares using Decimal for precision
+  const balanceDecimals = balances.map((b) => {
+    const rawStr = (b.balance).toFixed(18);
+    const rawDecimal = new Decimal(rawStr);
+    const scaled = rawDecimal.toSorobanI128(2, 'round');
+    return Decimal.fromScaledBigInt(scaled, 2);
+  });
+
+  const totalBalanceDecimal = balanceDecimals.reduce((sum, bd) => sum.add(bd), new Decimal('0'));
+
+  if (totalBalanceDecimal.isZero() || totalBalanceDecimal.isNegative()) {
+    throw Errors.badRequest('Total balance must be > 0 to distribute revenue');
+  }
+
+  const revenueRawStr = revenueAmount.toFixed(18);
+  const revenueRawDecimal = new Decimal(revenueRawStr);
+  const revenueScaled = revenueRawDecimal.toSorobanI128(2, 'round');
+  const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
+
+  interface RawShare {
+    investor_id: string;
+    rawShare: Decimal;
+  }
+  const rawShares: RawShare[] = balances.map((b, index) => {
+    const balanceDecimal = balanceDecimals[index];
+    const share = balanceDecimal.divide(totalBalanceDecimal).multiply(revenueDecimal);
+    return { investor_id: b.investor_id, rawShare: share };
+  });
+
+  interface RoundedShare {
+    investor_id: string;
+    amount: Decimal;
+    rawShare: Decimal;
+  }
+  const rounded: RoundedShare[] = rawShares.map((r) => {
+    const scaledValue = r.rawShare.toSorobanI128(2, 'round');
+    const amountDecimal = Decimal.fromScaledBigInt(scaledValue, 2);
+    return { investor_id: r.investor_id, amount: amountDecimal, rawShare: r.rawShare };
+  });
+
+  const roundedSum = rounded.reduce((sum, r) => sum.add(r.amount), new Decimal('0'));
+
+  // 2. Largest-Share Reconciliation Adjustment
+  const rawDiff = revenueDecimal.subtract(roundedSum);
+  const diffScaled = rawDiff.toSorobanI128(2, 'round');
+  const diff = Decimal.fromScaledBigInt(diffScaled, 2);
+
+  if (!diff.isZero()) {
+    let maxIdx = 0;
+    for (let i = 1; i < rawShares.length; i++) {
+      if (rawShares[i].rawShare.compareTo(rawShares[maxIdx].rawShare) > 0) {
+        maxIdx = i;
+      }
+    }
+    rounded[maxIdx].amount = rounded[maxIdx].amount.add(diff);
+  }
+
+  return { rounded, totalBalanceDecimal, revenueDecimal };
 }
 
 class DistributionEngine {
@@ -225,66 +334,11 @@ class DistributionEngine {
       throw Errors.serviceUnavailable(`Failed to acquire balances: ${failure.class}`);
     }
 
-    if (!balances || balances.length === 0) {
-      throw Errors.badRequest('No investors or balances found for offering');
-    }
-
-    // 4. Sum balances and compute shares using Decimal for precision
-    const balanceDecimals = balances.map((b) => {
-      const rawStr = (b.balance).toFixed(18);
-      const rawDecimal = new Decimal(rawStr);
-      const scaled = rawDecimal.toSorobanI128(2, 'round');
-      return Decimal.fromScaledBigInt(scaled, 2);
-    });
-
-    const totalBalanceDecimal = balanceDecimals.reduce((sum, bd) => sum.add(bd), new Decimal('0'));
-
-    if (totalBalanceDecimal.isZero() || totalBalanceDecimal.isNegative()) {
-      throw Errors.badRequest('Total balance must be > 0 to distribute revenue');
-    }
-
-    const revenueRawStr = revenueAmount.toFixed(18);
-    const revenueRawDecimal = new Decimal(revenueRawStr);
-    const revenueScaled = revenueRawDecimal.toSorobanI128(2, 'round');
-    const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
-
-    interface RawShare {
-      investor_id: string;
-      rawShare: Decimal;
-    }
-    const rawShares: RawShare[] = balances.map((b, index) => {
-      const balanceDecimal = balanceDecimals[index];
-      const share = balanceDecimal.divide(totalBalanceDecimal).multiply(revenueDecimal);
-      return { investor_id: b.investor_id, rawShare: share };
-    });
-
-    interface RoundedShare {
-      investor_id: string;
-      amount: Decimal;
-      rawShare: Decimal;
-    }
-    const rounded: RoundedShare[] = rawShares.map((r) => {
-      const scaledValue = r.rawShare.toSorobanI128(2, 'round');
-      const amountDecimal = Decimal.fromScaledBigInt(scaledValue, 2);
-      return { investor_id: r.investor_id, amount: amountDecimal, rawShare: r.rawShare };
-    });
-
-    const roundedSum = rounded.reduce((sum, r) => sum.add(r.amount), new Decimal('0'));
-
-    // Largest-Share Reconciliation Adjustment
-    const rawDiff = revenueDecimal.subtract(roundedSum);
-    const diffScaled = rawDiff.toSorobanI128(2, 'round');
-    const diff = Decimal.fromScaledBigInt(diffScaled, 2);
-
-    if (!diff.isZero()) {
-      let maxIdx = 0;
-      for (let i = 1; i < rawShares.length; i++) {
-        if (rawShares[i].rawShare.compareTo(rawShares[maxIdx].rawShare) > 0) {
-          maxIdx = i;
-        }
-      }
-      rounded[maxIdx].amount = rounded[maxIdx].amount.add(diff);
-    }
+    // 4. Run the SHARED pure calculation logic
+    // Both real distribution and previews use this exact same function,
+    // guaranteeing that preview totals equal actual-run totals when inputs are unchanged.
+    const calculation = calculateDistributionPayouts(balances, revenueAmount);
+    const { rounded } = calculation;
 
     // 5. Ensure distribution run exists and is in 'processing' state
     if (!run) {
@@ -514,6 +568,111 @@ class DistributionEngine {
       failedPayouts,
       totalPayouts: rounded.length,
     };
+  }
+
+  /**
+   * Preview-only distribution run: uses the exact same calculation logic as real distribution
+   * but performs zero side effects (no DB writes, no webhooks, no idempotency-key consumption).
+   * 
+   * This is designed for treasury to dry-run distribution math before approving/executing
+   * a real distribution window. Returns per-investor projected amounts with a fresh preview-id.
+   * 
+   * SECURITY NOTES:
+   * - Returns real, sensitive per-investor financial data — must be RBAC-gated appropriately.
+   * - No persistence: no DB writes of any kind.
+   * - No webhooks: notifications are never emitted.
+   * - No idempotency state: idempotency-key consumption is skipped; previews are freely repeatable.
+   * - Preview-id is a fresh UUID per call, not persisted or queryable as a resource unless
+   *   the caller explicitly builds a secondary record (outside this engine).
+   * 
+   * @param offeringId  The offering to preview distribution for
+   * @param period      Distribution period (must include an `id` field)
+   * @param revenueAmount The total amount of revenue to preview distributing
+   * @returns Preview result with per-investor projected amounts and preview metadata
+   */
+  async previewRun(
+    offeringId: string,
+    period: { id?: string; start: Date; end: Date } & Record<string, any>,
+    revenueAmount: number
+  ): Promise<DistributionPreviewResult> {
+    const startTime = Date.now();
+    const previewId = this.generatePreviewId();
+
+    // 1. Validation
+    if (!offeringId) throw Errors.badRequest('offeringId is required');
+    if (revenueAmount <= 0) throw Errors.badRequest('revenueAmount must be > 0');
+    if (!period || !period.id) throw Errors.badRequest('Valid distribution period with ID is required');
+
+    this.logger.info('Distribution preview requested', {
+      previewId,
+      offeringId,
+      periodId: period.id,
+      revenueAmount,
+    });
+
+    // 2. Acquire balances with retry and classification
+    let balances: BalanceRow[] = [];
+    try {
+      balances = await this.withRetry(() => this.fetchBalances(offeringId, period));
+    } catch (err) {
+      const failure = classifyStellarRPCFailure(err, {
+        operation: 'fetchBalances',
+        offeringId,
+        periodId: period.id,
+      });
+      this.logger.error('Failed to acquire balances for preview', {
+        previewId,
+        offeringId,
+        periodId: period.id,
+        error: err instanceof Error ? err.message : String(err),
+        failureClass: failure.class
+      });
+      throw Errors.serviceUnavailable(`Failed to acquire balances: ${failure.class}`);
+    }
+
+    // 3. Run the SHARED pure calculation logic (same as real distribution)
+    const calculation = calculateDistributionPayouts(balances, revenueAmount);
+    const { rounded } = calculation;
+
+    // 4. Build response
+    const projections = rounded.map((r) => ({
+      investor_id: r.investor_id,
+      amount: r.amount.toString(),
+    }));
+
+    const duration = Date.now() - startTime;
+
+    this.logger.info('Distribution preview completed', {
+      previewId,
+      offeringId,
+      periodId: period.id,
+      revenueAmount,
+      investorCount: balances.length,
+      duration,
+    });
+
+    return {
+      preview_id: previewId,
+      offering_id: offeringId,
+      period_id: period.id,
+      revenue_amount: revenueAmount.toFixed(2),
+      computed_at: new Date().toISOString(),
+      investor_count: balances.length,
+      projections,
+    };
+  }
+
+  /**
+   * Generate a fresh UUID for a preview computation.
+   * This identifies a specific preview call without implying persistence.
+   */
+  private generatePreviewId(): string {
+    // Simple UUID v4 generation (RFC 4122 compliant)
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
   }
 
   /**
