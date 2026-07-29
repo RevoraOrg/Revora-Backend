@@ -16,7 +16,7 @@
  */
 
 import { StellarSubmissionService } from '../../services/stellarSubmissionService';
-import { StellarRPCFailureClass } from '../../lib/stellarRpcFailure';
+import { StellarRPCFailureClass, classifyStellarRPCFailure, shouldRetryStellarRPCFailure, createStellarErrorResponse } from '../../lib/stellarRpcFailure';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -58,14 +58,12 @@ function makeGenericError(message: string): Error {
 // ===========================================================================
 describe('classifyStellarRPCFailure - bad_seq', () => {
   it('detects BAD_SEQUENCE from code property', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(42);
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     expect(result.class).toBe(StellarRPCFailureClass.BAD_SEQUENCE);
   });
 
   it('detects BAD_SEQUENCE from tx_bad_seq result_xdr', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = new Error('protocol error');
     (err as any).result_xdr = 'tx_bad_seq';
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
@@ -73,28 +71,24 @@ describe('classifyStellarRPCFailure - bad_seq', () => {
   });
 
   it('detects BAD_SEQUENCE from message keywords', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = new Error('sequence number mismatch: expected 42 but got 7');
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     expect(result.class).toBe(StellarRPCFailureClass.BAD_SEQUENCE);
   });
 
   it('BAD_SEQUENCE is classified as retryable', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(99);
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     expect(result.shouldRetry).toBe(true);
   });
 
   it('non-sequence errors do not produce BAD_SEQUENCE', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeGenericError('insufficient balance');
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     expect(result.class).not.toBe(StellarRPCFailureClass.BAD_SEQUENCE);
   });
 
   it('does not leak raw upstream message in sanitized error', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(7);
     const result = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     const sanitized = result.originalError as any;
@@ -108,35 +102,30 @@ describe('classifyStellarRPCFailure - bad_seq', () => {
 // ===========================================================================
 describe('shouldRetryStellarRPCFailure - bad_seq', () => {
   it('returns true for first attempt', () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(1);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 1 });
     expect(shouldRetryStellarRPCFailure(failure, 3)).toBe(true);
   });
 
   it('returns true for second attempt (within budget)', () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(2);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 2 });
     expect(shouldRetryStellarRPCFailure(failure, 3)).toBe(true);
   });
 
   it('returns false after max retries exhausted', () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(3);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 3 });
     expect(shouldRetryStellarRPCFailure(failure, 3)).toBe(false);
   });
 
   it('still allows retry even at attemptCount=1 with service default max', () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(4);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 1 });
     expect(shouldRetryStellarRPCFailure(failure)).toBe(true);
   });
 
   it('detects bad_seq in TX_RESULT_CODE envelope via Horizon extras', () => {
-    const { classifyStellarRPCFailure, StellarRPCFailureClass } = require('../../lib/stellarRpcFailure');
     const err: any = new Error('Horizon error');
     err.status = 400;
     err.extras = {
@@ -277,28 +266,24 @@ describe('StellarSubmissionService - bad_seq retry', () => {
 // ===========================================================================
 describe('bad_seq retry budget - edge cases', () => {
   it('handles retry budget=1 (no retries allowed)', async () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(1);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 1 });
     expect(shouldRetryStellarRPCFailure(failure, 1)).toBe(false);
   });
 
   it('handles retry budget=0 (edge case)', async () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(1);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 1 });
     expect(shouldRetryStellarRPCFailure(failure, 0)).toBe(false);
   });
 
   it('handles very large retry budget without overflow', async () => {
-    const { shouldRetryStellarRPCFailure, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(1);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 50 });
     expect(shouldRetryStellarRPCFailure(failure, 100)).toBe(true);
   });
 
   it('bad_seq with attemptCount=0 classified as first attempt', async () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(1);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 0 });
     expect(failure.class).toBe(StellarRPCFailureClass.BAD_SEQUENCE);
@@ -306,19 +291,16 @@ describe('bad_seq retry budget - edge cases', () => {
   });
 
   it('empty/null error object does not crash classification', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const result = classifyStellarRPCFailure(null, { operation: 'send_transaction' });
     expect(result.class).toBe(StellarRPCFailureClass.UNKNOWN);
   });
 
   it('non-Error thrown value (string) is classified without crash', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const result = classifyStellarRPCFailure('string error', { operation: 'send_transaction' });
     expect(result.class).toBe(StellarRPCFailureClass.UNKNOWN);
   });
 
   it('non-Error thrown value (number) is classified without crash', () => {
-    const { classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const result = classifyStellarRPCFailure(42, { operation: 'send_transaction' });
     expect(result.class).toBe(StellarRPCFailureClass.UNKNOWN);
   });
@@ -330,7 +312,6 @@ describe('bad_seq retry budget - edge cases', () => {
 // ===========================================================================
 describe('createStellarErrorResponse - bad_seq', () => {
   it('produces correct error response for BAD_SEQUENCE', () => {
-    const { createStellarErrorResponse, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(5);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction', attemptCount: 2 });
     const response = createStellarErrorResponse(failure);
@@ -343,7 +324,6 @@ describe('createStellarErrorResponse - bad_seq', () => {
   });
 
   it('includes requestId when provided', () => {
-    const { createStellarErrorResponse, classifyStellarRPCFailure } = require('../../lib/stellarRpcFailure');
     const err = makeBadSeqError(10);
     const failure = classifyStellarRPCFailure(err, { operation: 'send_transaction' });
     const response = createStellarErrorResponse(failure, 'req-123');
