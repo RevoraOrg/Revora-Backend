@@ -420,3 +420,5 @@ Each row records the date, the engineer who drove the drill, the measured RTO an
 | `src/config/env.ts` | Environment configuration including `DATABASE_URL` |
 | `src/middleware/idempotency.ts` | Idempotency middleware that keys off request hashes |
 | `scripts/drill-multi-region-failover.sh` | Automated drill script for failover verification |
+| `scripts/failover-drill/ttl-check.ts` | Automated DNS TTL policy, propagation lag, and health-check verification script |
+| `docs/runbooks/dns-failover-drill-checklist.md` | DNS failover drill checklist, expected propagation windows, and quarterly calendar |
