@@ -8,10 +8,14 @@ import {
   RetentionLabelService,
 } from '../services/retentionLabelService';
 import { Errors } from '../lib/errors';
+import { TenantSettingsRepository } from '../db/repositories/tenantSettingsRepository';
+import { SessionPolicyValidator } from '../services/sessionPolicyValidator';
 
 export function createAdminRouter(
   auditLogRepo: AuditLogRepository,
   retentionLabelService?: RetentionLabelService,
+  tenantSettingsRepo?: TenantSettingsRepository,
+  sessionPolicyValidator?: SessionPolicyValidator,
 ): Router {
   const router = Router();
 
@@ -167,6 +171,34 @@ export function createAdminRouter(
           next(mapRetentionError(error));
         }
       },
+    );
+  }
+
+  if (tenantSettingsRepo && sessionPolicyValidator) {
+    router.post(
+      '/tenant-settings/:tenantId/session-policy',
+      async (req: Request, res: Response, next: NextFunction) => {
+        try {
+          const { tenantId } = req.params;
+          const { policy } = req.body;
+          if (policy !== 'lax' && policy !== 'strict') {
+            next(Errors.badRequest('Policy must be lax or strict'));
+            return;
+          }
+
+          if (policy === 'strict') {
+            await sessionPolicyValidator.validateStrictOptIn(tenantId);
+          }
+
+          const settingsRow = await tenantSettingsRepo.findByTenantId(tenantId);
+          const settings = settingsRow ? settingsRow.settings : {};
+          const updated = await tenantSettingsRepo.upsertSettings(tenantId, settings, policy);
+          
+          res.status(200).json({ session_policy: updated.session_policy });
+        } catch (error) {
+          next(error);
+        }
+      }
     );
   }
 

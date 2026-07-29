@@ -61,25 +61,29 @@ export class Decimal {
   }
 
   /**
-   * Returns the decimal value as a string.
+   * Returns the decimal value as a string. Correctly handles negative values
+   * (the scaled `_value` can be negative after a subtraction).
    */
   toString(): string {
+    const isNegative = this._value < 0n;
+    const absValue = isNegative ? -this._value : this._value;
+    const valueStr = absValue.toString();
+
     if (this._scale === 0) {
-      return this._value.toString();
+      return isNegative ? `-${valueStr}` : valueStr;
     }
 
-    const valueStr = this._value.toString();
     const integerPartLength = valueStr.length - this._scale;
 
     if (integerPartLength <= 0) {
-      // e.g., 0.001 for value=1, scale=3
-      return `0.${'0'.repeat(-integerPartLength)}${valueStr}`;
+      // e.g., 0.001 for value=1, scale=3 (or -0.0005 for value=-5, scale=4)
+      return `${isNegative ? '-' : ''}0.${'0'.repeat(-integerPartLength)}${valueStr}`;
     }
 
     const integerPart = valueStr.substring(0, integerPartLength);
     const fractionalPart = valueStr.substring(integerPartLength).padEnd(this._scale, '0');
 
-    return `${integerPart}.${fractionalPart}`;
+    return `${isNegative ? '-' : ''}${integerPart}.${fractionalPart}`;
   }
 
   /**

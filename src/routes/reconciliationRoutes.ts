@@ -1,8 +1,12 @@
 /**
  * Revenue Reconciliation Routes
- * 
+ *
  * Exposes endpoints for revenue distribution reconciliation checks.
  * All routes require authentication and appropriate authorization.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ * @see ../docs/revenue-reconciliation-checks.md
+ * @see ../docs/rbac-hierarchy-property-tests.md
  */
 
 import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
