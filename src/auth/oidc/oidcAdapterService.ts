@@ -10,22 +10,71 @@ import {
   OidcTokenResponse,
 } from './types';
 import { JwksCacheService } from './jwksCache';
+import { digestDiscoveryDocument } from './discoveryDigest';
+import { globalMetrics } from '../../lib/metrics';
 
-const DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
 const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
 
-export class OidcAdapterService {
-  private readonly discoveryCache = new Map<string, OidcDiscoveryDocument>();
-  private readonly flowStates = new Map<string, OidcFlowState>();
+interface DiscoveryCacheEntry {
+  doc: OidcDiscoveryDocument;
+  cachedUntil: number;
+}
 
-  constructor(private readonly jwksCache: JwksCacheService) {}
+interface OidcDiscoveryMetrics {
+  incrementCounter(
+    name: string,
+    labels?: Record<string, string>,
+    value?: number,
+    help?: string,
+  ): void;
+}
+
+export interface OidcAdapterServiceOptions {
+  /** Override discovery document cache TTL (ms). Defaults to OIDC_DISCOVERY_TTL_MS or 1h. */
+  discoveryTtlMs?: number;
+  metrics?: OidcDiscoveryMetrics;
+  now?: () => number;
+}
+
+function resolveDiscoveryTtlMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return override;
+  }
+  const fromEnv = Number(process.env.OIDC_DISCOVERY_TTL_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return DEFAULT_DISCOVERY_TTL_MS;
+}
+
+export class OidcAdapterService {
+  private readonly discoveryCache = new Map<string, DiscoveryCacheEntry>();
+  /** SHA-256 hex digest of the last accepted discovery document, keyed by issuer URL. */
+  private readonly discoveryDigests = new Map<string, string>();
+  private readonly flowStates = new Map<string, OidcFlowState>();
+  private readonly discoveryTtlMs: number;
+  private readonly metrics: OidcDiscoveryMetrics;
+  private readonly now: () => number;
+
+  constructor(
+    private readonly jwksCache: JwksCacheService,
+    options: OidcAdapterServiceOptions = {},
+  ) {
+    this.discoveryTtlMs = resolveDiscoveryTtlMs(options.discoveryTtlMs);
+    this.metrics = options.metrics ?? globalMetrics;
+    this.now = options.now ?? (() => Date.now());
+  }
+
+  /** Last observed discovery digest for an issuer, if any. */
+  getDiscoveryDigest(issuerUrl: string): string | undefined {
+    return this.discoveryDigests.get(issuerUrl);
+  }
 
   // ── Discovery ─────────────────────────────────────────────────────────
 
   async getDiscovery(issuerUrl: string): Promise<OidcDiscoveryDocument> {
     const cached = this.discoveryCache.get(issuerUrl);
-    if (cached?._cachedUntil && Date.now() < cached._cachedUntil) return cached;
+    if (cached && this.now() < cached.cachedUntil) return cached.doc;
 
     const url = `${issuerUrl.replace(/\/$/, '')}/.well-known/openid-configuration`;
     const res = await fetch(url);
@@ -33,8 +82,25 @@ export class OidcAdapterService {
 
     const doc = (await res.json()) as OidcDiscoveryDocument;
     this.validateDiscovery(doc, issuerUrl);
-    doc._cachedUntil = Date.now() + DISCOVERY_TTL_MS;
-    this.discoveryCache.set(issuerUrl, doc);
+
+    const digest = digestDiscoveryDocument(doc);
+    const previous = this.discoveryDigests.get(issuerUrl);
+    if (previous && previous !== digest) {
+      this.metrics.incrementCounter(
+        'oidc.discovery.changed',
+        { issuer: issuerUrl },
+        1,
+        'OIDC discovery document digest changed for issuer; admin should validate endpoint updates',
+      );
+      console.warn(
+        `[OidcAdapter] oidc.discovery.changed issuer=${issuerUrl} ` +
+          `previous=${previous.slice(0, 12)}… current=${digest.slice(0, 12)}…`,
+      );
+    }
+
+    this.discoveryDigests.set(issuerUrl, digest);
+    doc._cachedUntil = this.now() + this.discoveryTtlMs;
+    this.discoveryCache.set(issuerUrl, { doc, cachedUntil: doc._cachedUntil });
     return doc;
   }
 
@@ -200,6 +266,81 @@ export class OidcAdapterService {
     }
 
     if (claims.nonce !== expectedNonce) throw new Error('ID token nonce mismatch');
+    return claims;
+  }
+
+  async validateLogoutToken(
+    logoutToken: string,
+    provider: OidcProviderRow,
+    discovery: OidcDiscoveryDocument,
+  ): Promise<OidcIdTokenClaims> {
+    let header: { alg?: string; kid?: string };
+    try {
+      const [h] = logoutToken.split('.');
+      header = JSON.parse(Buffer.from(h, 'base64url').toString());
+    } catch {
+      throw new Error('Malformed logout token header');
+    }
+
+    if (!header.alg) throw new Error('Logout token missing alg header');
+    if ((BLOCKED_ID_TOKEN_ALGORITHMS as readonly string[]).includes(header.alg)) {
+      throw new Error(`Insecure algorithm rejected: ${header.alg}`);
+    }
+    if (!(ALLOWED_ID_TOKEN_ALGORITHMS as readonly string[]).includes(header.alg)) {
+      throw new Error(`Unknown or disallowed algorithm: ${header.alg}`);
+    }
+    if (!header.kid) throw new Error('Logout token missing kid header');
+
+    let publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
+
+    const verifyOpts: jwt.VerifyOptions = {
+      algorithms: [...ALLOWED_ID_TOKEN_ALGORITHMS] as jwt.Algorithm[],
+      issuer: provider.issuer_url,
+      audience: provider.client_id,
+      clockTolerance: CLOCK_SKEW_SECONDS,
+    };
+
+    let claims: OidcIdTokenClaims;
+    try {
+      claims = jwt.verify(logoutToken, publicKey as unknown as string, verifyOpts) as OidcIdTokenClaims;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('invalid signature') || msg.includes('unable to verify')) {
+        this.jwksCache.evict(discovery.jwks_uri);
+        publicKey = await this.jwksCache.getKey(discovery.jwks_uri, header.kid, provider.issuer_url);
+        try {
+          claims = jwt.verify(logoutToken, publicKey as unknown as string, verifyOpts) as OidcIdTokenClaims;
+        } catch {
+          throw new Error('Logout token signature invalid after JWKS rotation');
+        }
+      } else {
+        throw new Error(`Logout token validation failed: ${msg}`);
+      }
+    }
+
+    if (!claims.events || typeof claims.events !== 'object' || !('http://schemas.openid.net/event/backchannel-logout' in claims.events)) {
+      throw new Error('Logout token missing backchannel-logout event');
+    }
+    
+    if (claims.nonce !== undefined) {
+      throw new Error('Logout token must not contain a nonce');
+    }
+
+    if (typeof claims.jti === 'string') {
+      if (this.consumedJtis.has(claims.jti)) {
+        throw new Error('Logout token replayed');
+      }
+      this.consumedJtis.set(claims.jti, claims.exp * 1000);
+      
+      // Lazy cleanup
+      const now = Date.now();
+      for (const [jti, exp] of this.consumedJtis.entries()) {
+        if (now > exp) {
+          this.consumedJtis.delete(jti);
+        }
+      }
+    }
+
     return claims;
   }
 }

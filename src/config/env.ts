@@ -25,6 +25,7 @@ import { z } from "zod";
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
+ * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
  * | SENDGRID_API_KEY            | SendGrid | (empty)                 | SendGrid API key                                 |
@@ -32,18 +33,28 @@ import { z } from "zod";
  * | SMTP_PORT                   | SMTP     | 587                     | SMTP relay port                                  |
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
+ * | CURSOR_SIGNING_SECRET       | No       | dev-cursor-secret...    | Secret for HMAC-signed opaque pagination cursors |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
-  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
-  * | HOLIDAY_CALENDAR_FILE_PATH  | No       | (empty)                 | Path to signed static holiday calendar file      |
-  * | HOLIDAY_CALENDAR_SECRET     | No       | (empty)                 | HMAC secret for holiday calendar signature       |
-  * | HOLIDAY_FALLBACK_SHIFT_POLICY | No     | previous                | Fallback shift policy: previous or next business day |
-  */
+ * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
+ * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
+ * | SENDGRID_EVENT_WEBHOOK_SECRET| No      | (empty)                 | Secret for SendGrid event webhook verification   |
+ * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
+ * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
+ * | BOUNCE_RATIO_ALARM_THRESHOLD| No       | 0.05                    | Bounce ratio threshold for alarms (e.g. 0.05=5%)|
+ * | OFAC_LIST_URL               | No       | (empty)                 | URL for OFAC SDN list CSV                         |
+ * | OFAC_SIG_URL                | No       | (empty)                 | URL for OFAC SDN list Ed25519 signature (hex)     |
+ * | OFAC_TRUST_ANCHOR_BASE64    | No       | (empty)                 | Base64-encoded Ed25519 public key for OFAC sig vfy |
+ * | OFAC_FETCH_TIMEOUT_MS       | No       | 30000                   | Timeout in ms for OFAC list fetch                 |
+ * | SCIM_TOKEN                  | No       | (empty)                 | Bearer token for SCIM 2.0 provisioning API       |
+ */
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  ROLE: z.enum(["api", "batch", "all"]).optional(),
   PORT: z.coerce.number().int().positive().default(4000),
   API_VERSION_PREFIX: z.string().default("/api/v1"),
   DATABASE_URL: z.string().optional(),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
   JWT_SECRET: z.string().min(16).optional(),
   JWT_SECRET_PREVIOUS: z.string().optional(),
   JWT_KEY_ID: z.string().optional(),
@@ -59,8 +70,10 @@ const envSchema = z.object({
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
+  CURSOR_SIGNING_SECRET: z.string().min(16).optional(),
   REGION: z.string().default("us-east-1"),
   FAILOVER_ACTIVE_REGION: z.string().optional(),
   SENDGRID_API_KEY: z.string().optional(),
@@ -71,11 +84,11 @@ const envSchema = z.object({
   HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
   HOLIDAY_CALENDAR_SECRET: z.string().optional(),
   HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
-  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(false),
-  SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(30),
-  BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().default(0.05),
+  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
   SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
-  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(1000),
+  SES_SNS_TOPIC_ARN: z.string().optional(),
+  SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
+  BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
