@@ -6,6 +6,9 @@ import { AppError, Errors } from '../lib/errors';
 import { Logger } from '../lib/logger';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { MetricsCollector } from '../lib/metrics';
+import { Readable, pipeline } from 'stream';
+import Cursor from 'pg-cursor';
+import { pool } from '../db/pool';
 
 /**
  * @title Ledger Routes
@@ -85,7 +88,7 @@ export function createLedgerRoutes(
 
       try {
         const { offeringId, periodId } = req.params;
-        const securityContext = (req as any).securityContext || req.user;
+        const securityContext = (req as any).securityContext || (req as any).user;
 
         if (!securityContext?.id) {
           throw Errors.unauthorized('User authentication required');
@@ -182,7 +185,7 @@ export function createLedgerRoutes(
 
       try {
         const { offeringId, periodId } = req.params;
-        const securityContext = (req as any).securityContext || req.user;
+        const securityContext = (req as any).securityContext || (req as any).user;
 
         if (!securityContext?.id) {
           throw Errors.unauthorized('User authentication required');
@@ -324,5 +327,250 @@ export function createLedgerRoutes(
     }
   );
 
+  /**
+   * GET /ledger/export.jsonl
+   * Streams ledger export in chunked JSON-Lines format.
+   * Query parameters:
+   * - offeringId: UUID (required)
+   * - year: YYYY (optional)
+   * - periodId: string (optional)
+   */
+  router.get(
+    '/export.jsonl',
+    async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+      const requestId = req.requestId || (req as any).id || 'unknown';
+
+      try {
+        const queryParsed = ledgerExportQuerySchema.safeParse(req.query);
+        if (!queryParsed.success) {
+          throw Errors.validationError(
+            'Invalid request parameters',
+            queryParsed.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`)
+          );
+        }
+
+        const { offeringId, year, periodId } = queryParsed.data;
+        const securityContext = (req as any).securityContext || (req as any).user;
+
+        if (!securityContext?.id) {
+          throw Errors.unauthorized('User authentication required');
+        }
+
+        logger.info('GET /ledger/export.jsonl', {
+          requestId,
+          offeringId,
+          year,
+          periodId,
+        });
+
+        // Enforce back-pressure: get pool client
+        const client = await pool.connect();
+
+        try {
+          // Build query dynamically
+          let queryText = `
+            SELECT id, offering_id, period_id, amount, issuer_id, reported_at, created_at
+            FROM revenue_reports
+            WHERE offering_id = $1
+          `;
+          const values: any[] = [offeringId];
+
+          if (year) {
+            const startYear = `${year}-01-01T00:00:00Z`;
+            const endYear = `${parseInt(year) + 1}-01-01T00:00:00Z`;
+            const pattern = `${year}-%`;
+            queryText += ` AND (
+              (period_start >= $2 AND period_start < $3)
+              OR (period_id LIKE $4)
+            )`;
+            values.push(startYear, endYear, pattern);
+          } else if (periodId) {
+            let dateParam = periodId;
+            if (/^\d{4}-\d{2}$/.test(periodId)) {
+              dateParam = `${periodId}-01`;
+            }
+            queryText += ` AND (period_id = $2 OR (
+              period_id IS NULL 
+              AND DATE_TRUNC('month', period_start)::DATE = DATE_TRUNC('month', $3::DATE)::DATE
+            ))`;
+            values.push(periodId, dateParam);
+          }
+
+          queryText += ` ORDER BY created_at ASC, id ASC`;
+
+          // Get count estimate first
+          const countQueryText = `SELECT COUNT(*) FROM (${queryText}) as temp`;
+          const countRes = await client.query(countQueryText, values);
+          const countEstimate = parseInt(countRes.rows[0].count, 10);
+
+          // Instantiate DB cursor
+          const cursor = client.query(new Cursor(queryText, values));
+
+          // Set response headers for chunked streaming
+          res.setHeader('Content-Type', 'application/x-jsonlines');
+          res.setHeader('X-Content-Type-Options', 'nosniff');
+          res.setHeader('Content-Disposition', `attachment; filename="ledger-export-${offeringId}.jsonl"`);
+
+          const stream = new LedgerExportStream({
+            cursor,
+            client,
+            countEstimate,
+            offeringId,
+            year,
+            periodId,
+            metricsCollector,
+          });
+
+          // Connect stream to response via pipeline
+          pipeline(stream, res, (err) => {
+            if (err) {
+              logger.error('Error in ledger export stream pipeline', {
+                requestId,
+                error: err.message,
+              });
+            } else {
+              logger.info('Ledger export stream pipeline completed successfully', {
+                requestId,
+                offeringId,
+                rowsSent: stream.getRowsSent(),
+              });
+            }
+          });
+        } catch (dbError) {
+          // If we fail before setup of the pipeline, release client and propagate error
+          client.release();
+          throw dbError;
+        }
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
   return router;
+}
+
+// GET /ledger/export.jsonl Query Params Schema
+const ledgerExportQuerySchema = z.object({
+  offeringId: z.string().regex(UUID_V4_REGEX, 'Invalid offering UUID'),
+  year: z.string().regex(/^\d{4}$/, 'Invalid year format').optional(),
+  periodId: z.string().regex(PERIOD_ID_REGEX, 'Invalid period ID format').optional(),
+});
+
+class LedgerExportStream extends Readable {
+  private cursor: Cursor;
+  private client: any;
+  private countEstimate: number;
+  private offeringId: string;
+  private year?: string;
+  private periodId?: string;
+  private metricsCollector: MetricsCollector;
+  private sentManifest = false;
+  private rowsSent = 0;
+  private startTime: number;
+  private batchSize = 100;
+  private keepaliveInterval = 100;
+  private released = false;
+
+  constructor(options: {
+    cursor: Cursor;
+    client: any;
+    countEstimate: number;
+    offeringId: string;
+    year?: string;
+    periodId?: string;
+    metricsCollector: MetricsCollector;
+  }) {
+    super({ objectMode: false });
+    this.cursor = options.cursor;
+    this.client = options.client;
+    this.countEstimate = options.countEstimate;
+    this.offeringId = options.offeringId;
+    this.year = options.year;
+    this.periodId = options.periodId;
+    this.metricsCollector = options.metricsCollector;
+    this.startTime = Date.now();
+  }
+
+  getRowsSent(): number {
+    return this.rowsSent;
+  }
+
+  _read(size: number) {
+    if (!this.sentManifest) {
+      this.sentManifest = true;
+      const manifest = {
+        type: 'manifest',
+        offeringId: this.offeringId,
+        year: this.year,
+        periodId: this.periodId,
+        estimatedRowCount: this.countEstimate,
+        exportedAt: new Date().toISOString(),
+      };
+      this.push(JSON.stringify(manifest) + '\n');
+      return;
+    }
+
+    this.cursor.read(this.batchSize, (err, rows) => {
+      if (err) {
+        this.destroy(err);
+        return;
+      }
+
+      if (!rows || rows.length === 0) {
+        const duration = Date.now() - this.startTime;
+        this.metricsCollector.recordHistogram(
+          'export.stream.duration',
+          duration,
+          { offering_id: this.offeringId },
+          'Duration of ledger export streams'
+        );
+        this.push(null);
+        this.release();
+        return;
+      }
+
+      let chunk = '';
+      for (const row of rows) {
+        const entry = {
+          id: row.id,
+          offering_id: row.offering_id,
+          period_id: row.period_id,
+          amount: row.amount,
+          issuer_id: row.issuer_id,
+          reported_at: row.reported_at instanceof Date ? row.reported_at.toISOString() : row.reported_at,
+          created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+        };
+
+        chunk += JSON.stringify(entry) + '\n';
+        this.rowsSent++;
+        this.metricsCollector.incrementCounter(
+          'export.stream.rows',
+          { offering_id: this.offeringId },
+          1,
+          'Count of rows exported in ledger streams'
+        );
+
+        if (this.rowsSent % this.keepaliveInterval === 0) {
+          chunk += '# keepalive\n';
+        }
+      }
+
+      this.push(chunk);
+    });
+  }
+
+  release() {
+    if (!this.released) {
+      this.released = true;
+      this.cursor.close(() => {
+        this.client.release();
+      });
+    }
+  }
+
+  _destroy(err: Error | null, callback: (err?: Error | null) => void) {
+    this.release();
+    callback(err);
+  }
 }

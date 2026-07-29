@@ -1,5 +1,6 @@
 import request from 'supertest';
 import { Pool } from 'pg';
+import express from 'express';
 import { createPasswordResetRouter } from './passwordReset';
 import { EmailService } from '../services/emailService';
 
@@ -7,14 +8,41 @@ import { EmailService } from '../services/emailService';
 jest.mock('../services/emailService');
 
 describe('Password Reset Router', () => {
-  let mockPool: jest.Mocked<Pool>;
-  let mockEmailService: jest.Mocked<EmailService>;
-  let router: ReturnType<typeof createPasswordResetRouter>;
+  let mockPool: any;
+  let mockEmailService: any;
+  let router: any;
 
   beforeEach(() => {
+    // Mock PoolClient
+    const mockClient = {
+      query: jest.fn().mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM password_reset_tokens')) {
+          return Promise.resolve({
+            rows: [{ id: 'token-123', user_id: 'user-123', expires_at: new Date(Date.now() + 60000), used_at: null }],
+          });
+        }
+        return Promise.resolve({ rows: [] });
+      }),
+      release: jest.fn(),
+    };
+
     // Mock pool
     mockPool = {
-      query: jest.fn(),
+      query: jest.fn().mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          const email = values ? values[0] : 'test@example.com';
+          return Promise.resolve({
+            rows: [{ id: 'user-123', email: email }],
+          });
+        }
+        if (queryText.includes('COUNT(*)')) {
+          return Promise.resolve({
+            rows: [{ count: '0' }],
+          });
+        }
+        return Promise.resolve({ rows: [] });
+      }),
+      connect: jest.fn().mockResolvedValue(mockClient),
     } as unknown as jest.Mocked<Pool>;
 
     // Mock EmailService
@@ -22,10 +50,14 @@ describe('Password Reset Router', () => {
       sendMail: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<EmailService>;
 
-    router = createPasswordResetRouter({ db: mockPool, emailService: mockEmailService });
+    const app = express();
+    app.use(express.json());
+    app.use(createPasswordResetRouter({ db: mockPool, emailService: mockEmailService }));
+    router = app;
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
     jest.clearAllMocks();
   });
 
@@ -57,7 +89,12 @@ describe('Password Reset Router', () => {
     });
 
     it('should process valid email and send reset email', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'test@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockResolvedValue(undefined);
 
       const response = await request(router)
@@ -70,7 +107,7 @@ describe('Password Reset Router', () => {
       });
       expect(mockEmailService.sendMail).toHaveBeenCalledWith(
         'test@example.com',
-        expect.stringContaining('password reset'),
+        expect.stringMatching(/password reset/i),
         expect.any(String)
       );
     });
@@ -105,7 +142,12 @@ describe('Password Reset Router', () => {
     });
 
     it('should handle email service errors gracefully', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'test@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockRejectedValue(new Error('Email service error'));
 
       const response = await request(router)
@@ -119,7 +161,12 @@ describe('Password Reset Router', () => {
     });
 
     it('should normalize email to lowercase', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'test@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockResolvedValue(undefined);
 
       await request(router)
@@ -172,7 +219,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should successfully reset password with valid token', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -183,7 +230,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should return 400 for invalid token', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+
 
       // Mock the service to return false for invalid token
       const { PasswordResetService } = require('../services/passwordResetService');
@@ -198,7 +245,20 @@ describe('Password Reset Router', () => {
     });
 
     it('should return 400 for expired token', async () => {
-      mockPool.query.mockRejectedValue(new Error('Token expired'));
+      mockPool.connect.mockImplementationOnce(() => {
+        const expiredClient = {
+          query: jest.fn().mockImplementation((queryText: string) => {
+            if (queryText.includes('FROM password_reset_tokens')) {
+              return Promise.resolve({
+                rows: [{ id: 'token-123', user_id: 'user-123', expires_at: new Date(Date.now() - 60000), used_at: null }],
+              });
+            }
+            return Promise.resolve({ rows: [] });
+          }),
+          release: jest.fn(),
+        };
+        return Promise.resolve(expiredClient);
+      });
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -209,7 +269,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should handle database errors gracefully', async () => {
-      mockPool.query.mockRejectedValue(new Error('Database connection failed'));
+      mockPool.connect.mockRejectedValue(new Error('Database connection failed'));
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -220,7 +280,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should accept password with exactly 8 characters', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -231,7 +291,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should accept long passwords', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -244,7 +304,7 @@ describe('Password Reset Router', () => {
 
   describe('Security - Token Leakage Prevention', () => {
     it('should not log reset token in error messages', async () => {
-      mockPool.query.mockRejectedValue(new Error('Database error'));
+      mockPool.connect.mockRejectedValue(new Error('Database error'));
 
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
 
@@ -259,7 +319,7 @@ describe('Password Reset Router', () => {
     });
 
     it('should not expose token in response body', async () => {
-      mockPool.query.mockRejectedValue(new Error('Invalid token'));
+      mockPool.connect.mockRejectedValue(new Error('Invalid token'));
 
       const response = await request(router)
         .post('/api/auth/reset-password')
@@ -272,7 +332,12 @@ describe('Password Reset Router', () => {
 
   describe('Security - Account Enumeration Prevention', () => {
     it('should return same response for non-existent email', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
 
       const response = await request(router)
         .post('/api/auth/forgot-password')
@@ -285,7 +350,12 @@ describe('Password Reset Router', () => {
     });
 
     it('should return same response for existing email', async () => {
-      mockPool.query.mockResolvedValue({ rows: [{ id: 'user-123' }] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'existing@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockResolvedValue(undefined);
 
       const response = await request(router)
@@ -312,7 +382,12 @@ describe('Password Reset Router', () => {
 
   describe('Email Service Integration', () => {
     it('should call EmailService.sendMail with correct parameters', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'user@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockResolvedValue(undefined);
 
       await request(router)
@@ -322,13 +397,18 @@ describe('Password Reset Router', () => {
       expect(mockEmailService.sendMail).toHaveBeenCalledTimes(1);
       expect(mockEmailService.sendMail).toHaveBeenCalledWith(
         'user@example.com',
-        expect.stringContaining('password reset'),
+        expect.stringMatching(/password reset/i),
         expect.any(String)
       );
     });
 
     it('should handle EmailService sendMail errors without exposing details', async () => {
-      mockPool.query.mockResolvedValue({ rows: [] });
+      mockPool.query.mockImplementation((queryText: string, values?: any[]) => {
+        if (queryText.includes('FROM users')) {
+          return Promise.resolve({ rows: [{ id: 'user-123', email: 'user@example.com' }] });
+        }
+        return Promise.resolve({ rows: [] });
+      });
       mockEmailService.sendMail.mockRejectedValue(new Error('SMTP authentication failed'));
 
       const response = await request(router)

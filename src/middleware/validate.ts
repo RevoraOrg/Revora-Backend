@@ -168,7 +168,7 @@ export function validateZodBody(schema: AnyZodObject | ZodEffects<any>): Request
   return (req: Request, res: Response, next: NextFunction) => {
     const result = schema.safeParse(req.body);
     if (!result.success) {
-      return next(Errors.validationError('Invalid request parameters', result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`)));
+      return next(Errors.validationError('Invalid request parameters', result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`)));
     }
     req.body = result.data;
     next();
@@ -179,7 +179,7 @@ export function validateZodParams(schema: AnyZodObject | ZodEffects<any>): Reque
   return (req: Request, res: Response, next: NextFunction) => {
     const result = schema.safeParse(req.params);
     if (!result.success) {
-      return next(Errors.validationError('Invalid request parameters', result.error.errors.map((e) => `${e.path.join('.')}: ${e.message}`)));
+      return next(Errors.validationError('Invalid request parameters', result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`)));
     }
     req.params = result.data;
     next();

@@ -45,6 +45,8 @@ import { TenantSettingsRepository } from "./db/repositories/tenantSettingsReposi
 import { ContractUpgradeOrchestratorService } from "./services/contractUpgradeOrchestratorService";
 import { createContractUpgradeRouter } from "./routes/contractUpgradeRoutes";
 import { AuditPurgeService } from "./services/auditPurgeService";
+import { SessionCompactionService } from "./services/sessionCompactionService";
+import { SessionRepository } from "./db/repositories/sessionRepository";
 import { RetentionLabelRepository } from "./db/repositories/retentionLabelRepository";
 import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
@@ -61,6 +63,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
+import taxationRouter from './routes/taxation';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -676,6 +679,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
+  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,
@@ -711,6 +715,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const ledgerRepo = new InMemoryLedgerRepository();
   const ledgerExportService = new LedgerExportService(ledgerRepo);
   apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
+
+  // Mount taxation routes for per-lot cost-basis tax reporting
+  app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -1018,6 +1025,8 @@ if (require.main === module && env.NODE_ENV !== "test") {
     void shutdown("SIGINT");
   });
 
+  const backgroundStopFns: (() => void)[] = [];
+
   // Resolve worker role — fail-fast on invalid value
   const { resolveWorkerRole, getRoleConfig } = require("./config/workerRole");
   const workerRole = resolveWorkerRole(env.ROLE, env.NODE_ENV);
@@ -1042,6 +1051,14 @@ if (require.main === module && env.NODE_ENV !== "test") {
     auditPurgeService.start();
     backgroundStopFns.push(() => auditPurgeService.stop());
     console.log("[server] AuditPurgeService started");
+  }
+
+  if (roleConfig.auditPurge) { // Reusing auditPurge role for general cleanup tasks
+    const sessionRepo = new SessionRepository(pool);
+    const sessionCompactionService = new SessionCompactionService(sessionRepo, metricsCollector);
+    sessionCompactionService.start();
+    backgroundStopFns.push(() => sessionCompactionService.stop());
+    console.log("[server] SessionCompactionService started");
   }
 
   if (roleConfig.payoutDrift) {

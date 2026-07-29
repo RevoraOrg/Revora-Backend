@@ -248,6 +248,51 @@ export class SessionRepository {
     return result.rows[0]?.count ?? 0;
   }
 
+  /**
+   * Get the date of the oldest expired or revoked session.
+   * Useful for calculating retention lag before compaction.
+   */
+  async getOldestCompactedSessionDate(cutoffDate: Date, client?: Pool): Promise<Date | null> {
+    const db = client || this.db;
+    const query = `
+      SELECT MIN(LEAST(COALESCE(expires_at, 'infinity'::timestamp), COALESCE(revoked_at, 'infinity'::timestamp))) AS oldest
+      FROM sessions
+      WHERE expires_at < $1 OR revoked_at < $1
+    `;
+    const result = await db.query(query, [cutoffDate]);
+    return result.rows[0]?.oldest ?? null;
+  }
+
+  /**
+   * Delete expired or revoked sessions older than a specific cutoff date.
+   * Uses a bounded batch size to avoid long-held locks.
+   * 
+   * Returns the number of rows deleted in this batch.
+   */
+  async purgeOlderThan(cutoffDate: Date, batchSize: number, client?: Pool): Promise<number> {
+    const db = client || this.db;
+    const query = `
+      DELETE FROM sessions 
+      WHERE id IN (
+        SELECT id FROM sessions 
+        WHERE expires_at < $1 OR revoked_at < $1 
+        LIMIT $2
+      )
+    `;
+    const result = await db.query(query, [cutoffDate, batchSize]);
+    return result.rowCount ?? 0;
+  }
+
+  /**
+   * Run VACUUM on the sessions table to reclaim space after bulk deletions.
+   * Note: VACUUM cannot be run inside a transaction block.
+   */
+  async vacuumSessions(): Promise<void> {
+    // We use the direct pool because VACUUM cannot run in a transaction block
+    // and passing a client could inadvertently be inside one.
+    await this.db.query(`VACUUM sessions;`);
+  }
+
   private mapSession(row: any): Session {
     return {
       id: row.id,
