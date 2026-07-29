@@ -21,6 +21,9 @@ interface JwtPayload {
   email_verified?: boolean | string;
   exp?: number;
   nbf?: number;
+  /** @notice Apple "Hide My Email" / private-relay indicator.
+   *          When `true`, the email is a transient forwarding address. */
+  is_private_email?: boolean | string;
 }
 
 interface ProviderConfig {
@@ -61,6 +64,10 @@ function decodeJwtPart<T>(part: string): T {
 }
 
 function normalizeEmailVerified(value: boolean | string | undefined): boolean {
+  return value === true || value === 'true';
+}
+
+function normalizePrivateRelay(value: boolean | string | undefined): boolean {
   return value === true || value === 'true';
 }
 
@@ -163,6 +170,7 @@ export class JwksSocialTokenVerifier implements SocialTokenVerifier {
       subject: payload.sub,
       email: payload.email.toLowerCase().trim(),
       emailVerified: normalizeEmailVerified(payload.email_verified),
+      isPrivateRelay: normalizePrivateRelay(payload.is_private_email),
       issuer: payload.iss,
       audience,
     };

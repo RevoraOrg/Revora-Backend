@@ -448,12 +448,13 @@ describe('Distribution Preview Feature', () => {
       /**
        * Input validation: offering_id is required.
        */
-      
+
       expect(() => {
-        if (!'' || !'offering-id') {
+        const offeringId = '';
+        if (!offeringId) {
           throw Errors.badRequest('Missing offering id');
         }
-      }).not.toThrow();
+      }).toThrow('Missing offering id');
     });
 
     it('should reject preview with invalid revenue amount', async () => {
