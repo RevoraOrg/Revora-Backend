@@ -1,3 +1,11 @@
+/**
+ * DistributionRepository — persistence for distribution_runs + payouts.
+ *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      Architecture map (see §5 — Database tables and ownership).
+ * @see ../docs/distribution-engine-atomic-transactions.md
+ * @see ../docs/payout-filters-and-pagination.md
+ */
 import { Pool, PoolClient, QueryResult } from 'pg';
 
 /**

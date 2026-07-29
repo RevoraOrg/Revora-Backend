@@ -32,6 +32,7 @@ import { z } from "zod";
  * | SMTP_PORT                   | SMTP     | 587                     | SMTP relay port                                  |
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
+ * | CURSOR_SIGNING_SECRET       | No       | dev-cursor-secret...    | Secret for HMAC-signed opaque pagination cursors |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
  * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
@@ -69,6 +70,7 @@ const envSchema = z.object({
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
+  CURSOR_SIGNING_SECRET: z.string().min(16).optional(),
   REGION: z.string().default("us-east-1"),
   FAILOVER_ACTIVE_REGION: z.string().optional(),
   SENDGRID_API_KEY: z.string().optional(),
@@ -81,11 +83,7 @@ const envSchema = z.object({
   SES_SNS_TOPIC_ARN: z.string().optional(),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  OFAC_LIST_URL: z.string().optional(),
-  OFAC_SIG_URL: z.string().optional(),
-  OFAC_TRUST_ANCHOR_BASE64: z.string().optional(),
-  OFAC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
-  SCIM_TOKEN: z.string().optional(),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

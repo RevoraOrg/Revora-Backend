@@ -6,6 +6,11 @@
  * and raises/clears a dead-letter alarm gauge when discrepancies breach the
  * configured tolerance.
  *
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ *      End-to-end architecture map (sequence diagram + state machine).
+ * @see ../docs/prometheus-metrics-endpoint.md
+ * @see ../docs/metrics-and-logging-baseline.md
+ *
  * Metric naming
  * ─────────────
  * reconciliation_discrepancy_total  counter  {offering_id}  Running sum of
