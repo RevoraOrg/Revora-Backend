@@ -376,6 +376,41 @@ describe('StatementPdfBatchWorker', () => {
     worker.stop();
     jest.useRealTimers();
   });
+
+  it('passes renderOptions to the render function during drainOnce', async () => {
+    const job = makeJob();
+    const repo = makeRepo([job]);
+    const renderFn = jest.fn().mockResolvedValue({
+      storageKey: 'k',
+      checksum: 'c',
+      bytes: Buffer.from('pdf'),
+      watermarkSuppressed: true,
+      ledgerRevisionHash: 'rev-1',
+    });
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const renderOptions = { ledgerRevisionHash: 'rev-1' };
+    const worker = new StatementPdfBatchWorker(repo, renderFn, metrics, { renderOptions });
+
+    await worker.drainOnce();
+    expect(renderFn).toHaveBeenCalledWith(job, renderOptions);
+  });
+
+  it('runs mapPool bounded worker pool during drainOnce with multiple jobs', async () => {
+    const jobs = [makeJob({ id: 'j1' }), makeJob({ id: 'j2' }), makeJob({ id: 'j3' })];
+    const repo = makeRepo(jobs);
+    const renderFn = jest.fn().mockResolvedValue({
+      storageKey: 'k',
+      checksum: 'c',
+      bytes: Buffer.from('pdf'),
+      watermarkSuppressed: false,
+      ledgerRevisionHash: 'rev-1',
+    });
+    const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    const worker = new StatementPdfBatchWorker(repo, renderFn, metrics, { concurrency: 2 });
+    const processed = await worker.drainOnce();
+    expect(processed).toBe(3);
+    expect(renderFn).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe('PdfRenderJobRepository helpers', () => {

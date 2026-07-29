@@ -49,6 +49,42 @@ npm run verify-audit-integrity
 - Exit `0` — chain valid
 - Exit `1` — tamper detected or runtime error
 
+### Standalone Receipt Verifier CLI (Auditors)
+
+Auditors can verify an exported audit log excerpt against a published cryptographic receipt without running the application server or accessing the database:
+
+```bash
+npx ts-node scripts/verify-audit-receipt.ts --receipt <path-or-url-to-receipt> --excerpt <path-or-url-to-excerpt>
+```
+
+Or positional format:
+
+```bash
+npx ts-node scripts/verify-audit-receipt.ts <receipt.json> <excerpt.json-or-jsonl>
+```
+
+#### Verification Receipt Schema (`AuditReceipt`)
+
+```json
+{
+  "version": "revora-audit-receipt-v1",
+  "published_at": "2026-01-15T10:15:00.000Z",
+  "start_prev_hash": "bee58147dc813f93e3b43277b5da53c1a1620f2258f953b75a25fe5774f999be",
+  "expected_head_hash": "75da7a8205ab1cb890612851d7ae5ca2da6a390cca5df14754b75597ff8d1f7e",
+  "total_rows": 3,
+  "start_id": "00000000-0000-4000-8000-000000000001",
+  "end_id": "00000000-0000-4000-8000-000000000003",
+  "signature": "ed25519:abcdef1234567890"
+}
+```
+
+#### Exit Codes & Output Format
+
+- `0` — Pass: Step-by-step derivation trace confirms integrity of all log entries against the published receipt.
+- `1` — Fail: Tamper detected, missing entries (truncated excerpt), broken chain link, or missing receipt anchor. Emits actionable recovery recommendation details.
+
+Pass `--json` to output machine-readable JSON reports.
+
 ### Programmatic
 
 ```typescript
