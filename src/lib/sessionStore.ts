@@ -24,6 +24,17 @@
 
 import { randomBytes, createHash, timingSafeEqual } from "crypto";
 import type { SessionRepository } from "../db/repositories/sessionRepository";
+import { globalMetrics } from "./metrics";
+
+// ─── Defaults ──────────────────────────────────────────────────────────────────
+
+const DEFAULT_ROLE_TTL: Record<string, number> = {
+  admin: 30 * 60 * 1000,      // 30 min
+  verifier: 60 * 60 * 1000,    // 1 hour
+  issuer: 2 * 60 * 60 * 1000,  // 2 hours
+  investor: 4 * 60 * 60 * 1000, // 4 hours
+  anonymous: 15 * 60 * 1000,   // 15 min
+};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,7 +58,7 @@ export interface Session {
 export interface ISessionStore {
   create(userId: string, role: string): Promise<Session>;
   get(token: string): Promise<Session | null>;
-  touch(token: string): Promise<boolean>;
+  touch(token: string, role?: string): Promise<boolean>;
   delete(token: string): Promise<void>;
   deleteAllForUser(userId: string): Promise<void>;
 }
@@ -64,6 +75,19 @@ export interface SessionStoreOptions {
    * @default 300_000  (5 minutes)
    */
   sweepIntervalMs?: number;
+  /**
+   * Per-role session TTL overrides (milliseconds).
+   * Keys are role names; values are TTLs in ms.
+   * Falls back to `ttlMs` for roles not present.
+   */
+  roleTtlMs?: Record<string, number>;
+  /**
+   * Absolute maximum session lifetime from creation (milliseconds).
+   * When set, `touch()` will never extend a session past
+   * `createdAt + maxExtendedExpiry`, even if the role TTL would
+   * otherwise allow it.
+   */
+  maxExtendedExpiry?: number;
 }
 
 export interface SessionStats {
@@ -78,6 +102,8 @@ export class SessionStore {
   private readonly sessions = new Map<string, Session>();
   private readonly ttlMs:           number;
   private readonly sweepIntervalMs: number;
+  private readonly roleTtlMs:       Record<string, number>;
+  private readonly maxExtendedExpiry: number | null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Running total of sessions deleted by any cleanup path. */
@@ -86,8 +112,10 @@ export class SessionStore {
   private totalCreated = 0;
 
   constructor(opts: SessionStoreOptions = {}) {
-    this.ttlMs           = opts.ttlMs           ?? 3_600_000;
-    this.sweepIntervalMs = opts.sweepIntervalMs ?? 300_000;
+    this.ttlMs              = opts.ttlMs              ?? 3_600_000;
+    this.sweepIntervalMs    = opts.sweepIntervalMs    ?? 300_000;
+    this.roleTtlMs          = { ...DEFAULT_ROLE_TTL, ...opts.roleTtlMs };
+    this.maxExtendedExpiry  = opts.maxExtendedExpiry  ?? null;
   }
 
   // ─── Lifecycle ─────────────────────────────────────────────────────────────
@@ -132,12 +160,13 @@ export class SessionStore {
   async create(userId: string, role: string): Promise<Session> {
     const token = randomBytes(16).toString("hex"); // 128-bit entropy
     const now   = Date.now();
+    const ttl   = this.getRoleTtl(role);
 
     const session: Session = {
       token,
       userId,
       role,
-      expiresAt:  now + this.ttlMs,
+      expiresAt:  now + ttl,
       createdAt:  now,
       lastSeenAt: now,
     };
@@ -172,16 +201,28 @@ export class SessionStore {
    *
    * @param token - The opaque session token.
    */
-  async touch(token: string): Promise<boolean> {
+  async touch(token: string, role?: string): Promise<boolean> {
     const session = this.sessions.get(token);
     if (!session || this.isExpired(session)) {
       if (session) this.evict(token);
       return false;
     }
 
-    const now = Date.now();
-    session.expiresAt  = now + this.ttlMs;
+    const now  = Date.now();
+    const ttl  = this.getRoleTtl(role ?? session.role);
+    let expiresAt = now + ttl;
+
+    if (this.maxExtendedExpiry !== null) {
+      const maxExpiry = session.createdAt + this.maxExtendedExpiry;
+      if (expiresAt > maxExpiry) {
+        expiresAt = maxExpiry;
+      }
+    }
+
+    session.expiresAt  = expiresAt;
     session.lastSeenAt = now;
+
+    globalMetrics.incrementCounter("session.idle_extended", { role: session.role });
     return true;
   }
 
@@ -241,6 +282,10 @@ export class SessionStore {
       }
     }
     return evicted;
+  }
+
+  private getRoleTtl(role: string): number {
+    return this.roleTtlMs[role] ?? this.ttlMs;
   }
 
   private isExpired(session: Session): boolean {
@@ -303,6 +348,17 @@ export interface PostgresSessionStoreOptions {
   cleanupIntervalMs?: number;
   /** Injectable clock for deterministic testing. Defaults to Date.now. */
   now?: () => number;
+  /**
+   * Per-role session TTL overrides (milliseconds).
+   * Falls back to `ttlMs` for roles not present.
+   */
+  roleTtlMs?: Record<string, number>;
+  /**
+   * Absolute maximum session lifetime from creation (milliseconds).
+   * When set, `touch()` will never extend a session past
+   * `createdAt + maxExtendedExpiry`.
+   */
+  maxExtendedExpiry?: number;
 }
 
 /**
@@ -316,15 +372,19 @@ export class PostgresSessionStore implements ISessionStore {
   private readonly ttlMs: number;
   private readonly cleanupIntervalMs: number;
   private readonly now: () => number;
+  private readonly roleTtlMs: Record<string, number>;
+  private readonly maxExtendedExpiry: number | null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly repo: SessionRepository,
     opts: PostgresSessionStoreOptions = {},
   ) {
-    this.ttlMs = opts.ttlMs ?? 3_600_000;
-    this.cleanupIntervalMs = opts.cleanupIntervalMs ?? 0;
-    this.now = opts.now ?? Date.now;
+    this.ttlMs              = opts.ttlMs              ?? 3_600_000;
+    this.cleanupIntervalMs  = opts.cleanupIntervalMs  ?? 0;
+    this.now                = opts.now                ?? Date.now;
+    this.roleTtlMs          = { ...DEFAULT_ROLE_TTL, ...opts.roleTtlMs };
+    this.maxExtendedExpiry  = opts.maxExtendedExpiry  ?? null;
   }
 
   // ─── ISessionStore ─────────────────────────────────────────────────────────
@@ -333,7 +393,8 @@ export class PostgresSessionStore implements ISessionStore {
     const token = generateSessionToken();
     const tokenHash = hashSessionToken(token);
     const now = this.now();
-    const expiresAt = new Date(now + this.ttlMs);
+    const ttl = this.getRoleTtl(role);
+    const expiresAt = new Date(now + ttl);
 
     const row = await this.repo.createWebSession({
       user_id: userId,
@@ -364,11 +425,26 @@ export class PostgresSessionStore implements ISessionStore {
     return this.toSession(row, token);
   }
 
-  async touch(token: string): Promise<boolean> {
+  async touch(token: string, role?: string): Promise<boolean> {
     const existing = await this.get(token);
     if (!existing) return false;
-    const expiresAt = new Date(this.now() + this.ttlMs);
-    await this.repo.touchExpiryByTokenHash(hashSessionToken(token), expiresAt);
+
+    const ttl = this.getRoleTtl(role ?? existing.role);
+    let expiresAt = this.now() + ttl;
+
+    if (this.maxExtendedExpiry !== null) {
+      const maxExpiry = existing.createdAt + this.maxExtendedExpiry;
+      if (expiresAt > maxExpiry) {
+        expiresAt = maxExpiry;
+      }
+    }
+
+    await this.repo.touchExpiryByTokenHash(
+      hashSessionToken(token),
+      new Date(expiresAt),
+    );
+
+    globalMetrics.incrementCounter("session.idle_extended", { role: existing.role });
     return true;
   }
 
@@ -411,15 +487,18 @@ export class PostgresSessionStore implements ISessionStore {
 
   // ─── Internal ─────────────────────────────────────────────────────────────
 
-  private toSession(row: { user_id: string; role?: string | null; expires_at: Date }, token: string): Session {
-    const now = this.now();
+  private getRoleTtl(role: string): number {
+    return this.roleTtlMs[role] ?? this.ttlMs;
+  }
+
+  private toSession(row: { user_id: string; role?: string | null; expires_at: Date; created_at: Date }, token: string): Session {
     return {
       token,
       userId: row.user_id,
       role: row.role ?? "",
       expiresAt: new Date(row.expires_at).getTime(),
-      createdAt: now,
-      lastSeenAt: now,
+      createdAt: new Date(row.created_at).getTime(),
+      lastSeenAt: this.now(),
     };
   }
 }

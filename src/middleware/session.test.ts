@@ -117,7 +117,7 @@ describe("SessionStore", () => {
 
     it("returns null and evicts a session that has passed its TTL (lazy expiry)", async () => {
       const store   = new SessionStore({ ttlMs: 1_000, sweepIntervalMs: 0 });
-      const session = await store.create("user-1", "admin");
+      const session = await store.create("user-1", "session-expiry-role");
 
       const found = await withTimeAdvanced(2_000, () => store.get(session.token));
 
@@ -161,7 +161,7 @@ describe("SessionStore", () => {
 
     it("returns false and evicts an already-expired session", async () => {
       const store   = new SessionStore({ ttlMs: 1_000, sweepIntervalMs: 0 });
-      const session = await store.create("user-1", "admin");
+      const session = await store.create("user-1", "session-expiry-role");
 
       const touched = await withTimeAdvanced(2_000, () => store.touch(session.token));
 
@@ -181,9 +181,9 @@ describe("SessionStore", () => {
   describe("sweep()", () => {
     it("evicts all expired sessions and updates expiredCleaned counter", async () => {
       const store = new SessionStore({ ttlMs: 1_000, sweepIntervalMs: 0 });
-      await store.create("u1", "admin");
-      await store.create("u2", "client");
-      await store.create("u3", "verifier");
+      await store.create("u1", "expiry-role");
+      await store.create("u2", "expiry-role");
+      await store.create("u3", "expiry-role");
 
       // Advance time so all three are expired, then sweep.
       jest.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
@@ -211,16 +211,12 @@ describe("SessionStore", () => {
 
       // One session with 1 s TTL (will expire), one with 60 s TTL (won't).
       const shortLived = new SessionStore({ ttlMs: 1_000, sweepIntervalMs: 0 });
-      const s1 = await shortLived.create("u1", "admin");
+      const s1 = await shortLived.create("u1", "expiry-role");
       const s2 = await store.create("u2", "client");
 
-      // Create a store whose sessions have different TTLs by manipulating directly.
-      const mixed = new SessionStore({ ttlMs: 60_000, sweepIntervalMs: 0 });
-      const alive  = await mixed.create("alive",   "admin");
-      const zombie = await mixed.create("zombie",  "client");
       // Create a short-lived session, then advance time beyond its TTL.
       const mixedShort = new SessionStore({ ttlMs: 500, sweepIntervalMs: 0 });
-      await mixedShort.create("alive", "admin");  // this one is "dead"
+      await mixedShort.create("expired", "expiry-role");  // this one is "dead"
       jest.spyOn(Date, "now").mockReturnValue(now + 2_000);
       const evicted = mixedShort.sweep();
       jest.restoreAllMocks();
@@ -356,7 +352,7 @@ describe("Session middleware and routes", () => {
       const login = await request(app)
         .post("/session/login")
         .set("x-user-id",   "user-1")
-        .set("x-user-role", "admin");
+        .set("x-user-role", "expiry-role");
 
       const { token } = login.body;
 
@@ -425,7 +421,7 @@ describe("Session middleware and routes", () => {
     it("reflects cleaned sessions after a sweep", async () => {
       await request(app)
         .post("/session/login")
-        .set("x-user-id", "u1").set("x-user-role", "admin");
+        .set("x-user-id", "u1").set("x-user-role", "expiry-role");
 
       // Advance clock and trigger sweep
       jest.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
@@ -450,7 +446,7 @@ describe("Session middleware and routes", () => {
     it("does not leak session details in error responses", async () => {
       const login = await request(app)
         .post("/session/login")
-        .set("x-user-id", "secret-user-id").set("x-user-role", "admin");
+        .set("x-user-id", "secret-user-id").set("x-user-role", "expiry-role");
 
       const { token } = login.body;
 
