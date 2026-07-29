@@ -25,6 +25,7 @@ export interface DistributionRun {
   status: 'pending' | 'processing' | 'completed' | 'failed';
   run_at: Date; // From migration (replaces distribution_date)
   tx_batch_id?: string | null;
+  frozen_fx_rate_id?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -52,6 +53,7 @@ export interface CreateDistributionRunInput {
   total_amount: string;
   run_at?: Date;
   status?: 'pending' | 'processing' | 'completed' | 'failed';
+  frozen_fx_rate_id?: string;
 }
 
 /**

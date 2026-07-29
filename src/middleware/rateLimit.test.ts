@@ -463,4 +463,51 @@ describe('createRateLimitMiddleware — perProviderSub', () => {
     expect(res.headers['x-ratelimit-remaining']).toBe('4');
     expect(res.headers['x-ratelimit-reset']).toBeDefined();
   });
+
+  it('uses default options when called with no arguments', () => {
+    const mw = createRateLimitMiddleware();
+    const req = makeReq({ ip: '7.7.7.7' });
+    const res = makeRes();
+    const next: NextFunction = jest.fn();
+
+    mw(req, res, next);
+    expect(res.headers['x-ratelimit-limit']).toBe('100');
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it('customizes the error message when specified in options', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 1, windowMs: 60_000, message: 'Custom rate limit message', store });
+    const req = makeReq({ ip: '8.8.8.8' });
+    const next: NextFunction = jest.fn();
+
+    mw(req, makeRes(), next); // allowed
+    mw(req, makeRes(), next); // blocked
+
+    const err = (next as jest.Mock).mock.calls[1][0];
+    expect(err.message).toBe('Custom rate limit message');
+  });
+
+  it('perProviderSub falls back to req.socket.remoteAddress when req.ip is undefined', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 2, windowMs: 60_000, perProviderSub: true, store });
+    const req = makeReq({ ip: undefined, socket: { remoteAddress: '6.6.6.6' } as any });
+    const next: NextFunction = jest.fn();
+
+    mw(req, makeRes(), next);
+    const res2 = makeRes();
+    mw(req, res2, next);
+
+    expect(res2.headers['x-ratelimit-remaining']).toBe('0');
+  });
+
+  it('perProviderSub falls back to unknown when both req.ip and socket are undefined', () => {
+    const store = new InMemoryRateLimitStore();
+    const mw = createRateLimitMiddleware({ limit: 2, windowMs: 60_000, perProviderSub: true, store });
+    const req = makeReq({ ip: undefined, socket: undefined as any });
+    const next: NextFunction = jest.fn();
+
+    mw(req, makeRes(), next);
+    expect(next).toHaveBeenCalledTimes(1);
+  });
 });

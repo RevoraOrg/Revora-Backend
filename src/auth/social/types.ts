@@ -9,6 +9,10 @@ export interface SocialProviderClaims {
   emailVerified: boolean;
   issuer: string;
   audience: string;
+  /** @notice Apple "Hide My Email" private-relay flag. When `true`, the email
+   *          is a transient forwarding address that may change on reinstall.
+   *          Account lookup must key on `subject` (sub), not email. */
+  isPrivateRelay?: boolean;
 }
 
 export interface SocialTokenVerifier {
@@ -22,6 +26,9 @@ export interface SocialIdentityRecord {
   providerSubject: string;
   providerEmail: string;
   emailVerified: boolean;
+  /** @notice When `true`, the stored email is an Apple private-relay address
+   *          and should only be used as a transient contact. */
+  isPrivateRelay: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -41,8 +48,13 @@ export interface SocialIdentityRepository {
     providerSubject: string;
     providerEmail: string;
     emailVerified: boolean;
+    isPrivateRelay?: boolean;
   }): Promise<SocialIdentityRecord>;
-  updateIdentityEmail(id: string, providerEmail: string): Promise<void>;
+  updateIdentityEmail(
+    id: string,
+    providerEmail: string,
+    isPrivateRelay?: boolean,
+  ): Promise<void>;
   deleteByUserAndProvider(userId: string, provider: SocialAuthProvider): Promise<boolean>;
 }
 
