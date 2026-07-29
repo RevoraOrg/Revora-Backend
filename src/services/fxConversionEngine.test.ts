@@ -323,6 +323,92 @@ describe('FxConversionEngine', () => {
     });
   });
 
+  // ── Stale-rate fallback & Auditing ────────────────────────────────────────
+
+  describe('stale-rate fallback & auditing', () => {
+    it('tolerates stale rate when allowStaleFallback is true and emits audit', async () => {
+      const provider = makeProvider();
+      const old = new Date(Date.now() - 600000);
+      provider.setRateWithTimestamp('USD/EUR', '0.91', '0.93', '0.92', old, 300000, 'rate_123');
+      
+      const metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+      const auditRepo = {
+        record: jest.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const engine = new FxConversionEngine(provider, {
+        metrics,
+        auditRepository: auditRepo,
+      });
+
+      const result = await engine.convert(new Decimal('100'), 'USD', 'EUR', {
+        maxRateAgeMs: 300000,
+        allowStaleFallback: true,
+        auditUserId: 'user_1',
+      });
+
+      expect(result.outputAmount.toString()).toBe('92.00');
+
+      // Metric should be emitted
+      const prom = metrics.exportPrometheus();
+      expect(prom).toContain('fx_stale_fallback_staleness_ms');
+
+      // Audit should be recorded
+      expect(auditRepo.record).toHaveBeenCalledTimes(1);
+      const auditEvent = auditRepo.record.mock.calls[0][0];
+      expect(auditEvent.action).toBe('FX_STALE_RATE_FALLBACK');
+      expect(auditEvent.details.reason).toBe('STALE_RATE_TOLERATED');
+      expect(auditEvent.details.substituteRateId).toBe('rate_123');
+      expect(auditEvent.userId).toBe('user_1');
+    });
+
+    it('uses fallbackRateProvider when primary rate is stale', async () => {
+      const primaryProvider = makeProvider();
+      const old = new Date(Date.now() - 600000);
+      primaryProvider.setRateWithTimestamp('USD/EUR', '0.91', '0.93', '0.92', old, 300000, 'stale_rate');
+      
+      const fallbackProvider = makeProvider();
+      fallbackProvider.setRateWithTimestamp('USD/EUR', '0.90', '0.94', '0.91', new Date(), 300000, 'fresh_fallback_rate');
+
+      const auditRepo = {
+        record: jest.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const engine = new FxConversionEngine(primaryProvider, {
+        fallbackRateProvider: fallbackProvider,
+        auditRepository: auditRepo,
+      });
+
+      const result = await engine.convert(new Decimal('100'), 'USD', 'EUR', {
+        maxRateAgeMs: 300000,
+      });
+
+      // Should use the fallback rate (0.91 mid)
+      expect(result.outputAmount.toString()).toBe('91.00');
+
+      // Audit should be recorded
+      expect(auditRepo.record).toHaveBeenCalledTimes(1);
+      const auditEvent = auditRepo.record.mock.calls[0][0];
+      expect(auditEvent.action).toBe('FX_STALE_RATE_FALLBACK');
+      expect(auditEvent.details.reason).toBe('SUBSTITUTE_PROVIDER_USED');
+      expect(auditEvent.details.substituteRateId).toBe('fresh_fallback_rate');
+    });
+
+    it('no audit event if rate is fresh', async () => {
+      const provider = makeProvider();
+      const auditRepo = {
+        record: jest.fn().mockResolvedValue(undefined),
+      } as any;
+
+      const engine = new FxConversionEngine(provider, {
+        auditRepository: auditRepo,
+      });
+
+      await engine.convert(new Decimal('100'), 'USD', 'EUR');
+      expect(auditRepo.record).not.toHaveBeenCalled();
+    });
+  });
+
   // ── Property-based round-trip ─────────────────────────────────────────────
 
   describe('property-based round-trip conversion', () => {
