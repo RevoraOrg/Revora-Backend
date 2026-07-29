@@ -54,6 +54,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   API_VERSION_PREFIX: z.string().default("/api/v1"),
   DATABASE_URL: z.string().optional(),
+  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
   JWT_SECRET: z.string().min(16).optional(),
   JWT_SECRET_PREVIOUS: z.string().optional(),
   JWT_KEY_ID: z.string().optional(),

@@ -30,6 +30,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",
     "pg": "^8.19.0",
+    "pg-cursor": "^2.21.0",
     "require-directory": "^2.1.1",
     "stellar-sdk": "^13.3.0",
     "zod": "^4.3.6"
@@ -46,6 +47,7 @@
     "@types/morgan": "^1.9.9",
     "@types/nock": "^10.0.3",
     "@types/node": "^25.5.0",
+    "@types/pg-cursor": "^2.7.2",
     "@types/supertest": "^7.2.0",
     "@types/swagger-ui-express": "^4.1.8",
     "@typescript-eslint/eslint-plugin": "^8.15.0",
