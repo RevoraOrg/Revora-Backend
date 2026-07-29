@@ -146,6 +146,9 @@ export function createSessionAuth(store: ISessionStore) {
       return;
     }
 
+    // Sliding idle: extend the session on each authenticated request.
+    store.touch(session.token, session.role).catch(() => {});
+
     // Attach the server-side record to the request — never trust header claims.
     req.user = {
       id:           session.userId,

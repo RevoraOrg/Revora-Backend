@@ -536,15 +536,15 @@ describe("WebhookQueue", () => {
     jest.restoreAllMocks();
   });
 
-  it("classifies safe and unsafe webhook targets correctly", () => {
+  it("classifies safe and unsafe webhook targets correctly", async () => {
     const isSafeUrl = (
-      WebhookQueue as unknown as { isSafeUrl: (url: string) => boolean }
+      WebhookQueue as unknown as { isSafeUrl: (url: string) => Promise<boolean> }
     ).isSafeUrl;
 
-    expect(isSafeUrl("https://example.com/hooks")).toBe(true);
-    expect(isSafeUrl("http://127.0.0.1")).toBe(false);
-    expect(isSafeUrl("http://localhost")).toBe(false);
-    expect(isSafeUrl("not-a-valid-url")).toBe(false);
+    expect(await isSafeUrl("https://example.com/hooks")).toBe(true);
+    expect(await isSafeUrl("http://127.0.0.1")).toBe(false);
+    expect(await isSafeUrl("http://localhost")).toBe(false);
+    expect(await isSafeUrl("not-a-valid-url")).toBe(false);
   });
 
   it("uses exponential backoff and stops after the configured retry ceiling", async () => {

@@ -597,8 +597,8 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   });
 
   app.get("/health/failover", async (_req: Request, res: Response) => {
-    const region = env.REGION;
-    const activeRegion = env.FAILOVER_ACTIVE_REGION ?? region;
+    const region = process.env.REGION ?? env.REGION;
+    const activeRegion = process.env.FAILOVER_ACTIVE_REGION ?? env.FAILOVER_ACTIVE_REGION ?? region;
     const db = await healthStatus();
     res.status(db.healthy ? 200 : 503).json({
       region,

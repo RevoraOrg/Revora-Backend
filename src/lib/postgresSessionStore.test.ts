@@ -55,7 +55,7 @@ class FakeSessionRepository {
       role: input.role,
       token_hash: input.token_hash,
       expires_at: input.expires_at,
-      created_at: new Date(),
+      created_at: new Date(this.clock()),
     };
     this.rows.set(input.token_hash, row);
     return { ...row };
@@ -98,9 +98,18 @@ class FakeSessionRepository {
 }
 
 function makeStore(repo: FakeSessionRepository, now: () => number, ttlMs = 60_000) {
+  // Normalize all known roles to ttlMs for backward-compatible test behavior.
+  const flatRoleTtl: Record<string, number> = {
+    admin: ttlMs,
+    verifier: ttlMs,
+    issuer: ttlMs,
+    investor: ttlMs,
+    anonymous: ttlMs,
+  };
   return new PostgresSessionStore(repo as unknown as SessionRepository, {
     ttlMs,
     now,
+    roleTtlMs: flatRoleTtl,
   });
 }
 
