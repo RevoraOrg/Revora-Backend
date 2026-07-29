@@ -33,14 +33,22 @@ import { z } from "zod";
  * | SMTP_USER                   | No       | (empty)                 | SMTP username; sent only after STARTTLS          |
  * | SMTP_PASS                   | No       | (empty)                 | SMTP password; sent only after STARTTLS          |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
-  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
-  * | HOLIDAY_CALENDAR_FILE_PATH  | No       | (empty)                 | Path to signed static holiday calendar file      |
-  * | HOLIDAY_CALENDAR_SECRET     | No       | (empty)                 | HMAC secret for holiday calendar signature       |
-  * | HOLIDAY_FALLBACK_SHIFT_POLICY | No     | previous                | Fallback shift policy: previous or next business day |
-  */
+ * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
+ * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
+ * | SENDGRID_EVENT_WEBHOOK_SECRET| No      | (empty)                 | Secret for SendGrid event webhook verification   |
+ * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
+ * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
+ * | BOUNCE_RATIO_ALARM_THRESHOLD| No       | 0.05                    | Bounce ratio threshold for alarms (e.g. 0.05=5%)|
+ * | OFAC_LIST_URL               | No       | (empty)                 | URL for OFAC SDN list CSV                         |
+ * | OFAC_SIG_URL                | No       | (empty)                 | URL for OFAC SDN list Ed25519 signature (hex)     |
+ * | OFAC_TRUST_ANCHOR_BASE64    | No       | (empty)                 | Base64-encoded Ed25519 public key for OFAC sig vfy |
+ * | OFAC_FETCH_TIMEOUT_MS       | No       | 30000                   | Timeout in ms for OFAC list fetch                 |
+ * | SCIM_TOKEN                  | No       | (empty)                 | Bearer token for SCIM 2.0 provisioning API       |
+ */
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  ROLE: z.enum(["api", "batch", "all"]).optional(),
   PORT: z.coerce.number().int().positive().default(4000),
   API_VERSION_PREFIX: z.string().default("/api/v1"),
   DATABASE_URL: z.string().optional(),
@@ -68,9 +76,16 @@ const envSchema = z.object({
   SMTP_PORT: z.coerce.number().int().positive().max(65535).optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
-  HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
-  HOLIDAY_CALENDAR_SECRET: z.string().optional(),
-  HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
+  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
+  SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
+  SES_SNS_TOPIC_ARN: z.string().optional(),
+  SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
+  BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
+  OFAC_LIST_URL: z.string().optional(),
+  OFAC_SIG_URL: z.string().optional(),
+  OFAC_TRUST_ANCHOR_BASE64: z.string().optional(),
+  OFAC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
+  SCIM_TOKEN: z.string().optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

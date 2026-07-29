@@ -4,7 +4,7 @@
  * notification preferences, interacting with the `NotificationPreferencesRepository`.
  */
 
-import { InMemoryNotificationPreferencesRepository, NotificationPreferences } from '../repositories/notificationPreferencesRepository';
+import { InMemoryNotificationPreferencesRepository, NotificationPreferences, QuietHoursConfig } from '../lib/notificationPreferencesRepository';
 import { NotFoundError, BadRequestError } from '../lib/errors';
 
 /**
@@ -17,6 +17,34 @@ export interface UpdateNotificationPreferencesInput {
   emailAddress?: string;
   phoneNumber?: string;
   preferredLanguage?: string;
+  quietHours?: QuietHoursConfig;
+}
+
+/**
+ * Validates a quiet-hours configuration.
+ * @throws {BadRequestError} If any field is invalid.
+ */
+function validateQuietHours(quietHours: QuietHoursConfig): void {
+  const { enabled, startHour, endHour, timezone } = quietHours;
+
+  if (typeof enabled !== 'boolean') {
+    throw new BadRequestError('quietHours.enabled must be a boolean');
+  }
+  for (const [field, value] of [['startHour', startHour], ['endHour', endHour]] as const) {
+    if (!Number.isInteger(value) || value < 0 || value > 23) {
+      throw new BadRequestError(`quietHours.${field} must be an integer between 0 and 23`);
+    }
+  }
+  if (typeof timezone !== 'string' || timezone.length === 0) {
+    throw new BadRequestError('quietHours.timezone must be a non-empty IANA timezone string');
+  }
+  // Validate the timezone against the runtime's tz database. An invalid zone
+  // throws a RangeError, which we surface as a client error rather than a 500.
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone });
+  } catch {
+    throw new BadRequestError(`quietHours.timezone is not a valid IANA timezone: ${timezone}`);
+  }
 }
 
 /**
@@ -54,6 +82,9 @@ export class NotificationPreferencesService {
     // Basic validation for PII fields if they are provided
     if (input.emailAddress && !/\S+@\S+\.\S+/.test(input.emailAddress)) {
       throw new BadRequestError('Invalid email address format');
+    }
+    if (input.quietHours) {
+      validateQuietHours(input.quietHours);
     }
     // Add more robust phone number validation if necessary
     return this.repository.upsert(userId, input);

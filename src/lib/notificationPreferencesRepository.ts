@@ -5,7 +5,36 @@
  * replaced with a database-backed implementation (e.g., PostgreSQL).
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
+
+/**
+ * @interface QuietHoursConfig
+ * @description Quiet-hours window for push notifications.
+ * Times are interpreted in the investor's local timezone (IANA identifier).
+ * Non-urgent pushes arriving within the window are deferred to the next
+ * available window. Default window: 22:00–08:00.
+ */
+export interface QuietHoursConfig {
+  /** Whether quiet hours are active for this user. */
+  enabled: boolean;
+  /** Hour to begin quiet period (0–23, inclusive). Default 22. */
+  startHour: number;
+  /** Hour to end quiet period (0–23, exclusive). Default 8. */
+  endHour: number;
+  /** IANA timezone string, e.g. "America/New_York". */
+  timezone: string;
+}
+
+/**
+ * Default quiet-hours configuration: 22:00–08:00 in UTC, enabled.
+ * Callers should override `timezone` with the investor's local timezone.
+ */
+export const DEFAULT_QUIET_HOURS: QuietHoursConfig = {
+  enabled: true,
+  startHour: 22,
+  endHour: 8,
+  timezone: 'UTC',
+};
 
 /**
  * @interface NotificationPreferences
@@ -20,6 +49,7 @@ export interface NotificationPreferences {
   emailAddress?: string; // PII
   phoneNumber?: string; // PII
   preferredLanguage: string;
+  quietHours?: QuietHoursConfig; // push notification quiet-hours config
   createdAt: Date;
   updatedAt: Date;
 }
@@ -54,7 +84,7 @@ export class InMemoryNotificationPreferencesRepository {
       this.preferences.set(existing.id, existing);
       return existing;
     }
-    const newPreferences: NotificationPreferences = { id: uuidv4(), userId, ...data, createdAt: new Date(), updatedAt: new Date() } as NotificationPreferences;
+    const newPreferences: NotificationPreferences = { id: randomUUID(), userId, ...data, createdAt: new Date(), updatedAt: new Date() } as NotificationPreferences;
     this.preferences.set(newPreferences.id, newPreferences);
     return newPreferences;
   }
