@@ -12,6 +12,7 @@ interface SocialIdentityRow {
   provider_subject: string;
   provider_email: string;
   email_verified: boolean;
+  is_private_relay: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -57,6 +58,7 @@ export class SocialIdentityRepository implements ISocialIdentityRepository {
     providerSubject: string;
     providerEmail: string;
     emailVerified: boolean;
+    isPrivateRelay?: boolean;
   }): Promise<SocialIdentityRecord> {
     const result: QueryResult<SocialIdentityRow> = await this.db.query(
       `
@@ -66,10 +68,11 @@ export class SocialIdentityRepository implements ISocialIdentityRepository {
           provider_subject,
           provider_email,
           email_verified,
+          is_private_relay,
           created_at,
           updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
         RETURNING *
       `,
       [
@@ -78,20 +81,32 @@ export class SocialIdentityRepository implements ISocialIdentityRepository {
         input.providerSubject,
         input.providerEmail,
         input.emailVerified,
+        input.isPrivateRelay ?? false,
       ],
     );
     return this.mapRow(result.rows[0]);
   }
 
-  async updateIdentityEmail(id: string, providerEmail: string): Promise<void> {
-    await this.db.query(
-      `
-        UPDATE social_identities
-        SET provider_email = $1, email_verified = TRUE, updated_at = NOW()
-        WHERE id = $2
-      `,
-      [providerEmail, id],
-    );
+  async updateIdentityEmail(id: string, providerEmail: string, isPrivateRelay?: boolean): Promise<void> {
+    if (isPrivateRelay !== undefined) {
+      await this.db.query(
+        `
+          UPDATE social_identities
+          SET provider_email = $1, email_verified = TRUE, is_private_relay = $2, updated_at = NOW()
+          WHERE id = $3
+        `,
+        [providerEmail, isPrivateRelay, id],
+      );
+    } else {
+      await this.db.query(
+        `
+          UPDATE social_identities
+          SET provider_email = $1, email_verified = TRUE, updated_at = NOW()
+          WHERE id = $2
+        `,
+        [providerEmail, id],
+      );
+    }
   }
 
   async deleteByUserAndProvider(userId: string, provider: SocialAuthProvider): Promise<boolean> {
@@ -113,6 +128,7 @@ export class SocialIdentityRepository implements ISocialIdentityRepository {
       providerSubject: row.provider_subject,
       providerEmail: row.provider_email,
       emailVerified: row.email_verified,
+      isPrivateRelay: row.is_private_relay,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
