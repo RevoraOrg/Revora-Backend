@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { VestingService, PartialClaimRequest } from '../services/vestingService';
 import { requireAuth } from '../middleware/auth';
 
@@ -9,10 +9,10 @@ const vestingService = new VestingService();
  * POST /api/v1/vesting/claim
  * Process a partial claim for a vesting schedule
  */
-router.post('/claim', requireAuth, async (req, res) => {
+router.post('/claim', requireAuth, async (req: Request, res: Response) => {
   try {
     const { scheduleId, claimAmount } = req.body;
-    const userId = req.user?.id;
+    const userId = (req as any).user?.id;
 
     if (!scheduleId || typeof claimAmount !== 'number' || claimAmount < 0) {
       return res.status(400).json({
