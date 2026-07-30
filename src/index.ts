@@ -61,6 +61,9 @@ import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
 import { OfacSanctionsLoader } from './services/ofacSanctionsLoader';
+import { SanctionsListVersionsRepository } from './db/repositories/sanctionsListVersionsRepository';
+import { SanctionsListDiffService } from './services/sanctionsListDiffService';
+import { createComplianceRouter } from './routes/compliance';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
 import taxationRouter from './routes/taxation';
@@ -685,7 +688,6 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
@@ -709,6 +711,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Initialize AML service and routes
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
+
+  // Initialize sanctions list versioning and compliance routes
+  const sanctionsVersionsRepo = new SanctionsListVersionsRepository(pool);
+  const sanctionsListDiffService = new SanctionsListDiffService(sanctionsVersionsRepo);
+  apiRouter.use("/compliance", createComplianceRouter(sanctionsVersionsRepo, sanctionsListDiffService));
 
   // Initialize ledger export with in-memory repository
   // TODO: Replace with PgLedgerEntryRepository when ledger_entries table exists
