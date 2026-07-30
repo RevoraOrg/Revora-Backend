@@ -1,14 +1,14 @@
-import { Router, Request, Response, NextFunction } from 'express';
-import { validateZodBody, validateZodParams } from '../middleware/validate';
-import { z } from 'zod';
-import { LedgerService } from '../services/ledgerService';
-import { AppError, Errors } from '../lib/errors';
-import { Logger } from '../lib/logger';
-import { AuditLogRepository } from '../db/repositories/auditLogRepository';
-import { MetricsCollector } from '../lib/metrics';
-import { Readable, pipeline } from 'stream';
-import Cursor from 'pg-cursor';
-import { pool } from '../db/pool';
+import { Router, Request, Response, NextFunction } from "express";
+import { validateZodBody, validateZodParams } from "../middleware/validate";
+import { z } from "zod";
+import { LedgerService } from "../services/ledgerService";
+import { AppError, Errors } from "../lib/errors";
+import { Logger } from "../lib/logger";
+import { AuditLogRepository } from "../db/repositories/auditLogRepository";
+import { MetricsCollector } from "../lib/metrics";
+import { Readable, pipeline } from "stream";
+import Cursor from "pg-cursor";
+import { pool } from "../db/pool";
 
 /**
  * @title Ledger Routes
@@ -27,15 +27,16 @@ import { pool } from '../db/pool';
  */
 
 // Regex for UUID v4 format
-const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Period ID: alphanumeric + dash/underscore (e.g., "2024-01", "Q1-2024")
 const PERIOD_ID_REGEX = /^[a-zA-Z0-9_-]{1,50}$/;
 
 // Path params schema: offering ID and period ID
 const ledgerCloseParamsSchema = z.object({
-  offeringId: z.string().regex(UUID_V4_REGEX, 'Invalid offering UUID'),
-  periodId: z.string().regex(PERIOD_ID_REGEX, 'Invalid period ID format'),
+  offeringId: z.string().regex(UUID_V4_REGEX, "Invalid offering UUID"),
+  periodId: z.string().regex(PERIOD_ID_REGEX, "Invalid period ID format"),
 });
 
 /**
@@ -62,7 +63,7 @@ export function createLedgerRoutes(
   ledgerService: LedgerService,
   auditLogRepo: AuditLogRepository,
   metricsCollector: MetricsCollector,
-  logger: Logger
+  logger: Logger,
 ): Router {
   const router = Router();
 
@@ -79,24 +80,25 @@ export function createLedgerRoutes(
    * - 409: Period already locked or close already initiated
    */
   router.post(
-    '/close/:offeringId/initiate/:periodId',
+    "/close/:offeringId/initiate/:periodId",
     validateZodParams(ledgerCloseParamsSchema),
     validateZodBody(emptyBodySchema),
     async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-      const requestId = req.requestId || (req as any).id || 'unknown';
+      const requestId = req.requestId || (req as any).id || "unknown";
       const startTime = Date.now();
 
       try {
         const { offeringId, periodId } = req.params;
-        const securityContext = (req as any).securityContext || (req as any).user;
+        const securityContext =
+          (req as any).securityContext || (req as any).user;
 
         if (!securityContext?.id) {
-          throw Errors.unauthorized('User authentication required');
+          throw Errors.unauthorized("User authentication required");
         }
 
         const initiatorId = securityContext.id;
 
-        logger.info('POST /ledger/close/:offeringId/initiate/:periodId', {
+        logger.info("POST /ledger/close/:offeringId/initiate/:periodId", {
           requestId,
           offeringId,
           periodId,
@@ -107,40 +109,41 @@ export function createLedgerRoutes(
         const response = await ledgerService.initiatePeriodClose(
           offeringId,
           periodId,
-          initiatorId
+          initiatorId,
         );
 
         // Record audit event for initiation
         await auditLogRepo.createAuditLog({
           user_id: initiatorId,
-          action: 'ledger_close_initiated',
+          action: "ledger_close_initiated",
           resource: `offering:${offeringId}/period:${periodId}`,
           details: JSON.stringify({
             lock_id: response.lock_id,
-            message: 'Ledger period close initiated, awaiting confirmation',
+            message: "Ledger period close initiated, awaiting confirmation",
           }),
           ip_address: securityContext.ipAddress || req.ip || undefined,
-          user_agent: securityContext.userAgent || req.get('user-agent') || undefined,
+          user_agent:
+            securityContext.userAgent || req.get("user-agent") || undefined,
         });
 
         // Record metric
         metricsCollector.incrementCounter(
-          'ledger_close_initiated_total',
+          "ledger_close_initiated_total",
           { offering_id: offeringId },
           1,
-          'Total ledger close initiations'
+          "Total ledger close initiations",
         );
 
         metricsCollector.recordHistogram(
-          'ledger_close_initiate_duration_ms',
+          "ledger_close_initiate_duration_ms",
           Date.now() - startTime,
           { offering_id: offeringId },
-          'Duration of ledger close initiation'
+          "Duration of ledger close initiation",
         );
 
         res.status(201).json(response);
       } catch (error) {
-        logger.error('Error initiating ledger close', {
+        logger.error("Error initiating ledger close", {
           requestId,
           error: error instanceof Error ? error.message : String(error),
           offeringId: req.params?.offeringId,
@@ -148,18 +151,19 @@ export function createLedgerRoutes(
         });
 
         metricsCollector.incrementCounter(
-          'ledger_close_initiate_errors_total',
+          "ledger_close_initiate_errors_total",
           {
-            offering_id: req.params?.offeringId || 'unknown',
-            error_type: error instanceof AppError ? error.code : 'internal_error',
+            offering_id: req.params?.offeringId || "unknown",
+            error_type:
+              error instanceof AppError ? error.code : "internal_error",
           },
           1,
-          'Total ledger close initiation errors'
+          "Total ledger close initiation errors",
         );
 
         next(error);
       }
-    }
+    },
   );
 
   /**
@@ -176,24 +180,25 @@ export function createLedgerRoutes(
    * - 409: Period already locked or close not in initiated state
    */
   router.post(
-    '/close/:offeringId/confirm/:periodId',
+    "/close/:offeringId/confirm/:periodId",
     validateZodParams(ledgerCloseParamsSchema),
     validateZodBody(emptyBodySchema),
     async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-      const requestId = req.requestId || (req as any).id || 'unknown';
+      const requestId = req.requestId || (req as any).id || "unknown";
       const startTime = Date.now();
 
       try {
         const { offeringId, periodId } = req.params;
-        const securityContext = (req as any).securityContext || (req as any).user;
+        const securityContext =
+          (req as any).securityContext || (req as any).user;
 
         if (!securityContext?.id) {
-          throw Errors.unauthorized('User authentication required');
+          throw Errors.unauthorized("User authentication required");
         }
 
         const confirmerId = securityContext.id;
 
-        logger.info('POST /ledger/close/:offeringId/confirm/:periodId', {
+        logger.info("POST /ledger/close/:offeringId/confirm/:periodId", {
           requestId,
           offeringId,
           periodId,
@@ -204,13 +209,13 @@ export function createLedgerRoutes(
         const response = await ledgerService.confirmPeriodClose(
           offeringId,
           periodId,
-          confirmerId
+          confirmerId,
         );
 
         // Record audit event for confirmation (with both actors)
         await auditLogRepo.createAuditLog({
           user_id: confirmerId,
-          action: 'ledger_close_confirmed',
+          action: "ledger_close_confirmed",
           resource: `offering:${offeringId}/period:${periodId}`,
           details: JSON.stringify({
             lock_id: response.lock_id,
@@ -218,37 +223,38 @@ export function createLedgerRoutes(
             confirmed_by: response.confirmed_by,
             entry_count: response.entry_count,
             export_hash: response.export_hash,
-            message: 'Ledger period successfully locked',
+            message: "Ledger period successfully locked",
           }),
           ip_address: securityContext.ipAddress || req.ip || undefined,
-          user_agent: securityContext.userAgent || req.get('user-agent') || undefined,
+          user_agent:
+            securityContext.userAgent || req.get("user-agent") || undefined,
         });
 
         // Record metric
         metricsCollector.incrementCounter(
-          'ledger_close_confirmed_total',
+          "ledger_close_confirmed_total",
           { offering_id: offeringId },
           1,
-          'Total ledger close confirmations'
+          "Total ledger close confirmations",
         );
 
         metricsCollector.recordHistogram(
-          'ledger_close_confirm_duration_ms',
+          "ledger_close_confirm_duration_ms",
           Date.now() - startTime,
           { offering_id: offeringId },
-          'Duration of ledger close confirmation'
+          "Duration of ledger close confirmation",
         );
 
         metricsCollector.setGauge(
-          'ledger_export_entry_count',
+          "ledger_export_entry_count",
           response.entry_count,
           { offering_id: offeringId, period_id: periodId },
-          'Number of entries in locked period export'
+          "Number of entries in locked period export",
         );
 
         res.status(200).json(response);
       } catch (error) {
-        logger.error('Error confirming ledger close', {
+        logger.error("Error confirming ledger close", {
           requestId,
           error: error instanceof Error ? error.message : String(error),
           offeringId: req.params?.offeringId,
@@ -256,18 +262,19 @@ export function createLedgerRoutes(
         });
 
         metricsCollector.incrementCounter(
-          'ledger_close_confirm_errors_total',
+          "ledger_close_confirm_errors_total",
           {
-            offering_id: req.params?.offeringId || 'unknown',
-            error_type: error instanceof AppError ? error.code : 'internal_error',
+            offering_id: req.params?.offeringId || "unknown",
+            error_type:
+              error instanceof AppError ? error.code : "internal_error",
           },
           1,
-          'Total ledger close confirmation errors'
+          "Total ledger close confirmation errors",
         );
 
         next(error);
       }
-    }
+    },
   );
 
   /**
@@ -281,15 +288,15 @@ export function createLedgerRoutes(
    * - 404: No close operation found for this period
    */
   router.get(
-    '/close/:offeringId/status/:periodId',
+    "/close/:offeringId/status/:periodId",
     validateZodParams(ledgerCloseParamsSchema),
     async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-      const requestId = req.requestId || (req as any).id || 'unknown';
+      const requestId = req.requestId || (req as any).id || "unknown";
 
       try {
         const { offeringId, periodId } = req.params;
 
-        logger.info('GET /ledger/close/:offeringId/status/:periodId', {
+        logger.info("GET /ledger/close/:offeringId/status/:periodId", {
           requestId,
           offeringId,
           periodId,
@@ -298,24 +305,25 @@ export function createLedgerRoutes(
         // Check if period is locked and get metadata
         const metadata = await ledgerService.getLockedPeriodMetadata(
           offeringId,
-          periodId
+          periodId,
         );
 
         if (!metadata) {
           throw Errors.notFound(
-            `No close found for period ${periodId} in offering ${offeringId}`
+            `No close found for period ${periodId} in offering ${offeringId}`,
           );
         }
 
         res.status(200).json({
           offering_id: offeringId,
           period_id: periodId,
-          status: 'locked',
+          status: "locked",
           ...metadata,
-          message: 'Period is locked. Export can be verified using export_hash and export_signature.',
+          message:
+            "Period is locked. Export can be verified using export_hash and export_signature.",
         });
       } catch (error) {
-        logger.error('Error getting ledger close status', {
+        logger.error("Error getting ledger close status", {
           requestId,
           error: error instanceof Error ? error.message : String(error),
           offeringId: req.params?.offeringId,
@@ -324,7 +332,7 @@ export function createLedgerRoutes(
 
         next(error);
       }
-    }
+    },
   );
 
   /**
@@ -336,27 +344,30 @@ export function createLedgerRoutes(
    * - periodId: string (optional)
    */
   router.get(
-    '/export.jsonl',
+    "/export.jsonl",
     async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-      const requestId = req.requestId || (req as any).id || 'unknown';
+      const requestId = req.requestId || (req as any).id || "unknown";
 
       try {
         const queryParsed = ledgerExportQuerySchema.safeParse(req.query);
         if (!queryParsed.success) {
           throw Errors.validationError(
-            'Invalid request parameters',
-            queryParsed.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`)
+            "Invalid request parameters",
+            queryParsed.error.issues.map(
+              (e: any) => `${e.path.join(".")}: ${e.message}`,
+            ),
           );
         }
 
         const { offeringId, year, periodId } = queryParsed.data;
-        const securityContext = (req as any).securityContext || (req as any).user;
+        const securityContext =
+          (req as any).securityContext || (req as any).user;
 
         if (!securityContext?.id) {
-          throw Errors.unauthorized('User authentication required');
+          throw Errors.unauthorized("User authentication required");
         }
 
-        logger.info('GET /ledger/export.jsonl', {
+        logger.info("GET /ledger/export.jsonl", {
           requestId,
           offeringId,
           year,
@@ -407,11 +418,18 @@ export function createLedgerRoutes(
           const cursor = client.query(new Cursor(queryText, values));
 
           // Set response headers for chunked streaming
-          res.setHeader('Content-Type', 'application/x-jsonlines');
-          res.setHeader('X-Content-Type-Options', 'nosniff');
-          res.setHeader('Content-Disposition', `attachment; filename="ledger-export-${offeringId}.jsonl"`);
+          res.setHeader("Content-Type", "application/x-jsonlines");
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("Pragma", "no-cache");
+          res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="ledger-export-${offeringId}.jsonl"`,
+          );
+          res.flushHeaders();
 
-          const stream = new LedgerExportStream({
+          let stream: LedgerExportStream | undefined;
+          stream = new LedgerExportStream({
             cursor,
             client,
             countEstimate,
@@ -421,19 +439,31 @@ export function createLedgerRoutes(
             metricsCollector,
           });
 
+          const cleanupOnDisconnect = () => {
+            if (stream && !stream.isDestroyed()) {
+              stream.destroy();
+            }
+          };
+
+          res.once("close", cleanupOnDisconnect);
+          req.once("close", cleanupOnDisconnect);
+
           // Connect stream to response via pipeline
           pipeline(stream, res, (err) => {
             if (err) {
-              logger.error('Error in ledger export stream pipeline', {
+              logger.error("Error in ledger export stream pipeline", {
                 requestId,
                 error: err.message,
               });
             } else {
-              logger.info('Ledger export stream pipeline completed successfully', {
-                requestId,
-                offeringId,
-                rowsSent: stream.getRowsSent(),
-              });
+              logger.info(
+                "Ledger export stream pipeline completed successfully",
+                {
+                  requestId,
+                  offeringId,
+                  rowsSent: stream.getRowsSent(),
+                },
+              );
             }
           });
         } catch (dbError) {
@@ -444,7 +474,7 @@ export function createLedgerRoutes(
       } catch (error) {
         next(error);
       }
-    }
+    },
   );
 
   return router;
@@ -452,12 +482,18 @@ export function createLedgerRoutes(
 
 // GET /ledger/export.jsonl Query Params Schema
 const ledgerExportQuerySchema = z.object({
-  offeringId: z.string().regex(UUID_V4_REGEX, 'Invalid offering UUID'),
-  year: z.string().regex(/^\d{4}$/, 'Invalid year format').optional(),
-  periodId: z.string().regex(PERIOD_ID_REGEX, 'Invalid period ID format').optional(),
+  offeringId: z.string().regex(UUID_V4_REGEX, "Invalid offering UUID"),
+  year: z
+    .string()
+    .regex(/^\d{4}$/, "Invalid year format")
+    .optional(),
+  periodId: z
+    .string()
+    .regex(PERIOD_ID_REGEX, "Invalid period ID format")
+    .optional(),
 });
 
-class LedgerExportStream extends Readable {
+export class LedgerExportStream extends Readable {
   private cursor: Cursor;
   private client: any;
   private countEstimate: number;
@@ -471,6 +507,7 @@ class LedgerExportStream extends Readable {
   private batchSize = 100;
   private keepaliveInterval = 100;
   private released = false;
+  private destroyed = false;
 
   constructor(options: {
     cursor: Cursor;
@@ -497,17 +534,21 @@ class LedgerExportStream extends Readable {
   }
 
   _read(size: number) {
+    if (this.released || this.destroyed) {
+      return;
+    }
+
     if (!this.sentManifest) {
       this.sentManifest = true;
       const manifest = {
-        type: 'manifest',
+        type: "manifest",
         offeringId: this.offeringId,
         year: this.year,
         periodId: this.periodId,
         estimatedRowCount: this.countEstimate,
         exportedAt: new Date().toISOString(),
       };
-      this.push(JSON.stringify(manifest) + '\n');
+      this.push(JSON.stringify(manifest) + "\n");
       return;
     }
 
@@ -520,17 +561,17 @@ class LedgerExportStream extends Readable {
       if (!rows || rows.length === 0) {
         const duration = Date.now() - this.startTime;
         this.metricsCollector.recordHistogram(
-          'export.stream.duration',
+          "export.stream.duration",
           duration,
           { offering_id: this.offeringId },
-          'Duration of ledger export streams'
+          "Duration of ledger export streams",
         );
         this.push(null);
         this.release();
         return;
       }
 
-      let chunk = '';
+      let chunk = "";
       for (const row of rows) {
         const entry = {
           id: row.id,
@@ -538,21 +579,27 @@ class LedgerExportStream extends Readable {
           period_id: row.period_id,
           amount: row.amount,
           issuer_id: row.issuer_id,
-          reported_at: row.reported_at instanceof Date ? row.reported_at.toISOString() : row.reported_at,
-          created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+          reported_at:
+            row.reported_at instanceof Date
+              ? row.reported_at.toISOString()
+              : row.reported_at,
+          created_at:
+            row.created_at instanceof Date
+              ? row.created_at.toISOString()
+              : row.created_at,
         };
 
-        chunk += JSON.stringify(entry) + '\n';
+        chunk += JSON.stringify(entry) + "\n";
         this.rowsSent++;
         this.metricsCollector.incrementCounter(
-          'export.stream.rows',
+          "export.stream.rows",
           { offering_id: this.offeringId },
           1,
-          'Count of rows exported in ledger streams'
+          "Count of rows exported in ledger streams",
         );
 
         if (this.rowsSent % this.keepaliveInterval === 0) {
-          chunk += '# keepalive\n';
+          chunk += "# keepalive\n";
         }
       }
 
@@ -561,15 +608,18 @@ class LedgerExportStream extends Readable {
   }
 
   release() {
-    if (!this.released) {
+    if (!this.released && !this.destroyed) {
       this.released = true;
       this.cursor.close(() => {
-        this.client.release();
+        if (typeof this.client?.release === "function") {
+          this.client.release();
+        }
       });
     }
   }
 
   _destroy(err: Error | null, callback: (err?: Error | null) => void) {
+    this.destroyed = true;
     this.release();
     callback(err);
   }
