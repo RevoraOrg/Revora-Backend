@@ -322,6 +322,15 @@ describe('webhookAuth middleware', () => {
     // Clock skew boundary tests
     describe('clock skew boundary tests', () => {
       const clockSkewMs = 30_000; // 30 seconds default
+      const FIXED_NOW = 1735689600000; // 2025-01-01T00:00:00.000Z
+
+      beforeAll(() => {
+        jest.useFakeTimers({ now: new Date(FIXED_NOW) });
+      });
+
+      afterAll(() => {
+        jest.useRealTimers();
+      });
 
       it('should accept timestamp exactly at clock skew boundary (future)', () => {
         const signature = signWebhookPayload(TEST_SECRET, TEST_PAYLOAD_STRING);

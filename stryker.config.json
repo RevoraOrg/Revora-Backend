@@ -14,7 +14,10 @@
   "mutate": [
     "src/lib/jwt.ts",
     "src/lib/webhookSignature.ts",
-    "src/middleware/webhookAuth.ts"
+    "src/middleware/webhookAuth.ts",
+    "src/services/distributionEngine.ts",
+    "src/services/revenueReconciliationService.ts",
+    "src/services/payoutDriftDetector.ts"
   ],
   "reporters": ["html", "clear-text", "progress"],
   "thresholds": {

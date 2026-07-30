@@ -6,6 +6,9 @@ module.exports = {
     '**/lib/jwt.test.ts',
     '**/lib/webhookSignature.test.ts',
     '**/middleware/webhookAuth.test.ts',
+    '**/services/distributionEngine.test.ts',
+    '**/services/revenueReconciliationService.test.ts',
+    '**/services/payoutDriftDetector.test.ts',
   ],
   globals: {
     'ts-jest': {
