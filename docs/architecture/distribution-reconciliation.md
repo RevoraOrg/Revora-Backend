@@ -2,7 +2,7 @@
 
 > **Authoritative end-to-end map** of how offerings, revenue reports, the
 > distribution engine, the reconciliation service, and the transactional webhook
-> outbox interlock for the gauravkarakoti/revora-backend repository. Every flow diagram in this document is rendered from a
+> outbox interlock for the revoraorg/revora-backend repository. Every flow diagram in this document is rendered from a
 > committed Mermaid source block, so it can be diff-reviewed and regenerated
 > deterministically.
 >
