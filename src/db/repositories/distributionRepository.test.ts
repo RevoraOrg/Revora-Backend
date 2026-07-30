@@ -53,9 +53,48 @@ describe('DistributionRepository', () => {
 
       expect(mockPool.query).toHaveBeenCalledWith(
         expect.stringMatching(/INSERT\s+INTO\s+distributions/i),
-        ['offering-123', 'period-456', '10000.50', expect.any(Date), 'pending']
+        ['offering-123', 'period-456', '10000.50', expect.any(Date), 'pending', null]
       );
       expect(result.id).toBe('run-123');
+    });
+
+    it('should create a distribution run with frozen_fx_rate_id', async () => {
+      const input: CreateDistributionRunInput = {
+        offering_id: 'offering-123',
+        period_id: 'period-456',
+        total_amount: '10000.50',
+        frozen_fx_rate_id: 'rate-frozen-99',
+      };
+
+      const mockResult: QueryResult<DistributionRun> = {
+        rows: [
+          {
+            id: 'run-123',
+            offering_id: 'offering-123',
+            period_id: 'period-456',
+            total_amount: '10000.50',
+            status: 'pending',
+            frozen_fx_rate_id: 'rate-frozen-99',
+            run_at: new Date(),
+            created_at: new Date(),
+            updated_at: new Date(),
+          },
+        ],
+        rowCount: 1,
+        command: 'INSERT',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const result = await repository.createDistributionRun(input);
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/INSERT\s+INTO\s+distributions/i),
+        ['offering-123', 'period-456', '10000.50', expect.any(Date), 'pending', 'rate-frozen-99']
+      );
+      expect(result.frozen_fx_rate_id).toBe('rate-frozen-99');
     });
   });
 
@@ -92,6 +131,38 @@ describe('DistributionRepository', () => {
         ['run-1']
       );
       expect(result).toHaveLength(1);
+    });
+  });
+
+  describe('createPayout', () => {
+    it('should create a payout with frozen_fx_rate_id', async () => {
+      const input: CreatePayoutInput = {
+        distribution_id: 'run-1',
+        investor_id: 'inv-1',
+        amount: '250.00',
+        frozen_fx_rate_id: 'rate-frozen-42',
+      };
+
+      const mockPayoutRow = {
+        id: 'p-1',
+        distribution_id: 'run-1',
+        investor_id: 'inv-1',
+        amount: '250.00',
+        status: 'pending',
+        frozen_fx_rate_id: 'rate-frozen-42',
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      mockPool.query.mockResolvedValueOnce({ rows: [mockPayoutRow] });
+
+      const result = await repository.createPayout(input);
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/INSERT\s+INTO\s+distribution_payouts/i),
+        ['run-1', 'inv-1', '250.00', 'pending', null, 'rate-frozen-42']
+      );
+      expect(result.frozen_fx_rate_id).toBe('rate-frozen-42');
     });
   });
 

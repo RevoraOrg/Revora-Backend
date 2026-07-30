@@ -28,6 +28,7 @@ New alerts MUST be added to this table before their PR merges (validated by CI).
 | `contract_upgrade_auto_rollback` | Contract upgrade auto-rolled back | [`contract-upgrade-slsa-attestation.md`](../contract-upgrade-slsa-attestation.md) | Smart Contract Team | Verify on-chain state; re-run upgrade with fix; attest new deployment |
 | `email_alarm_alignment_failure` | DKIM/SPF/DMARC alignment check failed for outbound email | [`emailDeliverabilityService.ts`](../../src/services/emailDeliverabilityService.ts) | Backend Platform | Inspect SES bounce complaint feed; update DNS records; re-send after fix |
 | `email_alarm_high_bounce_ratio` | Bounce rate exceeds threshold over 1 h window | [`emailDeliverabilityService.ts`](../../src/services/emailDeliverabilityService.ts) | Backend Platform | Review recipient list quality; pause sends; warm up new sending domain |
+| `CertPinningMismatch` | Mobile client TLS handshake errors due to cert pin mismatch | [`mobile-cert-pinning.md`](mobile-cert-pinning.md) | Backend Platform | Check vault `revora/mobile/cert-pins/current`; verify server cert fingerprint; execute Phase 0–3 rotation or emergency unpin |
 
 ## Runbook Index
 
@@ -39,6 +40,7 @@ New alerts MUST be added to this table before their PR merges (validated by CI).
 | OIDC Discovery Change | [`../oidc-discovery-digest-alert.md`](../oidc-discovery-digest-alert.md) | `oidc_discovery_changed` |
 | FX Provider Health | [`../fx-provider-health-scoring.md`](../fx-provider-health-scoring.md) | `fx_provider_health_score`, `provider_demoted`, `provider_degraded` |
 | Metrics & Alerting | [`../METRICS_NEXT_STEPS.md`](../METRICS_NEXT_STEPS.md) | `HighErrorRate`, `HighLatency`, `DatabasePoolExhausted`, `MemoryUsageHigh` |
+| Mobile Cert Pinning | [`mobile-cert-pinning.md`](mobile-cert-pinning.md) | `CertPinningMismatch` |
 | Contract Upgrade | [`../contract-upgrade-slsa-attestation.md`](../contract-upgrade-slsa-attestation.md) | `contract_upgrade_auto_rollback` |
 
 ## Adding a New Alert
