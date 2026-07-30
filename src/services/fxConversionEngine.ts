@@ -265,10 +265,10 @@ export class FxConversionEngine {
       }
     }
 
-    // Enforce hop budget.  Each "via" currency adds 2 legs → 1 hop-pair.
-    // We count hops as the number of intermediate legs, so a single-via
-    // chain = 2 hops.  Multi-via not yet supported (spec says max 2 hops).
-    const hopCount = vias.length === 1 ? 2 : vias.length + 1;
+    // Enforce hop budget.  Each triangulation uses ONE via currency,
+    // which adds 2 legs → 2 hops.  Multiple vias are alternatives,
+    // not chained — we try each until one succeeds.
+    const hopCount = 2;
     if (hopCount > this.maxHops) {
       throw Errors.badRequest(
         `Triangulation requires ${hopCount} hops but maxHops is ${this.maxHops}. ` +
