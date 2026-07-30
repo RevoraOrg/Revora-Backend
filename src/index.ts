@@ -685,7 +685,6 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
