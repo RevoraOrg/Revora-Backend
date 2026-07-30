@@ -43,6 +43,8 @@ export interface StatementRenderOptions {
   treasuryPublicKey?: string | Buffer | KeyObject;
   eventEmitter?: EventEmitter;
   auditLogRepository?: AuditLogRepository;
+  signerKeyId?: string;
+  requestingPrincipal?: string;
 }
 
 export interface StatementPdfRenderResult {
@@ -251,6 +253,17 @@ export function verifyTreasurySignature(
 /**
  * Renders statement PDF details, returning bytes, watermark state, and revision hash.
  */
+export function deriveSignerKeyId(pubKeyInput: string | Buffer | KeyObject | undefined): string | undefined {
+  if (!pubKeyInput) return undefined;
+  try {
+    const keyObj = parseEd25519PublicKey(pubKeyInput);
+    const der = keyObj.export({ format: 'der', type: 'spki' }) as Buffer;
+    return createHash('sha256').update(der).digest('hex').slice(0, 16);
+  } catch {
+    return undefined;
+  }
+}
+
 export function renderStatementPdfDetails(
   job: PdfRenderJobRow,
   options?: StatementRenderOptions
@@ -258,19 +271,35 @@ export function renderStatementPdfDetails(
   const verification = verifyTreasurySignature(job, options);
   const watermarkSuppressed = verification.valid;
 
+  if (!watermarkSuppressed && options?.finalFlag) {
+    globalLogger.warn('pdf.watermark.security-relevant: signature verification failed', {
+      periodId: job.period_id,
+      investorId: job.investor_id,
+      batchId: job.batch_id,
+      reason: verification.reason,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   const ledgerRevisionHash =
     options?.ledgerRevisionHash ||
     verification.payloadObj?.ledgerRevisionHash ||
     checksumPayload(`${job.period_id}:${job.investor_id}`).slice(0, 16);
 
   if (watermarkSuppressed) {
-    const auditData = {
+    const signerKeyId =
+      options?.signerKeyId ||
+      verification.payloadObj?.kid ||
+      deriveSignerKeyId(options?.treasuryPublicKey ?? process.env.TREASURY_ED25519_PUBKEY);
+    const auditData: Record<string, unknown> = {
       event: EVENT_PDF_WATERMARK_SUPPRESSED,
       periodId: job.period_id,
       investorId: job.investor_id,
       ledgerRevisionHash,
       batchId: job.batch_id,
       timestamp: new Date().toISOString(),
+      signerKeyId: signerKeyId ?? null,
+      requestingPrincipal: options?.requestingPrincipal ?? null,
     };
 
     statementPdfEventEmitter.emit(EVENT_PDF_WATERMARK_SUPPRESSED, auditData);
