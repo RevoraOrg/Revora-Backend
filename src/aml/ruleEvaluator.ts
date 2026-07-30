@@ -24,6 +24,12 @@ interface StructuringRuleConfig {
   amount_threshold: number;
   min_transactions: number;
   reporting_threshold: number;
+  /** Histogram bin size for amount clustering (default 500). */
+  cluster_bin_size?: number;
+  /** Minimum cluster score (0-1) required to trigger (default 0.5). */
+  score_threshold?: number;
+  /** Per-jurisdiction overrides (ISO 3166-1 alpha-2 → reporting_threshold, currency). */
+  jurisdictions?: Record<string, { reporting_threshold: number; currency: string }>;
 }
 
 interface GeoMismatchRuleConfig {
@@ -262,17 +268,103 @@ export class RuleEvaluator {
     };
   }
 
+  /**
+   * @notice Amount-clustering structuring detection rule.
+   * @dev    Builds a histogram of deposit amounts using a configurable bin size,
+   *         computes a per-investor cluster score, and triggers when deposits
+   *         are clustered just under regulatory reporting thresholds (smurfing).
+   *
+   *         Algorithm:
+   *          1. Filter non-failed transactions in the sliding window.
+   *          2. Resolve jurisdiction-aware reporting threshold.
+   *          3. Bucket amounts into histogram bins of size `cluster_bin_size`.
+   *          4. Compute a cluster score (0–1) from bin concentration and
+   *             proximity to the reporting threshold.
+   *          5. Trigger if `cluster_score >= score_threshold` AND at least
+   *             `min_transactions` similar transactions exist.
+   *
+   *         Metrics: `aml.structuring.score` gauge (labels: investor_id, rule_id).
+   *         Jurisdiction-aware: `config.jurisdictions[country]` overrides
+   *         `config.reporting_threshold`.
+   */
   private evaluateStructuringRule(context: TransactionContext, rule: AMLRule): { triggered: boolean; details: Record<string, unknown> } {
     const config = rule.config as unknown as StructuringRuleConfig;
-    const transactions = context.previous_transactions || [];
+    const transactions = context.previous_transactions ?? [];
     const currentAmount = parseFloat(context.amount);
-    const windowStart = new Date(context.timestamp);
-    windowStart.setHours(windowStart.getHours() - config.window_hours);
-    const recentTransactions = transactions.filter(tx => tx.timestamp >= windowStart && tx.status !== 'failed');
-    const similarTransactions = recentTransactions.filter(tx => Math.abs(parseFloat(tx.amount) - currentAmount) <= config.amount_threshold);
-    const totalAmount = similarTransactions.reduce((sum, tx) => sum + parseFloat(tx.amount), currentAmount);
-    const triggered = similarTransactions.length >= config.min_transactions && totalAmount > config.reporting_threshold;
-    return { triggered, details: { window_hours: config.window_hours, similar_transaction_count: similarTransactions.length, total_amount: totalAmount, reporting_threshold: config.reporting_threshold, amount_threshold: config.amount_threshold } };
+
+    // Resolve jurisdiction-aware reporting threshold
+    const reportingThreshold = this.resolveStructuingThreshold(config, context);
+
+    // Build the sliding window
+    const windowEnd = new Date(context.timestamp);
+    const windowStart = new Date(windowEnd.getTime() - (config.window_hours ?? 24) * 60 * 60 * 1000);
+
+    // Collect non-failed transactions inside the window
+    const recentTransactions = transactions.filter(
+      tx => tx.timestamp >= windowStart && tx.timestamp <= windowEnd && tx.status !== 'failed'
+    );
+
+    // Include the current transaction
+    const allAmounts = [
+      ...recentTransactions.map(tx => parseFloat(tx.amount)),
+      currentAmount,
+    ];
+
+    // Compute amount-clustering histogram and score
+    const binSize = config.cluster_bin_size ?? 500;
+    const { clusterScore, histogram, similarTransactionCount, totalClusteredAmount } =
+      computeStructuringClusterScore(allAmounts, reportingThreshold, binSize);
+
+    const scoreThreshold = config.score_threshold ?? 0.5;
+    const minTx = config.min_transactions ?? 3;
+    const triggered = clusterScore >= scoreThreshold && similarTransactionCount >= minTx;
+
+    // Emit metrics gauge
+    if (this.metrics) {
+      this.metrics.setGauge('aml.structuring.score', clusterScore, {
+        investor_id: context.investor_id,
+        rule_id: rule.id,
+      });
+    }
+
+    return {
+      triggered,
+      details: {
+        window_hours: config.window_hours ?? 24,
+        window_start: windowStart.toISOString(),
+        window_end: windowEnd.toISOString(),
+        reporting_threshold: reportingThreshold,
+        cluster_score: clusterScore,
+        score_threshold: scoreThreshold,
+        similar_transaction_count: similarTransactionCount,
+        min_transactions: minTx,
+        total_clustered_amount: totalClusteredAmount,
+        bin_size: binSize,
+        histogram_bins: histogram.length,
+        /** Top 3 histogram bins for analyst review. */
+        top_bins: histogram.slice(0, 3).map(bin => ({
+          range: `${bin.min}-${bin.max}`,
+          count: bin.count,
+          total: bin.total,
+        })),
+      },
+    };
+  }
+
+  /**
+   * @notice Resolve the jurisdiction-aware reporting threshold.
+   * @dev    Checks `config.jurisdictions` for a per-country override; falls back
+   *         to `config.reporting_threshold`. If the investor's country is in the
+   *         jurisdiction map, its `reporting_threshold` is used instead.
+   *
+   *         Example: investor from US → $10,000, investor from EU → €10,000.
+   */
+  private resolveStructuingThreshold(config: StructuringRuleConfig, context: TransactionContext): number {
+    const country = context.investor_country?.toUpperCase();
+    if (country && config.jurisdictions?.[country]) {
+      return config.jurisdictions[country].reporting_threshold;
+    }
+    return config.reporting_threshold;
   }
 
   private evaluateGeoMismatchRule(context: TransactionContext, rule: AMLRule): { triggered: boolean; details: Record<string, unknown> } {
@@ -525,4 +617,138 @@ export class RuleEvaluator {
       },
     };
   }
+}
+
+// ─── Structuring Cluster Score Computation ────────────────────────────────────
+
+/** A single histogram bin in the amount-clustering histogram. */
+export interface StructuringHistogramBin {
+  /** Lower bound (inclusive). */
+  min: number;
+  /** Upper bound (exclusive). */
+  max: number;
+  /** Number of transactions in this bin. */
+  count: number;
+  /** Total amount in this bin. */
+  total: number;
+}
+
+/** Result of the structuring cluster score computation. */
+export interface StructuringClusterResult {
+  /** Overall cluster score (0–1), higher = more suspicious. */
+  clusterScore: number;
+  /** Full histogram bins, sorted by count descending. */
+  histogram: StructuringHistogramBin[];
+  /** Number of transactions that fall into bins near the reporting threshold. */
+  similarTransactionCount: number;
+  /** Total amount across all clustered bins (bins with count ≥ 2). */
+  totalClusteredAmount: number;
+}
+
+/**
+ * @notice Compute a structuring cluster score from a list of deposit amounts
+ *         using histogram-based clustering.
+ *
+ * @dev    Algorithm:
+ *         1. Sort amounts and bucket them into histogram bins of `binSize`.
+ *         2. Identify the "threshold band" — bins whose upper bound is just
+ *            below the reporting threshold (within 2 × binSize).
+ *         3. Count transactions in the threshold band as "similar transactions."
+ *         4. Compute the cluster score as a weighted combination of:
+ *            - `concentrationScore`: fraction of all transactions inside the
+ *              threshold band (higher = more suspicious clustering).
+ *            - `volumeScore`: total amount in the threshold band relative to the
+ *              reporting threshold (higher = closer to triggering manual review).
+ *         5. The final score is clamped to [0, 1].
+ *
+ *         Refunds (`status === 'failed'`) must be filtered by the caller before
+ *         passing amounts to this function; they will distort the cluster score.
+ *
+ * @param amounts           - Array of deposit amounts (already filtered for non-failed).
+ * @param reportingThreshold - Regulatory reporting threshold (e.g., 10000).
+ * @param binSize           - Size of each histogram bin (default 500).
+ * @returns A `StructuringClusterResult` with score, histogram, and metadata.
+ */
+export function computeStructuringClusterScore(
+  amounts: number[],
+  reportingThreshold: number,
+  binSize: number = 500,
+): StructuringClusterResult {
+  if (amounts.length === 0) {
+    return { clusterScore: 0, histogram: [], similarTransactionCount: 0, totalClusteredAmount: 0 };
+  }
+
+  // Sort amounts for consistent binning
+  const sorted = [...amounts].sort((a, b) => a - b);
+  const minAmount = sorted[0];
+  const maxAmount = sorted[sorted.length - 1];
+
+  // Build histogram bins
+  const histogram: StructuringHistogramBin[] = [];
+  for (let edge = Math.floor(minAmount / binSize) * binSize; edge <= maxAmount; edge += binSize) {
+    const binMin = edge;
+    const binMax = edge + binSize;
+    const inBin = sorted.filter(a => a >= binMin && a < binMax);
+    if (inBin.length > 0) {
+      histogram.push({
+        min: binMin,
+        max: binMax,
+        count: inBin.length,
+        total: inBin.reduce((s, a) => s + a, 0),
+      });
+    }
+  }
+
+  // Sort bins by count descending for the top_bins output
+  const sortedBins = [...histogram].sort((a, b) => b.count - a.count);
+
+  // Identify the "threshold band": bins whose amounts are within 2 × binSize
+  // below the reporting threshold. These represent deposits clustered just
+  // under the regulatory limit (classic structuring/smurfing pattern).
+  const thresholdBandLower = reportingThreshold - 2 * binSize;
+  const thresholdBandUpper = reportingThreshold;
+
+  const thresholdBins = histogram.filter(
+    b => b.max > thresholdBandLower && b.max <= thresholdBandUpper,
+  );
+
+  const similarTransactionCount = thresholdBins.reduce((s, b) => s + b.count, 0);
+  const totalClusteredAmount = histogram
+    .filter(b => b.count >= 2)
+    .reduce((s, b) => s + b.total, 0);
+
+  // ── Score computation ──────────────────────────────────────────────────
+
+  // concentrationScore: fraction of all transactions that fall into the
+  // threshold band. A high fraction means the investor is heavily
+  // concentrating deposits just under the reporting limit.
+  const concentrationScore = amounts.length > 0
+    ? similarTransactionCount / amounts.length
+    : 0;
+
+  // volumeScore: total amount in the threshold band relative to the
+  // reporting threshold. Values near 1.0 indicate deposits are nearly
+  // hitting the threshold (multiplied across multiple transactions).
+  const thresholdBandTotal = thresholdBins.reduce((s, b) => s + b.total, 0);
+  const volumeScore = reportingThreshold > 0
+    ? Math.min(thresholdBandTotal / reportingThreshold, 1.0)
+    : 0;
+
+  // Bin concentration bonus: if most transactions are in a single bin,
+  // that's a stronger signal of deliberate structuring.
+  const maxBinCount = sortedBins.length > 0 ? sortedBins[0].count : 0;
+  const binConcentrationBonus = amounts.length > 0
+    ? (maxBinCount / amounts.length) * 0.3
+    : 0;
+
+  // Final cluster score: weighted combination, clamped to [0, 1]
+  const rawScore = (concentrationScore * 0.4) + (volumeScore * 0.4) + binConcentrationBonus;
+  const clusterScore = Math.min(Math.max(rawScore, 0), 1);
+
+  return {
+    clusterScore: Math.round(clusterScore * 10000) / 10000, // round to 4 decimals
+    histogram: sortedBins,
+    similarTransactionCount,
+    totalClusteredAmount,
+  };
 }

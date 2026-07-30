@@ -247,30 +247,33 @@ describe('RuleEvaluator', () => {
   });
 
   describe('Structuring Rule Evaluation', () => {
-    it('should detect transaction splitting', async () => {
+    it('should detect amount clustering below reporting threshold', async () => {
       const rule: AMLRule = {
         id: 'rule2',
         name: 'Structuring Detection',
-        description: 'Detects transaction splitting',
+        description: 'Detects transaction splitting via amount clustering',
         type: 'structuring',
-        version: { major: 1, minor: 0, patch: 0 },
+        version: { major: 2, minor: 0, patch: 0 },
         severity: 'high',
         enabled: true,
         config: {
           window_hours: 24,
           amount_threshold: 100,
           min_transactions: 3,
-          reporting_threshold: 9000,
+          reporting_threshold: 10000,
+          cluster_bin_size: 500,
+          score_threshold: 0.3,
         },
         created_at: new Date(),
         updated_at: new Date(),
       };
 
+      // Classic smurfing: 4 deposits of ~$9,900 each, just below $10K threshold
       const context: TransactionContext = {
         investment_id: 'inv1',
         investor_id: 'inv1',
         offering_id: 'off1',
-        amount: '3000',
+        amount: '9900',
         asset: 'USD',
         timestamp: new Date(),
         previous_transactions: [
@@ -278,7 +281,7 @@ describe('RuleEvaluator', () => {
             investment_id: 'inv2',
             investor_id: 'inv1',
             offering_id: 'off1',
-            amount: '3050',
+            amount: '9850',
             asset: 'USD',
             timestamp: new Date(Date.now() - 18 * 60 * 60 * 1000),
             status: 'completed',
@@ -287,7 +290,7 @@ describe('RuleEvaluator', () => {
             investment_id: 'inv3',
             investor_id: 'inv1',
             offering_id: 'off1',
-            amount: '2950',
+            amount: '9925',
             asset: 'USD',
             timestamp: new Date(Date.now() - 12 * 60 * 60 * 1000),
             status: 'completed',
@@ -296,7 +299,7 @@ describe('RuleEvaluator', () => {
             investment_id: 'inv4',
             investor_id: 'inv1',
             offering_id: 'off1',
-            amount: '3020',
+            amount: '9875',
             asset: 'USD',
             timestamp: new Date(Date.now() - 6 * 60 * 60 * 1000),
             status: 'completed',
@@ -307,28 +310,34 @@ describe('RuleEvaluator', () => {
       const results = await evaluator.evaluate(context, [rule]);
       expect(results).toHaveLength(1);
       expect(results[0].triggered).toBe(true);
-      expect(results[0].details.similar_transaction_count).toBe(3);
+      expect(results[0].details.cluster_score).toBeGreaterThan(0.3);
+      expect(results[0].details.similar_transaction_count).toBeGreaterThanOrEqual(3);
+      expect(results[0].details.top_bins).toBeDefined();
+      expect(Array.isArray(results[0].details.top_bins)).toBe(true);
     });
 
-    it('should not trigger when below min transaction threshold', async () => {
+    it('should not trigger when amounts are far from reporting threshold', async () => {
       const rule: AMLRule = {
         id: 'rule2',
         name: 'Structuring Detection',
         description: 'Detects transaction splitting',
         type: 'structuring',
-        version: { major: 1, minor: 0, patch: 0 },
+        version: { major: 2, minor: 0, patch: 0 },
         severity: 'high',
         enabled: true,
         config: {
           window_hours: 24,
           amount_threshold: 100,
-          min_transactions: 5,
-          reporting_threshold: 9000,
+          min_transactions: 3,
+          reporting_threshold: 10000,
+          cluster_bin_size: 500,
+          score_threshold: 0.3,
         },
         created_at: new Date(),
         updated_at: new Date(),
       };
 
+      // Amounts around $3,000 — far below $10K threshold, no clustering signal
       const context: TransactionContext = {
         investment_id: 'inv1',
         investor_id: 'inv1',
@@ -342,6 +351,54 @@ describe('RuleEvaluator', () => {
             investor_id: 'inv1',
             offering_id: 'off1',
             amount: '3050',
+            asset: 'USD',
+            timestamp: new Date(Date.now() - 12 * 60 * 60 * 1000),
+            status: 'completed',
+          },
+        ],
+      };
+
+      const results = await evaluator.evaluate(context, [rule]);
+      expect(results).toHaveLength(1);
+      expect(results[0].triggered).toBe(false);
+      expect(results[0].details.cluster_score).toBeLessThan(0.3);
+    });
+
+    it('should not trigger when below min_transactions for similar amounts', async () => {
+      const rule: AMLRule = {
+        id: 'rule2',
+        name: 'Structuring Detection',
+        description: 'Detects transaction splitting',
+        type: 'structuring',
+        version: { major: 2, minor: 0, patch: 0 },
+        severity: 'high',
+        enabled: true,
+        config: {
+          window_hours: 24,
+          amount_threshold: 100,
+          min_transactions: 5,
+          reporting_threshold: 10000,
+          cluster_bin_size: 500,
+          score_threshold: 0.3,
+        },
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+
+      // Only 2 transactions near threshold — below min_transactions=5
+      const context: TransactionContext = {
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        offering_id: 'off1',
+        amount: '9900',
+        asset: 'USD',
+        timestamp: new Date(),
+        previous_transactions: [
+          {
+            investment_id: 'inv2',
+            investor_id: 'inv1',
+            offering_id: 'off1',
+            amount: '9850',
             asset: 'USD',
             timestamp: new Date(Date.now() - 12 * 60 * 60 * 1000),
             status: 'completed',
