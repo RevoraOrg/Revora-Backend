@@ -1,7 +1,6 @@
 import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
-import { SecurityAuditRepository } from '../security/types';
 
 export type ConversionPathType = 'direct' | 'inverse' | 'triangulated';
 
@@ -74,6 +73,7 @@ const METRIC_STALE_RATE_REJECTED    = 'fx_stale_rate_rejected_total';
 const METRIC_CONVERSIONS_TOTAL      = 'fx_conversions_total';
 const METRIC_TRIANGULATIONS_TOTAL   = 'fx_triangulations_total';
 const METRIC_TRIANGULATION_HOPS     = 'fx_triangulation_hops';
+const METRIC_SPREAD_MISSING         = 'fx_rate_spread_missing_total';
 
 /** Default maximum number of intermediate hops allowed in a triangulation chain. */
 const DEFAULT_MAX_HOPS = 2;
@@ -119,9 +119,6 @@ export class FxConversionEngine {
       bucketIncrement?: Decimal;
       side?: 'bid' | 'ask' | 'mid';
       maxRateAgeMs?: number;
-      allowStaleFallback?: boolean;
-      auditUserId?: string;
-      auditSessionId?: string;
     }
   ): Promise<FxConversionResult> {
     if (amount.isZero()) {
@@ -151,11 +148,13 @@ export class FxConversionEngine {
     }
 
     let rate = await this.rateProvider.getRate(from, to);
+    let wasInverted = false;
 
     if (!rate) {
       rate = await this.rateProvider.getRate(to, from);
       if (rate) {
         rate = this.invertRate(rate);
+        wasInverted = true;
       }
     }
 
@@ -168,32 +167,7 @@ export class FxConversionEngine {
 
     const maxAge = options?.maxRateAgeMs ?? 300000;
     
-    let isStale = this.isRateStale(rate, maxAge);
-    let fallbackUsed = false;
-    let fallbackReason: FxFallbackReason | undefined;
-    
-    // First, try fallback provider if rate is stale and a fallback provider is configured
-    if (isStale && this.fallbackRateProvider) {
-      let fRate = await this.fallbackRateProvider.getRate(from, to);
-      if (!fRate) {
-        fRate = await this.fallbackRateProvider.getRate(to, from);
-        if (fRate) {
-          fRate = this.invertRate(fRate);
-        }
-      }
-      if (fRate && !this.isRateStale(fRate, maxAge)) {
-        rate = fRate;
-        isStale = false;
-        fallbackUsed = true;
-        fallbackReason = FxFallbackReason.SUBSTITUTE_PROVIDER_USED;
-      }
-    }
-    
-    // Next, if still stale, but we allow stale fallbacks on the primary rate
-    if (isStale && options?.allowStaleFallback) {
-      fallbackUsed = true;
-      fallbackReason = FxFallbackReason.STALE_RATE_TOLERATED;
-    } else if (isStale) {
+    if (this.isRateStale(rate, maxAge)) {
       this.metrics?.incrementCounter(METRIC_STALE_RATE_REJECTED, { pair: rate.pair });
       throw Errors.serviceUnavailable(
         `Exchange rate for ${rate.pair} is stale (age: ${this.rateAgeMs(rate)}ms, max: ${maxAge}ms)`,
@@ -201,7 +175,7 @@ export class FxConversionEngine {
       );
     }
 
-    const side = options?.side ?? 'mid';
+    const side = this.resolveDefaultSide(rate, wasInverted, options?.side);
     const effectiveRate = this.resolveSide(rate, side);
     const rawOutput = amount.multiply(effectiveRate);
 
@@ -277,29 +251,32 @@ export class FxConversionEngine {
       );
     }
 
-    const side = options?.side ?? 'mid';
     const missingPairs: string[] = [];
 
     // Try each candidate reference currency in order.
     for (const via of vias) {
-      const leg1Result = await this._singleLeg(amount, from, via, side, options);
+      const leg1Result = await this._singleLeg(amount, from, via, options?.side, options);
       if (!leg1Result) {
         missingPairs.push(`${from}/${via}`);
         continue;
       }
 
-      const leg2Result = await this._singleLeg(leg1Result.outputAmount, via, to, side, options);
+      const leg2Result = await this._singleLeg(leg1Result.outputAmount, via, to, options?.side, options);
       if (!leg2Result) {
         missingPairs.push(`${via}/${to}`);
         continue;
       }
 
+      // Determine the effective side for hop provenance.
+      const legSide = options?.side ??
+        this.inferSideFromRate(leg1Result.rate);
+
       // ── Hop provenance ─────────────────────────────────────────────────────
       const hop0: FxHop = {
         from,
         to: via,
-        effectiveRate: this.resolveSide(leg1Result.rate, side),
-        side,
+        effectiveRate: this.resolveSide(leg1Result.rate, legSide),
+        side: legSide,
         rawRate: leg1Result.rate,
         inputAmount: amount,
         outputAmount: leg1Result.outputAmount,
@@ -310,8 +287,8 @@ export class FxConversionEngine {
       const hop1: FxHop = {
         from: via,
         to,
-        effectiveRate: this.resolveSide(leg2Result.rate, side),
-        side,
+        effectiveRate: this.resolveSide(leg2Result.rate, legSide),
+        side: legSide,
         rawRate: leg2Result.rate,
         inputAmount: leg1Result.outputAmount,
         outputAmount: leg2Result.outputAmount,
@@ -368,7 +345,7 @@ export class FxConversionEngine {
     amount: Decimal,
     from: string,
     to: string,
-    side: 'bid' | 'ask' | 'mid',
+    side?: 'bid' | 'ask' | 'mid',
     options?: { bucketIncrement?: Decimal; maxRateAgeMs?: number }
   ): Promise<FxConversionResult | null> {
     try {
@@ -429,6 +406,49 @@ export class FxConversionEngine {
     }
   }
 
+  /**
+   * @notice Determine the effective rate side for a conversion.
+   * @dev    When the caller provides an explicit side, that side is used.
+   *         Otherwise:
+   *           - If the rate has a non-zero spread (bid !== ask), default to `bid`
+   *             (the sell side, reflecting the cost the user pays).
+   *           - If the rate has zero spread (bid === ask), fall back to `mid`
+   *             and emit a `fx.rate.spread_missing` counter so operators can
+   *             identify providers that do not supply spread data.
+   * @param rate         The resolved exchange rate.
+   * @param _wasInverted Whether the rate was derived by inverting another pair.
+   * @param explicitSide An explicitly requested side, if any.
+   */
+  private resolveDefaultSide(
+    rate: ExchangeRate,
+    _wasInverted: boolean,
+    explicitSide?: 'bid' | 'ask' | 'mid'
+  ): 'bid' | 'ask' | 'mid' {
+    if (explicitSide) return explicitSide;
+
+    // If the provider supplies no spread (bid === ask), fall back to mid
+    // and record the gap so operators can improve provider coverage.
+    if (rate.bid.toString() === rate.ask.toString()) {
+      this.metrics?.incrementCounter(METRIC_SPREAD_MISSING, { pair: rate.pair });
+      return 'mid';
+    }
+
+    // Default to bid: the user sells the source currency at the bid price,
+    // which reflects the actual cost (mid understates the spread).
+    return 'bid';
+  }
+
+  /**
+   * @notice Infer which rate side was used for a conversion result, accounting
+   *         for the bid/ask spread logic in `resolveDefaultSide`.
+   * @dev    Used by `triangulate` to populate FxHop.side when no explicit side
+   *         was requested.  Mirrors the logic in `resolveDefaultSide`.
+   */
+  private inferSideFromRate(rate: ExchangeRate): 'bid' | 'ask' | 'mid' {
+    if (rate.bid.toString() === rate.ask.toString()) return 'mid';
+    return 'bid';
+  }
+
   /** Frozen-rate store: context -> ExchangeRate remap. */
   private readonly frozenRates = new Map<string, ExchangeRate>();
 
@@ -443,13 +463,13 @@ export class FxConversionEngine {
       this.metrics?.incrementCounter('fx_rate_frozen_reused', { context });
       return existing;
     }
-    const result = await this.convert(new Decimal('1'), from, to, { side: side ?? 'mid' });
+    const result = await this.convert(new Decimal('1'), from, to, { side });
     const frozen: ExchangeRate = {
       ...result.rate,
       id: result.rate.id ?? 'frozen-' + context + '-' + Date.now(),
     };
     this.frozenRates.set(context, frozen);
-    this.metrics?.incrementCounter('fx_rate_frozen_total', { context, from, to, side: side ?? 'mid' });
+    this.metrics?.incrementCounter('fx_rate_frozen_total', { context, from, to });
     return frozen;
   }
 
