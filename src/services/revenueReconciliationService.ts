@@ -18,16 +18,18 @@ import { DistributionRepository, DistributionRun, Payout } from '../db/repositor
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger, Logger, LogLevel } from '../lib/logger';
-import { 
-  classifyStellarRPCFailure, 
+import {
+  classifyStellarRPCFailure,
   StellarRPCFailureClass,
-  StellarRPCFailureContext 
+  StellarRPCFailureContext
 } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
-import { 
+import {
   StellarTransactionVerifier,
-  TransactionVerificationResult 
+  TransactionVerificationResult
 } from '../lib/stellarTransactionVerifier';
+import { HorizonFixtureAdapter } from '../lib/horizonFixtureAdapter';
+import { createHash } from 'crypto';
 
 export interface OnChainRevenueState {
   totalDistributed: string;
@@ -94,6 +96,7 @@ export interface ReconciliationOptions {
   checkInvestorAllocations?: boolean;
   validateChainEvents?: boolean;
   logger?: Logger;
+  horizonFixtureUrl?: string;
 }
 
 const DEFAULT_TOLERANCE = 0.01;
@@ -109,7 +112,9 @@ export class RevenueReconciliationService {
   constructor(
     private readonly db: Pool,
     private readonly stellarClient?: StellarRevenueClient,
-    txVerifier?: StellarTransactionVerifier
+    txVerifier?: StellarTransactionVerifier,
+    private readonly horizonFixtureAdapter?: HorizonFixtureAdapter,
+    private readonly signingKey?: string
   ) {
     this.revenueReportRepo = new RevenueReportRepository(db);
     this.distributionRepo = new DistributionRepository(db);
@@ -117,6 +122,8 @@ export class RevenueReconciliationService {
     this.offeringRepo = new OfferingRepository(db);
     this.logger = logger.child({ service: 'RevenueReconciliationService' });
     this.txVerifier = txVerifier;
+    this.horizonFixtureAdapter = horizonFixtureAdapter;
+    this.signingKey = signingKey;
   }
 
   /**
@@ -130,8 +137,10 @@ export class RevenueReconciliationService {
     offeringId: string,
     periodStart: Date,
     periodEnd: Date,
-    options: ReconciliationOptions = {}
+    options: ReconciliationOptions = {},
+    horizonFixtureUrl?: string
   ): Promise<ReconciliationResult> {
+    const fixtureHash = horizonFixtureUrl ? await this.horizonFixtureAdapter?.getFixtureHash(horizonFixtureUrl) : undefined;
     const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
@@ -186,9 +195,9 @@ export class RevenueReconciliationService {
       }
 
       // Drift Detection
-      if (this.stellarClient) {
+if (this.stellarClient || horizonFixtureUrl) {
         try {
-          const driftResult = await this.detectChainDrift(offeringId);
+          const driftResult = await this.detectChainDrift(offeringId, horizonFixtureUrl);
           if (driftResult.hasDrift) {
             discrepancies.push({
               type: 'CHAIN_DRIFT_DETECTED',
@@ -197,7 +206,7 @@ export class RevenueReconciliationService {
               details: driftResult,
               offeringId,
             });
-
+            
             this.logger.error('Revenue reconciliation drift detected', {
               offeringId,
               ...driftResult,
@@ -215,7 +224,7 @@ export class RevenueReconciliationService {
             details: { error: String(error), failureClass: failure.class },
             offeringId,
           });
-
+          
           this.logger.warn('Failed to fetch on-chain state during reconciliation', {
             offeringId,
             failureClass: failure.class,
@@ -375,9 +384,16 @@ export class RevenueReconciliationService {
           payoutsProcessed: this.countProcessedPayouts(relevantRuns),
           payoutsFailed: totalFailedPayouts,
           chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
+          fixtureHash,
         },
         checkedAt: new Date(),
       };
+
+      if (this.horizonFixtureAdapter && this.signingKey) {
+        return this.horizonFixtureAdapter.signReport(result);
+      }
+      
+      return result;
 
       return result;
     } catch (error) {
@@ -491,11 +507,12 @@ export class RevenueReconciliationService {
   /**
    * Detect drift between local DB and on-chain state
    */
-  async detectChainDrift(offeringId: string): Promise<{
+  async detectChainDrift(offeringId: string, horizonFixtureUrl?: string): Promise<{
     hasDrift: boolean;
     onChainAmount: string;
     localAmount: string;
     drift: string;
+    fixtureHash?: string;
   }> {
     if (!this.stellarClient) {
       throw Errors.internal('Stellar client not configured for drift detection');
@@ -503,11 +520,36 @@ export class RevenueReconciliationService {
 
     const offering = await this.offeringRepo.findById(offeringId);
     if (!offering || !offering.contract_address) {
+      if (!horizonFixtureUrl) {
+        return {
+          hasDrift: false,
+          onChainAmount: '0.00',
+          localAmount: '0.00',
+          drift: '0.00',
+        };
+      }
+      
+      if (!this.horizonFixtureAdapter) {
+        throw Errors.internal('Horizon fixture adapter not configured');
+      }
+      
+      const fixtureState = await this.horizonFixtureAdapter.getRevenueState(horizonFixtureUrl);
+      const stats = await this.distributionRepo.getAggregateStats(offeringId);
+      
+      const onChainAmount = parseFloat(fixtureState.totalDistributed);
+      const localAmount = parseFloat(stats.totalDistributed);
+      const drift = Math.abs(onChainAmount - localAmount);
+      
+      const hasDrift = drift > DEFAULT_TOLERANCE;
+      
+      const fixtureHash = horizonFixtureUrl ? createHash('sha256').update(horizonFixtureUrl).digest('hex') : undefined;
+      
       return {
-        hasDrift: false,
-        onChainAmount: '0.00',
-        localAmount: '0.00',
-        drift: '0.00',
+        hasDrift,
+        onChainAmount: onChainAmount.toFixed(2),
+        localAmount: localAmount.toFixed(2),
+        drift: drift.toFixed(2),
+        fixtureHash,
       };
     }
 

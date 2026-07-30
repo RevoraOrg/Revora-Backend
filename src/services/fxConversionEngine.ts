@@ -64,6 +64,11 @@ export interface FxConversionResult {
    * Direct/inverse conversions have an empty array.
    */
   hops: FxHop[];
+  /**
+   * The SHA-256 hash of the Horizon fixture URL used for this conversion.
+   * Only populated if a fixture was used.
+   */
+  fixtureHash?: string;
 }
 
 export interface RateProvider {
@@ -122,6 +127,7 @@ export class FxConversionEngine {
       allowStaleFallback?: boolean;
       auditUserId?: string;
       auditSessionId?: string;
+      fixtureHash?: string;
     }
   ): Promise<FxConversionResult> {
     if (amount.isZero()) {
@@ -224,6 +230,7 @@ export class FxConversionEngine {
       path: { type: 'direct', description: `${from}/${to}` },
       roundedToIncrement: rounded,
       hops: [],
+      fixtureHash: options?.fixtureHash,
     };
   }
 
@@ -254,6 +261,7 @@ export class FxConversionEngine {
       bucketIncrement?: Decimal;
       side?: 'bid' | 'ask' | 'mid';
       maxRateAgeMs?: number;
+      fixtureHash?: string;
     }
   ): Promise<FxConversionResult> {
     const vias = Array.isArray(viaOrVias) ? viaOrVias : [viaOrVias];
@@ -348,6 +356,7 @@ export class FxConversionEngine {
         },
         roundedToIncrement: leg1Result.roundedToIncrement || leg2Result.roundedToIncrement,
         hops,
+        fixtureHash: options?.fixtureHash,
       };
     }
 
