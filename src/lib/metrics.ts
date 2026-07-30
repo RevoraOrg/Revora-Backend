@@ -657,6 +657,40 @@ export class MetricsCollector {
       lines.push(`${name}${labelStr} ${value} ${timestamp}`);
     }
 
+    // Export histograms
+    for (const [key, observations] of this.histograms.entries()) {
+      const { name, labels } = this.parseMetricKey(key);
+      const metadata = this.metricMetadata.get(name);
+      
+      if (metadata?.help) {
+        lines.push(`# HELP ${name} ${metadata.help}`);
+      }
+      lines.push(`# TYPE ${name} histogram`);
+      
+      const data = this.calculateHistogram(observations);
+      const labelStr = labels && Object.keys(labels).length > 0
+        ? `{${Object.entries(labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`
+        : '';
+      
+      // Export buckets
+      for (const bucket of data.buckets) {
+        const bucketLabel = labelStr
+          ? `{${labelStr.slice(1, -1)},le="${bucket.le}"}`
+          : `{le="${bucket.le}"}`;
+        lines.push(`${name}${bucketLabel} ${bucket.count} ${timestamp}`);
+      }
+      
+      // Export +Inf bucket
+      const infLabel = labelStr
+        ? `{${labelStr.slice(1, -1)},le="+Inf"}`
+        : `{le="+Inf"}`;
+      lines.push(`${name}${infLabel} ${data.count} ${timestamp}`);
+      
+      // Export sum and count
+      lines.push(`${name}_sum${labelStr} ${data.sum} ${timestamp}`);
+      lines.push(`${name}_count${labelStr} ${data.count} ${timestamp}`);
+    }
+
     return lines.join('\n') + '\n';
   }
 
