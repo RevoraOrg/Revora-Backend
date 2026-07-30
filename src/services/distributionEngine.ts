@@ -1,12 +1,16 @@
 /**
- * DistributionEngine — prorates revenue across investors and persists payouts.
- *
- * @see ../../docs/architecture/distribution-reconciliation.md
- *      End-to-end architecture map (sequence diagram + state machine).
- * @see ../docs/distribution-engine-retry-strategy.md
- * @see ../docs/distribution-advisory-lock.md
- * @see ../docs/distribution-engine-atomic-transactions.md
- * @see ../docs/distribution-engine-safety.md
+ * @fileoverview Core engine for calculating and executing offering distributions.
+ * 
+ * @remarks
+ * This service relies on strict transactional boundaries and advisory locks to prevent double-payouts.
+ * For the complete end-to-end architectural flow bridging this service to the Outbox and Reconciliation subsystems,
+ * @see {@link file://../../docs/architecture/distribution-reconciliation.md | Distribution & Reconciliation Architecture}
+ * 
+ * Related Component Documentation:
+ * @see {@link file://../../docs/distribution-engine-retry-strategy.md | Retry Strategy}
+ * @see {@link file://../../docs/distribution-advisory-lock.md | Advisory Lock}
+ * @see {@link file://../../docs/distribution-engine-atomic-transactions.md | Atomic Transactions}
+ * @see {@link file://../../docs/distribution-engine-safety.md | Engine Safety}
  */
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors, AppError } from '../lib/errors';
@@ -198,6 +202,9 @@ function calculateDistributionPayouts(
   return { rounded, totalBalanceDecimal, revenueDecimal };
 }
 
+/**
+ * Engine responsible for calculating, validating, and committing batch payouts for an offering.
+ */
 class DistributionEngine {
   private readonly maxRetries: number;
   private readonly initialDelayMs: number;
