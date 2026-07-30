@@ -1,38 +1,49 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import { pool } from './db/pool';
-import { createRequireAuth } from './middleware/auth';
-import { createCorsMiddleware } from './middleware/cors';
-import { SessionRepository } from './db/repositories/sessionRepository';
-import { WebhookEndpointRepository } from './db/repositories/webhookEndpointRepository';
-import { createAdminWebhooksRouter } from './routes/adminWebhooks';
-import { createLogoutRouter } from './auth/logout/logoutRoute';
-import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
-import { createLoginRouter } from './auth/login/loginRoute';
-import { createHealthRouter } from './routes/health';
-import { dbHealth } from './db/client';
-import { createOfferingSyncRouter } from './routes/offeringSync';
-import { UserRepository } from './db/repositories/userRepository';
-import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionRepository as ISessionRepository } from './auth/login/types';
-import { LoginService } from './auth/login/loginService';
-import { issueToken } from './lib/jwt';
-import { MetricsCollector } from './lib/metrics';
-import { metricsMiddleware, createPrometheusHandler } from './middleware/metricsMiddleware';
-import { Logger } from './lib/logger';
-import { RefreshService } from './auth/refresh/refreshService';
-import { createRefreshRouter } from './auth/refresh/refreshRoute';
-import { RefreshTokenRepository, TokenService } from './auth/refresh/types';
-import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
-import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
-import { errorHandler } from './middleware/errorHandler';
-import { SocialIdentityRepository } from './db/repositories/socialIdentityRepository';
-import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryAdapter';
-import { SocialAuthService } from './auth/social/socialAuthService';
-import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
-import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
-import { createReconciliationMetricsHandler } from './routes/reconciliationRoutes';
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import { pool } from "./db/pool";
+import { createRequireAuth } from "./middleware/auth";
+import { createCorsMiddleware } from "./middleware/cors";
+import { SessionRepository } from "./db/repositories/sessionRepository";
+import { WebhookEndpointRepository } from "./db/repositories/webhookEndpointRepository";
+import { createAdminWebhooksRouter } from "./routes/adminWebhooks";
+import { createLogoutRouter } from "./auth/logout/logoutRoute";
+import { createChangePasswordRouter } from "./auth/changePassword/changePasswordRoute";
+import { createLoginRouter } from "./auth/login/loginRoute";
+import { createHealthRouter } from "./routes/health";
+import { dbHealth } from "./db/client";
+import { createOfferingSyncRouter } from "./routes/offeringSync";
+import { UserRepository } from "./db/repositories/userRepository";
+import {
+  JwtIssuer,
+  UserRole,
+  UserRepository as IUserRepository,
+  SessionRepository as ISessionRepository,
+} from "./auth/login/types";
+import { LoginService } from "./auth/login/loginService";
+import { issueToken } from "./lib/jwt";
+import { MetricsCollector } from "./lib/metrics";
+import {
+  metricsMiddleware,
+  createPrometheusHandler,
+} from "./middleware/metricsMiddleware";
+import { Logger } from "./lib/logger";
+import { RefreshService } from "./auth/refresh/refreshService";
+import { createRefreshRouter } from "./auth/refresh/refreshRoute";
+import { RefreshTokenRepository, TokenService } from "./auth/refresh/types";
+import { RefreshTokenRepositoryAdapter } from "./auth/refresh/repositoryAdapter";
+import { JwtTokenServiceAdapter } from "./auth/refresh/tokenServiceAdapter";
+import { errorHandler } from "./middleware/errorHandler";
+import { SocialIdentityRepository } from "./db/repositories/socialIdentityRepository";
+import { SocialUserRepositoryAdapter } from "./auth/social/socialUserRepositoryAdapter";
+import { SocialAuthService } from "./auth/social/socialAuthService";
+import { createDefaultSocialTokenVerifierFromEnv } from "./auth/social/providerVerifiers";
+import { createSocialAuthRouter } from "./auth/social/socialAuthRoute";
+import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
+import { createDisputeSLARouter } from "./routes/disputes";
+import { NotificationRepository } from "./db/repositories/notificationRepository";
+import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -99,31 +110,35 @@ class JwtIssuerImpl implements JwtIssuer {
 
 /**
  * Middleware to secure the /metrics endpoint with bearer token authentication.
- * 
+ *
  * Security Assumptions:
  * - METRICS_TOKEN environment variable must be set in production
  * - Token should be a cryptographically random string (min 32 characters)
  * - Requests without valid token are rejected with 401
  * - In development/test, endpoint is accessible without token for convenience
- * 
+ *
  * Usage:
  * Set METRICS_TOKEN environment variable:
  * ```bash
  * export METRICS_TOKEN="your-secure-random-token-here"
  * ```
- * 
+ *
  * Access metrics:
  * ```bash
  * curl -H "Authorization: Bearer your-secure-random-token-here" http://localhost:4000/metrics
  * ```
  */
 function createMetricsAuthMiddleware() {
-  return (req: express.Request, res: express.Response, next: express.NextFunction): void => {
+  return (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): void => {
     const metricsToken = process.env.METRICS_TOKEN;
     const nodeEnv = process.env.NODE_ENV;
 
     // In development/test, allow access without token for convenience
-    if (nodeEnv === 'development' || nodeEnv === 'test') {
+    if (nodeEnv === "development" || nodeEnv === "test") {
       next();
       return;
     }
@@ -131,18 +146,18 @@ function createMetricsAuthMiddleware() {
     // In production, require METRICS_TOKEN to be set
     if (!metricsToken) {
       res.status(503).json({
-        error: 'Metrics endpoint not configured',
-        message: 'METRICS_TOKEN environment variable must be set',
+        error: "Metrics endpoint not configured",
+        message: "METRICS_TOKEN environment variable must be set",
       });
       return;
     }
 
     // Extract bearer token from Authorization header
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
       res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Bearer token required',
+        error: "Unauthorized",
+        message: "Bearer token required",
       });
       return;
     }
@@ -150,10 +165,13 @@ function createMetricsAuthMiddleware() {
     const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
     // Constant-time comparison to prevent timing attacks
-    if (token.length !== metricsToken.length || !timingSafeEqual(Buffer.from(token), Buffer.from(metricsToken))) {
+    if (
+      token.length !== metricsToken.length ||
+      !timingSafeEqual(Buffer.from(token), Buffer.from(metricsToken))
+    ) {
       res.status(401).json({
-        error: 'Unauthorized',
-        message: 'Invalid token',
+        error: "Unauthorized",
+        message: "Invalid token",
       });
       return;
     }
@@ -168,7 +186,7 @@ function createMetricsAuthMiddleware() {
  */
 function timingSafeEqual(a: Buffer, b: Buffer): boolean {
   try {
-    const crypto = require('crypto');
+    const crypto = require("crypto");
     return crypto.timingSafeEqual(a, b);
   } catch {
     return false;
@@ -197,7 +215,10 @@ export function createApp() {
 
   // Admin webhooks management
   const webhookRepo = new WebhookEndpointRepository(pool);
-  app.use('/api/v1/admin/webhooks', createAdminWebhooksRouter({ repo: webhookRepo, requireAuth }));
+  app.use(
+    "/api/v1/admin/webhooks",
+    createAdminWebhooksRouter({ repo: webhookRepo, requireAuth }),
+  );
 
   const userRepository = new UserRepository(pool);
   const jwtIssuer = new JwtIssuerImpl();
@@ -215,10 +236,17 @@ export function createApp() {
   );
 
   // Refresh service
-  const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
+  const refreshTokenRepository = new RefreshTokenRepositoryAdapter(
+    sessionRepository,
+  );
   const tokenService = new JwtTokenServiceAdapter();
-  const logger = new Logger({ serviceName: 'auth-refresh' });
-  const refreshService = new RefreshService(refreshTokenRepository, tokenService, pool, logger);
+  const logger = new Logger({ serviceName: "auth-refresh" });
+  const refreshService = new RefreshService(
+    refreshTokenRepository,
+    tokenService,
+    pool,
+    logger,
+  );
 
   // Auth and health routes
   app.use(createLoginRouter({ loginService }));
@@ -226,20 +254,37 @@ export function createApp() {
   app.use(createRefreshRouter({ refreshService }));
   app.use(createLogoutRouter({ requireAuth, sessionRepository }));
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
-  app.use('/api/v1/health', createHealthRouter(pool, dbHealth, metrics));
+  app.use("/api/v1/health", createHealthRouter(pool, dbHealth, metrics));
 
   // Metrics endpoint (Prometheus format) - secured with internal token
-  app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics));
+  app.get(
+    "/metrics",
+    createMetricsAuthMiddleware(),
+    createPrometheusHandler(metrics),
+  );
 
   // Reconciliation metrics endpoint (OpenMetrics format) - same auth guard
   app.get(
-    '/metrics/reconciliation',
+    "/metrics/reconciliation",
     createMetricsAuthMiddleware(),
-    createReconciliationMetricsHandler(metrics)
+    createReconciliationMetricsHandler(metrics),
   );
 
   // Offering sync routes
-  app.use('/api/v1/offerings', createOfferingSyncRouter());
+  app.use("/api/v1/offerings", createOfferingSyncRouter());
+
+  // Dispute SLA and evidence export routes
+  const notificationRepository = new NotificationRepository(pool);
+  const auditLogRepository = new AuditLogRepository(pool);
+  app.use(
+    "/api/v1",
+    createDisputeSLARouter({
+      db: pool,
+      notificationRepo: notificationRepository,
+      auditLogRepo: auditLogRepository,
+      requireAuth,
+    }),
+  );
 
   // Global error handler — must be mounted after all routes
   app.use(errorHandler);

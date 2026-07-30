@@ -1,10 +1,20 @@
-import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
-import { Pool } from 'pg';
-import { DisputeSLAService } from '../services/disputeSLAService';
-import { NotificationRepository } from '../db/repositories/notificationRepository';
-import { AuditLogRepository } from '../db/repositories/auditLogRepository';
-import { DISPUTE_STATES, DISPUTE_JURISDICTIONS } from '../config/disputeSLAConfig';
-import { DisputeRefundService } from '../services/disputeRefundService';
+import {
+  Router,
+  Request,
+  Response,
+  NextFunction,
+  RequestHandler,
+} from "express";
+import { Pool } from "pg";
+import { DisputeSLAService } from "../services/disputeSLAService";
+import { NotificationRepository } from "../db/repositories/notificationRepository";
+import { AuditLogRepository } from "../db/repositories/auditLogRepository";
+import {
+  DISPUTE_STATES,
+  DISPUTE_JURISDICTIONS,
+} from "../config/disputeSLAConfig";
+import { DisputeRefundService } from "../services/disputeRefundService";
+import { DisputeEvidenceExporter } from "../services/disputeEvidenceExporter";
 
 /**
  * Dispute SLA Routes
@@ -29,8 +39,8 @@ function validateEnum(
   allowed: readonly string[],
   fieldName: string,
 ): string | null {
-  if (typeof value !== 'string' || !allowed.includes(value)) {
-    return `${fieldName} must be one of: ${allowed.join(', ')}`;
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    return `${fieldName} must be one of: ${allowed.join(", ")}`;
   }
   return null;
 }
@@ -39,7 +49,7 @@ function validateEnum(
  * Validate a date string.
  */
 function validateDate(value: unknown, fieldName: string): Date | null {
-  if (typeof value !== 'string') return null;
+  if (typeof value !== "string") return null;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return null;
   return d;
@@ -50,29 +60,38 @@ function validateDate(value: unknown, fieldName: string): Date | null {
  */
 export function createDisputeSLAHandlers(
   disputeSLAService: DisputeSLAService,
-  disputeRefundService?: DisputeRefundService
+  disputeRefundService?: DisputeRefundService,
+  evidenceExporter?: DisputeEvidenceExporter,
 ) {
   /**
    * POST /api/v1/disputes/:disputeId/sla/start
    * Start an SLA timer for a dispute.
    */
-  async function startSLA(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function startSLA(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { disputeId } = req.params;
       const { jurisdiction, state, assignedUserId } = req.body || {};
 
       if (!disputeId) {
-        res.status(400).json({ error: 'disputeId path parameter is required' });
+        res.status(400).json({ error: "disputeId path parameter is required" });
         return;
       }
 
-      const jurisError = validateEnum(jurisdiction, DISPUTE_JURISDICTIONS, 'jurisdiction');
+      const jurisError = validateEnum(
+        jurisdiction,
+        DISPUTE_JURISDICTIONS,
+        "jurisdiction",
+      );
       if (jurisError) {
         res.status(400).json({ error: jurisError });
         return;
       }
 
-      const stateError = validateEnum(state, DISPUTE_STATES, 'state');
+      const stateError = validateEnum(state, DISPUTE_STATES, "state");
       if (stateError) {
         res.status(400).json({ error: stateError });
         return;
@@ -95,24 +114,32 @@ export function createDisputeSLAHandlers(
    * POST /api/v1/disputes/:disputeId/sla/transition
    * Transition a dispute to a new state, updating the SLA timer.
    */
-  async function transitionSLA(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function transitionSLA(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { disputeId } = req.params;
       const { newState, newJurisdiction } = req.body || {};
 
       if (!disputeId) {
-        res.status(400).json({ error: 'disputeId path parameter is required' });
+        res.status(400).json({ error: "disputeId path parameter is required" });
         return;
       }
 
-      const stateError = validateEnum(newState, DISPUTE_STATES, 'newState');
+      const stateError = validateEnum(newState, DISPUTE_STATES, "newState");
       if (stateError) {
         res.status(400).json({ error: stateError });
         return;
       }
 
       if (newJurisdiction !== undefined) {
-        const jurisError = validateEnum(newJurisdiction, DISPUTE_JURISDICTIONS, 'newJurisdiction');
+        const jurisError = validateEnum(
+          newJurisdiction,
+          DISPUTE_JURISDICTIONS,
+          "newJurisdiction",
+        );
         if (jurisError) {
           res.status(400).json({ error: jurisError });
           return;
@@ -135,12 +162,16 @@ export function createDisputeSLAHandlers(
    * POST /api/v1/disputes/:disputeId/sla/pause
    * Pause the SLA timer for a dispute.
    */
-  async function pauseSLA(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function pauseSLA(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { disputeId } = req.params;
 
       if (!disputeId) {
-        res.status(400).json({ error: 'disputeId path parameter is required' });
+        res.status(400).json({ error: "disputeId path parameter is required" });
         return;
       }
 
@@ -155,12 +186,16 @@ export function createDisputeSLAHandlers(
    * POST /api/v1/disputes/:disputeId/sla/resume
    * Resume a paused SLA timer.
    */
-  async function resumeSLA(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function resumeSLA(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { disputeId } = req.params;
 
       if (!disputeId) {
-        res.status(400).json({ error: 'disputeId path parameter is required' });
+        res.status(400).json({ error: "disputeId path parameter is required" });
         return;
       }
 
@@ -180,49 +215,122 @@ export function createDisputeSLAHandlers(
    * - endDate: ISO date string (required)
    * - jurisdiction: Optional jurisdiction filter
    */
-  async function exportBurnReport(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function exportBurnReport(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { startDate, endDate, jurisdiction } = req.query;
 
-      const start = validateDate(startDate, 'startDate');
+      const start = validateDate(startDate, "startDate");
       if (!start) {
-        res.status(400).json({ error: 'startDate query parameter is required and must be a valid ISO date' });
+        res
+          .status(400)
+          .json({
+            error:
+              "startDate query parameter is required and must be a valid ISO date",
+          });
         return;
       }
 
-      const end = validateDate(endDate, 'endDate');
+      const end = validateDate(endDate, "endDate");
       if (!end) {
-        res.status(400).json({ error: 'endDate query parameter is required and must be a valid ISO date' });
+        res
+          .status(400)
+          .json({
+            error:
+              "endDate query parameter is required and must be a valid ISO date",
+          });
         return;
       }
 
       if (start >= end) {
-        res.status(400).json({ error: 'startDate must be before endDate' });
+        res.status(400).json({ error: "startDate must be before endDate" });
         return;
       }
 
-      if (jurisdiction !== undefined && typeof jurisdiction === 'string') {
-        const jurisError = validateEnum(jurisdiction, DISPUTE_JURISDICTIONS, 'jurisdiction');
+      if (jurisdiction !== undefined && typeof jurisdiction === "string") {
+        const jurisError = validateEnum(
+          jurisdiction,
+          DISPUTE_JURISDICTIONS,
+          "jurisdiction",
+        );
         if (jurisError) {
           res.status(400).json({ error: jurisError });
           return;
         }
       }
 
-      const { csv, filename, rowCount } = await disputeSLAService.exportBurnReportCSV({
-        startDate: start,
-        endDate: end,
-        jurisdiction: typeof jurisdiction === 'string' ? jurisdiction : undefined,
-      });
+      const { csv, filename, rowCount } =
+        await disputeSLAService.exportBurnReportCSV({
+          startDate: start,
+          endDate: end,
+          jurisdiction:
+            typeof jurisdiction === "string" ? jurisdiction : undefined,
+        });
 
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`,
+      );
       // Prevent caching of sensitive reports
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-      res.setHeader('Pragma', 'no-cache');
-      res.setHeader('X-Row-Count', String(rowCount));
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("X-Row-Count", String(rowCount));
 
       res.status(200).send(csv);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * POST /api/v1/disputes/:disputeId/evidence/export
+   * Export a signed dispute evidence bundle manifest and artifact payloads.
+   */
+  async function exportEvidenceBundle(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      const { disputeId } = req.params;
+      const { artifacts, reviewerId } = req.body || {};
+
+      if (!disputeId) {
+        res.status(400).json({ error: "disputeId path parameter is required" });
+        return;
+      }
+
+      if (!Array.isArray(artifacts) || artifacts.length === 0) {
+        res
+          .status(400)
+          .json({
+            error:
+              "artifacts array is required and must contain at least one entry",
+          });
+        return;
+      }
+
+      if (!evidenceExporter) {
+        res
+          .status(500)
+          .json({ error: "DisputeEvidenceExporter is not initialized" });
+        return;
+      }
+
+      const bundle = await evidenceExporter.exportEvidenceBundle({
+        disputeId,
+        artifacts,
+        reviewerId,
+      });
+
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+      res.status(200).json({ bundle });
     } catch (err) {
       next(err);
     }
@@ -232,23 +340,39 @@ export function createDisputeSLAHandlers(
    * POST /api/v1/disputes/:disputeId/refund
    * Process a partial refund for a dispute.
    */
-  async function processRefund(req: Request, res: Response, next: NextFunction): Promise<void> {
+  async function processRefund(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
     try {
       const { disputeId } = req.params;
-      const { amount, originalDisbursement, reason, ledgerEventId, distributionId } = req.body || {};
+      const {
+        amount,
+        originalDisbursement,
+        reason,
+        ledgerEventId,
+        distributionId,
+      } = req.body || {};
 
       if (!disputeId) {
-        res.status(400).json({ error: 'disputeId path parameter is required' });
+        res.status(400).json({ error: "disputeId path parameter is required" });
         return;
       }
 
       if (!amount || !originalDisbursement) {
-        res.status(400).json({ error: 'amount and originalDisbursement are required in body' });
+        res
+          .status(400)
+          .json({
+            error: "amount and originalDisbursement are required in body",
+          });
         return;
       }
 
       if (!disputeRefundService) {
-        res.status(500).json({ error: 'DisputeRefundService is not initialized' });
+        res
+          .status(500)
+          .json({ error: "DisputeRefundService is not initialized" });
         return;
       }
 
@@ -273,6 +397,7 @@ export function createDisputeSLAHandlers(
     pauseSLA,
     resumeSLA,
     exportBurnReport,
+    exportEvidenceBundle,
     processRefund,
   };
 }
@@ -290,7 +415,9 @@ export interface CreateDisputeSLARouterDeps {
 /**
  * Create an Express router for dispute SLA endpoints.
  */
-export function createDisputeSLARouter(deps: CreateDisputeSLARouterDeps): Router {
+export function createDisputeSLARouter(
+  deps: CreateDisputeSLARouterDeps,
+): Router {
   const router = Router();
 
   const disputeSLAService = new DisputeSLAService({
@@ -300,20 +427,58 @@ export function createDisputeSLARouter(deps: CreateDisputeSLARouterDeps): Router
   });
 
   const disputeRefundService = new DisputeRefundService(deps.db);
+  const evidenceExporter = new DisputeEvidenceExporter({
+    auditLogRepo: deps.auditLogRepo,
+  });
 
-  const handlers = createDisputeSLAHandlers(disputeSLAService, disputeRefundService);
+  const handlers = createDisputeSLAHandlers(
+    disputeSLAService,
+    disputeRefundService,
+    evidenceExporter,
+  );
 
   // All dispute SLA endpoints require authentication
-  router.post('/disputes/:disputeId/sla/start', deps.requireAuth, handlers.startSLA);
-  router.post('/disputes/:disputeId/sla/transition', deps.requireAuth, handlers.transitionSLA);
-  router.post('/disputes/:disputeId/sla/pause', deps.requireAuth, handlers.pauseSLA);
-  router.post('/disputes/:disputeId/sla/resume', deps.requireAuth, handlers.resumeSLA);
-  
+  router.post(
+    "/disputes/:disputeId/sla/start",
+    deps.requireAuth,
+    handlers.startSLA,
+  );
+  router.post(
+    "/disputes/:disputeId/sla/transition",
+    deps.requireAuth,
+    handlers.transitionSLA,
+  );
+  router.post(
+    "/disputes/:disputeId/sla/pause",
+    deps.requireAuth,
+    handlers.pauseSLA,
+  );
+  router.post(
+    "/disputes/:disputeId/sla/resume",
+    deps.requireAuth,
+    handlers.resumeSLA,
+  );
+
   // Partial refund endpoint
-  router.post('/disputes/:disputeId/refund', deps.requireAuth, handlers.processRefund);
+  router.post(
+    "/disputes/:disputeId/refund",
+    deps.requireAuth,
+    handlers.processRefund,
+  );
 
   // SLA burn report (auth required)
-  router.get('/disputes/sla/report', deps.requireAuth, handlers.exportBurnReport);
+  router.get(
+    "/disputes/sla/report",
+    deps.requireAuth,
+    handlers.exportBurnReport,
+  );
+
+  // Signed dispute evidence bundle export (auth required)
+  router.post(
+    "/disputes/:disputeId/evidence/export",
+    deps.requireAuth,
+    handlers.exportEvidenceBundle,
+  );
 
   return router;
 }
