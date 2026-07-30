@@ -21,6 +21,7 @@
     "test:ci": "jest --coverage --ci",
     "stryker": "stryker run --concurrency 4",
     "stryker:quick": "stryker run --concurrency 4 --timeoutMS 120000",
+    "pact:publish": "npx pact-broker publish pacts/notifications/revora-consumer-revora-backend.json --consumer revora-consumer --provider revora-backend --tag main --consumer-app-version ${GITHUB_SHA:-local}",
     "pact:verify": "jest --testPathPatterns='\\.pact\\.test\\.ts$' --runInBand --forceExit"
   },
   "dependencies": {

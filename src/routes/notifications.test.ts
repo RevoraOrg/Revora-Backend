@@ -140,7 +140,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 401);
+    assert.strictEqual(capturedError.statusCode, 401);
   });
 
   it("returns 404 when notification not found or belongs to another user", async () => {
@@ -152,7 +152,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 404);
+    assert.strictEqual(capturedError.statusCode, 404);
   });
 
   it("returns 400 for invalid UUID in params", async () => {
@@ -164,7 +164,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 400);
+    assert.strictEqual(capturedError.statusCode, 400);
     assert.strictEqual((capturedError as any).code, "VALIDATION_ERROR");
   });
 
@@ -177,7 +177,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 400);
+    assert.strictEqual(capturedError.statusCode, 400);
     assert.strictEqual((capturedError as any).code, "VALIDATION_ERROR");
   });
 
@@ -190,7 +190,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 400);
+    assert.strictEqual(capturedError.statusCode, 400);
   });
 
   it("returns 400 when bulk mark not supported by repo", async () => {
@@ -208,7 +208,7 @@ describe("notifications routes", () => {
     });
 
     assert(capturedError instanceof AppError);
-    assert.strictEqual(capturedError.httpCode, 400);
+    assert.strictEqual(capturedError.statusCode, 400);
   });
 
   it("handles error in getNotifications", async () => {
