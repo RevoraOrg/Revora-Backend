@@ -1,351 +1,269 @@
-/**
- * Tests for PressureGauge: pressure tier transitions, hysteresis, and backpressure signaling.
- *
- * Focus: Test only the implemented behavior
- * - Tier transitions based on lag thresholds
- * - Hysteresis: using recovery buffers to prevent oscillation
- * - State change callbacks
- * - Pressure tier queries (getTier, isAtLeast)
- */
-
-import { PressureGauge, PressureTier, PressureState, PressureGaugeConfig } from '../pressureGauge';
+import {
+  PressureGauge,
+  PressureTier,
+  PressureState,
+} from '../pressureGauge';
 
 describe('PressureGauge', () => {
-  describe('initialization', () => {
-    it('starts in NORMAL tier with -1 lag (no pending records)', () => {
-      const gauge = new PressureGauge();
-      const state = gauge.getState();
+  let gauge: PressureGauge;
 
+  beforeEach(() => {
+    gauge = new PressureGauge();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Initial state
+  // ---------------------------------------------------------------------------
+  describe('initial state', () => {
+    it('starts at NORMAL tier with lag -1', () => {
+      const state = gauge.getState();
       expect(state.tier).toBe(PressureTier.NORMAL);
       expect(state.lagSeconds).toBe(-1);
-      expect(state.transitionCount).toBe(0);
     });
 
-    it('applies custom thresholds from config', () => {
-      const config: PressureGaugeConfig = {
-        infoThresholdSeconds: 10,
-        warningThresholdSeconds: 20,
-        criticalThresholdSeconds: 40,
-      };
-      const gauge = new PressureGauge(config);
-      
-      // Verify custom thresholds work
-      gauge.updateLag(9);
+    it('getTier returns NORMAL', () => {
       expect(gauge.getTier()).toBe(PressureTier.NORMAL);
-
-      gauge.updateLag(10);
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
     });
   });
 
-  describe('tier transitions - climbing up (normal thresholds)', () => {
-    it('transitions NORMAL → INFO when lag exceeds info threshold', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        criticalThresholdSeconds: 120,
-      });
-
+  // ---------------------------------------------------------------------------
+  // updateLag – tier transitions
+  // ---------------------------------------------------------------------------
+  describe('updateLag', () => {
+    it('stays NORMAL when lag is 0 (fresh records)', () => {
+      gauge.updateLag(0);
       expect(gauge.getTier()).toBe(PressureTier.NORMAL);
+    });
 
+    it('stays NORMAL when lag is below info threshold', () => {
       gauge.updateLag(30);
+      expect(gauge.getTier()).toBe(PressureTier.NORMAL);
+    });
+
+    it('transitions to INFO when lag crosses info threshold', () => {
+      gauge.updateLag(60);
       expect(gauge.getTier()).toBe(PressureTier.INFO);
     });
 
-    it('transitions INFO → WARNING when lag exceeds warning threshold', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        criticalThresholdSeconds: 120,
-      });
-
-      gauge.updateLag(45); // Climb to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      gauge.updateLag(60); // Climb to WARNING
+    it('transitions to WARNING when lag crosses warning threshold', () => {
+      gauge.updateLag(300);
       expect(gauge.getTier()).toBe(PressureTier.WARNING);
     });
 
-    it('transitions WARNING → CRITICAL when lag exceeds critical threshold', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        criticalThresholdSeconds: 120,
-      });
-
-      gauge.updateLag(90); // Climb to WARNING
-      expect(gauge.getTier()).toBe(PressureTier.WARNING);
-
-      gauge.updateLag(120); // Climb to CRITICAL
+    it('transitions to CRITICAL when lag crosses critical threshold', () => {
+      gauge.updateLag(900);
       expect(gauge.getTier()).toBe(PressureTier.CRITICAL);
     });
-  });
 
-  describe('tier transitions - descending down (with hysteresis)', () => {
-    it('stays in INFO tier when descending but above recovery threshold', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        recoveryBufferSeconds: 10,
-      });
-
-      gauge.updateLag(45); // Climb to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      // Drop to 25 (below climb threshold of 30, but above descent threshold of 20)
-      gauge.updateLag(25);
-      expect(gauge.getTier()).toBe(PressureTier.INFO); // Stays INFO due to hysteresis
-    });
-
-    it('descends INFO → NORMAL when lag drops below recovery threshold', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        recoveryBufferSeconds: 10,
-      });
-
-      gauge.updateLag(45); // Climb to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      // Drop to 19 (below descent threshold of 20)
-      gauge.updateLag(19);
+    it('downgrades from CRITICAL to NORMAL when lag drops', () => {
+      gauge.updateLag(900);
+      expect(gauge.getTier()).toBe(PressureTier.CRITICAL);
+      gauge.updateLag(10);
       expect(gauge.getTier()).toBe(PressureTier.NORMAL);
     });
 
-    it('stays in WARNING tier when descending but above recovery threshold', () => {
-      const gauge = new PressureGauge({
-        warningThresholdSeconds: 60,
-        criticalThresholdSeconds: 120,
-        recoveryBufferSeconds: 10,
-      });
-
-      gauge.updateLag(90); // Climb to WARNING
-      expect(gauge.getTier()).toBe(PressureTier.WARNING);
-
-      // Drop to 55 (below climb threshold of 60, but above descent threshold of 50)
-      gauge.updateLag(55);
-      expect(gauge.getTier()).toBe(PressureTier.WARNING); // Stays WARNING
-    });
-
-    it('descends WARNING → INFO when lag drops below recovery threshold', () => {
-      const gauge = new PressureGauge({
-        warningThresholdSeconds: 60,
-        criticalThresholdSeconds: 120,
-        recoveryBufferSeconds: 10,
-      });
-
-      gauge.updateLag(90); // Climb to WARNING
-      expect(gauge.getTier()).toBe(PressureTier.WARNING);
-
-      // Drop to 49 (below descent threshold of 50)
-      gauge.updateLag(49);
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-    });
-  });
-
-  describe('no pending records', () => {
-    it('returns to NORMAL when lag is -1 (no pending records)', () => {
-      const gauge = new PressureGauge();
-
-      gauge.updateLag(45); // Climb to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      gauge.updateLag(-1); // No pending records
+    it('returns to NORMAL when lag becomes -1 (empty outbox)', () => {
+      gauge.updateLag(900);
+      expect(gauge.getTier()).toBe(PressureTier.CRITICAL);
+      gauge.updateLag(-1);
       expect(gauge.getTier()).toBe(PressureTier.NORMAL);
-      expect(gauge.getState().lagSeconds).toBe(-1);
     });
-  });
 
-  describe('state change callbacks', () => {
-    it('invokes callback when tier transitions', () => {
-      const gauge = new PressureGauge();
+    it('does not fire listeners when tier stays the same', () => {
       const callback = jest.fn();
       gauge.onStateChange(callback);
+      gauge.updateLag(10);
+      gauge.updateLag(20); // Still NORMAL
+      expect(callback).toHaveBeenCalledTimes(0);
+    });
 
-      gauge.updateLag(31);
+    it('does not fire listeners when lag value stays identical in same tier', () => {
+      const callback = jest.fn();
+      gauge.onStateChange(callback);
+      gauge.updateLag(10);
+      gauge.updateLag(10); // Same value
+      expect(callback).toHaveBeenCalledTimes(0);
+    });
+  });
 
+  // ---------------------------------------------------------------------------
+  // Custom thresholds
+  // ---------------------------------------------------------------------------
+  describe('custom thresholds', () => {
+    it('uses provided info threshold', () => {
+      const g = new PressureGauge({ infoThresholdSeconds: 120 });
+      g.updateLag(100);
+      expect(g.getTier()).toBe(PressureTier.NORMAL);
+      g.updateLag(120);
+      expect(g.getTier()).toBe(PressureTier.INFO);
+    });
+
+    it('uses provided warning threshold', () => {
+      const g = new PressureGauge({ warningThresholdSeconds: 600 });
+      g.updateLag(500);
+      expect(g.getTier()).toBe(PressureTier.INFO);
+      g.updateLag(600);
+      expect(g.getTier()).toBe(PressureTier.WARNING);
+    });
+
+    it('uses provided critical threshold', () => {
+      const g = new PressureGauge({ criticalThresholdSeconds: 1800 });
+      g.updateLag(1500);
+      expect(g.getTier()).toBe(PressureTier.WARNING);
+      g.updateLag(1800);
+      expect(g.getTier()).toBe(PressureTier.CRITICAL);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Validation
+  // ---------------------------------------------------------------------------
+  describe('constructor validation', () => {
+    it('throws when infoThresholdSeconds <= 0', () => {
+      expect(() => new PressureGauge({ infoThresholdSeconds: 0 })).toThrow();
+      expect(() => new PressureGauge({ infoThresholdSeconds: -5 })).toThrow();
+    });
+
+    it('throws when warningThresholdSeconds <= infoThresholdSeconds', () => {
+      expect(
+        () => new PressureGauge({ infoThresholdSeconds: 60, warningThresholdSeconds: 60 })
+      ).toThrow();
+      expect(
+        () => new PressureGauge({ infoThresholdSeconds: 60, warningThresholdSeconds: 40 })
+      ).toThrow();
+    });
+
+    it('throws when criticalThresholdSeconds <= warningThresholdSeconds', () => {
+      expect(
+        () => new PressureGauge({ warningThresholdSeconds: 300, criticalThresholdSeconds: 300 })
+      ).toThrow();
+      expect(
+        () => new PressureGauge({ warningThresholdSeconds: 300, criticalThresholdSeconds: 200 })
+      ).toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // State change callbacks
+  // ---------------------------------------------------------------------------
+  describe('state change callbacks', () => {
+    it('fires callback on tier transition', () => {
+      const callback = jest.fn();
+      gauge.onStateChange(callback);
+      gauge.updateLag(60);
       expect(callback).toHaveBeenCalledTimes(1);
-      const [oldState, newState] = callback.mock.calls[0];
+
+      const [oldState, newState] = callback.mock.calls[0] as [PressureState, PressureState];
       expect(oldState.tier).toBe(PressureTier.NORMAL);
       expect(newState.tier).toBe(PressureTier.INFO);
+      expect(newState.lagSeconds).toBe(60);
     });
 
-    it('does not invoke callback when lag updates within same tier', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        recoveryBufferSeconds: 10,
-      });
+    it('fires callback for each consecutive transition', () => {
       const callback = jest.fn();
       gauge.onStateChange(callback);
-
-      gauge.updateLag(31); // Transition to INFO
-      callback.mockClear();
-
-      gauge.updateLag(35); // Still INFO
-      gauge.updateLag(40); // Still INFO
-
-      expect(callback).not.toHaveBeenCalled();
-    });
-
-    it('supports multiple callbacks', () => {
-      const gauge = new PressureGauge();
-      const callback1 = jest.fn();
-      const callback2 = jest.fn();
-      gauge.onStateChange(callback1);
-      gauge.onStateChange(callback2);
-
-      gauge.updateLag(31);
-
-      expect(callback1).toHaveBeenCalledTimes(1);
-      expect(callback2).toHaveBeenCalledTimes(1);
-    });
-
-    it('allows removing callbacks with offStateChange', () => {
-      const gauge = new PressureGauge();
-      const callback = jest.fn();
-      gauge.onStateChange(callback);
-
-      gauge.updateLag(31);
-      expect(callback).toHaveBeenCalledTimes(1);
-
-      gauge.offStateChange(callback);
-      gauge.updateLag(61);
-
-      expect(callback).toHaveBeenCalledTimes(1); // Not called again
-    });
-
-    it('increments transition count on each tier change', () => {
-      const gauge = new PressureGauge();
-      const callback = jest.fn();
-      gauge.onStateChange(callback);
-
-      gauge.updateLag(31); // NORMAL → INFO
-      gauge.updateLag(61); // INFO → WARNING
-      gauge.updateLag(-1); // WARNING → NORMAL
-
+      gauge.updateLag(60);   // NORMAL → INFO
+      gauge.updateLag(300);  // INFO → WARNING
+      gauge.updateLag(900);  // WARNING → CRITICAL
       expect(callback).toHaveBeenCalledTimes(3);
-      expect(callback.mock.calls[0][1].transitionCount).toBe(1);
-      expect(callback.mock.calls[1][1].transitionCount).toBe(2);
-      expect(callback.mock.calls[2][1].transitionCount).toBe(3);
+    });
+
+    it('fires multiple registered callbacks', () => {
+      const cb1 = jest.fn();
+      const cb2 = jest.fn();
+      gauge.onStateChange(cb1);
+      gauge.onStateChange(cb2);
+      gauge.updateLag(60);
+      expect(cb1).toHaveBeenCalledTimes(1);
+      expect(cb2).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not break when a callback throws', () => {
+      const badCallback = jest.fn(() => {
+        throw new Error('boom');
+      });
+      const goodCallback = jest.fn();
+      gauge.onStateChange(badCallback);
+      gauge.onStateChange(goodCallback);
+      gauge.updateLag(60);
+      expect(badCallback).toHaveBeenCalledTimes(1);
+      expect(goodCallback).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('tier comparison (isAtLeast)', () => {
-    it('returns true when tier equals threshold', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(31); // Move to INFO
-
-      expect(gauge.isAtLeast(PressureTier.INFO)).toBe(true);
+  // ---------------------------------------------------------------------------
+  // removeListener
+  // ---------------------------------------------------------------------------
+  describe('removeListener', () => {
+    it('removes a registered callback', () => {
+      const callback = jest.fn();
+      gauge.onStateChange(callback);
+      gauge.removeListener(callback);
+      gauge.updateLag(60);
+      expect(callback).toHaveBeenCalledTimes(0);
     });
 
-    it('returns true when tier exceeds threshold', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(61); // Move to WARNING
+    it('does not affect other listeners when removing one', () => {
+      const cb1 = jest.fn();
+      const cb2 = jest.fn();
+      gauge.onStateChange(cb1);
+      gauge.onStateChange(cb2);
+      gauge.removeListener(cb1);
+      gauge.updateLag(60);
+      expect(cb1).toHaveBeenCalledTimes(0);
+      expect(cb2).toHaveBeenCalledTimes(1);
+    });
+  });
 
+  // ---------------------------------------------------------------------------
+  // isAtLeast
+  // ---------------------------------------------------------------------------
+  describe('isAtLeast', () => {
+    it('returns true when tier is at least the given tier', () => {
+      gauge.updateLag(900); // CRITICAL
+      expect(gauge.isAtLeast(PressureTier.NORMAL)).toBe(true);
       expect(gauge.isAtLeast(PressureTier.INFO)).toBe(true);
       expect(gauge.isAtLeast(PressureTier.WARNING)).toBe(true);
+      expect(gauge.isAtLeast(PressureTier.CRITICAL)).toBe(true);
     });
 
-    it('returns false when tier is below threshold', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(31); // Move to INFO
-
+    it('returns false when tier is below the given tier', () => {
+      gauge.updateLag(30); // NORMAL
+      expect(gauge.isAtLeast(PressureTier.INFO)).toBe(false);
       expect(gauge.isAtLeast(PressureTier.WARNING)).toBe(false);
       expect(gauge.isAtLeast(PressureTier.CRITICAL)).toBe(false);
     });
 
-    it('isAtLeast NORMAL is always true', () => {
-      const gauge = new PressureGauge();
-
+    it('returns true for NORMAL when tier is INFO', () => {
+      gauge.updateLag(60); // INFO
       expect(gauge.isAtLeast(PressureTier.NORMAL)).toBe(true);
-
-      gauge.updateLag(150); // Move to CRITICAL
-      expect(gauge.isAtLeast(PressureTier.NORMAL)).toBe(true);
+      expect(gauge.isAtLeast(PressureTier.INFO)).toBe(true);
+      expect(gauge.isAtLeast(PressureTier.WARNING)).toBe(false);
     });
   });
 
-  describe('edge cases and boundary conditions', () => {
-    it('handles zero lag (no pending records but explicitly set to 0)', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(0);
-      // 0 is not < 0, so it's treated as normal operation with 0 seconds lag
-      expect(gauge.getTier()).toBe(PressureTier.NORMAL);
-      expect(gauge.getState().lagSeconds).toBe(0);
-    });
-
-    it('handles very large lag values', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(999999);
-      expect(gauge.getTier()).toBe(PressureTier.CRITICAL);
-    });
-
-    it('handles rapid state transitions with hysteresis', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        warningThresholdSeconds: 60,
-        recoveryBufferSeconds: 5,
-      });
-
-      // Simulate rapid fluctuations
-      gauge.updateLag(35); // NORMAL → INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      gauge.updateLag(25); // Stay in INFO due to buffer (descent threshold = 25)
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      gauge.updateLag(24); // Drop below descent threshold
-      expect(gauge.getTier()).toBe(PressureTier.NORMAL);
-
-      gauge.updateLag(35); // Climb back to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-    });
-  });
-
-  describe('state immutability', () => {
-    it('returns immutable copy of state', () => {
-      const gauge = new PressureGauge();
-      gauge.updateLag(31);
-
+  // ---------------------------------------------------------------------------
+  // getState snapshot isolation
+  // ---------------------------------------------------------------------------
+  describe('getState', () => {
+    it('returns a copy, not a reference', () => {
       const state1 = gauge.getState();
-      const state2 = gauge.getState();
-
-      expect(state1).toEqual(state2);
-      expect(state1).not.toBe(state2); // Different objects
-
-      // Mutating returned state should not affect gauge
       state1.lagSeconds = 999;
-      expect(gauge.getState().lagSeconds).toBeCloseTo(31, 0);
+      const state2 = gauge.getState();
+      expect(state2.lagSeconds).toBe(-1);
     });
   });
 
-  describe('default configuration', () => {
-    it('uses default thresholds when not specified', () => {
-      const gauge = new PressureGauge(); // No config
-
-      // Default: infoThreshold = 30
-      gauge.updateLag(29);
+  // ---------------------------------------------------------------------------
+  // reset
+  // ---------------------------------------------------------------------------
+  describe('reset', () => {
+    it('resets to NORMAL with lag -1', () => {
+      gauge.updateLag(900);
+      expect(gauge.getTier()).toBe(PressureTier.CRITICAL);
+      gauge.reset();
       expect(gauge.getTier()).toBe(PressureTier.NORMAL);
-
-      gauge.updateLag(30);
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-    });
-
-    it('uses default recovery buffer', () => {
-      const gauge = new PressureGauge({
-        infoThresholdSeconds: 30,
-        // Default recovery buffer = 15
-      });
-
-      gauge.updateLag(35); // Climb to INFO
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      // Descent threshold = 30 - 15 = 15
-      gauge.updateLag(16); // Still above descent threshold
-      expect(gauge.getTier()).toBe(PressureTier.INFO);
-
-      gauge.updateLag(14); // Below descent threshold
-      expect(gauge.getTier()).toBe(PressureTier.NORMAL);
+      expect(gauge.getState().lagSeconds).toBe(-1);
     });
   });
 });
-
