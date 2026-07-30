@@ -214,7 +214,8 @@ class DistributionEngine {
     private pool?: Pool,
     private notificationRepo?: any,
     private notificationPreferencesRepo?: any,
-    private fxConversionEngine?: FxConversionEngine
+    private fxConversionEngine?: FxConversionEngine,
+    private auditLogRepo?: any
   ) {
     this.maxRetries = options.maxRetries ?? 3;
     this.initialDelayMs = options.initialDelayMs ?? 500;
@@ -353,32 +354,57 @@ class DistributionEngine {
     const { rounded } = calculation;
 
     // 5. Ensure distribution run exists and is in 'processing' state
+    let frozenFxRateId: string | undefined = run?.frozen_fx_rate_id || undefined;
+    if (this.fxConversionEngine) {
+      try {
+        const contextKey = offeringId + '-' + period.id;
+        const fromCurrency = period.fromCurrency || period.currency || 'USD';
+        const toCurrency = period.toCurrency || period.payoutCurrency || 'USD';
+
+        const frozenRate = await this.fxConversionEngine.freezeRate(
+          contextKey,
+          fromCurrency,
+          toCurrency
+        );
+        frozenFxRateId = frozenFxRateId || frozenRate.id;
+
+        this.logger.info('FX rate frozen for distribution', {
+          offeringId,
+          periodId: period.id,
+          runId: run?.id,
+          frozenFxRateId,
+          pair: frozenRate.pair,
+          midRate: frozenRate.mid.toString(),
+        });
+
+        if (this.auditLogRepo && typeof this.auditLogRepo.createAuditLog === 'function') {
+          await this.auditLogRepo.createAuditLog({
+            action: 'fx.rate.frozen',
+            resource: `distribution:${offeringId}:${period.id}`,
+            details: JSON.stringify({
+              offering_id: offeringId,
+              period_id: period.id,
+              run_id: run?.id,
+              frozen_fx_rate_id: frozenFxRateId,
+              pair: frozenRate.pair,
+              mid_rate: frozenRate.mid.toString(),
+              bid_rate: frozenRate.bid.toString(),
+              ask_rate: frozenRate.ask.toString(),
+              timestamp: frozenRate.timestamp,
+            }),
+          });
+        }
+      } catch (fxErr) {
+        this.logger.warn('Failed to freeze FX rate, continuing without freeze', {
+          offeringId,
+          periodId: period.id,
+          error: fxErr instanceof Error ? fxErr.message : String(fxErr),
+        });
+      }
+    }
+
     if (!run) {
       try {
-        // Freeze the FX conversion rate before creating the run
-        let frozenFxRateId: string | undefined;
-        if (this.fxConversionEngine) {
-          try {
-            const frozenRate = await this.fxConversionEngine.freezeRate(
-              offeringId + '-' + period.id,
-              'USD',
-              'USD'
-            );
-            frozenFxRateId = frozenRate.id;
-            this.logger.info('FX rate frozen for distribution', {
-              offeringId,
-              periodId: period.id,
-              frozenFxRateId,
-            });
-          } catch (fxErr) {
-            this.logger.warn('Failed to freeze FX rate, continuing without freeze', {
-              offeringId,
-              periodId: period.id,
-              error: fxErr instanceof Error ? fxErr.message : String(fxErr),
-            });
-          }
-        }
-
         run = await this.withRetry(() =>
           this.distributionRepo.createDistributionRun({
             offering_id: offeringId,
@@ -465,6 +491,7 @@ class DistributionEngine {
                     investor_id: r.investor_id,
                     amount: amtStr,
                     status: 'pending',
+                    frozen_fx_rate_id: run.frozen_fx_rate_id || frozenFxRateId,
                   },
                   client
                 )
@@ -486,6 +513,7 @@ class DistributionEngine {
                   investor_id: r.investor_id,
                   amount: amtStr,
                   status: 'pending',
+                  frozen_fx_rate_id: run.frozen_fx_rate_id || frozenFxRateId,
                 })
               );
               successfulPayouts.push({ investor_id: r.investor_id, amount: amtStr });
