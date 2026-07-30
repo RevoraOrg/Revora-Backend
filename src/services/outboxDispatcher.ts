@@ -1,11 +1,15 @@
 /**
- * OutboxDispatcher — drains webhook_outbox rows and delivers them to subscribers.
- * See architecture map for how the outbox participates in the producer transaction.
- *
- * @see ../../docs/architecture/distribution-reconciliation.md
- * @see ../docs/transactional-outbox.md
- * @see ../docs/webhook-queue-backpressure.md
- * @see ../docs/webhook-dead-letters.md
+ * @fileoverview Dispatches pending events from the transactional outbox to configured webhooks.
+ * 
+ * @remarks
+ * Ensures at-least-once delivery semantics for subsystem hand-offs (e.g., Distribution -> Reconciliation).
+ * For the complete sequence diagrams mapping outbox integration,
+ * @see {@link file://../../docs/architecture/distribution-reconciliation.md | Distribution & Reconciliation Architecture}
+ * 
+ * Related Component Documentation:
+ * @see {@link file://../../docs/transactional-outbox.md | Transactional Outbox}
+ * @see {@link file://../../docs/webhook-queue-backpressure.md | Webhook Queue Backpressure}
+ * @see {@link file://../../docs/webhook-dead-letters.md | Webhook Dead Letters}
  */
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 import { WebhookEventType } from './webhookService';
