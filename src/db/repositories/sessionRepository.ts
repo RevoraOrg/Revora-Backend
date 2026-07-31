@@ -249,37 +249,51 @@ export class SessionRepository {
   }
 
   /**
-   * Get the date of the oldest expired or revoked session.
-   * Useful for calculating retention lag before compaction.
+   * Get the date of the oldest expired or revoked session that sits past the
+   * retention boundary. Useful for calculating retention lag before compaction.
+   *
+   * The retention boundary is computed with the database clock (`NOW()`), not
+   * the application clock. This keeps the boundary stable even during a
+   * bad-clock event on the app server, where a skewed `Date.now()` would
+   * otherwise push the boundary forward and make the job delete rows that have
+   * not actually aged past retention.
    */
-  async getOldestCompactedSessionDate(cutoffDate: Date, client?: Pool): Promise<Date | null> {
+  async getOldestCompactedSessionDate(retentionDays: number, client?: Pool): Promise<Date | null> {
     const db = client || this.db;
     const query = `
       SELECT MIN(LEAST(COALESCE(expires_at, 'infinity'::timestamp), COALESCE(revoked_at, 'infinity'::timestamp))) AS oldest
       FROM sessions
-      WHERE expires_at < $1 OR revoked_at < $1
+      WHERE expires_at < NOW() - ($1 * INTERVAL '1 day')
+         OR revoked_at < NOW() - ($1 * INTERVAL '1 day')
     `;
-    const result = await db.query(query, [cutoffDate]);
+    const result = await db.query(query, [retentionDays]);
     return result.rows[0]?.oldest ?? null;
   }
 
   /**
-   * Delete expired or revoked sessions older than a specific cutoff date.
+   * Delete expired or revoked sessions older than the retention boundary.
    * Uses a bounded batch size to avoid long-held locks.
-   * 
+   *
+   * The boundary is computed from the database clock (`NOW()`) so the job can
+   * never be pushed by a skewed application-server clock into deleting rows
+   * that are still within the retention window. The predicate only matches
+   * rows whose `expires_at` or `revoked_at` has fallen behind the boundary —
+   * active sessions (future `expires_at`, no `revoked_at`) can never match.
+   *
    * Returns the number of rows deleted in this batch.
    */
-  async purgeOlderThan(cutoffDate: Date, batchSize: number, client?: Pool): Promise<number> {
+  async purgeOlderThan(retentionDays: number, batchSize: number, client?: Pool): Promise<number> {
     const db = client || this.db;
     const query = `
       DELETE FROM sessions 
       WHERE id IN (
         SELECT id FROM sessions 
-        WHERE expires_at < $1 OR revoked_at < $1 
+        WHERE expires_at < NOW() - ($1 * INTERVAL '1 day')
+           OR revoked_at < NOW() - ($1 * INTERVAL '1 day')
         LIMIT $2
       )
     `;
-    const result = await db.query(query, [cutoffDate, batchSize]);
+    const result = await db.query(query, [retentionDays, batchSize]);
     return result.rowCount ?? 0;
   }
 

@@ -397,6 +397,89 @@ describe('SessionRepository', () => {
     });
   });
 
+  // ── purgeOlderThan ────────────────────────────────────────────────────────
+
+  describe('purgeOlderThan', () => {
+    it('deletes expired/revoked rows past the DB-computed boundary in a bounded batch', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 42 } as any);
+
+      const deleted = await repository.purgeOlderThan(30, 1000);
+
+      expect(deleted).toBe(42);
+      const [query, params] = mockPool.query.mock.calls[0] as [string, any[]];
+      expect(query).toContain('DELETE FROM sessions');
+      expect(query).toContain('LIMIT $2');
+      expect(params).toEqual([30, 1000]);
+    });
+
+    it('computes the retention boundary with the database clock, not the app clock', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
+
+      await repository.purgeOlderThan(30, 100);
+
+      const [query, params] = mockPool.query.mock.calls[0] as [string, any[]];
+      // The boundary must come from NOW() so a bad-clock event on the app
+      // server cannot push the boundary forward and make the job delete rows
+      // that have not actually aged past retention.
+      expect(query).toContain('NOW() - ($1 * INTERVAL');
+      expect(query).not.toContain('WHERE expires_at < $1');
+      expect(params[0]).toBe(30);
+    });
+
+    it('only ever targets expired or revoked rows, never active ones', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
+
+      await repository.purgeOlderThan(30, 100);
+
+      const [query] = mockPool.query.mock.calls[0] as [string];
+      // An active session has expires_at in the future and no revoked_at, so it
+      // can never satisfy either branch of the predicate.
+      expect(query).toMatch(/expires_at < NOW\(\)/);
+      expect(query).toMatch(/revoked_at < NOW\(\)/);
+      expect(query).not.toMatch(/WHERE expires_at < \$1 OR revoked_at < \$1/);
+    });
+
+    it('returns 0 when the DB reports a null rowCount', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: null } as any);
+
+      await expect(repository.purgeOlderThan(30, 100)).resolves.toBe(0);
+    });
+  });
+
+  // ── getOldestCompactedSessionDate ─────────────────────────────────────────
+
+  describe('getOldestCompactedSessionDate', () => {
+    it('returns the oldest eligible session date', async () => {
+      const oldest = new Date('2026-05-01T00:00:00.000Z');
+      mockPool.query.mockResolvedValueOnce({ rows: [{ oldest }], rowCount: 1 } as any);
+
+      const result = await repository.getOldestCompactedSessionDate(30);
+
+      expect(result).toEqual(oldest);
+      const [query, params] = mockPool.query.mock.calls[0] as [string, any[]];
+      expect(query).toContain('MIN(LEAST(');
+      expect(query).toContain('NOW() - ($1 * INTERVAL');
+      expect(params).toEqual([30]);
+    });
+
+    it('uses the database clock so the lag metric matches the purge boundary', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ oldest: null }], rowCount: 0 } as any);
+
+      await repository.getOldestCompactedSessionDate(30);
+
+      const [query] = mockPool.query.mock.calls[0] as [string];
+      expect(query).toMatch(/expires_at < NOW\(\)/);
+      expect(query).toMatch(/revoked_at < NOW\(\)/);
+      expect(query).not.toContain('WHERE expires_at < $1');
+    });
+
+    it('returns null when no rows are eligible for compaction', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ oldest: null }], rowCount: 0 } as any);
+
+      await expect(repository.getOldestCompactedSessionDate(30)).resolves.toBeNull();
+    });
+  });
+
   // ── createSession / mapSession: revoked_at and parent_id from existing tests ─
 
   describe('legacy compatibility (original test cases preserved)', () => {

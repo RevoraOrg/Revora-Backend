@@ -26,6 +26,7 @@ import { z } from "zod";
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
+ * | SESSION_COMPACTION_MAX_ROWS_PER_RUN | No | 100000          | Max rows a single compaction run may delete; caps blast radius on anomalies|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
  * | SENDGRID_API_KEY            | SendGrid | (empty)                 | SendGrid API key                                 |
@@ -74,6 +75,7 @@ const envSchema = z.object({
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+  SESSION_COMPACTION_MAX_ROWS_PER_RUN: z.coerce.number().int().positive().default(100000),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
   CURSOR_SIGNING_SECRET: z.string().min(16).optional(),
