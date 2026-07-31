@@ -219,6 +219,32 @@ export class StellarSubmissionService {
         
         // Calculate exponential backoff delay
         const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+        /**
+   * Rebuilds and re-signs a transaction against a freshly-fetched source account.
+   *
+   * A signed Stellar transaction has its sequence number baked into the signature,
+   * so resending the same signed transaction after a BAD_SEQUENCE failure will
+   * always fail identically. This re-fetches the current account state and
+   * rebuilds the transaction with the correct sequence before retrying.
+   */
+  private rebuildTransactionWithFreshSequence(
+    original: StellarSdk.Transaction,
+    freshAccount: StellarSdk.Account,
+  ): StellarSdk.Transaction {
+    const builder = new StellarSdk.TransactionBuilder(freshAccount, {
+      fee: original.fee,
+      networkPassphrase: original.networkPassphrase,
+      memo: original.memo,
+    });
+
+    for (const operation of original.operations) {
+      builder.addOperation(operation);
+    }
+
+    const rebuilt = builder.setTimeout(30).build();
+    rebuilt.sign(this.keypair);
+    return rebuilt;
+  }
         logger.debug('Retrying Stellar account retrieval', {
           publicKey,
           attemptCount,
@@ -245,8 +271,8 @@ export class StellarSubmissionService {
     transaction: StellarSdk.Transaction,
     context: StellarRPCFailureContext
   ): Promise<StellarSdk.rpc.Api.SendTransactionResponse> {
-    let attemptCount = context.attemptCount || 1;
-    const transactionHash = transaction.hash().toString('hex');
+  let attemptCount = context.attemptCount || 1;
+    let transactionHash = transaction.hash().toString('hex');
     
     while (attemptCount <= this.maxRetries) {
       try {
@@ -292,6 +318,25 @@ export class StellarSubmissionService {
         }
         
         this.logStellarFailure(failure);
+
+        // A bad-sequence failure means the signed transaction's sequence number is
+        // stale. Resending it unchanged will fail identically every time, so we
+        // must re-fetch the account and rebuild + re-sign before retrying.
+        if (failure.class === StellarRPCFailureClass.BAD_SEQUENCE) {
+          try {
+            const freshAccount = await this.getAccountWithRetry(this.keypair.publicKey(), {
+              ...context,
+              operation: 'get_account',
+              attemptCount,
+            });
+            transaction = this.rebuildTransactionWithFreshSequence(transaction, freshAccount);
+            transactionHash = transaction.hash().toString('hex');
+          } catch {
+            // Can't even re-fetch the account (e.g. it no longer exists) — surface
+            // the original bad-sequence failure rather than masking it.
+            throw this.createAppErrorFromFailure(failure);
+          }
+        }
         
         // Calculate exponential backoff delay
         const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
