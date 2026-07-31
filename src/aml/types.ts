@@ -1,6 +1,6 @@
 /**
  * AML Transaction Monitoring Types
- * 
+ *
  * Provides type-safe interfaces for AML rule definitions,
  * evaluation context, and case management workflow.
  */
@@ -9,12 +9,12 @@
  * AML Rule Types - supported detection patterns
  */
 export type AMLRuleType =
-  | 'velocity'                   // High transaction frequency/amount in time window
-  | 'structuring'                // Breaking large transactions into smaller ones
-  | 'geo_mismatch'               // Geographic inconsistency in transactions
-  | 'amount_threshold'           // Single transaction exceeds threshold
-  | 'sanctions_screening'        // Sanctions list screening — person queue (exact & Jaro-Winkler fuzzy)
-  | 'ofac_counterparty_screening'; // OFAC screening for non-person counterparty metadata (vessels, aircraft, organisations)
+  | "velocity" // High transaction frequency/amount in time window
+  | "structuring" // Breaking large transactions into smaller ones
+  | "geo_mismatch" // Geographic inconsistency in transactions
+  | "amount_threshold" // Single transaction exceeds threshold
+  | "sanctions_screening" // Sanctions list screening — person queue (exact & Jaro-Winkler fuzzy)
+  | "ofac_counterparty_screening"; // OFAC screening for non-person counterparty metadata (vessels, aircraft, organisations)
 
 /**
  * OFAC entity taxonomy — covers the four entity classes that appear on the
@@ -22,7 +22,7 @@ export type AMLRuleType =
  *
  * @see https://ofac.treasury.gov/faqs/topic/1521
  */
-export type OfacEntityType = 'person' | 'vessel' | 'aircraft' | 'organisation';
+export type OfacEntityType = "person" | "vessel" | "aircraft" | "organisation";
 
 /**
  * A single counterparty attached to an offering that must be screened against
@@ -57,7 +57,7 @@ export interface OfacScreeningMatch {
   /** Jaro-Winkler similarity or 1.0 for exact matches. */
   similarity_score: number;
   /** 'exact' = normalised string equality; 'fuzzy' = Jaro-Winkler above threshold. */
-  match_type: 'exact' | 'fuzzy';
+  match_type: "exact" | "fuzzy";
   /**
    * Human-readable match reason recorded on the alert, e.g.
    * 'ofac_vessel_exact', 'ofac_aircraft_fuzzy', 'ofac_organisation_exact'.
@@ -65,23 +65,25 @@ export interface OfacScreeningMatch {
    */
   match_reason: string;
   /** Analyst action: 'auto_deny' (exact match) or 'pending_review' (fuzzy). */
-  action: 'auto_deny' | 'pending_review';
+  action: "auto_deny" | "pending_review";
 }
 
 /**
  * Rule severity levels for prioritization
  */
-export type AMLSeverity = 'low' | 'medium' | 'high' | 'critical';
+export type AMLSeverity = "low" | "medium" | "high" | "critical";
 
 /**
  * Case workflow statuses
  */
-export type AMLCaseStatus = 'open' | 'assigned' | 'investigating' | 'closed' | 'dismissed';
+export type AMLCaseStatus =
+  "open" | "assigned" | "investigating" | "closed" | "dismissed";
 
 /**
  * Case disposition outcomes
  */
-export type AMLDisposition = 'confirmed_suspicious' | 'false_positive' | 'inconclusive' | 'legitimate';
+export type AMLDisposition =
+  "confirmed_suspicious" | "false_positive" | "inconclusive" | "legitimate";
 
 /**
  * Semver version for rule versioning
@@ -122,7 +124,7 @@ export interface TransactionContext {
   investor_country?: string;
   investor_ip_country?: string;
   previous_transactions?: TransactionContext[];
-  status?: 'pending' | 'completed' | 'failed';
+  status?: "pending" | "completed" | "failed" | "refunded";
   tenant_id?: string;
   tenant_settings?: {
     sanctions_threshold?: number;
@@ -185,7 +187,7 @@ export interface AMLAlert {
   rule_version: SemVer;
   severity: AMLSeverity;
   details: Record<string, unknown>;
-  status: 'pending' | 'reviewed' | 'dismissed';
+  status: "pending" | "reviewed" | "dismissed";
   case_id?: string;
   created_at: Date;
   updated_at: Date;
@@ -276,6 +278,62 @@ export interface UpdateCaseInput {
 }
 
 /**
+ * Configuration for structuring detection rule with amount-clustering heuristic.
+ * Stored in AMLRule.config for rules of type 'structuring'.
+ */
+export interface StructuringDetectionRuleConfig {
+  /** Rolling window length in days (e.g. 30 days). Defaults to 30 if window_hours is omitted. */
+  window_days?: number;
+  /** Rolling window length in hours (optional alternate unit). */
+  window_hours?: number;
+  /** Primary regulatory reporting threshold (e.g. 10000 for USD). Defaults to 10000. */
+  reporting_threshold?: number;
+  /** Lower ratio for near-threshold cluster band (e.g. 0.8 -> $8,000 for $10,000 threshold). Defaults to 0.8. */
+  cluster_lower_ratio?: number;
+  /** Upper ratio for near-threshold cluster band (e.g. 0.999 -> $9,999.99 for $10,000 threshold). Defaults to 0.999. */
+  cluster_upper_ratio?: number;
+  /** Minimum number of transactions in cluster band required to trigger alert. Defaults to 2. */
+  min_cluster_count?: number;
+  /** Score threshold (0-100) above which rule triggers alert. Defaults to 50. */
+  score_threshold?: number;
+  /** Jurisdiction identifier for jurisdiction-aware reporting thresholds (e.g. 'US', 'EU', 'JP'). Defaults to 'US'. */
+  jurisdiction?: string;
+  /** Optional dictionary of jurisdiction-specific reporting thresholds. */
+  jurisdiction_thresholds?: Record<string, number>;
+  /** Minimum transaction amount filter for similar transaction check (fallback). */
+  amount_threshold?: number;
+  /** Minimum transaction count filter (fallback). */
+  min_transactions?: number;
+}
+
+/**
+ * Single bucket in the deposit amount histogram.
+ */
+export interface StructuringHistogramBucket {
+  label: string;
+  min_amount: number;
+  max_amount: number;
+  count: number;
+  total_amount: number;
+}
+
+/**
+ * Result of deposit histogram clustering evaluation.
+ */
+export interface StructuringClusterResult {
+  cluster_score: number;
+  score_threshold: number;
+  clustered_count: number;
+  clustered_total_amount: number;
+  total_deposits_count: number;
+  total_deposits_amount: number;
+  reporting_threshold: number;
+  jurisdiction: string;
+  histogram_buckets: StructuringHistogramBucket[];
+  linked_investment_ids: string[];
+}
+
+/**
  * Configuration for the sliding-window investment velocity rule.
  * Stored in AMLRule.config for rules of type 'velocity'.
  */
@@ -322,13 +380,19 @@ export interface VelocityRepository {
    * updated in-place so late-arriving events shift the window without
    * duplicating records.
    */
-  upsert(record: Omit<InvestmentVelocityRecord, 'id' | 'created_at' | 'updated_at'>): Promise<InvestmentVelocityRecord>;
+  upsert(
+    record: Omit<InvestmentVelocityRecord, "id" | "created_at" | "updated_at">,
+  ): Promise<InvestmentVelocityRecord>;
 
   /**
    * Return all velocity records for an investor within the given time range,
    * ordered by window_end descending.
    */
-  findByInvestor(investorId: string, from: Date, to: Date): Promise<InvestmentVelocityRecord[]>;
+  findByInvestor(
+    investorId: string,
+    from: Date,
+    to: Date,
+  ): Promise<InvestmentVelocityRecord[]>;
 }
 
 /**
@@ -388,11 +452,11 @@ export interface AssignmentResult {
  * - `rejected`                – manually rejected by a compliance officer.
  */
 export type OFACReviewStatus =
-  | 'pending_first_approval'
-  | 'pending_second_approval'
-  | 'cleared'
-  | 'expired'
-  | 'rejected';
+  | "pending_first_approval"
+  | "pending_second_approval"
+  | "cleared"
+  | "expired"
+  | "rejected";
 
 /**
  * A persisted OFAC false-positive review case.
