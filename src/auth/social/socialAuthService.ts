@@ -36,11 +36,16 @@ import {
   SocialIdentityRepository,
   SocialLinkResult,
   SocialLoginResult,
+  SocialProviderClaims,
   SocialTokenVerifier,
   SocialUnlinkResult,
   SocialUserRecord,
   SocialUserRepository,
 } from './types';
+import {
+  SocialLinkAttemptOutcome,
+} from './socialLinkAttemptStore';
+import { SocialLinkAnomalyDetector } from './socialLinkAnomalyDetector';
 
 // ── Constant-time lookup helper ────────────────────────────────────────────────
 
@@ -98,6 +103,7 @@ export class SocialAuthService {
     private readonly sessionRepository: SessionRepository,
     private readonly jwtIssuer: JwtIssuer,
     private readonly tokenVerifier: SocialTokenVerifier,
+    private readonly anomalyDetector?: SocialLinkAnomalyDetector,
   ) {}
 
   /**
@@ -163,6 +169,10 @@ export class SocialAuthService {
    *         prevent an attacker who has obtained a provider token from silently
    *         adding a social login to an account they do not fully control.
    *
+   *         The provider ID token is verified FIRST so every attempt — including
+   *         step-up failures — can be attributed to the trusted `sub` claim and
+   *         recorded with the anomaly detector (see `SocialLinkAnomalyDetector`).
+   *
    * @param input.userId          Authenticated user's UUID.
    * @param input.provider        Social provider to link.
    * @param input.idToken         Provider-issued identity token.
@@ -175,63 +185,89 @@ export class SocialAuthService {
     idToken: string;
     currentPassword: string;
   }): Promise<SocialLinkResult> {
-    const user = await this.requireUserWithPassword(input.userId, input.currentPassword);
     const claims = await this.verifyVerifiedEmail(input.provider, input.idToken);
 
-    const existingProviderSubject = await this.identityRepository.findByProviderSubject(
-      input.provider,
-      claims.subject,
-    );
-    if (existingProviderSubject && existingProviderSubject.userId !== input.userId) {
-      throw new SocialAuthError(
-        'IDENTITY_LINKED_TO_ANOTHER_USER',
-        'Social identity is already linked to another account.',
+    let outcome: SocialLinkAttemptOutcome | null = 'link_success';
+
+    try {
+      const user = await this.requireUserWithPassword(input.userId, input.currentPassword);
+
+      const existingProviderSubject = await this.identityRepository.findByProviderSubject(
+        input.provider,
+        claims.subject,
       );
-    }
-
-    const existingUserProvider = await this.identityRepository.findByUserAndProvider(
-      input.userId,
-      input.provider,
-    );
-
-    if (existingUserProvider) {
-      if (existingUserProvider.providerSubject !== claims.subject) {
+      if (existingProviderSubject && existingProviderSubject.userId !== input.userId) {
+        outcome = 'identity_conflict';
         throw new SocialAuthError(
           'IDENTITY_LINKED_TO_ANOTHER_USER',
-          'This account already has a different identity for the provider.',
+          'Social identity is already linked to another account.',
         );
       }
-      if (existingUserProvider.providerEmail !== claims.email) {
-        await this.identityRepository.updateIdentityEmail(
-          existingUserProvider.id,
-          claims.email,
-          claims.isPrivateRelay,
-        );
+
+      const existingUserProvider = await this.identityRepository.findByUserAndProvider(
+        input.userId,
+        input.provider,
+      );
+
+      if (existingUserProvider) {
+        if (existingUserProvider.providerSubject !== claims.subject) {
+          outcome = 'identity_conflict';
+          throw new SocialAuthError(
+            'IDENTITY_LINKED_TO_ANOTHER_USER',
+            'This account already has a different identity for the provider.',
+          );
+        }
+        if (existingUserProvider.providerEmail !== claims.email) {
+          await this.identityRepository.updateIdentityEmail(
+            existingUserProvider.id,
+            claims.email,
+            claims.isPrivateRelay,
+          );
+        }
+        return { linked: true, identity: existingUserProvider };
       }
-      return { linked: true, identity: existingUserProvider };
+
+      // Apple private-relay emails are transient — skip email-collision check.
+      if (!claims.isPrivateRelay && user.email !== claims.email) {
+        const emailUser = await this.userRepository.findByEmail(claims.email);
+        if (emailUser && emailUser.id !== input.userId) {
+          outcome = 'email_conflict';
+          throw new SocialAuthError(
+            'EMAIL_ACCOUNT_REQUIRES_LINK',
+            'Provider email belongs to another password account.',
+          );
+        }
+      }
+
+      const identity = await this.identityRepository.createIdentity({
+        userId: input.userId,
+        provider: input.provider,
+        providerSubject: claims.subject,
+        providerEmail: claims.email,
+        emailVerified: claims.emailVerified,
+        isPrivateRelay: claims.isPrivateRelay,
+      });
+
+      return { linked: true, identity };
+    } catch (err) {
+      if (err instanceof SocialAuthError) {
+        switch (err.code) {
+          case 'STEP_UP_REQUIRED':
+            outcome = 'step_up_failed';
+            break;
+          case 'USER_NOT_FOUND':
+            // A non-existent user is not a real candidate account — recording it
+            // would let an attacker with a valid token fabricate alert noise.
+            outcome = null;
+            break;
+        }
+      }
+      throw err;
+    } finally {
+      if (outcome !== null) {
+        await this.recordLinkAttempt(input.userId, claims, outcome);
+      }
     }
-
-    // Apple private-relay emails are transient — skip email-collision check.
-    if (!claims.isPrivateRelay && user.email !== claims.email) {
-      const emailUser = await this.userRepository.findByEmail(claims.email);
-      if (emailUser && emailUser.id !== input.userId) {
-        throw new SocialAuthError(
-          'EMAIL_ACCOUNT_REQUIRES_LINK',
-          'Provider email belongs to another password account.',
-        );
-      }
-    }
-
-    const identity = await this.identityRepository.createIdentity({
-      userId: input.userId,
-      provider: input.provider,
-      providerSubject: claims.subject,
-      providerEmail: claims.email,
-      emailVerified: claims.emailVerified,
-      isPrivateRelay: claims.isPrivateRelay,
-    });
-
-    return { linked: true, identity };
   }
 
   /**
@@ -254,6 +290,31 @@ export class SocialAuthService {
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * @notice Forwards a link attempt to the anomaly detector.
+   *
+   * @dev    Recording failures are swallowed: anomaly detection must never
+   *         change the outcome of an otherwise valid link.
+   */
+  private async recordLinkAttempt(
+    userId: string,
+    claims: SocialProviderClaims,
+    outcome: SocialLinkAttemptOutcome,
+  ): Promise<void> {
+    if (!this.anomalyDetector) return;
+    try {
+      await this.anomalyDetector.recordAttempt({
+        provider: claims.provider,
+        providerSubject: claims.subject,
+        userId,
+        outcome,
+        attemptedAt: new Date(),
+      });
+    } catch {
+      // Detection is best-effort; never break the link flow.
+    }
+  }
 
   private async verifyVerifiedEmail(provider: SocialAuthProvider, idToken: string) {
     const claims = await this.tokenVerifier.verify(provider, idToken);

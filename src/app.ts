@@ -32,6 +32,9 @@ import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryA
 import { SocialAuthService } from './auth/social/socialAuthService';
 import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
 import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
+import { PgSocialLinkAttemptStore } from './auth/social/socialLinkAttemptStore';
+import { AuditLogAmlSink, SocialLinkAnomalyDetector } from './auth/social/socialLinkAnomalyDetector';
+import { createSecurityAuditRepository } from './security/audit';
 import { createReconciliationMetricsHandler } from './routes/reconciliationRoutes';
 
 // Adapter to convert database User to login service UserRecord
@@ -206,12 +209,20 @@ export function createApp() {
     new SessionRepositoryAdapter(sessionRepository),
     jwtIssuer,
   );
+  const socialAuditRepository = createSecurityAuditRepository(pool);
   const socialAuthService = new SocialAuthService(
     new SocialUserRepositoryAdapter(userRepository),
     new SocialIdentityRepository(pool),
     new SessionRepositoryAdapter(sessionRepository),
     jwtIssuer,
     createDefaultSocialTokenVerifierFromEnv(),
+    // Social identity-spray anomaly detector.  The default AML sink persists
+    // detections as SECURITY_VIOLATION audit events so the signal survives even
+    // without a dedicated AML integration.
+    new SocialLinkAnomalyDetector({
+      store: new PgSocialLinkAttemptStore(pool),
+      amlSink: new AuditLogAmlSink(socialAuditRepository),
+    }),
   );
 
   // Refresh service

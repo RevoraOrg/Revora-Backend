@@ -21,6 +21,13 @@ import {
   SocialUserRecord,
   SocialUserRepository,
 } from './types';
+import {
+  SocialLinkAnomalyDetector,
+  SocialLinkAnomalyDetection,
+  SocialLinkAnomalyAmlSink,
+} from './socialLinkAnomalyDetector';
+import { InMemorySocialLinkAttemptStore } from './socialLinkAttemptStore';
+import { MetricsCollector } from '../../lib/metrics';
 
 const hashPassword = (plain: string): string =>
   createHash('sha256').update(plain).digest('hex');
@@ -679,5 +686,194 @@ describe('SocialAuthService', () => {
     expect(result.linked).toBe(true);
     expect(result.identity.providerEmail).toBe('second-relay@privaterelay.appleid.com');
     expect(result.identity.isPrivateRelay).toBe(true);
+  });
+});
+
+// ── Anomaly-detection integration tests ──────────────────────────────────────
+//
+// Covers the malicious-link scenarios from issue #688: a single verified social
+// identity (`provider:sub`) sprayed across many candidate accounts must trip the
+// SocialLinkAnomalyDetector and feed the AML sink.
+
+describe('SocialAuthService — link anomaly detection', () => {
+  function fixtureWithDetector(threshold = 3) {
+    const users = new FakeUsers();
+    const identities = new FakeIdentities();
+    const sessions = new FakeSessions();
+    const verifier = new FakeVerifier();
+
+    const emissions: SocialLinkAnomalyDetection[] = [];
+    const amlSink: SocialLinkAnomalyAmlSink = {
+      emit: jest.fn(async (detection: SocialLinkAnomalyDetection) => {
+        emissions.push(detection);
+      }),
+    };
+
+    const detector = new SocialLinkAnomalyDetector({
+      threshold,
+      store: new InMemorySocialLinkAttemptStore(),
+      metrics: { incrementCounter: jest.fn() } as unknown as MetricsCollector,
+      amlSink,
+      now: () => new Date(),
+    });
+
+    const service = new SocialAuthService(
+      users,
+      identities,
+      sessions,
+      new FakeJwtIssuer(),
+      verifier,
+      detector,
+    );
+
+    return { users, identities, sessions, verifier, detector, service, emissions };
+  }
+
+  function addUser(users: FakeUsers, id: string, email: string, password: string): void {
+    users.add({ id, email, role: 'investor', passwordHash: hashPassword(password) });
+  }
+
+  it('flags the same social sub sprayed across many accounts (step-up failures)', async () => {
+    const { users, service, detector, emissions } = fixtureWithDetector(3);
+
+    for (let i = 1; i <= 4; i++) {
+      addUser(users, `user-${i}`, `user${i}@example.com`, 'Password123!');
+    }
+
+    // Attacker holds a valid token for `google-subject-1` and probes 4 accounts
+    // with a wrong current password.  Each attempt fails step-up but is recorded.
+    for (let i = 1; i <= 4; i++) {
+      await expect(
+        service.linkProvider({
+          userId: `user-${i}`,
+          provider: 'google',
+          idToken: 'token',
+          currentPassword: 'WrongPassword!',
+        }),
+      ).rejects.toMatchObject({ code: 'STEP_UP_REQUIRED' });
+    }
+
+    // All four distinct candidate accounts are observed.
+    expect(await detector.getCandidateCount('google', 'google-subject-1')).toBe(4);
+
+    // The AML sink was fed once (threshold 3 crossed on the third account;
+    // the fourth is suppressed by cooldown).
+    expect(emissions).toHaveLength(1);
+    expect(emissions[0].candidateCount).toBe(3);
+    expect(emissions[0].candidateUserIds).toEqual(['user-1', 'user-2', 'user-3']);
+  });
+
+  it('does not flag repeated step-up failures against the same single account', async () => {
+    const { users, service, detector, emissions } = fixtureWithDetector(3);
+    addUser(users, 'user-1', 'user1@example.com', 'Password123!');
+
+    // Legitimate owner fat-fingers their password three times on the same account.
+    for (let i = 0; i < 3; i++) {
+      await expect(
+        service.linkProvider({
+          userId: 'user-1',
+          provider: 'google',
+          idToken: 'token',
+          currentPassword: 'WrongPassword!',
+        }),
+      ).rejects.toMatchObject({ code: 'STEP_UP_REQUIRED' });
+    }
+
+    expect(await detector.getCandidateCount('google', 'google-subject-1')).toBe(1);
+    expect(emissions).toHaveLength(0);
+  });
+
+  it('does not record non-existent account probes as candidates', async () => {
+    const { service, detector, emissions } = fixtureWithDetector(3);
+
+    for (let i = 0; i < 3; i++) {
+      await expect(
+        service.linkProvider({
+          userId: `ghost-${i}`,
+          provider: 'google',
+          idToken: 'token',
+          currentPassword: 'Anything!',
+        }),
+      ).rejects.toMatchObject({ code: 'USER_NOT_FOUND' });
+    }
+
+    expect(await detector.getCandidateCount('google', 'google-subject-1')).toBe(0);
+    expect(emissions).toHaveLength(0);
+  });
+
+  it('records identity-conflict attempts and a genuine spray across linked accounts', async () => {
+    const { users, identities, service, detector, emissions } = fixtureWithDetector(2);
+
+    // user-1 already owns google-subject-1.
+    addUser(users, 'user-1', 'user1@example.com', 'Password123!');
+    addUser(users, 'user-2', 'user2@example.com', 'Password123!');
+    await identities.createIdentity({
+      userId: 'user-1',
+      provider: 'google',
+      providerSubject: 'google-subject-1',
+      providerEmail: 'user1@example.com',
+      emailVerified: true,
+    });
+
+    // user-1 relinks its own identity → idempotent success (counted as candidate).
+    await service.linkProvider({
+      userId: 'user-1',
+      provider: 'google',
+      idToken: 'token',
+      currentPassword: 'Password123!',
+    });
+
+    // user-2 tries to link the same identity → IDENTITY_LINKED_TO_ANOTHER_USER.
+    await expect(
+      service.linkProvider({
+        userId: 'user-2',
+        provider: 'google',
+        idToken: 'token',
+        currentPassword: 'Password123!',
+      }),
+    ).rejects.toMatchObject({ code: 'IDENTITY_LINKED_TO_ANOTHER_USER' });
+
+    // Two distinct candidate accounts → threshold (2) crossed.
+    expect(await detector.getCandidateCount('google', 'google-subject-1')).toBe(2);
+    expect(emissions).toHaveLength(1);
+    expect(emissions[0].candidateCount).toBe(2);
+  });
+
+  it('detector failure never breaks an otherwise valid link', async () => {
+    const users = new FakeUsers();
+    const identities = new FakeIdentities();
+    const sessions = new FakeSessions();
+    const verifier = new FakeVerifier();
+
+    const brokenDetector = new SocialLinkAnomalyDetector({
+      threshold: 2,
+      store: {
+        recordAttempt: jest.fn(async () => {
+          throw new Error('store unavailable');
+        }),
+        listCandidateUserIds: jest.fn(async () => []),
+        reset: jest.fn(async () => undefined),
+      } as never,
+      now: () => new Date(),
+    });
+
+    const service = new SocialAuthService(
+      users,
+      identities,
+      sessions,
+      new FakeJwtIssuer(),
+      verifier,
+      brokenDetector,
+    );
+    addUser(users, 'user-1', 'user1@example.com', 'Password123!');
+
+    // Link succeeds even though the detector's store throws.
+    const result = await service.linkProvider({
+      userId: 'user-1',
+      provider: 'google',
+      idToken: 'token',
+      currentPassword: 'Password123!',
+    });
+    expect(result.linked).toBe(true);
   });
 });
