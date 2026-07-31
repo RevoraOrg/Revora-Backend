@@ -10,6 +10,7 @@ import {
   shouldRetryStellarRPCFailure,
   createStellarErrorResponse
 } from '../lib/stellarRpcFailure';
+import { globalMetrics } from '../lib/metrics';
 
 const logger = globalLogger.child({ service: 'stellar-submission' });
 
@@ -265,10 +266,13 @@ export class StellarSubmissionService {
         if (result.status === 'PENDING') {
           return result;
         } else if (result.status === 'DUPLICATE') {
-          throw Errors.conflict('Transaction already submitted', {
-            hash: result.hash,
+          globalMetrics.increment('submission.duplicate.recovered', 1);
+          logger.info('Recovered duplicate transaction submission', {
             transactionHash,
+            attemptCount,
+            operation: 'send_transaction',
           });
+          return result;
         } else if (result.status === 'TRY_AGAIN_LATER') {
           throw Errors.serviceUnavailable('Transaction rate limited, try again later');
         } else {
