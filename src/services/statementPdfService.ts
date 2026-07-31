@@ -10,12 +10,18 @@
 import crypto, { KeyObject, createHash } from 'crypto';
 import { EventEmitter } from 'events';
 import { globalLogger } from '../lib/logger';
+import { MetricsCollector } from '../lib/metrics';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import {
   buildStatementStorageKey,
   checksumPayload,
   PdfRenderJobRow,
 } from '../db/repositories/pdfRenderJobRepository';
+import {
+  resolveDisclaimerBundle,
+  METRIC_PDF_LOCALE_FALLBACK,
+  LocaleDisclaimerBundle,
+} from '../i18n/disclaimerBundles';
 
 export const WATERMARK_DRAFT_TEXT = 'DRAFT - subject to audit';
 export const EVENT_PDF_WATERMARK_SUPPRESSED = 'pdf.watermark.suppressed';
@@ -45,6 +51,10 @@ export interface StatementRenderOptions {
   auditLogRepository?: AuditLogRepository;
   signerKeyId?: string;
   requestingPrincipal?: string;
+  /** IETF BCP 47 locale tag (e.g. "en-US", "de-DE"). Falls back to en-US if unsupported. */
+  locale?: string;
+  /** Optional metrics collector for `pdf.locale.fallback` counter emission. */
+  metrics?: MetricsCollector;
 }
 
 export interface StatementPdfRenderResult {
@@ -267,7 +277,13 @@ export function deriveSignerKeyId(pubKeyInput: string | Buffer | KeyObject | und
 export function renderStatementPdfDetails(
   job: PdfRenderJobRow,
   options?: StatementRenderOptions
-): { bytes: Buffer; watermarkSuppressed: boolean; ledgerRevisionHash: string } {
+): {
+  bytes: Buffer;
+  watermarkSuppressed: boolean;
+  ledgerRevisionHash: string;
+  disclaimerBundle: LocaleDisclaimerBundle;
+  localeFallback: boolean;
+} {
   const verification = verifyTreasurySignature(job, options);
   const watermarkSuppressed = verification.valid;
 
@@ -278,6 +294,28 @@ export function renderStatementPdfDetails(
       batchId: job.batch_id,
       reason: verification.reason,
       timestamp: new Date().toISOString(),
+    });
+  }
+
+  // ── Locale disclaimer resolution (#673) ──────────────────────────────
+  const localeResult = resolveDisclaimerBundle(options?.locale ?? 'en-US');
+  if (localeResult.fallback && options?.metrics) {
+    options.metrics.incrementCounter(
+      METRIC_PDF_LOCALE_FALLBACK,
+      {
+        requested_locale: localeResult.requestedLocale,
+        resolved_locale: localeResult.bundle.locale,
+      },
+      1,
+      'Locale fallback count for investor statement PDF disclaimers',
+    );
+  }
+  if (localeResult.fallback) {
+    globalLogger.info('pdf.locale.fallback', {
+      requestedLocale: localeResult.requestedLocale,
+      resolvedLocale: localeResult.bundle.locale,
+      periodId: job.period_id,
+      investorId: job.investor_id,
     });
   }
 
@@ -322,12 +360,19 @@ export function renderStatementPdfDetails(
     globalLogger.info('pdf.watermark.suppressed audit event emitted', auditData);
   }
 
+  const disclaimerBundle = localeResult.bundle;
+
   const lines = [
     '%PDF-1.4',
     `% Revora investor statement`,
     `% period=${job.period_id}`,
     `% investor=${job.investor_id}`,
     `% batch=${job.batch_id}`,
+    `% locale=${disclaimerBundle.locale}`,
+    `% localeFallback=${localeResult.fallback}`,
+    `% --- Header (${disclaimerBundle.locale}) ---`,
+    `% HEADER: ${disclaimerBundle.headerText}`,
+    `/Header << /Text (${disclaimerBundle.headerText}) >>`,
   ];
 
   if (!watermarkSuppressed) {
@@ -339,16 +384,34 @@ export function renderStatementPdfDetails(
     lines.push(`% WATERMARK: SUPPRESSED (FINAL SIGNED STATEMENT)`);
   }
 
+  // ── Locale-specific legal disclaimers (#673) ─────────────────────────
+  lines.push(
+    `% --- Disclaimers (${disclaimerBundle.locale}) ---`
+  );
+  for (let i = 0; i < disclaimerBundle.disclaimers.length; i++) {
+    const d = disclaimerBundle.disclaimers[i];
+    lines.push(
+      `% DISCLAIMER_${i + 1}: [${d.jurisdiction}] ${d.text}`
+    );
+  }
+
   lines.push(
     `% FOOTER_VERSION_STAMP: ledger_revision=${ledgerRevisionHash}`,
-    `/Footer << /Text (Ledger Revision: ${ledgerRevisionHash}) >>`,
+    `% --- Footer (${disclaimerBundle.locale}) ---`,
+    `/Footer << /Text (Ledger Revision: ${ledgerRevisionHash} | ${disclaimerBundle.footerText}) >>`,
     `1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj`,
     `trailer<< /Root 1 0 R >>`,
     `%%EOF`
   );
 
   const bytes = Buffer.from(lines.join('\n'), 'utf8');
-  return { bytes, watermarkSuppressed, ledgerRevisionHash };
+  return {
+    bytes,
+    watermarkSuppressed,
+    ledgerRevisionHash,
+    disclaimerBundle,
+    localeFallback: localeResult.fallback,
+  };
 }
 
 /**

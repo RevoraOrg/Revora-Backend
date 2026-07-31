@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import { MetricsCollector } from '../lib/metrics';
 import {
   renderStatementPdfBytes,
   renderStatementPdfDetails,
@@ -15,6 +16,7 @@ import {
   FinalSignaturePayload,
 } from './statementPdfService';
 import { globalLogger } from '../lib/logger';
+import { SUPPORTED_LOCALES, METRIC_PDF_LOCALE_FALLBACK } from '../i18n/disclaimerBundles';
 import {
   PdfRenderJobRow,
   buildStatementStorageKey,
@@ -77,7 +79,7 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
       expect(pdfText).toContain('/Watermark');
       expect(pdfText).toContain('Rotation 45');
       expect(pdfText).toContain('FOOTER_VERSION_STAMP: ledger_revision=');
-      expect(pdfText).toContain(`/Footer << /Text (Ledger Revision: ${result.ledgerRevisionHash}) >>`);
+      expect(pdfText).toContain(`/Footer << /Text (Ledger Revision: ${result.ledgerRevisionHash} |`);
     });
 
     it('uses provided ledgerRevisionHash in footer version stamp', () => {
@@ -761,6 +763,278 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
       });
 
       expect(res.watermarkSuppressed).toBe(true);
+    });
+  });
+
+  // ── Locale i18n disclaimer tests (Issue #673) ─────────────────────
+  describe('Locale i18n disclaimers (#673)', () => {
+    it.each(SUPPORTED_LOCALES)('renders locale-specific header and footer for %s', (locale) => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(result.disclaimerBundle).toBeDefined();
+      expect(result.disclaimerBundle.locale).toBe(locale);
+      expect(result.localeFallback).toBe(false);
+
+      // Header should contain locale-specific text
+      expect(pdfText).toContain(`% locale=${locale}`);
+      expect(pdfText).toContain(`% HEADER: ${result.disclaimerBundle.headerText}`);
+      expect(pdfText).toContain(`/Header << /Text (${result.disclaimerBundle.headerText}) >>`);
+
+      // Footer should contain locale-specific disclaimer text
+      expect(pdfText).toContain(result.disclaimerBundle.footerText);
+
+      // All locale-specific disclaimers should be present
+      for (const d of result.disclaimerBundle.disclaimers) {
+        expect(pdfText).toContain(d.jurisdiction);
+        expect(pdfText).toContain(d.text);
+      }
+    });
+
+    it('renders en-US golden header text', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'en-US' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('CONFIDENTIAL');
+      expect(pdfText).toContain('Reg D');
+      expect(pdfText).toContain('Securities Act of 1933');
+    });
+
+    it('renders de-DE golden header text', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'de-DE' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('VERTRAULICH');
+      expect(pdfText).toContain('MiFID II');
+      expect(pdfText).toContain('Richtlinie 2014/65/EU');
+    });
+
+    it('renders fr-FR golden header text', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'fr-FR' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('CONFIDENTIEL');
+      expect(pdfText).toContain('MiFID II');
+      expect(pdfText).toContain('directive 2014/65/UE');
+    });
+
+    it('renders ja-JP golden header text', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'ja-JP' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('親展');
+      expect(pdfText).toContain('金融商品取引法');
+    });
+
+    it('renders es-ES golden header text', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'es-ES' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('CONFIDENCIAL');
+      expect(pdfText).toContain('MiFID II');
+      expect(pdfText).toContain('Directiva 2014/65/UE');
+    });
+
+    it('defaults to en-US when no locale is provided', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job);
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(false);
+      expect(result.bytes.toString('utf8')).toContain('CONFIDENTIAL');
+    });
+
+    it('falls back to en-US for unsupported locale and emits counter', async () => {
+      const job = makeJob();
+      const metrics = new MetricsCollector({ enabled: true });
+
+      const result = renderStatementPdfDetails(job, { locale: 'zh-CN', metrics });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(true);
+      expect(result.bytes.toString('utf8')).toContain('CONFIDENTIAL');
+      expect(result.bytes.toString('utf8')).toContain('% localeFallback=true');
+
+      // Verify counter was emitted
+      const snapshot = (await metrics.getSnapshot()).custom;
+      const fallbackCounter = snapshot.find((m: any) => m.name === METRIC_PDF_LOCALE_FALLBACK);
+      expect(fallbackCounter).toBeDefined();
+      expect(fallbackCounter!.value).toBe(1);
+      expect(fallbackCounter!.labels).toEqual(
+        expect.objectContaining({
+          requested_locale: 'zh-CN',
+          resolved_locale: 'en-US',
+        })
+      );
+    });
+
+    it('falls back to en-US for empty locale string', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: '' });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(true);
+    });
+
+    it('falls back to en-US for "any" locale alias', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'any' });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(true);
+    });
+
+    it('accepts bare language codes (en → en-US, de → de-DE)', () => {
+      const job = makeJob();
+
+      const resultEn = renderStatementPdfDetails(job, { locale: 'en' });
+      expect(resultEn.disclaimerBundle.locale).toBe('en-US');
+      expect(resultEn.localeFallback).toBe(false);
+
+      const resultDe = renderStatementPdfDetails(job, { locale: 'de' });
+      expect(resultDe.disclaimerBundle.locale).toBe('de-DE');
+      expect(resultDe.localeFallback).toBe(false);
+    });
+
+    it('accepts underscore-separated locale variants (en_US → en-US)', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'en_US' });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(false);
+    });
+
+    it('accepts lowercase locale variants (de-de → de-DE)', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'de-de' });
+
+      expect(result.disclaimerBundle.locale).toBe('de-DE');
+      expect(result.localeFallback).toBe(false);
+    });
+
+    it('does not emit fallback counter when locale is supported', async () => {
+      const job = makeJob();
+      const metrics = new MetricsCollector({ enabled: true });
+
+      renderStatementPdfDetails(job, { locale: 'de-DE', metrics });
+      renderStatementPdfDetails(job, { locale: 'fr-FR', metrics });
+      renderStatementPdfDetails(job, { locale: 'en-US', metrics });
+
+      const snapshot = (await metrics.getSnapshot()).custom;
+      const fallbackCounter = snapshot.find((m: any) => m.name === METRIC_PDF_LOCALE_FALLBACK);
+      expect(fallbackCounter).toBeUndefined();
+    });
+
+    it('does not crash when metrics collector is omitted and fallback occurs', () => {
+      const job = makeJob();
+      // Should not throw even though we don't pass metrics
+      const result = renderStatementPdfDetails(job, { locale: 'xx-XX' });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(true);
+    });
+
+    it('logs pdf.locale.fallback info event when fallback occurs', () => {
+      const infoSpy = jest.spyOn(globalLogger, 'info').mockImplementation(() => {});
+      const job = makeJob();
+
+      renderStatementPdfDetails(job, { locale: 'zh-TW' });
+
+      expect(infoSpy).toHaveBeenCalledWith(
+        'pdf.locale.fallback',
+        expect.objectContaining({
+          requestedLocale: 'zh-TW',
+          resolvedLocale: 'en-US',
+          periodId: job.period_id,
+          investorId: job.investor_id,
+        })
+      );
+      infoSpy.mockRestore();
+    });
+
+    it('does not log pdf.locale.fallback when locale is supported', () => {
+      const infoSpy = jest.spyOn(globalLogger, 'info').mockImplementation(() => {});
+      const job = makeJob();
+
+      renderStatementPdfDetails(job, { locale: 'ja-JP' });
+
+      // Should not have been called with pdf.locale.fallback
+      const fallbackCalls = infoSpy.mock.calls.filter(
+        (call) => call[0] === 'pdf.locale.fallback'
+      );
+      expect(fallbackCalls).toHaveLength(0);
+      infoSpy.mockRestore();
+    });
+
+    it('includes disclaimerBundle metadata in render result', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'fr-FR' });
+
+      expect(result.disclaimerBundle).toEqual(
+        expect.objectContaining({
+          locale: 'fr-FR',
+          headerText: expect.any(String),
+          footerText: expect.any(String),
+          disclaimers: expect.arrayContaining([
+            expect.objectContaining({
+              jurisdiction: expect.any(String),
+              text: expect.any(String),
+            }),
+          ]),
+        })
+      );
+      expect(result.disclaimerBundle.disclaimers.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('locale-aware rendering works correctly through makeStatementRenderFn', async () => {
+      const storage = new InMemoryStatementPdfStorage();
+      const renderFn = makeStatementRenderFn(storage, { locale: 'de-DE' });
+      const job = makeJob();
+
+      const res = await renderFn(job);
+      const pdfText = res.bytes.toString('utf8');
+
+      expect(pdfText).toContain('VERTRAULICH');
+      expect(pdfText).toContain('MiFID II');
+    });
+
+    it('makeStatementRenderFn merges per-call locale over default locale', async () => {
+      const storage = new InMemoryStatementPdfStorage();
+      const renderFn = makeStatementRenderFn(storage, { locale: 'en-US' });
+      const job = makeJob();
+
+      const res = await renderFn(job, { locale: 'fr-FR' });
+      const pdfText = res.bytes.toString('utf8');
+
+      expect(pdfText).toContain('CONFIDENTIEL');
+      expect(pdfText).toContain('MiFID II');
+    });
+
+    it('markup is properly tagged with locale comments in PDF byte output', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'ja-JP' });
+      const pdfText = result.bytes.toString('utf8');
+
+      expect(pdfText).toContain('% locale=ja-JP');
+      expect(pdfText).toContain('% localeFallback=false');
+      expect(pdfText).toContain('% --- Header (ja-JP) ---');
+      expect(pdfText).toContain('% --- Disclaimers (ja-JP) ---');
+      expect(pdfText).toContain('% --- Footer (ja-JP) ---');
+    });
+
+    it('falls back gracefully for unknown bare language code', () => {
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job, { locale: 'ru' });
+
+      expect(result.disclaimerBundle.locale).toBe('en-US');
+      expect(result.localeFallback).toBe(true);
+      expect(result.bytes.toString('utf8')).toContain('CONFIDENTIAL');
     });
   });
 });
