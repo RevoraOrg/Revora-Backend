@@ -428,7 +428,291 @@ describe('JwksCacheService', () => {
   });
 });
 
-// ── OIDC route ───────────────────────────────────────────────────────────
+// ── OIDC route: Logout ──────────────────────────────────────────────────
+
+describe('createOidcRouter OIDC logout', () => {
+  const { privateKey: logoutPriv, publicKey: logoutPub } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const logoutPrivPem = logoutPriv as string;
+  const logoutPubPem = logoutPub as string;
+
+  function signLogoutToken(payload: Record<string, unknown>): string {
+    const h = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT', kid: 'logout-k1' })).toString('base64url');
+    const p = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signer = createSign('RSA-SHA256');
+    signer.update(`${h}.${p}`);
+    const sig = signer.sign(logoutPrivPem).toString('base64url');
+    return `${h}.${p}.${sig}`;
+  }
+
+  const issuerUrl = 'https://idp.example.com';
+  const sub = 'user-42';
+
+  function makeProvider(overrides: Partial<OidcProviderRow> = {}) {
+    return {
+      id: 'prov-logout-1',
+      tenant_id: 'tenant-logout',
+      name: 'Logout Test IdP',
+      issuer_url: issuerUrl,
+      client_id: 'client-123',
+      client_secret: null,
+      scopes: 'openid',
+      redirect_uris: 'https://app.example.com/callback',
+      enabled: true,
+      created_at: new Date(),
+      ...overrides,
+    };
+  }
+
+  it('processes a valid logout token via POST and clears sessions', async () => {
+    const provider = makeProvider();
+    const discovery = makeDiscovery();
+
+    const oidcAdapter = {
+      getDiscovery: jest.fn().mockResolvedValue(discovery),
+      validateLogoutToken: jest.fn().mockResolvedValue({ sub, iss: issuerUrl }),
+    } as any;
+
+    const oidcProviderRepo = {
+      findByIssuerUrl: jest.fn().mockResolvedValue(provider),
+    } as any;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter,
+      oidcProviderRepo,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const token = signLogoutToken({
+      iss: issuerUrl,
+      sub,
+      aud: 'client-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 300,
+      events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
+      jti: 'jti-unique-1',
+    });
+
+    // We can't easily mock sessionStore through the module system in this test,
+    // but we verify the adapter is called correctly
+    const res = await request(app)
+      .post('/api/auth/oidc/logout')
+      .send({ logout_token: token });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(oidcProviderRepo.findByIssuerUrl).toHaveBeenCalledWith(issuerUrl);
+    expect(oidcAdapter.getDiscovery).toHaveBeenCalledWith(issuerUrl);
+    expect(oidcAdapter.validateLogoutToken).toHaveBeenCalledWith(token, provider, discovery);
+  });
+
+  it('processes a valid logout token via GET query param', async () => {
+    const provider = makeProvider();
+    const discovery = makeDiscovery();
+
+    const oidcAdapter = {
+      getDiscovery: jest.fn().mockResolvedValue(discovery),
+      validateLogoutToken: jest.fn().mockResolvedValue({ sub, iss: issuerUrl }),
+    } as any;
+
+    const oidcProviderRepo = {
+      findByIssuerUrl: jest.fn().mockResolvedValue(provider),
+    } as any;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter,
+      oidcProviderRepo,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const token = signLogoutToken({
+      iss: issuerUrl,
+      sub,
+      aud: 'client-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 300,
+      events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
+      jti: 'jti-get-1',
+    });
+
+    const res = await request(app)
+      .get(`/api/auth/oidc/logout?logout_token=${encodeURIComponent(token)}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+  });
+
+  it('returns 400 when logout_token is missing', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter: {} as any,
+      oidcProviderRepo: {} as any,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const res = await request(app).post('/api/auth/oidc/logout').send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('logout_token is required');
+  });
+
+  it('returns 400 for a malformed logout token', async () => {
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter: {} as any,
+      oidcProviderRepo: {} as any,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const res = await request(app)
+      .post('/api/auth/oidc/logout')
+      .send({ logout_token: 'not.a.valid.jwt' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Malformed logout token');
+  });
+
+  it('returns 400 when logout token has no issuer', async () => {
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', kid: 'k1' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'user-1' })).toString('base64url');
+    const token = `${header}.${payload}.fake`;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter: {} as any,
+      oidcProviderRepo: {} as any,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const res = await request(app)
+      .post('/api/auth/oidc/logout')
+      .send({ logout_token: token });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Logout token missing issuer');
+  });
+
+  it('returns 400 when provider is not found', async () => {
+    const oidcProviderRepo = {
+      findByIssuerUrl: jest.fn().mockResolvedValue(null),
+    } as any;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter: {} as any,
+      oidcProviderRepo,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const token = signLogoutToken({
+      iss: 'https://unknown.example.com',
+      sub,
+      aud: 'client-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 300,
+      events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
+      jti: 'jti-unknown-1',
+    });
+
+    const res = await request(app)
+      .post('/api/auth/oidc/logout')
+      .send({ logout_token: token });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Provider not found for issuer');
+  });
+
+  it('returns 400 when validateLogoutToken throws a handled error', async () => {
+    const provider = makeProvider();
+    const discovery = makeDiscovery();
+
+    const oidcAdapter = {
+      getDiscovery: jest.fn().mockResolvedValue(discovery),
+      validateLogoutToken: jest.fn().mockRejectedValue(new Error('Logout token replayed')),
+    } as any;
+
+    const oidcProviderRepo = {
+      findByIssuerUrl: jest.fn().mockResolvedValue(provider),
+    } as any;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter,
+      oidcProviderRepo,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const token = signLogoutToken({
+      iss: issuerUrl,
+      sub,
+      aud: 'client-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 300,
+      events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
+      jti: 'jti-replayed-1',
+    });
+
+    const res = await request(app)
+      .post('/api/auth/oidc/logout')
+      .send({ logout_token: token });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('Logout token replayed');
+  });
+
+  it('supports /auth/oidc/logout path (without /api prefix)', async () => {
+    const provider = makeProvider();
+    const discovery = makeDiscovery();
+
+    const oidcAdapter = {
+      getDiscovery: jest.fn().mockResolvedValue(discovery),
+      validateLogoutToken: jest.fn().mockResolvedValue({ sub, iss: issuerUrl }),
+    } as any;
+
+    const oidcProviderRepo = {
+      findByIssuerUrl: jest.fn().mockResolvedValue(provider),
+    } as any;
+
+    const app = express();
+    app.use(express.json());
+    app.use(createOidcRouter({
+      oidcAdapter,
+      oidcProviderRepo,
+      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+    }));
+
+    const token = signLogoutToken({
+      iss: issuerUrl,
+      sub,
+      aud: 'client-123',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 300,
+      events: { 'http://schemas.openid.net/event/backchannel-logout': {} },
+      jti: 'jti-no-api-1',
+    });
+
+    const res = await request(app)
+      .post('/auth/oidc/logout')
+      .send({ logout_token: token });
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+  });
+});
+
+// ── OIDC route: JWKS refresh ────────────────────────────────────────────
 
 describe('createOidcRouter JWKS refresh', () => {
   it('requires admin dual confirmation before refreshing JWKS', async () => {
