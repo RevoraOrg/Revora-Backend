@@ -135,6 +135,113 @@ export async function readQuery<T extends QueryResultRow = Record<string, unknow
 }
 
 // ---------------------------------------------------------------------------
+// Credential rotation
+// ---------------------------------------------------------------------------
+
+/**
+ * Configuration for database credential rotation.
+ */
+export interface PoolCredentialConfig {
+  host?: string;
+  port?: number;
+  database?: string;
+  user?: string;
+  password?: string;
+}
+
+/**
+ * Callback invoked after credential rotation completes (success or failure).
+ */
+export type CredentialsRotatedCallback = (
+  event: 'rotated' | 'failed',
+  details: { timestamp: string; error?: string },
+) => void;
+
+const rotationListeners: CredentialsRotatedCallback[] = [];
+
+/**
+ * Register a callback to be notified of credential rotation events.
+ */
+export function onCredentialsRotated(cb: CredentialsRotatedCallback): void {
+  rotationListeners.push(cb);
+}
+
+/** Remove all credential rotation listeners (useful in test teardown). */
+export function clearRotationListeners(): void {
+  rotationListeners.length = 0;
+}
+
+function notifyListeners(
+  event: 'rotated' | 'failed',
+  details: { error?: string },
+): void {
+  const payload = { timestamp: new Date().toISOString(), ...details };
+  for (const cb of rotationListeners) {
+    try { cb(event, payload); } catch { /* swallow */ }
+  }
+}
+
+/**
+ * Rotate the primary database pool credentials at runtime.
+ *
+ * Creates a fresh pool with the supplied credentials, smoke-tests it,
+ * then swaps the exported `pool` reference. The old pool is drained
+ * gracefully (5 s delay) before closing.
+ *
+ * Guardrails:
+ *  - Gated on `DB_ROTATION_ENABLED=true` (no-op otherwise).
+ *  - Counter `db.pool.credential_rotation` incremented on success.
+ *  - Counter `db.pool.credential_rotation_failed` + listener on failure.
+ *
+ * @example
+ * await rotatePoolCredentials({ password: process.env.NEW_DB_PASSWORD });
+ */
+export async function rotatePoolCredentials(
+  config: PoolCredentialConfig,
+): Promise<void> {
+  if (process.env.DB_ROTATION_ENABLED !== 'true') {
+    return;
+  }
+
+  const newPool = new Pool({
+    host: config.host ?? process.env.DB_HOST ?? 'localhost',
+    port: config.port ?? Number(process.env.DB_PORT ?? 5432),
+    database: config.database ?? process.env.DB_NAME ?? 'revora',
+    user: config.user ?? process.env.DB_USER ?? 'postgres',
+    password: config.password ?? process.env.DB_PASSWORD ?? '',
+    max: 10,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 2_000,
+  });
+
+  // Smoke-test: verify new credentials with a lightweight query
+  try {
+    await newPool.query('SELECT 1');
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    globalMetrics.incrementCounter(
+      'db.pool.credential_rotation_failed', undefined, 1,
+      'Number of failed credential rotation attempts',
+    );
+    notifyListeners('failed', { error: message });
+    await newPool.end().catch(() => {});
+    throw new Error(`Credential rotation failed: ${message}`);
+  }
+
+  // Swap pools — keep old alive for in-flight queries
+  const oldPool = pool;
+  (pool as Pool) = newPool;
+
+  setTimeout(() => { oldPool.end().catch(() => {}); }, 5_000);
+
+  globalMetrics.incrementCounter(
+    'db.pool.credential_rotation', undefined, 1,
+    'Number of successful credential rotation events',
+  );
+  notifyListeners('rotated', {});
+}
+
+// ---------------------------------------------------------------------------
 // Graceful shutdown helper
 // ---------------------------------------------------------------------------
 
