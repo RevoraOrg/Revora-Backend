@@ -232,7 +232,9 @@ export async function rotatePoolCredentials(
   const oldPool = pool;
   (pool as Pool) = newPool;
 
-  setTimeout(() => { oldPool.end().catch(() => {}); }, 5_000);
+  setTimeout(() => { 
+    if (typeof oldPool.end === 'function') oldPool.end().catch(() => {});
+  }, 5_000);
 
   globalMetrics.incrementCounter(
     'db.pool.credential_rotation', undefined, 1,
