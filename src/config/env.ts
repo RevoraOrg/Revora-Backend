@@ -26,6 +26,9 @@ import { z } from "zod";
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
+ * | REPLICA_DB_URL              | No       | (empty)                 | Cross-region read replica URL (omit to disable)  |
+ * | REPLICA_LAG_THRESHOLD_MS    | No       | 5000                    | Lag SLO in ms; reads route to primary when breached |
+ * | REPLICA_POLL_INTERVAL_MS    | No       | 5000                    | Replica lag monitor polling interval in ms       |
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
  * | SENDGRID_API_KEY            | SendGrid | (empty)                 | SendGrid API key                                 |
@@ -87,6 +90,12 @@ const envSchema = z.object({
   HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
   HOLIDAY_CALENDAR_SECRET: z.string().optional(),
   HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
+  /** Cross-region read replica connection string. Omit to disable lag-aware routing. */
+  REPLICA_DB_URL: z.string().url().optional(),
+  /** Lag SLO in ms. Reads route to primary when measured lag >= this threshold. */
+  REPLICA_LAG_THRESHOLD_MS: z.coerce.number().int().positive().default(5000),
+  /** How often (ms) the lag monitor polls the replica. */
+  REPLICA_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
   EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
   SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
   SES_SNS_TOPIC_ARN: z.string().optional(),

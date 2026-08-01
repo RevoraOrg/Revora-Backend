@@ -1,7 +1,6 @@
 # Lag-Aware DB Read Routing
 
-**Owner:** Backend Platform Team  
-**Issue:** #527 — Multi-region failover: cross-region replica lag SLO with automatic read routing  
+**Issue:** [#715](https://github.com/RevoraOrg/Revora-Backend/issues/715) — Multi-region failover: cross-region replica lag SLO with automatic read routing  
 **Status:** Implemented
 
 ---
@@ -15,7 +14,8 @@ exceeds the configurable SLO threshold, then restores replica routing once lag
 recovers.
 
 The switch is recorded in the `db.replica.route_primary` counter metric so
-alert rules and dashboards can detect SLO breaches.
+alert rules and dashboards can detect SLO breaches. Recovery emits
+`db.replica.recovered`.
 
 ---
 
@@ -62,10 +62,12 @@ alert rules and dashboards can detect SLO breaches.
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
-| `DATABASE_URL` | — | Primary read/write connection string (required in production). |
+| `DATABASE_URL` / `DB_*` | — | Primary read/write connection (required in production). |
 | `REPLICA_DB_URL` | — | Replica connection string. **Omit to disable replica routing entirely.** |
 | `REPLICA_LAG_THRESHOLD_MS` | `5000` | Lag SLO in milliseconds. Reads route to primary when `lag_ms >= threshold`. |
 | `REPLICA_POLL_INTERVAL_MS` | `5000` | How often (ms) the monitor queries the replica for current lag. |
+
+Declared in `src/config/env.ts` and consumed by `src/db/pool.ts`.
 
 ### Minimal example (`.env`)
 
@@ -93,16 +95,7 @@ const { rows } = await readQuery<User>(
 ```
 
 Use `pool.query()` directly for **writes**, DDL, and anything that must reach
-the primary:
-
-```typescript
-import { pool } from './src/db/pool';
-
-await pool.query(
-  'INSERT INTO investments (user_id, amount) VALUES ($1, $2)',
-  [userId, amount],
-);
-```
+the primary.
 
 ### `ReplicaLagMonitor`
 
@@ -118,15 +111,7 @@ const monitor = new ReplicaLagMonitor({
 });
 
 await monitor.start();
-
-// In your request handler:
-if (monitor.isReplicaHealthy()) {
-  // use replica pool
-} else {
-  // use primary pool
-}
-
-// Graceful shutdown:
+// …
 await monitor.stop();
 ```
 
@@ -134,64 +119,28 @@ await monitor.stop();
 
 ## Metrics
 
-### `db.replica.route_primary` (counter)
+| Metric | Type | When |
+|--------|------|------|
+| `db.replica.route_primary` | counter | Each read steered to primary due to unhealthy replica |
+| `db.replica.recovered` | counter | Lag drops below SLO and replica routing resumes |
+| `db.replica.lag_ms` | gauge | Current lag on every successful poll |
 
-Incremented **once per query** that is routed to the primary because the
-replica lag monitor reported the replica as unhealthy (lag ≥ SLO or poll
-error).
+> `db.replica.route_primary` is **not** emitted when no replica is configured.
 
-> Not emitted when no replica is configured — that is normal operation, not
-> an SLO breach.
-
-**Suggested alert rule (Prometheus / CloudWatch):**
+**Suggested alert:**
 
 ```promql
 increase(db_replica_route_primary[5m]) > 0
 ```
 
-Fire an alert if any reads were rerouted to the primary in the last 5 minutes.
-
-### `db.replica.lag_ms` (gauge)
-
-Set on every successful poll to the current replication lag in milliseconds.
-Use this for dashboards and trend analysis.
-
----
-
-## Health check integration
-
-The existing `/health` endpoint (`src/routes/health.ts`) exposes database
-health. To surface replica lag status, add the following to the health
-response object:
-
-```typescript
-replicaLag: lagMonitor?.getStatus() ?? null,
-```
-
-This exposes:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `healthy` | boolean | Whether replica is within SLO |
-| `lastLagMs` | number \| null | Most recent lag measurement |
-| `lastCheckedAt` | string \| null | ISO-8601 timestamp of last successful poll |
-| `lastErrorAt` | string \| null | ISO-8601 timestamp of last poll error |
-| `consecutiveErrors` | number | How many polls have failed in a row |
-
 ---
 
 ## Security assumptions
 
-1. `REPLICA_DB_URL` is consumed by the pg Pool constructor and is never
-   logged, echoed in error messages, or included in metric labels.
-2. Metric labels contain no PII — only aggregate routing decisions and numeric
-   lag values.
-3. The replica pool uses the same SSL settings as the primary (inherited from
-   the pg Pool defaults and the connection string).
-4. Poll errors are swallowed at the logging layer with connection strings
-   redacted; they do not surface in HTTP responses.
-5. The monitor's conservative default (unhealthy before first poll) prevents
-   routing to a replica that has not yet been verified.
+1. `REPLICA_DB_URL` is never logged, echoed in errors, or included in metric labels.
+2. Metric labels contain no PII.
+3. Poll errors redact connection strings before logging.
+4. Conservative default (unhealthy before first poll) prevents routing to an unverified replica.
 
 ---
 
@@ -200,43 +149,24 @@ This exposes:
 | Scenario | Behaviour |
 |----------|-----------|
 | Replica never configured | `readQuery` always targets the primary; no counter emitted. |
-| First poll not yet complete | Replica is treated as unhealthy (conservative default). |
-| Poll returns `NULL` lag | Treated as unhealthy — replica may be uninitialised or is the primary. |
+| First poll not yet complete | Replica treated as unhealthy. |
+| Poll returns `NULL` lag | Treated as unhealthy. |
 | Lag exactly equals threshold | Treated as unhealthy (`lag_ms >= threshold`). |
-| Negative / NaN lag value | Treated as unhealthy. |
+| Negative / NaN lag | Treated as unhealthy. |
 | Replica pool connection timeout | Poll error → unhealthy; next successful poll restores health. |
-| `stop()` called before `start()` | No-op; safe. |
-| `start()` called after `stop()` | Throws `Error('…cannot be restarted')` — create a new instance. |
-| Concurrent polls | `setInterval` callbacks execute sequentially in Node.js event loop; no locking required. |
+| `start()` after `stop()` | Throws — create a new instance. |
 
 ---
 
 ## Testing
 
 ```bash
-# Run only the lag-routing tests
-npx jest src/db/replicaLagMonitor.test.ts --coverage
-
-# Run full suite
-npm test
+npx jest src/db/replicaLagMonitor.test.ts --forceExit
 ```
 
-Tests cover:
-
-- Initial unhealthy state
-- Healthy / unhealthy transitions across the threshold boundary
-- Lag equal to threshold (unhealthy)
-- NULL and invalid lag values
-- Poll errors (network / connection failures)
-- Recovery after lag drops
-- Recovery after poll errors resolve
-- `consecutiveErrors` accumulation
-- Gauge metric emission on successful poll
-- Counter metric emission on unhealthy route
-- No counter emitted when no replica configured
-- `stop()` closes the pool and cancels the interval
-- Restart-after-stop throws
-- `getStatus()` returns a defensive copy
+Covers healthy/unhealthy transitions, threshold boundary, NULL/invalid lag,
+poll errors, **recovery after lag drops**, recovery metric, and per-query
+routing to primary vs replica.
 
 ---
 
@@ -246,7 +176,6 @@ Tests cover:
 |------|---------|
 | `src/db/replicaLagMonitor.ts` | Background lag polling service |
 | `src/db/pool.ts` | Pool singletons + `readQuery` routing helper |
-| `src/db/replicaLagMonitor.test.ts` | Comprehensive unit tests |
-| `src/lib/metrics.ts` | `MetricsCollector` used for `db.replica.*` metrics |
-| `src/config/env.ts` | Environment variable definitions |
-| `docs/runbooks/multi-region-failover.md` | Operational runbook for region failover |
+| `src/db/replicaLagMonitor.test.ts` | Unit tests |
+| `src/config/env.ts` | `REPLICA_*` environment schema |
+| `src/lib/metrics.ts` | Metrics collector |

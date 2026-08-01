@@ -1,6 +1,8 @@
 /**
  * Database Connection Pools — primary + optional cross-region replica
  *
+ * @notice Lag-aware read routing for issue #715.
+ *
  * Exports:
  *   - `pool`        – primary read/write pool (always used for writes)
  *   - `replicaPool` – read replica pool (may be null when no replica is configured)
@@ -11,15 +13,15 @@
  *                         `db.replica.route_primary` when the replica lags
  *                         beyond the SLO or is unavailable
  *
- * Routing is applied per-query, not per-connection, so a single request can
+ * Routing is applied **per-query**, not per-connection, so a single request can
  * mix writes (primary) and reads (replica or primary, depending on lag).
  *
- * Environment variables:
- *   DATABASE_URL            – primary connection string (required in production)
- *   REPLICA_DB_URL          – replica connection string (optional; omit to
- *                             disable replica routing entirely)
- *   REPLICA_LAG_THRESHOLD_MS – lag SLO in ms (default: 5 000)
- *   REPLICA_POLL_INTERVAL_MS – monitor polling interval in ms (default: 5 000)
+ * Environment variables (also declared in `src/config/env.ts`):
+ *   DATABASE_URL / DB_*       – primary connection (required in production)
+ *   REPLICA_DB_URL            – replica connection string (optional; omit to
+ *                               disable replica routing entirely)
+ *   REPLICA_LAG_THRESHOLD_MS  – lag SLO in ms (default: 5 000)
+ *   REPLICA_POLL_INTERVAL_MS  – monitor polling interval in ms (default: 5 000)
  *
  * Security assumptions:
  *   - Connection strings are consumed by pg and never logged.

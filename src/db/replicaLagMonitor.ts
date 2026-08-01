@@ -1,16 +1,18 @@
 /**
  * ReplicaLagMonitor
  *
- * Polls the cross-region read replica at a configurable interval and tracks
- * whether the current replication lag is within the RPO SLO.
+ * @notice Polls a cross-region read replica and drives lag-aware read routing
+ *         for issue #715.
  *
- * When lag exceeds `lagThresholdMs` the monitor marks the replica as
- * "unhealthy" and read routing must steer queries to the primary.  Once lag
- * drops back below the threshold the replica is marked healthy again and reads
- * return to the replica (recovery).
+ * @dev When measured lag exceeds `lagThresholdMs` the monitor marks the replica
+ *      unhealthy and `readQuery()` in `pool.ts` steers SELECT traffic to the
+ *      primary, emitting `db.replica.route_primary`.  When lag drops back below
+ *      the SLO the replica is marked healthy again (recovery) and
+ *      `db.replica.recovered` is incremented so operators can see the restore.
  *
  * Design constraints:
  * - The monitor runs out-of-band; it never blocks query execution.
+ * - Routing is applied **per-query**, not per-connection.
  * - Polling errors are treated conservatively: the replica is considered
  *   unhealthy until a successful measurement re-establishes a known-good state.
  * - The class is injectable (accepts a pool factory) so tests can supply a
@@ -242,6 +244,14 @@ export class ReplicaLagMonitor {
         lagMs,
         thresholdMs: this.lagThresholdMs,
       });
+      // Surface recovery so dashboards can distinguish "still breached" from
+      // "just restored" without relying solely on the lag gauge.
+      this.metrics.incrementCounter(
+        'db.replica.recovered',
+        undefined,
+        1,
+        'Number of times replica lag recovered below SLO and read routing resumed',
+      );
     }
   }
 

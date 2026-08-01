@@ -257,6 +257,11 @@ describe('ReplicaLagMonitor', () => {
     expect(monitor.isReplicaHealthy()).toBe(true);
     expect(monitor.getStatus().consecutiveErrors).toBe(0);
     expect(monitor.getStatus().lastLagMs).toBe(200);
+
+    const snapshot = await metrics.getSnapshot();
+    const recovered = snapshot.custom.find((m) => m.name === 'db_replica_recovered');
+    expect(recovered).toBeDefined();
+    expect(recovered?.value).toBe(1);
   });
 
   it('recovers to healthy after poll error resolves', async () => {
