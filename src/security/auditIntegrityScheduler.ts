@@ -103,9 +103,10 @@ export class AuditIntegrityScheduler {
           headHash: result.headHash,
         });
 
+        // Publish the day's Merkle root AND the chain head to the public witness.
+        // Errors are caught internally and never fail the scheduler / local integrity.
+        void this.witnessPublisher.publishDayRoot();
         if (result.headHash) {
-          // Publish the root hash to the public witness in the background
-          // (Errors are caught internally and won't fail the scheduler)
           void this.witnessPublisher.publishLatest(result.headHash);
         }
       } else {

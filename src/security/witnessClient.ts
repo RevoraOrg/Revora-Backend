@@ -1,5 +1,11 @@
 /**
- * Interface for publishing audit log integrity roots to a public witness.
+ * @file witnessClient.ts
+ *
+ * @notice Interface + clients for publishing audit Merkle roots to a public
+ *         witness (Sigstore Rekor, Stellar memo, or mock for tests).
+ *
+ * @dev Witness downtime must never break local audit integrity verification —
+ *      callers catch publish errors and alert without rethrowing.
  */
 
 export interface WitnessReceipt {
@@ -24,7 +30,7 @@ export interface WitnessClient {
 }
 
 /**
- * A mock witness client for testing and development.
+ * Mock witness client for testing and local development.
  */
 export class MockWitnessClient implements WitnessClient {
   private publishAttempts = 0;
@@ -44,6 +50,64 @@ export class MockWitnessClient implements WitnessClient {
       receiptData: {
         attempt: this.publishAttempts,
         txId: `mock-tx-${Date.now()}`,
+      },
+    };
+  }
+}
+
+/**
+ * Stellar memo witness: posts the Merkle root as a transaction memo on the
+ * configured network.  Production deployments inject a real Horizon submitter;
+ * the default implementation records a deterministic receipt without network I/O
+ * so local integrity checks never depend on Horizon availability.
+ *
+ * Security assumptions:
+ * - The root hash is hex; memo text is truncated to Stellar's 28-byte memo limit
+ *   by storing a short prefix + full hash in `receiptData` for verification.
+ * - Secrets (`STELLAR_SERVER_SECRET`) are never logged.
+ */
+export class StellarMemoWitnessClient implements WitnessClient {
+  constructor(
+    private readonly options: {
+      /** Optional Horizon submitter. When omitted, a dry-run receipt is returned. */
+      submitMemo?: (memo: string) => Promise<{ txHash: string }>;
+      network?: string;
+    } = {},
+  ) {}
+
+  async publish(rootHash: string): Promise<WitnessReceipt> {
+    if (!/^[a-f0-9]{64}$/i.test(rootHash)) {
+      throw new Error('StellarMemoWitnessClient expects a 64-char hex Merkle root');
+    }
+
+    // Stellar text memos are limited to 28 bytes — store a short prefix on-chain
+    // and keep the full root in the receipt for offline verification.
+    const memo = `audit:${rootHash.slice(0, 20)}`;
+    const publishedAt = new Date();
+
+    if (this.options.submitMemo) {
+      const { txHash } = await this.options.submitMemo(memo);
+      return {
+        rootHash,
+        witnessType: 'stellar',
+        publishedAt,
+        receiptData: {
+          network: this.options.network ?? 'testnet',
+          memo,
+          txHash,
+        },
+      };
+    }
+
+    return {
+      rootHash,
+      witnessType: 'stellar',
+      publishedAt,
+      receiptData: {
+        network: this.options.network ?? 'testnet',
+        memo,
+        dryRun: true,
+        note: 'No Horizon submitter configured — receipt recorded locally only',
       },
     };
   }
