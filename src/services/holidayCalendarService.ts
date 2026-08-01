@@ -1,105 +1,108 @@
 /**
  * @title HolidayCalendarService
- * @notice Manages jurisdiction-specific bank holiday calendars with signed static files
- * and per-jurisdiction overrides. Distribution windows skip blackout days so investor
- * bank rails receive funds on a settleable day.
+ * @notice Jurisdiction-aware bank-holiday blackout calendar for the distribution
+ *         scheduler, loaded from a signed static file with per-jurisdiction
+ *         overrides and a fallback shift policy.
  *
- * @dev Signature validation occurs BEFORE applying the calendar to prevent tampering.
- * The calendar is loaded from a signed static file containing a base64 payload and
- * an HMAC-SHA256 signature.
+ * @dev The service answers two questions for the scheduler:
+ *        1. `isBlackout(date, jurisdictions)` – is this a blackout day?
+ *        2. `getShiftedDate(date, jurisdictions)` – which settleable day should
+ *           a distribution window scheduled for `date` actually run on?
+ *
+ *      Shift semantics (issue #664):
+ *        - A blackout day is shifted to the previous or next business day per
+ *          the configured fallback policy.
+ *        - The shifted date must itself be a *settleable* day: it must not fall
+ *          on a weekend AND must not be a blackout for ANY of the jurisdictions
+ *          that caused the original shift (overlapping holidays across
+ *          jurisdictions apply the strictest shift — we keep shifting until the
+ *          candidate day is clear for all affected jurisdictions).
+ *        - Per-jurisdiction overrides extend the base holiday set so regional
+ *          calendars (e.g. `US-NY`) can be layered on top of country calendars.
+ *
+ *      The calendar is distributed as a signed static file so updates are
+ *      auditable: `loadCalendar()` validates the HMAC-SHA256 signature with a
+ *      constant-time comparison BEFORE the payload is applied (fail-closed),
+ *      computes a SHA-256 hash of the canonical payload, and persists the hash
+ *      in a `holiday_calendar.load` audit event.
  *
  * Security assumptions:
- * - The signing secret is stored securely in environment variables and never logged.
- * - Signature validation uses constant-time comparison (timingSafeEqual).
- * - If validation fails, the calendar is rejected entirely (fail-closed).
- * - Overlapping holidays across jurisdictions apply the strictest shift.
- * - The calendar hash is persisted in an audit event for operational traceability.
+ *  - The signing secret lives in the environment (`HOLIDAY_CALENDAR_SECRET`)
+ *    and is never logged.
+ *  - Signature comparison uses `crypto.timingSafeEqual` on same-length buffers.
+ *  - A missing file, bad signature, malformed payload, or empty secret rejects
+ *    the whole calendar — the service stays uninitialised and the scheduler
+ *    falls back to its current behaviour (no shifting).
+ *  - Unknown jurisdictions are ignored (no shift) so calendar roll-outs do not
+ *    break schedulers for unlisted regions.
  *
- * Abuse/failure paths handled:
- * - Missing or unreadable calendar file → service remains uninitialized.
- * - Invalid or mismatched signature → calendar rejected, error logged.
- * - Malformed JSON payload → calendar rejected, error logged.
- * - Empty secret → calendar rejected.
- * - Unknown jurisdiction → falls back to default behavior (no shift).
+ * @see ../../docs/holiday-calendar-blackouts.md
  */
 
 import { createHmac, timingSafeEqual, createHash } from 'crypto';
 import { Logger, globalLogger } from '../lib/logger';
 import { MetricsCollector, globalMetrics } from '../lib/metrics';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
-import { Errors } from '../lib/errors';
 
-// ─── Types ─────────────────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
-/**
- * Canonical holiday calendar payload loaded from the signed static file.
- */
 export interface HolidayCalendarPayload {
   /** Semantic version of the calendar schema. */
   version: string;
-  /** ISO 8601 date strings (YYYY-MM-DD) keyed by jurisdiction code. */
+  /** ISO date strings (YYYY-MM-DD) keyed by jurisdiction code. */
   jurisdictions: Record<string, string[]>;
-  /** Per-offering/jurisdiction overrides that augment or replace base holidays. */
+  /** Per-jurisdiction overrides that augment the base holiday set. */
   overrides: Record<string, string[]>;
   /** ISO timestamp when the calendar was generated. */
   generatedAt: string;
 }
 
-/**
- * Raw signed file format expected on disk.
- */
 export interface SignedHolidayCalendarFile {
   /** Base64-encoded canonical JSON of the HolidayCalendarPayload. */
   payload: string;
-  /** HMAC-SHA256 signature in sha256=<hex> format. */
+  /** HMAC-SHA256 signature in `sha256=<hex>` format. */
   signature: string;
 }
 
-/**
- * Result of a blackout shift decision.
- */
+export type ShiftDirection = 'previous' | 'next';
+
 export interface BlackoutShiftDecision {
-  /** Original scheduled date before shift. */
+  /** Originally scheduled date before any shift. */
   originalDate: Date;
-  /** Shifted date after applying holiday rules. */
+  /** Settleable date after applying blackout rules. */
   shiftedDate: Date;
   /** Whether a shift occurred. */
   shifted: boolean;
-  /** Human-readable reason for the shift. */
+  /** Human-readable reason for the decision. */
   reason: string;
   /** Jurisdiction codes that caused the blackout. */
   jurisdictions: string[];
-  /** Direction of the shift. */
-  direction: 'previous' | 'next';
+  /** Direction the shift moved in. */
+  direction: ShiftDirection;
 }
 
-/**
- * Configuration for the holiday calendar service.
- */
 export interface HolidayCalendarServiceOptions {
-  /** Custom logger instance. */
   logger?: Logger;
-  /** Metrics collector for emitting scheduler.blackout.shift. */
   metrics?: MetricsCollector;
-  /** Audit repository for persisting calendar load events. */
   auditRepository?: SecurityAuditRepository;
   /** Fallback shift policy when no explicit policy is configured. */
-  fallbackShiftPolicy?: 'previous' | 'next';
+  fallbackShiftPolicy?: ShiftDirection;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const METRIC_BLACKOUT_SHIFT = 'scheduler_blackout_shift_total';
+const METRIC_BLACKOUT_SHIFT = 'scheduler.blackout.shift';
 const AUDIT_ACTION_LOAD = 'holiday_calendar.load';
 const AUDIT_RESOURCE = 'holiday_calendar';
+const MAX_SHIFT_ITERATIONS = 366;
 
-// ─── HolidayCalendarService ──────────────────────────────────────────────────
+// ─── Service ─────────────────────────────────────────────────────────────────
 
 export class HolidayCalendarService {
   private readonly logger: Logger;
-  private readonly metrics: MetricsCollector;
+  private readonly metrics?: MetricsCollector;
   private readonly auditRepository?: SecurityAuditRepository;
-  private readonly fallbackShiftPolicy: 'previous' | 'next';
+  private readonly fallbackShiftPolicy: ShiftDirection;
 
   private loaded = false;
   private payload: HolidayCalendarPayload | null = null;
@@ -107,31 +110,28 @@ export class HolidayCalendarService {
 
   constructor(options: HolidayCalendarServiceOptions = {}) {
     this.logger = options.logger ?? globalLogger;
-    this.metrics = options.metrics ?? (globalMetrics as any);
+    this.metrics = options.metrics ?? globalMetrics;
     this.auditRepository = options.auditRepository;
     this.fallbackShiftPolicy = options.fallbackShiftPolicy ?? 'previous';
   }
 
   /**
-   * Load and validate a signed holiday calendar file.
+   * @notice Load and validate a signed holiday calendar file.
    *
-   * @param filePath Absolute path to the signed static file.
-   * @param secret HMAC secret used to validate the file signature.
-   * @throws Error if the file cannot be read, the signature is invalid, or the payload is malformed.
+   * @dev Signature validation occurs BEFORE the payload is applied.  On any
+   *      validation failure the calendar is rejected in its entirety and the
+   *      service remains uninitialised (fail-closed).
+   *
+   * @param filePath Absolute path to the signed static calendar file.
+   * @param secret   HMAC secret used to sign the file.
+   * @throws         If the file is unreadable, unsigned, tampered, or malformed.
    */
   async loadCalendar(filePath: string, secret: string): Promise<void> {
     if (!secret) {
       throw new Error('Holiday calendar secret is required');
     }
 
-    let raw = '';
-    try {
-      raw = await require('fs').promises.readFile(filePath, 'utf8');
-    } catch (err) {
-      this.logger.error('Failed to read holiday calendar file', { filePath, error: err });
-      throw new Error(`Failed to read holiday calendar file: ${filePath}`);
-    }
-
+    const raw = await this.readFile(filePath);
     let file: SignedHolidayCalendarFile;
     try {
       file = JSON.parse(raw) as SignedHolidayCalendarFile;
@@ -140,39 +140,34 @@ export class HolidayCalendarService {
       throw new Error('Malformed holiday calendar JSON');
     }
 
-    if (!file.payload || !file.signature) {
+    if (!file.payload || typeof file.payload !== 'string' || !file.signature) {
       this.logger.error('Holiday calendar file missing payload or signature', { filePath });
       throw new Error('Holiday calendar file must contain payload and signature');
     }
 
     const expectedSig = this.computeSignature(secret, file.payload);
-
-    const signatureBuffer = Buffer.from(file.signature, 'utf8');
-    const expectedBuffer = Buffer.from(expectedSig, 'utf8');
-
-    if (signatureBuffer.length !== expectedBuffer.length || !timingSafeEqual(signatureBuffer, expectedBuffer)) {
+    const receivedBuf = Buffer.from(file.signature, 'utf8');
+    const expectedBuf = Buffer.from(expectedSig, 'utf8');
+    if (receivedBuf.length !== expectedBuf.length || !timingSafeEqual(receivedBuf, expectedBuf)) {
       this.logger.error('Holiday calendar signature verification failed', { filePath });
       throw new Error('Holiday calendar signature verification failed');
     }
 
-    let decoded: unknown;
-    try {
-      decoded = JSON.parse(Buffer.from(file.payload, 'base64').toString('utf8'));
-    } catch {
-      this.logger.error('Malformed holiday calendar base64 payload', { filePath });
-      throw new Error('Malformed holiday calendar base64 payload');
-    }
-
+    const decoded = this.decodePayload(file.payload);
     if (!this.isValidPayload(decoded)) {
       this.logger.error('Invalid holiday calendar payload structure', { filePath });
       throw new Error('Invalid holiday calendar payload structure');
     }
 
-    this.payload = decoded as HolidayCalendarPayload;
+    this.payload = decoded;
     this.calendarHash = this.computePayloadHash(file.payload);
     this.loaded = true;
 
-    await this.recordAuditEvent('SUCCESS', { filePath, hash: this.calendarHash, version: this.payload.version });
+    await this.recordAuditEvent('SUCCESS', {
+      filePath,
+      hash: this.calendarHash,
+      version: this.payload.version,
+    });
 
     this.logger.info('Holiday calendar loaded and validated', {
       filePath,
@@ -183,44 +178,36 @@ export class HolidayCalendarService {
   }
 
   /**
-   * Check whether a given date is a blackout day for the provided jurisdictions.
-   *
-   * @param date Date to evaluate (only the date portion is used).
-   * @param jurisdictions Array of jurisdiction codes (e.g. ['US', 'GB']).
-   * @returns True if the date falls on a holiday in any of the jurisdictions.
+   * @notice Check whether `date` is a blackout day in any of the jurisdictions.
    */
   isBlackout(date: Date, jurisdictions: string[]): boolean {
     this.ensureLoaded();
     const dateStr = this.toDateString(date);
     if (!dateStr) return false;
 
-    for (const jurisdiction of jurisdictions) {
-      const holidays = this.getHolidaysForJurisdiction(jurisdiction);
-      if (holidays.has(dateStr)) {
-        return true;
-      }
-    }
-
-    return false;
+    return jurisdictions.some((jurisdiction) =>
+      this.getHolidaysForJurisdiction(jurisdiction).has(dateStr),
+    );
   }
 
   /**
-   * Compute the shifted date for a given date and set of jurisdictions.
+   * @notice Compute the settleable shifted date for a scheduled distribution day.
    *
-   * If the date is not a blackout day, returns the original date unchanged.
-   * If it is a blackout day, shifts according to the fallback policy.
+   * @dev If `date` is not a blackout day the original date is returned
+   *      unchanged.  Otherwise the date is shifted in the `fallbackShiftPolicy`
+   *      direction until a day that is neither a weekend nor a blackout for any
+   *      of the jurisdictions that caused the shift is found.  Overlapping
+   *      holidays across jurisdictions therefore apply the strictest shift —
+   *      the scheduler only ever lands on a day that settles for every affected
+   *      jurisdiction.
    *
-   * Overlapping holidays in multiple jurisdictions are handled by applying the
-   * strictest shift: if any jurisdiction requires a shift, the date is shifted.
-   *
-   * @param date Date to evaluate.
-   * @param jurisdictions Array of jurisdiction codes.
-   * @returns BlackoutShiftDecision describing the result.
+   * @param date          Scheduled distribution date.
+   * @param jurisdictions Jurisdiction codes that govern the distribution.
    */
   getShiftedDate(date: Date, jurisdictions: string[]): BlackoutShiftDecision {
     this.ensureLoaded();
-    const dateStr = this.toDateString(date);
     const originalDate = new Date(date);
+    const dateStr = this.toDateString(date);
 
     if (!dateStr) {
       return {
@@ -233,13 +220,9 @@ export class HolidayCalendarService {
       };
     }
 
-    const blackoutJurisdictions: string[] = [];
-    for (const jurisdiction of jurisdictions) {
-      const holidays = this.getHolidaysForJurisdiction(jurisdiction);
-      if (holidays.has(dateStr)) {
-        blackoutJurisdictions.push(jurisdiction);
-      }
-    }
+    const blackoutJurisdictions = jurisdictions.filter((jurisdiction) =>
+      this.getHolidaysForJurisdiction(jurisdiction).has(dateStr),
+    );
 
     if (blackoutJurisdictions.length === 0) {
       return {
@@ -253,11 +236,14 @@ export class HolidayCalendarService {
     }
 
     const direction = this.fallbackShiftPolicy;
-    const shiftedDate = this.findBusinessDay(originalDate, direction);
+    // Strictest shift: the settleable day must be clear for EVERY jurisdiction
+    // in the distribution (not only the ones that blacked out the original day).
+    const shiftedDate = this.findSettleableDay(originalDate, direction, jurisdictions);
 
-    const reason = blackoutJurisdictions.length === 1
-      ? `Blackout in jurisdiction ${blackoutJurisdictions[0]}`
-      : `Blackout across ${blackoutJurisdictions.length} jurisdictions: ${blackoutJurisdictions.join(', ')}`;
+    const reason =
+      blackoutJurisdictions.length === 1
+        ? `Blackout in jurisdiction ${blackoutJurisdictions[0]}`
+        : `Blackout across ${blackoutJurisdictions.length} jurisdictions: ${blackoutJurisdictions.join(', ')}`;
 
     const decision: BlackoutShiftDecision = {
       originalDate,
@@ -269,26 +255,41 @@ export class HolidayCalendarService {
     };
 
     this.emitBlackoutMetric(decision);
-
     return decision;
   }
 
-  /**
-   * Returns true if the calendar has been successfully loaded.
-   */
   isLoaded(): boolean {
     return this.loaded;
   }
 
-  /**
-   * Returns the SHA-256 hash of the canonical payload for audit purposes.
-   * Returns null if the calendar has not been loaded.
-   */
+  /** SHA-256 hash of the canonical payload, or null before first load. */
   getCalendarHash(): string | null {
     return this.calendarHash;
   }
 
   // ─── Private helpers ────────────────────────────────────────────────────────
+
+  private async readFile(filePath: string): Promise<string> {
+    try {
+      const fs = await import('fs');
+      return await fs.promises.readFile(filePath, 'utf8');
+    } catch (err) {
+      this.logger.error('Failed to read holiday calendar file', {
+        filePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw new Error(`Failed to read holiday calendar file: ${filePath}`);
+    }
+  }
+
+  private decodePayload(base64Payload: string): unknown {
+    try {
+      return JSON.parse(Buffer.from(base64Payload, 'base64').toString('utf8'));
+    } catch {
+      this.logger.error('Malformed holiday calendar base64 payload');
+      throw new Error('Malformed holiday calendar base64 payload');
+    }
+  }
 
   private ensureLoaded(): void {
     if (!this.loaded || !this.payload) {
@@ -304,30 +305,44 @@ export class HolidayCalendarService {
     return `${year}-${month}-${day}`;
   }
 
+  /** Base holidays plus any per-jurisdiction override dates. */
   private getHolidaysForJurisdiction(jurisdiction: string): Set<string> {
     if (!this.payload) return new Set();
-
-    const overrideKey = jurisdiction;
-    const overrideDates = this.payload.overrides[overrideKey];
-    const baseDates = this.payload.jurisdictions[jurisdiction] ?? [];
-
-    const combined = new Set<string>([...baseDates, ...(overrideDates ?? [])]);
-    return combined;
+    const base = this.payload.jurisdictions[jurisdiction] ?? [];
+    const override = this.payload.overrides[jurisdiction] ?? [];
+    return new Set<string>([...base, ...override]);
   }
 
-  private findBusinessDay(startDate: Date, direction: 'previous' | 'next'): Date {
-    const d = new Date(startDate);
+  /**
+   * Walk from `startDate` in `direction` until a day that is a weekday and not
+   * a blackout for any of the distribution's jurisdictions is found.  This is
+   * the "strictest shift" rule: overlapping holidays keep the scheduler moving
+   * until every jurisdiction in the distribution can settle on the same day.
+   */
+  private findSettleableDay(
+    startDate: Date,
+    direction: ShiftDirection,
+    affectedJurisdictions: string[],
+  ): Date {
     const step = direction === 'previous' ? -1 : 1;
+    const cursor = new Date(startDate);
 
-    for (let i = 0; i < 366; i++) {
-      d.setUTCDate(d.getUTCDate() + step);
-      const dayOfWeek = d.getUTCDay();
-      if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-        return d;
-      }
+    for (let i = 0; i < MAX_SHIFT_ITERATIONS; i++) {
+      cursor.setUTCDate(cursor.getUTCDate() + step);
+      const dayOfWeek = cursor.getUTCDay();
+      if (dayOfWeek === 0 || dayOfWeek === 6) continue;
+
+      const candidate = this.toDateString(cursor);
+      const stillBlackout = affectedJurisdictions.some((jurisdiction) => {
+        if (!candidate) return false;
+        return this.getHolidaysForJurisdiction(jurisdiction).has(candidate);
+      });
+      if (stillBlackout) continue;
+
+      return new Date(cursor);
     }
 
-    throw new Error('Unable to find business day within 366 iterations');
+    throw new Error('Unable to find a settleable day within the shift horizon');
   }
 
   private computeSignature(secret: string, base64Payload: string): string {
@@ -343,59 +358,63 @@ export class HolidayCalendarService {
   private isValidPayload(obj: unknown): obj is HolidayCalendarPayload {
     if (!obj || typeof obj !== 'object') return false;
     const record = obj as Record<string, unknown>;
-
     if (typeof record.version !== 'string') return false;
     if (typeof record.generatedAt !== 'string') return false;
     if (typeof record.jurisdictions !== 'object' || record.jurisdictions === null) return false;
     if (typeof record.overrides !== 'object' || record.overrides === null) return false;
 
-    return true;
+    const jurisdictions = record.jurisdictions as Record<string, unknown>;
+    const overrides = record.overrides as Record<string, unknown>;
+    return (
+      Object.values(jurisdictions).every((v) => Array.isArray(v) && v.every((d) => typeof d === 'string')) &&
+      Object.values(overrides).every((v) => Array.isArray(v) && v.every((d) => typeof d === 'string'))
+    );
   }
 
   private emitBlackoutMetric(decision: BlackoutShiftDecision): void {
-    if (!this.metrics || typeof (this.metrics as any).incrementCounter !== 'function') return;
-
     try {
-      (this.metrics as any).incrementCounter(
+      this.metrics?.incrementCounter(
         METRIC_BLACKOUT_SHIFT,
         {
           direction: decision.direction,
           jurisdiction_count: String(decision.jurisdictions.length),
         },
         1,
-        'Total number of distribution blackout shifts due to jurisdiction holidays'
+        'Total number of distribution blackout shifts due to jurisdiction holidays',
       );
     } catch {
-      // Metrics emission must not break business logic
+      // Metric emission must never break the scheduling decision.
     }
   }
 
-  private async recordAuditEvent(outcome: 'SUCCESS' | 'FAILURE', details: Record<string, unknown>): Promise<void> {
+  private async recordAuditEvent(
+    outcome: 'SUCCESS' | 'FAILURE',
+    details: Record<string, unknown>,
+  ): Promise<void> {
     if (!this.auditRepository) return;
 
-    try {
-      const event: AuditEvent = {
-        id: `audit_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        type: 'VALIDATION',
-        action: AUDIT_ACTION_LOAD,
-        resource: AUDIT_RESOURCE,
-        outcome,
-        details: {
-          ...details,
-          calendarHash: this.calendarHash,
-        },
-        securityContext: {
-          requestId: `holiday-calendar-${Date.now()}`,
-          ipAddress: 'system',
-          userAgent: 'holiday-calendar-service',
-          timestamp: new Date(),
-        },
+    const event: AuditEvent = {
+      id: `audit_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      type: 'VALIDATION',
+      action: AUDIT_ACTION_LOAD,
+      resource: AUDIT_RESOURCE,
+      outcome,
+      details: { ...details, calendarHash: this.calendarHash },
+      securityContext: {
+        requestId: `holiday-calendar-${Date.now()}`,
+        ipAddress: 'system',
+        userAgent: 'holiday-calendar-service',
         timestamp: new Date(),
-      };
+      },
+      timestamp: new Date(),
+    };
 
+    try {
       await this.auditRepository.record(event);
     } catch (err) {
-      this.logger.warn('Failed to record holiday calendar audit event', { error: err });
+      this.logger.warn('Failed to record holiday calendar audit event', {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }

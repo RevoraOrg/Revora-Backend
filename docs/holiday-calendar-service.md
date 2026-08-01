@@ -1,26 +1,50 @@
 # Holiday Calendar Blackout Support
 
+Implements [issue #664](https://github.com/RevoraOrg/Revora-Backend/issues/664):
+jurisdiction-aware bank-holiday blackouts for the distribution scheduler, loaded
+from a signed static file with per-jurisdiction overrides and a fallback shift
+policy (previous vs next business day).
+
 ## Overview
 
-The `HolidayCalendarService` provides jurisdiction-specific bank holiday awareness for the distribution scheduler. Distribution windows skip blackout days so investor bank rails receive funds on a settleable business day.
+`HolidayCalendarService` answers two questions for the scheduler:
 
-## Key Concepts
+1. `isBlackout(date, jurisdictions)` — is this a blackout day?
+2. `getShiftedDate(date, jurisdictions)` — which settleable day should a
+   distribution window scheduled for `date` actually run on?
 
-- **Signed static file**: The calendar is loaded from a disk file containing a base64-encoded payload and an HMAC-SHA256 signature. This allows runtime updates without code changes while maintaining auditability.
-- **Signature validation before application**: The HMAC signature is verified using constant-time comparison before any calendar data is applied. Invalid or tampered files are rejected entirely (fail-closed).
-- **Per-jurisdiction overrides**: The calendar supports base holidays per jurisdiction and per-offering/jurisdiction overrides that augment or replace base holidays.
-- **Strictest shift policy**: When overlapping holidays exist across multiple jurisdictions, any blackout triggers a shift.
-- **Fallback shift policy**: Configurable as `previous` (default) or `next` business day.
+Distribution windows skip blackout days so investor bank rails receive funds on
+a settleable business day.
 
-## Environment Variables
+## Security model
 
-| Variable                        | Required | Default    | Description                                          |
-|---------------------------------|----------|------------|------------------------------------------------------|
-| `HOLIDAY_CALENDAR_FILE_PATH`    | No       | (empty)    | Absolute path to the signed static holiday calendar   |
-| `HOLIDAY_CALENDAR_SECRET`       | No       | (empty)    | HMAC secret for validating the calendar file signature|
-| `HOLIDAY_FALLBACK_SHIFT_POLICY` | No       | `previous` | Shift direction: `previous` or `next` business day   |
+| Control | Behaviour |
+|---------|-----------|
+| Signed static file | Calendar is distributed as `{ payload, signature }` where `payload` is base64-encoded JSON and `signature` is `sha256=<hmac-hex>` |
+| Signature validation first | HMAC-SHA256 is verified with `crypto.timingSafeEqual` **before** the payload is applied (fail-closed) |
+| Audit hash | SHA-256 of the canonical payload is persisted in a `holiday_calendar.load` audit event |
+| Secret handling | `HOLIDAY_CALENDAR_SECRET` is never logged |
+| Fail-closed | Missing file, bad signature, malformed payload, or empty secret rejects the whole calendar |
 
-## Calendar File Format
+## Shift semantics (strictest shift)
+
+- A blackout day is shifted to the previous or next business day per
+  `HOLIDAY_FALLBACK_SHIFT_POLICY` (default: `previous`).
+- The shifted date must itself be settleable: it must not fall on a weekend
+  **and** must not be a blackout for **any** jurisdiction in the distribution.
+- Overlapping holidays across jurisdictions therefore keep shifting until every
+  affected jurisdiction can settle on the same day.
+- Per-jurisdiction overrides (e.g. `US-NY`) augment the base holiday set.
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `HOLIDAY_CALENDAR_FILE_PATH` | No | (empty) | Absolute path to the signed static calendar |
+| `HOLIDAY_CALENDAR_SECRET` | No | (empty) | HMAC secret for validating the calendar signature |
+| `HOLIDAY_FALLBACK_SHIFT_POLICY` | No | `previous` | Shift direction: `previous` or `next` |
+
+## Calendar file format
 
 ```json
 {
@@ -29,7 +53,7 @@ The `HolidayCalendarService` provides jurisdiction-specific bank holiday awarene
 }
 ```
 
-The base64 payload decodes to:
+Decoded payload:
 
 ```json
 {
@@ -45,136 +69,71 @@ The base64 payload decodes to:
 }
 ```
 
-### Generating a Signed Calendar File
+### Generating a signed calendar
 
 ```typescript
 import { createHmac } from 'crypto';
 
-function signCalendar(payload: Record<string, unknown>, secret: string): string {
-  const base64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
-  const hmac = createHmac('sha256', secret);
-  hmac.update(base64);
-  return JSON.stringify({ payload: base64, signature: `sha256=${hmac.digest('hex')}` });
-}
+const payload = {
+  version: '1.0.0',
+  jurisdictions: { US: ['2026-01-01'] },
+  overrides: {},
+  generatedAt: new Date().toISOString(),
+};
+const base64 = Buffer.from(JSON.stringify(payload)).toString('base64');
+const signature = `sha256=${createHmac('sha256', process.env.HOLIDAY_CALENDAR_SECRET!)
+  .update(base64)
+  .digest('hex')}`;
 ```
 
-## Usage
-
-### Basic Integration
+## Integration
 
 ```typescript
 import { HolidayCalendarService } from './services/holidayCalendarService';
+import { DistributionScheduler } from './services/distributionScheduler';
 
 const calendar = new HolidayCalendarService({
-  metrics: globalMetrics,
-  auditRepository: auditRepo,
+  fallbackShiftPolicy: 'previous',
+  auditRepository,
+  metrics,
 });
+await calendar.loadCalendar(
+  process.env.HOLIDAY_CALENDAR_FILE_PATH!,
+  process.env.HOLIDAY_CALENDAR_SECRET!,
+);
 
-await calendar.loadCalendar('/secure/calendars/holidays.json', process.env.HOLIDAY_CALENDAR_SECRET!);
-
-const decision = calendar.getShiftedDate(new Date('2026-01-31'), ['US']);
-console.log(decision.shiftedDate); // 2026-01-30 (previous business day)
-console.log(decision.reason);      // "Blackout in jurisdiction US"
-```
-
-### Scheduler Integration
-
-```typescript
-import { DistributionScheduler } from './services/distributionScheduler';
-import { HolidayCalendarService } from './services/holidayCalendarService';
-
-const scheduler = new DistributionScheduler(engine, revenueRepo, {
+const scheduler = new DistributionScheduler(engine, revenueReportRepo, {
   holidayCalendarService: calendar,
-  resolveJurisdiction: async (offeringId: string) => {
-    // Resolve offering jurisdiction from database or cache
-    const offering = await offeringRepo.findById(offeringId);
-    return offering?.jurisdiction ?? null;
-  },
 });
 ```
 
-## API Reference
-
-### `HolidayCalendarService`
-
-#### `loadCalendar(filePath: string, secret: string): Promise<void>`
-
-Loads and validates a signed holiday calendar file. Must be called before `isBlackout` or `getShiftedDate`.
-
-**Throws**:
-- `Error` if file cannot be read.
-- `Error` if signature verification fails.
-- `Error` if payload is malformed.
-
-#### `isBlackout(date: Date, jurisdictions: string[]): boolean`
-
-Returns `true` if the date falls on a holiday in any of the provided jurisdictions.
-
-#### `getShiftedDate(date: Date, jurisdictions: string[]): BlackoutShiftDecision`
-
-Returns a shift decision. If the date is a blackout, computes the nearest business day per the configured fallback policy.
-
-```typescript
-interface BlackoutShiftDecision {
-  originalDate: Date;
-  shiftedDate: Date;
-  shifted: boolean;
-  reason: string;
-  jurisdictions: string[];
-  direction: 'previous' | 'next';
-}
-```
-
-#### `isLoaded(): boolean`
-
-Returns `true` if a calendar has been successfully loaded.
-
-#### `getCalendarHash(): string | null`
-
-Returns the SHA-256 hash of the canonical payload, or `null` if not loaded.
+When a claim's `period_end` is a blackout for the offering's jurisdiction, the
+scheduler shifts the distribution window and logs the decision.
 
 ## Metrics
 
-| Metric                          | Type   | Labels                     | Description                                      |
-|---------------------------------|--------|----------------------------|--------------------------------------------------|
-| `scheduler_blackout_shift_total`| counter| `direction`, `jurisdiction_count` | Count of distribution shifts due to blackout days |
+- `scheduler.blackout.shift` (counter, labels: `direction`, `jurisdiction_count`)
+  — emitted once per shift decision. Sanitized storage name:
+  `scheduler_blackout_shift`.
 
-## Audit Events
+## Abuse / failure paths
 
-When the calendar is loaded, an audit event is persisted:
+| Scenario | Behaviour |
+|----------|-----------|
+| Missing / unreadable file | `loadCalendar` throws; service stays uninitialized |
+| Invalid HMAC signature | Rejected; service stays uninitialized |
+| Malformed JSON / base64 / payload | Rejected; service stays uninitialized |
+| Empty secret | Rejected immediately |
+| Unknown jurisdiction | No shift (ignored) |
+| Adjacent business day also a holiday | Keep shifting until settleable |
+| Audit repository down | Load continues; warning logged |
 
-```typescript
-{
-  id: 'audit_...',
-  type: 'VALIDATION',
-  action: 'holiday_calendar.load',
-  resource: 'holiday_calendar',
-  outcome: 'SUCCESS' | 'FAILURE',
-  details: {
-    filePath: string,
-    hash: string,
-    version: string,
-  },
-  timestamp: Date,
-}
+## Tests
+
+```bash
+npx jest src/services/holidayCalendarService.test.ts src/services/distributionScheduler.test.ts
 ```
 
-## Security Considerations
-
-- **Secret management**: Store `HOLIDAY_CALENDAR_SECRET` in a secrets manager. Never commit it to version control.
-- **Constant-time comparison**: Signature validation uses `crypto.timingSafeEqual` to prevent timing attacks.
-- **Fail-closed**: Invalid signatures or malformed files cause the calendar to be rejected entirely.
-- **Hash persistence**: The calendar hash is recorded in an audit event for operational traceability and change detection.
-- **No PII in logs**: File paths and hashes are logged; the secret is never logged.
-
-## Abuse / Failure Paths
-
-| Scenario                           | Behavior                                              |
-|------------------------------------|-------------------------------------------------------|
-| Missing file                       | `loadCalendar` throws; service remains uninitialized  |
-| Invalid HMAC signature             | `loadCalendar` throws; service remains uninitialized  |
-| Malformed JSON or base64 payload   | `loadCalendar` throws; service remains uninitialized  |
-| Empty secret                       | `loadCalendar` throws immediately                     |
-| Unknown jurisdiction               | Treated as non-holiday (no shift)                     |
-| Overlapping holidays               | Shift applies if **any** jurisdiction is blacked out  |
-| Weekend + holiday                  | Weekend days are also skipped as non-business days    |
+Covers signature validation (including wrong-secret), blackout detection with
+overrides, previous/next policies, weekend skipping, overlapping multi-
+jurisdiction strictest shift, metric emission, and audit persistence.

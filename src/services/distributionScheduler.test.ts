@@ -611,7 +611,7 @@ describe('DistributionScheduler', () => {
       );
     });
 
-    it('emits scheduler_blackout_shift metric on shift', async () => {
+    it('emits scheduler.blackout.shift metric on shift', async () => {
       const schedulerWithCalendar = new DistributionScheduler(engine, revenueReportRepo, {
         holidayCalendarService: holidayService,
         resolveJurisdiction: () => 'US',
@@ -620,7 +620,9 @@ describe('DistributionScheduler', () => {
       await schedulerWithCalendar.processPendingDistributions();
 
       const snapshot = await metrics.getSnapshot();
-      const metric = snapshot.custom.find((p: any) => p.name === 'scheduler_blackout_shift_total')!;
+      // sanitizeName replaces '.' with '_' → scheduler_blackout_shift
+      const metric = snapshot.custom.find((p: any) => p.name === 'scheduler_blackout_shift')!;
+      expect(metric).toBeDefined();
       expect(metric.value).toBe(1);
       expect(metric.labels?.direction).toBe('previous');
     });
@@ -735,13 +737,14 @@ describe('DistributionScheduler', () => {
       const overlapRepo = {
         findApprovedWithoutDistribution: jest.fn().mockResolvedValue([
           { id: 'report-us', offering_id: 'off-US', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-31'), amount: '1000.00' },
-          { id: 'report-gb', offering_id: 'off-GB', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-31'), amount: '1000.00' },
+          // Distinct period_start so the timezone-window dedupe key does not collide with US
+          { id: 'report-gb', offering_id: 'off-GB', period_start: new Date('2026-01-02'), period_end: new Date('2026-01-31'), amount: '1000.00' },
           { id: 'report-de', offering_id: 'off-DE', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-30'), amount: '1000.00' },
         ]),
         claimApprovedReportForDistribution: jest.fn().mockImplementation(async (reportId: string) => {
           const map: Record<string, any> = {
             'report-us': { id: 'report-us', offering_id: 'off-US', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-31'), amount: '1000.00' },
-            'report-gb': { id: 'report-gb', offering_id: 'off-GB', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-31'), amount: '1000.00' },
+            'report-gb': { id: 'report-gb', offering_id: 'off-GB', period_start: new Date('2026-01-02'), period_end: new Date('2026-01-31'), amount: '1000.00' },
             'report-de': { id: 'report-de', offering_id: 'off-DE', period_start: new Date('2026-01-01'), period_end: new Date('2026-01-30'), amount: '1000.00' },
           };
           return map[reportId] ?? null;
