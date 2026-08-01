@@ -254,6 +254,29 @@ describe('HorizonTransactionHistoryFetcher – gap detection', () => {
     expect(pausedEvents).toHaveLength(1);
     expect(pausedEvents[0].cursor).toBe('104');
     expect(pausedEvents[0].meta?.reason).toBe('gap_detected');
+    expect(pausedEvents[0].meta?.severity).toBe('fatal');
+    expect(pausedEvents[0].meta?.alarm).toBe('horizon_history_gap');
+  });
+
+  it('createHorizonHttpFetchPage builds a Horizon /transactions URL', async () => {
+    const { createHorizonHttpFetchPage } = await import(
+      '../../services/horizonTransactionHistoryFetcher'
+    );
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL) => {
+      calls.push(String(input));
+      return {
+        ok: true,
+        json: async () => makePage(['1', '2']),
+      } as Response;
+    }) as typeof fetch;
+
+    const fetchPage = createHorizonHttpFetchPage('https://horizon.test/', fetchImpl);
+    const page = await fetchPage('10', 5);
+    expect(page._embedded.records).toHaveLength(2);
+    expect(calls[0]).toContain('https://horizon.test/transactions');
+    expect(calls[0]).toContain('cursor=10');
+    expect(calls[0]).toContain('limit=5');
   });
 
   it('emits ingest.gap.detected before ingest.cursor.paused', async () => {

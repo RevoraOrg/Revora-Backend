@@ -230,8 +230,11 @@ export class HorizonTransactionHistoryFetcher extends EventEmitter {
 
       if (this.haltOnGap) {
         this.paused = true;
+        // Fatal alert: gap detection must halt advancement so no records are skipped.
         this.emit('audit', this.buildAuditEvent('ingest.cursor.paused', {
           reason: 'gap_detected',
+          severity: 'fatal',
+          alarm: 'horizon_history_gap',
           ...gapDetail,
         }));
 
@@ -416,4 +419,43 @@ export class HorizonTransactionHistoryFetcher extends EventEmitter {
       meta,
     };
   }
+}
+
+/**
+ * @notice Build a `fetchPage` callback that talks to a real Horizon HTTP endpoint.
+ *
+ * @dev Used to wire `HorizonTransactionHistoryFetcher` to Horizon (issue #706)
+ *      without coupling the ingest layer to a specific SDK.  The base URL must
+ *      come from trusted config (e.g. `STELLAR_HORIZON_URL`), never from request
+ *      input.
+ *
+ * @param horizonBaseUrl Horizon root URL, e.g. `https://horizon-testnet.stellar.org`
+ * @param fetchImpl      Injectable fetch (defaults to global `fetch`)
+ */
+export function createHorizonHttpFetchPage(
+  horizonBaseUrl: string,
+  fetchImpl: typeof fetch = fetch,
+): (cursor: string, limit: number) => Promise<HorizonTransactionPage> {
+  if (!horizonBaseUrl || typeof horizonBaseUrl !== 'string') {
+    throw new Error('createHorizonHttpFetchPage: horizonBaseUrl is required');
+  }
+  const base = horizonBaseUrl.replace(/\/+$/, '');
+
+  return async (cursor: string, limit: number): Promise<HorizonTransactionPage> => {
+    const url = new URL(`${base}/transactions`);
+    url.searchParams.set('order', 'asc');
+    url.searchParams.set('limit', String(Math.min(Math.max(limit, 1), 200)));
+    if (cursor) {
+      url.searchParams.set('cursor', cursor);
+    }
+
+    const res = await fetchImpl(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) {
+      throw new Error(`Horizon transactions fetch failed: HTTP ${res.status}`);
+    }
+    return (await res.json()) as HorizonTransactionPage;
+  };
 }
