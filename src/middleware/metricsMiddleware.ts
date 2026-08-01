@@ -192,20 +192,31 @@ export function createMetricsHandler(metrics: MetricsCollector, pool?: any) {
 
 /**
  * Create Prometheus-format metrics endpoint handler
- * 
- * Exposes metrics in Prometheus text format for scraping.
- * 
+ *
+ * Exposes metrics in Prometheus / OpenMetrics-compatible text format for
+ * scraping.  When a DB pool is supplied, refreshes `db.pool.waiters` and
+ * `db.pool.utilization` on every scrape so the autoscaler always sees a
+ * defined series (issue #712).
+ *
+ * MUST be mounted behind metrics scrape auth (`createMetricsAuthMiddleware`).
+ *
  * Usage:
  * ```typescript
- * app.get('/metrics/prometheus', createPrometheusHandler(globalMetrics));
+ * app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics, pool));
  * ```
- * 
+ *
  * @param metrics Metrics collector instance
+ * @param pool Optional pg Pool used to publish saturation gauges
  * @returns Express route handler
  */
-export function createPrometheusHandler(metrics: MetricsCollector) {
+export function createPrometheusHandler(
+  metrics: MetricsCollector,
+  pool?: Parameters<MetricsCollector['updatePoolSaturationMetrics']>[0],
+) {
   return (_req: Request, res: Response, next: NextFunction): void => {
     try {
+      // Always refresh pool gauges — even when idle — before export.
+      metrics.updatePoolSaturationMetrics(pool ?? null);
       const output = metrics.exportPrometheus();
       res.set('Content-Type', 'text/plain; version=0.0.4');
       res.status(200).send(output);

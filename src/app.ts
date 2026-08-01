@@ -228,8 +228,9 @@ export function createApp() {
   app.use(createChangePasswordRouter({ requireAuth, db: pool }));
   app.use('/api/v1/health', createHealthRouter(pool, dbHealth, metrics));
 
-  // Metrics endpoint (Prometheus format) - secured with internal token
-  app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics));
+  // Metrics endpoint (Prometheus / OpenMetrics-compatible) - secured with internal token.
+  // Passes the primary pool so db.pool.waiters / db.pool.utilization are refreshed on scrape.
+  app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics, pool));
 
   // Reconciliation metrics endpoint (OpenMetrics format) - same auth guard
   app.get(

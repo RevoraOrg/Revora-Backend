@@ -25,6 +25,10 @@
  *   - Connection strings are consumed by pg and never logged.
  *   - Metric labels contain no PII.
  *
+ * Autoscaling (#712): `/metrics` scrapes refresh `db.pool.waiters` and
+ * `db.pool.utilization` from this primary pool (see
+ * `MetricsCollector.updatePoolSaturationMetrics`).
+ *
  * @module db/pool
  */
 

@@ -697,4 +697,85 @@ describe('MetricsCollector', () => {
       expect(output).toContain('beta');
     });
   });
+
+  describe('updatePoolSaturationMetrics (issue #712)', () => {
+    let metrics: MetricsCollector;
+
+    beforeEach(() => {
+      metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    });
+
+    afterEach(() => {
+      metrics.reset();
+    });
+
+    it('emits db.pool.waiters and db.pool.utilization when pool is busy', async () => {
+      const mockPool = {
+        totalCount: 8,
+        waitingCount: 3,
+        options: { max: 10 },
+      } as unknown as Pool;
+
+      metrics.updatePoolSaturationMetrics(mockPool);
+
+      const snapshot = await metrics.getSnapshot();
+      const waiters = snapshot.custom.find((m) => m.name === 'db_pool_waiters');
+      const util = snapshot.custom.find((m) => m.name === 'db_pool_utilization');
+      expect(waiters?.value).toBe(3);
+      expect(util?.value).toBeCloseTo(0.8);
+    });
+
+    it('keeps metrics defined when the pool is idle (waiters=0, utilization=0)', async () => {
+      const idlePool = {
+        totalCount: 0,
+        waitingCount: 0,
+        options: { max: 10 },
+      } as unknown as Pool;
+
+      metrics.updatePoolSaturationMetrics(idlePool);
+
+      const snapshot = await metrics.getSnapshot();
+      const waiters = snapshot.custom.find((m) => m.name === 'db_pool_waiters');
+      const util = snapshot.custom.find((m) => m.name === 'db_pool_utilization');
+      expect(waiters).toBeDefined();
+      expect(waiters?.value).toBe(0);
+      expect(util).toBeDefined();
+      expect(util?.value).toBe(0);
+    });
+
+    it('keeps metrics defined when no pool is provided', async () => {
+      metrics.updatePoolSaturationMetrics(null);
+
+      const snapshot = await metrics.getSnapshot();
+      expect(snapshot.custom.find((m) => m.name === 'db_pool_waiters')?.value).toBe(0);
+      expect(snapshot.custom.find((m) => m.name === 'db_pool_utilization')?.value).toBe(0);
+    });
+
+    it('clamps utilization to 1 when totalCount exceeds max', async () => {
+      metrics.updatePoolSaturationMetrics({
+        totalCount: 15,
+        waitingCount: 5,
+        options: { max: 10 },
+      } as unknown as Pool);
+
+      const snapshot = await metrics.getSnapshot();
+      expect(snapshot.custom.find((m) => m.name === 'db_pool_utilization')?.value).toBe(1);
+    });
+
+    it('exports pool gauges in OpenMetrics / Prometheus text', () => {
+      metrics.updatePoolSaturationMetrics({
+        totalCount: 5,
+        waitingCount: 2,
+        options: { max: 10 },
+      } as unknown as Pool);
+
+      const prom = metrics.exportPrometheus();
+      expect(prom).toContain('db_pool_waiters');
+      expect(prom).toContain('db_pool_utilization');
+
+      const om = metrics.exportOpenMetrics();
+      expect(om).toContain('db_pool_waiters');
+      expect(om).toContain('db_pool_utilization');
+    });
+  });
 });

@@ -455,6 +455,42 @@ export class MetricsCollector {
   }
 
   /**
+   * @notice Publish DB pool saturation gauges for horizontal autoscaling (#712).
+   *
+   * @dev Always writes both gauges — even when the pool is idle (waiters=0,
+   *      utilization=0) — so the autoscaler and alert rules never see a missing
+   *      series.  Call this on every metrics scrape (see
+   *      `createPrometheusHandler`).
+   *
+   * Metrics:
+   *  - `db.pool.waiters`     — clients waiting for a connection
+   *  - `db.pool.utilization` — totalCount / maxConnections in [0, 1]
+   *
+   * Security: labels contain no PII; values are pool counters only.
+   */
+  updatePoolSaturationMetrics(
+    pool?: Pick<Pool, 'totalCount' | 'waitingCount'> & { options?: { max?: number } } | null,
+  ): void {
+    const waiters = pool?.waitingCount ?? 0;
+    const total = pool?.totalCount ?? 0;
+    const max = pool?.options?.max ?? 0;
+    const utilization = max > 0 ? Math.min(1, Math.max(0, total / max)) : 0;
+
+    this.setGauge(
+      'db.pool.waiters',
+      waiters,
+      undefined,
+      'Number of clients waiting for a free DB pool connection',
+    );
+    this.setGauge(
+      'db.pool.utilization',
+      utilization,
+      undefined,
+      'DB pool utilization ratio (totalCount / maxConnections) in [0, 1]',
+    );
+  }
+
+  /**
    * Collect application-level metrics
    * @returns Application metrics snapshot
    */
