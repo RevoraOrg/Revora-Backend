@@ -516,8 +516,12 @@ export function parseCliArgs(args: string[]): CliOptions {
     const arg = args[i];
     if (arg === '--receipt' || arg === '-r') {
       options.receiptPathOrUrl = args[++i];
+    } else if (arg.startsWith('--receipt=')) {
+      options.receiptPathOrUrl = arg.slice('--receipt='.length);
     } else if (arg === '--excerpt' || arg === '-e' || arg === '--entries') {
       options.excerptPathOrUrl = args[++i];
+    } else if (arg.startsWith('--excerpt=')) {
+      options.excerptPathOrUrl = arg.slice('--excerpt='.length);
     } else if (arg === '--json') {
       options.jsonOutput = true;
     } else if (arg === '--quiet' || arg === '-q') {

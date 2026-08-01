@@ -43,7 +43,7 @@ npm run migrate
 ### CLI (operations / CI)
 
 ```bash
-npm run verify-audit-integrity
+npm run verify:audit-integrity
 ```
 
 - Exit `0` — chain valid
@@ -54,13 +54,13 @@ npm run verify-audit-integrity
 Auditors can verify an exported audit log excerpt against a published cryptographic receipt without running the application server or accessing the database:
 
 ```bash
-npx ts-node scripts/verify-audit-receipt.ts --receipt <path-or-url-to-receipt> --excerpt <path-or-url-to-excerpt>
+npm run verify:audit-receipt -- --receipt <path-or-url-to-receipt> --excerpt <path-or-url-to-excerpt>
 ```
 
 Or positional format:
 
 ```bash
-npx ts-node scripts/verify-audit-receipt.ts <receipt.json> <excerpt.json-or-jsonl>
+npm run verify:audit-receipt -- <receipt.json> <excerpt.json-or-jsonl>
 ```
 
 #### Verification Receipt Schema (`AuditReceipt`)

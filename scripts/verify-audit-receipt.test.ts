@@ -438,6 +438,33 @@ describe('verify-audit-receipt script', () => {
     });
   });
 
+  describe('package scripts and fixtures', () => {
+    it('exposes documented npm entry points for the audit verifier CLIs', () => {
+      const packageJson = JSON.parse(
+        fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'),
+      );
+
+      expect(packageJson.scripts['verify:audit-receipt']).toBeDefined();
+      expect(packageJson.scripts['verify:audit-integrity']).toBeDefined();
+    });
+
+    it('verifies the checked-in audit fixtures as a valid receipt/excerpt pair', async () => {
+      const actualFs = jest.requireActual('fs') as typeof import('fs');
+      (fs.promises.readFile as jest.Mock).mockImplementation((filePath: fs.PathOrFileDescriptor) =>
+        actualFs.promises.readFile(filePath, 'utf8'),
+      );
+
+      const receiptPath = path.resolve(__dirname, 'fixtures', 'audit', 'valid-receipt.json');
+      const excerptPath = path.resolve(__dirname, 'fixtures', 'audit', 'valid-excerpt.json');
+
+      const spy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      const code = await runCli([`--receipt=${receiptPath}`, `--excerpt=${excerptPath}`]);
+
+      expect(code).toBe(0);
+      expect(spy).toHaveBeenCalledWith(expect.stringContaining('PASS [VALID INTEGRITY PROOF]'));
+    });
+  });
+
   describe('parseCliArgs and printHelp', () => {
     it('parses flag options', () => {
       const opts = parseCliArgs([
