@@ -40,6 +40,7 @@ export interface Payout {
   amount: string;
   status: 'pending' | 'processed' | 'failed';
   tx_hash?: string | null; // From migration (replaces transaction_hash)
+  frozen_fx_rate_id?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -65,6 +66,7 @@ export interface CreatePayoutInput {
   amount: string;
   status?: 'pending' | 'processed' | 'failed';
   tx_hash?: string | null;
+  frozen_fx_rate_id?: string | null;
 }
 
 /**
@@ -91,10 +93,11 @@ export class DistributionRepository {
         total_amount,
         run_at,
         status,
+        frozen_fx_rate_id,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
 
@@ -106,6 +109,7 @@ export class DistributionRepository {
       input.total_amount,
       runAt,
       status,
+      input.frozen_fx_rate_id || null,
     ];
 
     const queryable = client || this.db;
@@ -135,10 +139,11 @@ export class DistributionRepository {
         amount,
         status,
         tx_hash,
+        frozen_fx_rate_id,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
 
@@ -149,6 +154,7 @@ export class DistributionRepository {
       input.amount,
       status,
       input.tx_hash || null,
+      input.frozen_fx_rate_id || null,
     ];
 
     const queryable = client || this.db;
@@ -302,6 +308,7 @@ export class DistributionRepository {
       run_at: row.run_at,
       status: row.status,
       tx_batch_id: row.tx_batch_id,
+      frozen_fx_rate_id: row.frozen_fx_rate_id || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
@@ -318,6 +325,7 @@ export class DistributionRepository {
       amount: row.amount,
       status: row.status,
       tx_hash: row.tx_hash || undefined,
+      frozen_fx_rate_id: row.frozen_fx_rate_id || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
