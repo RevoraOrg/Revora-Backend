@@ -1,9 +1,23 @@
+import { randomUUID } from 'crypto';
 import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
-import { SecurityAuditRepository } from '../security/types';
+import { AuditEvent, SecurityAuditRepository } from '../security/types';
 
 export type ConversionPathType = 'direct' | 'inverse' | 'triangulated';
+
+/**
+ * @notice Reasons why a stale rate was tolerated or a fallback was used.
+ * @dev    Recorded in audit events so auditors can trace rate provenance.
+ */
+export enum FxFallbackReason {
+  /** The primary rate was fresh enough — no fallback needed. */
+  NONE = 'NONE',
+  /** A substitute rate provider supplied a fresh rate. */
+  SUBSTITUTE_PROVIDER_USED = 'SUBSTITUTE_PROVIDER_USED',
+  /** The primary rate was stale but tolerance was enabled. */
+  STALE_RATE_TOLERATED = 'STALE_RATE_TOLERATED',
+}
 
 export interface ConversionPath {
   type: ConversionPathType;
@@ -79,6 +93,7 @@ const METRIC_STALE_RATE_REJECTED    = 'fx_stale_rate_rejected_total';
 const METRIC_CONVERSIONS_TOTAL      = 'fx_conversions_total';
 const METRIC_TRIANGULATIONS_TOTAL   = 'fx_triangulations_total';
 const METRIC_TRIANGULATION_HOPS     = 'fx_triangulation_hops';
+const METRIC_STALE_FALLBACK_STALENESS_MS = 'fx_stale_fallback_staleness_ms';
 
 /** Default maximum number of intermediate hops allowed in a triangulation chain. */
 const DEFAULT_MAX_HOPS = 2;
@@ -86,6 +101,8 @@ const DEFAULT_MAX_HOPS = 2;
 export class FxConversionEngine {
   private readonly defaultBucketIncrement: Decimal;
   private readonly metrics?: MetricsCollector;
+  private readonly auditRepository?: SecurityAuditRepository;
+  private readonly fallbackRateProvider?: RateProvider;
   /**
    * Maximum number of intermediate hops permitted in a triangulation chain.
    * A two-currency triangulation (A→B→C) has 2 hops.
@@ -104,10 +121,16 @@ export class FxConversionEngine {
        * Must be a positive integer ≥ 1.
        */
       maxHops?: number;
+      /** Optional fallback provider used when the primary rate is stale. */
+      fallbackRateProvider?: RateProvider;
+      /** Optional audit repository for recording rate-fallback events. */
+      auditRepository?: SecurityAuditRepository;
     }
   ) {
     this.defaultBucketIncrement = new Decimal(options?.defaultBucketIncrement ?? '0.01');
     this.metrics = options?.metrics;
+    this.auditRepository = options?.auditRepository;
+    this.fallbackRateProvider = options?.fallbackRateProvider;
 
     const maxHops = options?.maxHops ?? DEFAULT_MAX_HOPS;
     if (!Number.isInteger(maxHops) || maxHops < 1) {
@@ -207,6 +230,41 @@ export class FxConversionEngine {
       );
     }
 
+    // Record audit event and metrics when a fallback was used
+    if (fallbackUsed && fallbackReason) {
+      this.metrics?.recordHistogram(METRIC_STALE_FALLBACK_STALENESS_MS, this.rateAgeMs(rate), { from, to });
+
+      if (this.auditRepository) {
+        const auditEvent: AuditEvent = {
+          id: randomUUID(),
+          type: 'SECURITY_VIOLATION',
+          userId: options?.auditUserId ?? 'system',
+          action: 'FX_STALE_RATE_FALLBACK',
+          resource: `fx_conversion:${from}/${to}`,
+          outcome: 'ALLOWED',
+          details: {
+            pair: `${from}/${to}`,
+            reason: fallbackReason,
+            substituteRateId: rate.id,
+            rateAgeMs: this.rateAgeMs(rate),
+            maxAgeMs: maxAge,
+          },
+          securityContext: {
+            requestId: options?.auditSessionId ?? 'fx-conversion-engine',
+            ipAddress: '0.0.0.0',
+            userAgent: 'fx-conversion-engine/1.0',
+            timestamp: new Date(),
+          },
+          timestamp: new Date(),
+        };
+
+        await this.auditRepository.record(auditEvent).catch((err) => {
+          // Best-effort: log but don't fail the conversion
+          console.error('[FxConversionEngine] Failed to record audit event:', err);
+        });
+      }
+    }
+
     const side = options?.side ?? 'mid';
     const effectiveRate = this.resolveSide(rate, side);
     const rawOutput = amount.multiply(effectiveRate);
@@ -273,10 +331,10 @@ export class FxConversionEngine {
       }
     }
 
-    // Enforce hop budget.  Each "via" currency adds 2 legs → 1 hop-pair.
-    // We count hops as the number of intermediate legs, so a single-via
-    // chain = 2 hops.  Multi-via not yet supported (spec says max 2 hops).
-    const hopCount = vias.length === 1 ? 2 : vias.length + 1;
+    // Enforce hop budget.  Each triangulation uses ONE via currency,
+    // which adds 2 legs → 2 hops.  Multiple vias are alternatives,
+    // not chained — we try each until one succeeds.
+    const hopCount = 2;
     if (hopCount > this.maxHops) {
       throw Errors.badRequest(
         `Triangulation requires ${hopCount} hops but maxHops is ${this.maxHops}. ` +
