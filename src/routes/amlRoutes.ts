@@ -436,5 +436,99 @@ export function createAMLRoutes(
     }
   });
 
+  // ── OFAC dual-control review queue ──────────────────────────────────────────
+
+  /**
+   * GET /aml/ofac-reviews
+   * Return the active review queue (pending_first_approval and
+   * pending_second_approval rows, oldest-first). Expired pending-second rows
+   * are reset to pending_first before the list is returned.
+   *
+   * Requires: compliance role.
+   */
+  router.get('/ofac-reviews', ...reviewQueueGuards, async (req: Request, res: Response) => {
+    try {
+      const queue = await amlService.getOFACReviewQueue();
+      res.json({ success: true, data: queue });
+    } catch (error) {
+      console.error('Error fetching OFAC review queue:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch OFAC review queue' });
+    }
+  });
+
+  /**
+   * POST /aml/ofac-reviews
+   * Open a new false-positive review for an OFAC-flagged investor.
+   *
+   * Requires: compliance role + valid CSRF token.
+   */
+  router.post('/ofac-reviews', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
+    try {
+      const actor = (req as any).amlActor as { id: string; role: string };
+      const validated = createOFACReviewSchema.parse(req.body);
+      const input = {
+        ...validated,
+        expires_at: validated.expires_at ? new Date(validated.expires_at) : undefined,
+      };
+      const review = await amlService.createOFACReview(input, actor.id);
+      res.status(201).json({ success: true, data: review });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+      } else {
+        console.error('Error creating OFAC review:', error);
+        res.status(500).json({ success: false, error: 'Failed to create OFAC review' });
+      }
+    }
+  });
+
+  /**
+   * POST /aml/ofac-reviews/:reviewId/approve
+   * Record a clearance approval on an existing review.
+   *
+   * Business rules enforced by `OFACReviewRepository.approve()`:
+   * - The case creator may not approve.
+   * - The first approver may not be the second approver (dual-control).
+   * - A `pending_second_approval` review whose `expires_at` has elapsed is
+   *   automatically reset to `pending_first_approval` before the new approval
+   *   is recorded, forcing the workflow to restart.
+   * - An already-cleared review is rejected with 409.
+   *
+   * Requires: compliance role + valid CSRF token.
+   */
+  router.post('/ofac-reviews/:reviewId/approve', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
+    try {
+      const { reviewId } = req.params;
+      const actor = (req as any).amlActor as { id: string; role: string };
+      const validated = approveOFACReviewSchema.parse(req.body);
+      const review = await amlService.approveOFACReview(reviewId, actor.id, validated.rationale);
+      res.json({ success: true, data: review });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+      } else if (error instanceof Error) {
+        const msg = error.message;
+        if (
+          msg.includes('not found')
+        ) {
+          res.status(404).json({ success: false, error: msg });
+        } else if (
+          msg.includes('creator cannot approve') ||
+          msg.includes('cannot approve an OFAC review twice') ||
+          msg.includes('already cleared') ||
+          msg.includes('rationale is required')
+        ) {
+          res.status(409).json({ success: false, error: msg });
+        } else {
+          console.error('Error approving OFAC review:', error);
+          res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
+        }
+      } else {
+        console.error('Error approving OFAC review:', error);
+        res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
+      }
+    }
+  });
+
   return router;
 }

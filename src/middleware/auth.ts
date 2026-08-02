@@ -192,6 +192,60 @@ export function requireInvestor(req: Request, _res: Response, next: NextFunction
   }
 }
 
+// ── requireCompliance ─────────────────────────────────────────────────────────
+/**
+ * Require the caller to hold the `compliance` or `admin` role.
+ *
+ * Compliance officers need full access to sanctions changelog endpoints.
+ * Admins retain access for operational support purposes.
+ *
+ * Security assumptions:
+ * - JWT is verified by this middleware; no upstream auth is assumed.
+ * - Role is read from the verified payload, never from a request header.
+ */
+export function requireCompliance(req: Request, _res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    globalLogger.warn('Auth failed: Missing or invalid Bearer token for compliance route', {
+      path: req.path,
+    });
+    next(Errors.unauthorized('Missing or invalid Authorization header'));
+    return;
+  }
+
+  const token = authHeader.slice(7);
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret) {
+    globalLogger.critical('Server config error: JWT_SECRET missing');
+    next(Errors.internal('Server configuration error'));
+    return;
+  }
+
+  try {
+    const secrets = getJwtSecretsForVerification();
+    const payload = verifyJwt(token, secrets);
+    const allowedRoles = ['compliance', 'admin'];
+    if (!allowedRoles.includes(payload.role)) {
+      globalLogger.warn('Auth failed: Forbidden role for compliance route', {
+        role: payload.role,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.forbidden('Forbidden: compliance role required'));
+      return;
+    }
+    (req as AuthenticatedRequest).user = { id: payload.sub, role: payload.role };
+    next();
+  } catch (error) {
+    globalLogger.warn('Auth failed: Compliance token verification failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      path: req.path,
+    });
+    next(Errors.unauthorized('Invalid or expired token'));
+  }
+}
+
 // ── requireAdmin ──────────────────────────────────────────────────────────────
 export function requireAdmin(req: Request, _res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization;

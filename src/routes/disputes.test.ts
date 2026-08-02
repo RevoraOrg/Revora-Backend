@@ -1,5 +1,6 @@
 import { createDisputeSLAHandlers, createDisputeSLARouter } from '../routes/disputes';
 import { DisputeSLAService } from '../services/disputeSLAService';
+import { DisputeRefundService } from '../services/disputeRefundService';
 import { Pool } from 'pg';
 import { NotificationRepository } from '../db/repositories/notificationRepository';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
@@ -7,6 +8,7 @@ import { Request, Response, NextFunction } from 'express';
 
 // Mock the service
 jest.mock('../services/disputeSLAService');
+jest.mock('../services/disputeRefundService');
 jest.mock('../db/repositories/notificationRepository');
 jest.mock('../db/repositories/auditLogRepository');
 
@@ -37,12 +39,14 @@ const mockNext: NextFunction = jest.fn();
 
 describe('createDisputeSLAHandlers', () => {
   let service: jest.Mocked<DisputeSLAService>;
+  let refundService: jest.Mocked<DisputeRefundService>;
   let handlers: ReturnType<typeof createDisputeSLAHandlers>;
 
   beforeEach(() => {
     jest.clearAllMocks();
     service = new MockedSLAService({} as any) as jest.Mocked<DisputeSLAService>;
-    handlers = createDisputeSLAHandlers(service);
+    refundService = new (DisputeRefundService as jest.MockedClass<typeof DisputeRefundService>)({} as any) as jest.Mocked<DisputeRefundService>;
+    handlers = createDisputeSLAHandlers(service, refundService);
   });
 
   describe('startSLA', () => {
@@ -136,6 +140,21 @@ describe('createDisputeSLAHandlers', () => {
 
       expect(mockNext).toHaveBeenCalledWith(error);
     });
+
+    it('should handle undefined req.body', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: undefined as any,
+      });
+      const res = createMockRes();
+
+      await handlers.startSLA(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('jurisdiction') }),
+      );
+    });
   });
 
   describe('transitionSLA', () => {
@@ -194,6 +213,52 @@ describe('createDisputeSLAHandlers', () => {
       expect(res.status).toHaveBeenCalledWith(400);
     });
 
+    it('should accept valid newJurisdiction in transitionSLA', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { newState: 'triage', newJurisdiction: 'EU' },
+      });
+      const res = createMockRes();
+
+      service.transitionState.mockResolvedValue({
+        id: 'sla-1',
+        dispute_id: 'dispute-1',
+        jurisdiction: 'EU',
+        state: 'triage',
+        sla_duration_hours: 8,
+        started_at: new Date(),
+        paused_at: null,
+        total_paused_ms: 0,
+        escalated_at: null,
+        escalated: false,
+        resolved_at: null,
+        assigned_user_id: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+
+      await handlers.transitionSLA(req, res, mockNext);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ sla: expect.objectContaining({ jurisdiction: 'EU' }) }),
+      );
+    });
+
+    it('should return 400 when disputeId is missing in transition', async () => {
+      const req = createMockReq({
+        params: {},
+        body: { newState: 'investigating' },
+      });
+      const res = createMockRes();
+
+      await handlers.transitionSLA(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('disputeId') }),
+      );
+    });
+
     it('should call next on service error', async () => {
       const req = createMockReq({
         params: { disputeId: 'dispute-1' },
@@ -206,6 +271,21 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.transitionSLA(req, res, mockNext);
 
       expect(mockNext).toHaveBeenCalledWith(error);
+    });
+
+    it('should handle undefined req.body in transitionSLA', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: undefined as any,
+      });
+      const res = createMockRes();
+
+      await handlers.transitionSLA(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('newState') }),
+      );
     });
   });
 
@@ -295,6 +375,16 @@ describe('createDisputeSLAHandlers', () => {
 
       expect(res.status).toHaveBeenCalledWith(400);
     });
+
+    it('should call next on service error', async () => {
+      const req = createMockReq({ params: { disputeId: 'dispute-1' } });
+      const res = createMockRes();
+      service.resumeTimer.mockRejectedValue(new Error('Service failure'));
+
+      await handlers.resumeSLA(req, res, mockNext);
+
+      expect(mockNext).toHaveBeenCalled();
+    });
   });
 
   describe('exportBurnReport', () => {
@@ -338,6 +428,34 @@ describe('createDisputeSLAHandlers', () => {
       expect(res.status).toHaveBeenCalledWith(400);
     });
 
+    it('should return 400 when startDate is an invalid date string', async () => {
+      const req = createMockReq({
+        query: { startDate: 'invalid-date-string', endDate: '2025-01-07T00:00:00Z' },
+      });
+      const res = createMockRes();
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('startDate') }),
+      );
+    });
+
+    it('should return 400 when endDate is an invalid date string', async () => {
+      const req = createMockReq({
+        query: { startDate: '2025-01-01T00:00:00Z', endDate: 'invalid-date-string' },
+      });
+      const res = createMockRes();
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('endDate') }),
+      );
+    });
+
     it('should return 400 when startDate is after endDate', async () => {
       const req = createMockReq({
         query: { startDate: '2025-01-07T00:00:00Z', endDate: '2025-01-01T00:00:00Z' },
@@ -352,19 +470,34 @@ describe('createDisputeSLAHandlers', () => {
       );
     });
 
-    it('should validate jurisdiction filter if provided', async () => {
+    it('should validate jurisdiction if provided', async () => {
       const req = createMockReq({
-        query: {
-          startDate: '2025-01-01T00:00:00Z',
-          endDate: '2025-01-07T00:00:00Z',
-          jurisdiction: 'INVALID',
-        },
+        query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-07T00:00:00Z', jurisdiction: 'INVALID' },
       });
       const res = createMockRes();
 
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('should pass jurisdiction to service when valid', async () => {
+      const req = createMockReq({
+        query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-07T00:00:00Z', jurisdiction: 'US' },
+      });
+      const res = createMockRes();
+
+      service.exportBurnReportCSV.mockResolvedValue({
+        csv: '# HMAC-SHA256:abc\nDispute ID,State\n',
+        filename: 'sla-burn-report.csv',
+        rowCount: 0,
+      });
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(service.exportBurnReportCSV).toHaveBeenCalledWith(
+        expect.objectContaining({ jurisdiction: 'US' }),
+      );
     });
 
     it('should set Cache-Control headers to prevent caching', async () => {
@@ -412,6 +545,129 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
+    });
+  });
+
+  describe('processRefund', () => {
+    it('should process refund and return 201', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '100.00', originalDisbursement: 'disb-1', reason: 'Customer dispute' },
+      });
+      const res = createMockRes();
+
+      refundService.processPartialRefund.mockResolvedValue({
+        id: 'refund-1',
+        dispute_id: 'dispute-1',
+        amount: '100.00',
+        original_disbursement: 'disb-1',
+        reason: 'Customer dispute',
+        created_at: new Date(),
+      } as any);
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ refund: expect.any(Object) }),
+      );
+      expect(refundService.processPartialRefund).toHaveBeenCalledWith({
+        disputeId: 'dispute-1',
+        amount: '100.00',
+        originalDisbursement: 'disb-1',
+        reason: 'Customer dispute',
+        ledgerEventId: undefined,
+        distributionId: undefined,
+      });
+    });
+
+    it('should return 400 when disputeId is missing', async () => {
+      const req = createMockReq({
+        params: {},
+        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+      });
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('disputeId') }),
+      );
+    });
+
+    it('should return 400 when amount is missing', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { originalDisbursement: 'disb-1' },
+      });
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('amount') }),
+      );
+    });
+
+    it('should return 400 when originalDisbursement is missing', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '100.00' },
+      });
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('originalDisbursement') }),
+      );
+    });
+
+    it('should return 500 when refundService is not initialized', async () => {
+      const handlersNoRefund = createDisputeSLAHandlers(service, undefined);
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+      });
+      const res = createMockRes();
+
+      await handlersNoRefund.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('DisputeRefundService') }),
+      );
+    });
+
+    it('should call next on service error', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+      });
+      const res = createMockRes();
+      refundService.processPartialRefund.mockRejectedValue(new Error('Refund failed'));
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(mockNext).toHaveBeenCalled();
+    });
+
+    it('should handle undefined req.body in processRefund', async () => {
+      const req = createMockReq({
+        params: { disputeId: 'dispute-1' },
+        body: undefined as any,
+      });
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ error: expect.stringContaining('amount') }),
+      );
     });
   });
 });
