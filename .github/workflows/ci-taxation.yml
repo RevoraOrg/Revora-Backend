@@ -1,0 +1,29 @@
+name: Taxation Reports CI
+on:
+  push:
+    branches: [master, 'feat/taxation*']
+    paths: ['src/taxation/**', 'tests/taxation/**']
+  pull_request:
+    paths: ['src/taxation/**', 'tests/taxation/**']
+
+jobs:
+  test-taxation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: revora_test
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx jest tests/taxation/ --coverage
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/revora_test
