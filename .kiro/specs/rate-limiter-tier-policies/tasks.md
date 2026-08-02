@@ -138,13 +138,13 @@ The core middleware (`src/middleware/rateLimit.ts` and `src/middleware/startupAu
     - Tag comment: `// Feature: rate-limiter-tier-policies, Property 9: IP key derivation is consistent and namespaced`
     - Generate IPv4 addresses; use a spy/mock on `store.increment` to capture the scoped key; assert key starts with the tier prefix, contains `'ip:'`, and contains the IP string
 
-- [ ] 7. Checkpoint — run full property-based test suite
+- [x] 7. Checkpoint — run full property-based test suite
   - Run `npx jest --testPathPattern="middleware/__tests__" --coverage --coverageReporters=text`
   - Confirm all property tests pass and no flakiness is observed.
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 8. Harden security documentation in `docs/rate-limiter-tier-policies.md`
-  - [ ] 8.1 Expand Security Assumptions section to cover all seven design assumptions
+- [x] 8. Harden security documentation in `docs/rate-limiter-tier-policies.md`
+  - [x] 8.1 Expand Security Assumptions section to cover all seven design assumptions
     - Add: "`x-revora-rate-tier` is treated as untrusted client input; it is never trusted without a matching secret" (covers Requirement 10.1)
     - Add: "Elevated tiers require a valid `x-revora-tier-secret` header matching `process.env.STARTUP_AUTH_TIER_SECRET`" (covers Requirement 10.2)
     - Add: "Missing or invalid secret results in silent downgrade to standard tier; no error is returned to the client" (covers Requirement 10.3)
@@ -152,29 +152,29 @@ The core middleware (`src/middleware/rateLimit.ts` and `src/middleware/startupAu
     - Add: "The in-memory store is process-local; multi-instance deployments require a shared store implementing `RateLimitStore`" (covers Requirement 10.5)
     - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
 
-  - [ ] 8.2 Add Abuse Scenarios and Failure Paths sections
+  - [x] 8.2 Add Abuse Scenarios and Failure Paths sections
     - Add Abuse Scenarios subsection: header spoofing (mitigated by secret validation), invalid tier names (silently downgraded), cross-tier counter exhaustion (prevented by key isolation) (covers Requirement 10.6)
     - Add Failure Paths subsection: store errors propagate as unhandled exceptions; missing IP falls back to `'unknown'`; missing env var defaults all requests to standard tier (covers Requirement 10.7)
     - _Requirements: 10.6, 10.7_
 
-  - [ ] 8.3 Add `RateLimitStore` interface documentation for distributed deployments
+  - [x] 8.3 Add `RateLimitStore` interface documentation for distributed deployments
     - Document the `RateLimitStore` interface contract (`increment`, `reset`, `clear?`)
     - Note that implementors should catch internal errors and either re-throw as `AppError` or fail-open
     - _Requirements: 11.2, 11.3, 11.4, 11.6_
 
-- [ ] 9. Verify middleware is wired into the application
-  - [ ] 9.1 Confirm `createStartupAuthTierLimiter` is applied to the startup registration route
+- [x] 9. Verify middleware is wired into the application
+  - [x] 9.1 Confirm `createStartupAuthTierLimiter` is applied to the startup registration route
     - Search `src/` for the route that handles `POST /startup/register` (or equivalent)
     - If the limiter is not yet applied, import `createStartupAuthTierLimiter` from `./middleware/startupAuthRateTierPolicy` and mount it before the route handler
     - Ensure `app.set('trust proxy', 1)` is present in the Express bootstrap (covers Requirement 10.4)
     - _Requirements: 7.1, 7.2, 7.5_
 
-  - [ ] 9.2 Confirm `/health` route is not behind the tier limiter
+  - [x] 9.2 Confirm `/health` route is not behind the tier limiter
     - Verify the health endpoint is registered before or outside the rate-limited router
     - Add or confirm an integration test that hits `/health` after exhausting the startup register limit and asserts a 200 response
     - _Requirements: 7.5, 9.7_
 
-- [ ] 10. Final coverage check and cleanup
+- [x] 10. Final coverage check and cleanup
   - Run `npm run test:coverage:backend-011` (or the equivalent Jest coverage command for the middleware files)
   - Confirm ≥ 95% statements, branches, functions, and lines for `src/middleware/rateLimit.ts` and `src/middleware/startupAuthRateTierPolicy.ts`
   - Remove any temporary debug logs or `console.log` statements introduced during development

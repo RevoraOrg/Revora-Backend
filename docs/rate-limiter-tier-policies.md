@@ -94,6 +94,51 @@ Located in [`src/middleware/rateLimit.ts`](../src/middleware/rateLimit.ts).
 
 ---
 
+## Pluggable Store (`RateLimitStore`)
+
+The limiter accepts an optional `store` implementing the `RateLimitStore`
+interface, so the in-memory default can be swapped for a shared store (e.g.
+Redis) in multi-instance deployments.
+
+### Interface contract
+
+```typescript
+interface RateLimitStore {
+  /** Increment the counter for `key` and return the updated state. */
+  increment(key: string, windowMs: number): { count: number; resetAt: number };
+  /** Reset the counter for `key` (useful in tests). */
+  reset(key: string): void;
+  /** Clear all counters (test helper). */
+  clear?(): void;
+}
+```
+
+Semantics the middleware relies on:
+
+- `increment(key, windowMs)` MUST return `{ count: 1, resetAt: now + windowMs }`
+  when no active window exists for `key`, and MUST return the **existing**
+  `resetAt` (not a new one) while the window is still active.  This is what
+  makes the fixed-window counter deterministic.
+- `resetAt` is an epoch-milliseconds timestamp; the middleware derives the
+  `X-RateLimit-Reset` header (epoch seconds) and `Retry-After` from it.
+- The middleware never inspects store internals beyond this contract, so a
+  Redis, Memcached, or Postgres-backed implementation can be dropped in
+  without changes to tier logic.
+
+### Implementor guidance
+
+- **Shared state**: Use atomic increment + expiry, e.g. Redis `INCR` +
+  `EXPIRE` (or `SET key 1 EX windowMs NX`) keyed by the full scoped key the
+  middleware passes (already namespaced with the tier prefix).
+- **Failure mode**: Catch internal store errors and either re-throw as an
+  `AppError` or **fail open** (skip enforcement and log).  A dead store must
+  never crash the request path with an opaque 500; if you prefer strict
+  fail-closed behavior, document it in the deployment runbook.
+- **Clock safety**: `resetAt` should be computed from the store's own clock
+  (or a monotonic source) to avoid skew between app instances.
+
+---
+
 ## Request Headers
 
 | Header                   | Required for tier  | Description                                            |
@@ -105,7 +150,7 @@ Located in [`src/middleware/rateLimit.ts`](../src/middleware/rateLimit.ts).
 
 ```
 resolveTier(req):
-  tier ← lowercase(header("x-revora-rate-tier")) or ""
+  tier ← trim(lowercase(header("x-revora-rate-tier"))) or ""
   if tier not in ["trusted", "internal"]:
     return "standard"
   secret ← env("STARTUP_AUTH_TIER_SECRET").trim()
@@ -143,7 +188,12 @@ These headers are set on **every** request, including those that are blocked:
 
 ## Security Assumptions
 
-1. **Identity Assertion**: Tier elevation is gated solely on the `x-revora-tier-secret`
+1. **Untrusted Tier Header**: `x-revora-rate-tier` is treated as **untrusted
+   client input**.  It is never trusted on its own; elevation to `trusted` or
+   `internal` always requires a matching secret.  Spoofing the header alone
+   yields no tier privilege.
+
+2. **Identity Assertion**: Tier elevation is gated solely on the `x-revora-tier-secret`
    header.  This is a **shared secret** pattern — it is not a substitute for
    request-level authentication.  Protect the secret with the same care as a
    signing key.
@@ -152,22 +202,23 @@ These headers are set on **every** request, including those that are blocked:
    in `standard` tier resolution.  The server never returns an error that
    distinguishes "wrong secret" from "no secret", preventing oracle attacks.
 
-3. **IP-Based Tracking**: Rate limits are tracked per resolved client IP
+4. **IP-Based Tracking**: Rate limits are tracked per resolved client IP
    (`req.ip`, with `trust proxy = 1`).  Ensure the Express app is configured
    correctly behind a load-balancer so `req.ip` reflects the real client IP.
    A misconfigured proxy could allow a single client to appear as many IPs,
    bypassing the limit.
 
-4. **In-Memory Store**: The current `InMemoryRateLimitStore` is **process-local**.
+5. **In-Memory Store**: The current `InMemoryRateLimitStore` is **process-local**.
    In a multi-instance deployment, counters are not shared between instances,
    so effective limits are `numInstances × limit`.  Replace the store with a
-   Redis-backed implementation (using `INCR`/`EXPIRE`) before horizontal scale-out.
+   Redis-backed implementation (see [Pluggable Store](#pluggable-store-ratelimitstore))
+   before horizontal scale-out.
 
-5. **Secret Rotation**: Rotating `STARTUP_AUTH_TIER_SECRET` requires a
+6. **Secret Rotation**: Rotating `STARTUP_AUTH_TIER_SECRET` requires a
    coordinated rolling deploy.  During the rotation window, requests with the
    old secret will be downgraded to `standard`; plan accordingly.
 
-6. **No Per-User Isolation**: The limiter keys by IP, not by user identity.
+7. **No Per-User Isolation**: The limiter keys by IP, not by user identity.
    Authenticated user IDs should be layered on top if per-account isolation is
    required in future tiers.
 
