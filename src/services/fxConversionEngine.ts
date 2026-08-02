@@ -34,11 +34,6 @@ export interface ExchangeRate {
   ttlMs: number;
 }
 
-export enum FxFallbackReason {
-  SUBSTITUTE_PROVIDER_USED = 'SUBSTITUTE_PROVIDER_USED',
-  STALE_RATE_TOLERATED = 'STALE_RATE_TOLERATED',
-}
-
 /**
  * @notice A single hop in a triangulation chain.
  * @dev    Per-hop records are attached to FxConversionResult.hops so auditors
@@ -127,8 +122,6 @@ export class FxConversionEngine {
        * Must be a positive integer ≥ 1.
        */
       maxHops?: number;
-      /** Optional fallback provider used when the primary rate is stale. */
-      fallbackRateProvider?: RateProvider;
       /** Optional audit repository for recording rate-fallback events. */
       auditRepository?: SecurityAuditRepository;
     }
@@ -270,7 +263,7 @@ export class FxConversionEngine {
           userId: options?.auditUserId ?? 'system',
           action: 'FX_STALE_RATE_FALLBACK',
           resource: `fx_conversion:${from}/${to}`,
-          outcome: 'ALLOWED',
+          outcome: 'SUCCESS',
           details: {
             pair: `${from}/${to}`,
             reason: fallbackReason,
