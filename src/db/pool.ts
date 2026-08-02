@@ -135,6 +135,78 @@ export async function readQuery<T extends QueryResultRow = Record<string, unknow
 }
 
 // ---------------------------------------------------------------------------
+// Pool saturation snapshot (autoscaling signal)
+// ---------------------------------------------------------------------------
+
+/**
+ * Synchronous snapshot of a pg Pool's saturation state.
+ *
+ * This is the source of the `db.pool.waiters` and `db.pool.utilization`
+ * autoscaling gauges exported as OpenMetrics from `GET /metrics/db-pool`.
+ * All values are read from the pool's internal counters, so no queries are
+ * issued and a scrape can never block on the database.
+ */
+export interface DbPoolSaturation {
+  /** Number of clients currently waiting to acquire a connection. */
+  waiters: number;
+  /** Total connections currently open in the pool. */
+  total: number;
+  /** Connections currently idle and available for checkout. */
+  idle: number;
+  /** Connections currently checked out (in use). */
+  active: number;
+  /** Maximum number of connections the pool is configured to open. */
+  max: number;
+  /**
+   * Ratio of in-use connections to `max`, clamped to [0, 1].
+   * Defined as 0 when `max` is 0 (pool configured without a size limit),
+   * so the metric stays defined even when the pool is idle.
+   */
+  utilization: number;
+}
+
+/** Fallback when a pool was created without an explicit `max` option. */
+const DEFAULT_POOL_MAX = 10;
+
+/**
+ * Compute a saturation snapshot for any pg Pool without issuing queries.
+ *
+ * `waitingCount` is the number of clients queued behind the pool's connection
+ * limit — a leading indicator of DB-pool contention.  `utilization` expresses
+ * how close the pool is to its configured capacity, which is the signal
+ * horizontal autoscaling should react to (CPU alone misses pool saturation).
+ *
+ * @param target The pg Pool to snapshot.
+ * @returns Synchronous saturation snapshot.
+ */
+export function getDbPoolSaturation(target: Pool): DbPoolSaturation {
+  const waiters = target.waitingCount;
+  const total = target.totalCount;
+  const idle = target.idleCount;
+  const active = Math.max(0, total - idle);
+  const max = target.options?.max ?? DEFAULT_POOL_MAX;
+
+  const utilization = max > 0 ? Math.min(1, Math.max(0, active / max)) : 0;
+
+  return { waiters, total, idle, active, max, utilization };
+}
+
+/**
+ * Saturation snapshot for the primary read/write pool.
+ */
+export function getPrimaryPoolSaturation(): DbPoolSaturation {
+  return getDbPoolSaturation(pool);
+}
+
+/**
+ * Saturation snapshot for the optional read replica pool.
+ * Returns `null` when no replica is configured.
+ */
+export function getReplicaPoolSaturation(): DbPoolSaturation | null {
+  return replicaPool ? getDbPoolSaturation(replicaPool) : null;
+}
+
+// ---------------------------------------------------------------------------
 // Graceful shutdown helper
 // ---------------------------------------------------------------------------
 

@@ -126,6 +126,27 @@ health_check_duration_ms{endpoint="ready"} 15.7
 
 The `MetricsCollector` tracks active HTTP connections in real-time through the metrics middleware.
 
+## DB Pool Saturation Metrics (Autoscaling)
+
+`GET /metrics/db-pool` exposes DB connection-pool saturation in **OpenMetrics
+format v1.0.0** for horizontal autoscaling (KEDA / HPA / Prometheus). It is
+guarded by the same bearer-token scrape auth as `/metrics`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `db.pool.waiters` | gauge | `pool` (`primary` \| `replica`) | Clients waiting to acquire a connection |
+| `db.pool.utilization` | gauge | `pool` (`primary` \| `replica`) | In-use connections / pool `max` ratio (0.0–1.0) |
+
+Both gauges are refreshed on every scrape from pg's synchronous pool counters
+(no queries issued) and remain defined (value 0) when the pool is idle.
+
+```bash
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:4000/metrics/db-pool
+```
+
+For HPA/KEDA configuration, alert rules, and target thresholds, see
+[Autoscaling: DB Pool Saturation Signal](./autoscaling-db-pool-signal.md).
+
 ## Cardinality Protection
 
 The metrics system enforces strict cardinality limits to prevent memory exhaustion:
@@ -412,9 +433,15 @@ const metrics = new MetricsCollector({
 - [MetricsCollector API](../src/lib/metrics.ts)
 - [Metrics Middleware](../src/middleware/metricsMiddleware.ts)
 - [Health Endpoints](./health-readiness-probe-expansion.md)
+- [Autoscaling: DB Pool Saturation Signal](./autoscaling-db-pool-signal.md)
 - [Prometheus Documentation](https://prometheus.io/docs/introduction/overview/)
 
 ## Changelog
+
+### 2026-08-02
+- ✅ Added `GET /metrics/db-pool` (OpenMetrics) exposing `db.pool.waiters` and
+  `db.pool.utilization` for the horizontal autoscaler, guarded by the same
+  `METRICS_TOKEN` bearer auth as `/metrics`
 
 ### 2024-01-15
 - ✅ Initial implementation of `/metrics` endpoint

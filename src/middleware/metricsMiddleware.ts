@@ -19,6 +19,10 @@ import { Request, Response, NextFunction } from 'express';
 import { MetricsCollector } from '../lib/metrics';
 import { Logger } from '../lib/logger';
 import { AppError, Errors } from '../lib/errors';
+import {
+  getPrimaryPoolSaturation,
+  getReplicaPoolSaturation,
+} from '../db/pool';
 
 /**
  * Middleware configuration
@@ -203,6 +207,44 @@ export function createMetricsHandler(metrics: MetricsCollector, pool?: any) {
  * @param metrics Metrics collector instance
  * @returns Express route handler
  */
+/**
+ * Create the DB pool saturation metrics endpoint handler.
+ *
+ * Exposes `db.pool.waiters` and `db.pool.utilization` in OpenMetrics text
+ * format (v1.0.0) for autoscaling consumers (KEDA / HPA / Prometheus).
+ * Values are refreshed synchronously from the pg pool counters on every
+ * scrape, so the series stay defined (value 0) even while the pool is idle.
+ *
+ * Security:
+ * - This handler MUST be mounted behind createMetricsAuthMiddleware() which
+ *   validates a METRICS_TOKEN bearer token before reaching this code.
+ * - No connection strings or PII are emitted — only aggregate pool counters.
+ *
+ * Usage (production):
+ *   curl -H "Authorization: Bearer $METRICS_TOKEN" \
+ *        http://localhost:4000/metrics/db-pool
+ *
+ * @param metrics Metrics collector instance
+ * @returns Express route handler
+ */
+export function createDbPoolMetricsHandler(metrics: MetricsCollector) {
+  return (_req: Request, res: Response, next: NextFunction): void => {
+    try {
+      metrics.collectDbPoolSaturation(getPrimaryPoolSaturation(), 'primary');
+      const replica = getReplicaPoolSaturation();
+      if (replica) {
+        metrics.collectDbPoolSaturation(replica, 'replica');
+      }
+      const output = metrics.exportOpenMetrics('db.pool.');
+      res.set('Content-Type', 'application/openmetrics-text; version=1.0.0; charset=utf-8');
+      res.status(200).send(output);
+    } catch (error) {
+      const appError = Errors.internal('Failed to export DB pool metrics', error instanceof Error ? error.message : String(error));
+      next(appError);
+    }
+  };
+}
+
 export function createPrometheusHandler(metrics: MetricsCollector) {
   return (_req: Request, res: Response, next: NextFunction): void => {
     try {
