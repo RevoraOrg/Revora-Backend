@@ -190,12 +190,18 @@ export class MetricsCollector {
   }
 
   /**
-   * Sanitize metric name to prevent injection and ensure valid format
+   * Sanitize metric name to prevent injection and ensure valid format.
+   *
+   * Keeps letters, digits, underscores, colons, and dots.  Dots are permitted
+   * in the OpenMetrics specification (v1.0.0) for backwards compatibility and
+   * are part of this service's own metric names (e.g. `db.pool.waiters`,
+   * `db.replica.lag_ms`), so they must survive sanitization.
+   *
    * @param name Raw metric name
    * @returns Sanitized metric name
    */
   private sanitizeName(name: string): string {
-    return name.replace(/[^a-zA-Z0-9_:]/g, '_');
+    return name.replace(/[^a-zA-Z0-9_:.]/g, '_');
   }
 
   /**
@@ -602,6 +608,43 @@ export class MetricsCollector {
     }
 
     return { name, labels };
+  }
+
+  /**
+   * Record DB pool saturation as autoscaling gauges.
+   *
+   * Emits the following gauge families (OpenMetrics / Prometheus):
+   *   - `db.pool.waiters{pool="<name>"}`      — clients waiting for a connection
+   *   - `db.pool.utilization{pool="<name>"}`  — in-use / max ratio in [0, 1]
+   *
+   * Both gauges are set explicitly on every scrape, so the time series stays
+   * defined (value 0) even when the pool is completely idle.  This lets
+   * autoscalers distinguish a healthy idle pool from a missing metric.
+   *
+   * The `pool` label identifies the logical pool (`primary` or `replica`).
+   * Labels are sanitized by the collector (PII filtered, cardinality bounded).
+   *
+   * @param saturation Saturation snapshot as produced by `getDbPoolSaturation`
+   * @param poolName   Logical pool name used in the `pool` label
+   */
+  collectDbPoolSaturation(
+    saturation: { waiters: number; utilization: number },
+    poolName: string,
+  ): void {
+    if (!this.config.enabled) return;
+
+    this.setGauge(
+      'db.pool.waiters',
+      saturation.waiters,
+      { pool: poolName },
+      'Number of clients waiting to acquire a database connection',
+    );
+    this.setGauge(
+      'db.pool.utilization',
+      saturation.utilization,
+      { pool: poolName },
+      'Ratio of in-use database connections to the pool maximum (0.0 to 1.0)',
+    );
   }
 
   /**

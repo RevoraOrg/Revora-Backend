@@ -29,6 +29,8 @@ New alerts MUST be added to this table before their PR merges (validated by CI).
 | `email_alarm_alignment_failure` | DKIM/SPF/DMARC alignment check failed for outbound email | [`emailDeliverabilityService.ts`](../../src/services/emailDeliverabilityService.ts) | Backend Platform | Inspect SES bounce complaint feed; update DNS records; re-send after fix |
 | `email_alarm_high_bounce_ratio` | Bounce rate exceeds threshold over 1 h window | [`emailDeliverabilityService.ts`](../../src/services/emailDeliverabilityService.ts) | Backend Platform | Review recipient list quality; pause sends; warm up new sending domain |
 | `CertPinningMismatch` | Mobile client TLS handshake errors due to cert pin mismatch | [`mobile-cert-pinning.md`](mobile-cert-pinning.md) | Backend Platform | Check vault `revora/mobile/cert-pins/current`; verify server cert fingerprint; execute Phase 0–3 rotation or emergency unpin |
+| `DbPoolWaitersHigh` | DB pool waiters > 0 for 1 min (pool is the bottleneck) | [`../autoscaling-db-pool-signal.md`](../autoscaling-db-pool-signal.md) | Backend Platform | Confirm autoscaler scaled out; check `pg_stat_activity` for stuck queries; kill idle tx |
+| `DbPoolUtilizationHigh` | DB pool utilization > 70% for 5 min | [`../autoscaling-db-pool-signal.md`](../autoscaling-db-pool-signal.md) | Backend Platform | Verify HPA scaled out; if utilization > 90% or waiters climb, check long-running tx and DB `max_connections` |
 
 ## Runbook Index
 
@@ -42,6 +44,7 @@ New alerts MUST be added to this table before their PR merges (validated by CI).
 | Metrics & Alerting | [`../METRICS_NEXT_STEPS.md`](../METRICS_NEXT_STEPS.md) | `HighErrorRate`, `HighLatency`, `DatabasePoolExhausted`, `MemoryUsageHigh` |
 | Mobile Cert Pinning | [`mobile-cert-pinning.md`](mobile-cert-pinning.md) | `CertPinningMismatch` |
 | Contract Upgrade | [`../contract-upgrade-slsa-attestation.md`](../contract-upgrade-slsa-attestation.md) | `contract_upgrade_auto_rollback` |
+| DB Pool Autoscaling | [`../autoscaling-db-pool-signal.md`](../autoscaling-db-pool-signal.md) | `DbPoolWaitersHigh`, `DbPoolUtilizationHigh` |
 
 ## Adding a New Alert
 

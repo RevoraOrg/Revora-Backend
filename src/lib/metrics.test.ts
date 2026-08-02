@@ -58,6 +58,14 @@ describe('MetricsCollector', () => {
       expect(snapshot.has('test_counter_____')).toBe(true);
     });
 
+    it('should preserve dots in metric names (valid OpenMetrics names)', () => {
+      metrics.setGauge('db.pool.waiters', 2);
+
+      const snapshot = metrics['gauges'];
+      expect(snapshot.has('db.pool.waiters')).toBe(true);
+      expect(snapshot.has('db_pool_waiters')).toBe(false);
+    });
+
     it('should sanitize label values', () => {
       metrics.incrementCounter('test', { 'key': 'value"with"quotes' });
       
@@ -695,6 +703,89 @@ describe('MetricsCollector', () => {
       const output = metrics.exportOpenMetrics();
       expect(output).toContain('alpha');
       expect(output).toContain('beta');
+    });
+  });
+
+  describe('collectDbPoolSaturation', () => {
+    let metrics: MetricsCollector;
+
+    beforeEach(() => {
+      metrics = new MetricsCollector({ enabled: true });
+    });
+
+    afterEach(() => {
+      metrics.reset();
+    });
+
+    it('should set db.pool.waiters and db.pool.utilization gauges with pool label', () => {
+      metrics.collectDbPoolSaturation({ waiters: 3, utilization: 0.5 }, 'primary');
+
+      const gauges = metrics['gauges'];
+      expect(gauges.get('db.pool.waiters{pool="primary"}')).toBe(3);
+      expect(gauges.get('db.pool.utilization{pool="primary"}')).toBe(0.5);
+    });
+
+    it('should keep the series defined (value 0) when the pool is idle', () => {
+      metrics.collectDbPoolSaturation({ waiters: 0, utilization: 0 }, 'primary');
+
+      const gauges = metrics['gauges'];
+      expect(gauges.has('db.pool.waiters{pool="primary"}')).toBe(true);
+      expect(gauges.get('db.pool.waiters{pool="primary"}')).toBe(0);
+      expect(gauges.get('db.pool.utilization{pool="primary"}')).toBe(0);
+    });
+
+    it('should support multiple logical pools independently', () => {
+      metrics.collectDbPoolSaturation({ waiters: 1, utilization: 0.2 }, 'primary');
+      metrics.collectDbPoolSaturation({ waiters: 4, utilization: 0.9 }, 'replica');
+
+      const gauges = metrics['gauges'];
+      expect(gauges.get('db.pool.waiters{pool="primary"}')).toBe(1);
+      expect(gauges.get('db.pool.utilization{pool="primary"}')).toBeCloseTo(0.2, 10);
+      expect(gauges.get('db.pool.waiters{pool="replica"}')).toBe(4);
+      expect(gauges.get('db.pool.utilization{pool="replica"}')).toBeCloseTo(0.9, 10);
+    });
+
+    it('should register gauge metadata (help text) for both families', () => {
+      metrics.collectDbPoolSaturation({ waiters: 0, utilization: 0 }, 'primary');
+
+      const metadata = metrics['metricMetadata'];
+      expect(metadata.get('db.pool.waiters')).toMatchObject({ type: MetricType.GAUGE });
+      expect(metadata.get('db.pool.utilization')).toMatchObject({ type: MetricType.GAUGE });
+    });
+
+    it('should export the db.pool.* gauges via exportOpenMetrics with the db.pool. prefix', () => {
+      metrics.collectDbPoolSaturation({ waiters: 2, utilization: 0.8 }, 'primary');
+
+      const output = metrics.exportOpenMetrics('db.pool.');
+      expect(output).toContain('# HELP db.pool.waiters Number of clients waiting to acquire a database connection');
+      expect(output).toContain('# TYPE db.pool.waiters gauge');
+      expect(output).toMatch(/db\.pool\.waiters\{pool="primary"\} 2 \d+/);
+      expect(output).toMatch(/db\.pool\.utilization\{pool="primary"\} 0\.8 \d+/);
+    });
+
+    it('should exclude non-db.pool metrics when filtered by prefix', () => {
+      metrics.incrementCounter('http_requests_total', undefined, 1, 'HTTP');
+      metrics.collectDbPoolSaturation({ waiters: 0, utilization: 0 }, 'primary');
+
+      const output = metrics.exportOpenMetrics('db.pool.');
+      expect(output).toContain('db.pool.waiters');
+      expect(output).not.toContain('http_requests_total');
+    });
+
+    it('should do nothing when metrics collection is disabled', () => {
+      const disabled = new MetricsCollector({ enabled: false });
+      disabled.collectDbPoolSaturation({ waiters: 5, utilization: 1 }, 'primary');
+
+      expect(disabled['gauges'].size).toBe(0);
+    });
+
+    it('should sanitize pool label values', () => {
+      metrics.collectDbPoolSaturation({ waiters: 0, utilization: 0 }, 'primary"PII;'); 
+
+      const gauges = metrics['gauges'];
+      const key = Array.from(gauges.keys())[0];
+      expect(key).not.toContain('primary"PII;');
+      expect(key).toContain('pool=');
     });
   });
 });

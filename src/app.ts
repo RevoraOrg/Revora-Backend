@@ -19,7 +19,7 @@ import { JwtIssuer, UserRole, UserRepository as IUserRepository, SessionReposito
 import { LoginService } from './auth/login/loginService';
 import { issueToken } from './lib/jwt';
 import { MetricsCollector } from './lib/metrics';
-import { metricsMiddleware, createPrometheusHandler } from './middleware/metricsMiddleware';
+import { metricsMiddleware, createPrometheusHandler, createDbPoolMetricsHandler } from './middleware/metricsMiddleware';
 import { Logger } from './lib/logger';
 import { RefreshService } from './auth/refresh/refreshService';
 import { createRefreshRouter } from './auth/refresh/refreshRoute';
@@ -230,6 +230,14 @@ export function createApp() {
 
   // Metrics endpoint (Prometheus format) - secured with internal token
   app.get('/metrics', createMetricsAuthMiddleware(), createPrometheusHandler(metrics));
+
+  // DB pool saturation endpoint (OpenMetrics format) - same auth guard.
+  // Consumed by the autoscaler (KEDA/HPA) as the horizontal-scale signal.
+  app.get(
+    '/metrics/db-pool',
+    createMetricsAuthMiddleware(),
+    createDbPoolMetricsHandler(metrics)
+  );
 
   // Reconciliation metrics endpoint (OpenMetrics format) - same auth guard
   app.get(

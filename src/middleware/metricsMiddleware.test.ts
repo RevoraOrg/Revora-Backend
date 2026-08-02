@@ -20,6 +20,7 @@ import {
   metricsMiddleware,
   createMetricsHandler,
   createPrometheusHandler,
+  createDbPoolMetricsHandler,
   MetricsMiddlewareConfig,
 } from './metricsMiddleware';
 
@@ -213,6 +214,66 @@ describe('metricsMiddleware', () => {
 
       // Restore original method
       metrics.exportPrometheus = originalExport;
+    });
+  });
+
+  describe('createDbPoolMetricsHandler', () => {
+    beforeEach(() => {
+      app.get('/metrics/db-pool', createDbPoolMetricsHandler(metrics));
+      app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+        res.status(err.statusCode).json(err.toResponse());
+      });
+    });
+
+    it('should return OpenMetrics text format with the db.pool.* families', async () => {
+      const response = await request(app).get('/metrics/db-pool');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('application/openmetrics-text');
+      expect(response.text).toContain('# HELP db.pool.waiters Number of clients waiting to acquire a database connection');
+      expect(response.text).toContain('# TYPE db.pool.waiters gauge');
+      expect(response.text).toContain('# TYPE db.pool.utilization gauge');
+      expect(response.text).toMatch(/db\.pool\.waiters\{pool="primary"\} \d+ \d+/);
+      expect(response.text).toMatch(/db\.pool\.utilization\{pool="primary"\} (0|[01](\.\d+)?) \d+/);
+      expect(response.text).toContain('# EOF');
+    });
+
+    it('should keep both series defined (value 0) when the pool is idle', async () => {
+      // In the test environment no connections are ever opened, so the
+      // primary pool is idle: waiters 0 and utilization 0 must still appear.
+      const response = await request(app).get('/metrics/db-pool');
+
+      expect(response.status).toBe(200);
+      expect(response.text).toMatch(/db\.pool\.waiters\{pool="primary"\} 0 \d+/);
+      expect(response.text).toMatch(/db\.pool\.utilization\{pool="primary"\} 0 \d+/);
+    });
+
+    it('should not include unrelated metric families', async () => {
+      metrics.incrementCounter('http_requests_total', undefined, 1, 'HTTP');
+
+      const response = await request(app).get('/metrics/db-pool');
+
+      expect(response.status).toBe(200);
+      expect(response.text).toContain('db.pool.waiters');
+      expect(response.text).not.toContain('http_requests_total');
+    });
+
+    it('should handle export errors with structured responses', async () => {
+      const originalExport = metrics.exportOpenMetrics;
+      metrics.exportOpenMetrics = jest.fn().mockImplementation(() => {
+        throw new Error('Export failed');
+      });
+
+      const response = await request(app).get('/metrics/db-pool');
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({
+        code: ErrorCode.INTERNAL_ERROR,
+        message: 'Failed to export DB pool metrics',
+        details: 'Export failed',
+      });
+
+      metrics.exportOpenMetrics = originalExport;
     });
   });
 
