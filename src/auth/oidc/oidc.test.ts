@@ -4,6 +4,9 @@ import request from 'supertest';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
 import { createOidcRouter } from './oidcRoute';
+import { AuthenticatedRequest } from '../../middleware/auth';
+import { JwksRefreshApprovalGate } from './jwksRefreshApprovalGate';
+import { InMemoryRateLimitStore } from '../../middleware/rateLimit';
 import { ALLOWED_ID_TOKEN_ALGORITHMS, OidcProviderRow } from './types';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -274,6 +277,52 @@ describe('OidcAdapterService', () => {
         .rejects.toThrow(/missing alg/);
     });
 
+    it('rejects a malformed ID token header', async () => {
+      await expect(service.validateIdToken('!!.xx.yy', makeProvider(), discovery, 'n'))
+        .rejects.toThrow(/Malformed ID token header/);
+    });
+
+    it('handleCallback exchanges the code end-to-end and validates the ID token', async () => {
+      const nonce = 'nonce-e2e';
+      (service as any).flowStates.set('state-ok', {
+        tenantId: 'acme',
+        codeVerifier: 'code-verifier',
+        nonce,
+        redirectUri: 'https://app.example.com/callback',
+        expiresAt: Date.now() + 60_000,
+      });
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => makeDiscovery() } as any)
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ id_token: signToken(validClaims(nonce)) }) } as any);
+
+      const claims = await service.handleCallback('exchange-code', 'state-ok', makeProvider());
+      expect(claims.sub).toBe('user-42');
+
+      const [, init] = (global.fetch as jest.Mock).mock.calls[1];
+      expect(init.method).toBe('POST');
+      const body = init.body.toString();
+      expect(body).toContain('grant_type=authorization_code');
+      expect(body).toContain('code=exchange-code');
+      expect(body).toContain('code_verifier=code-verifier');
+      expect(body).toContain('client_id=client-123');
+    });
+
+    it('handleCallback throws when the token exchange fails', async () => {
+      (service as any).flowStates.set('state-fail', {
+        tenantId: 'acme',
+        codeVerifier: 'v',
+        nonce: 'n-fail',
+        redirectUri: 'u',
+        expiresAt: Date.now() + 60_000,
+      });
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => makeDiscovery() } as any)
+        .mockResolvedValueOnce({ ok: false, status: 400, statusText: 'Bad Request', text: async () => 'invalid_grant' } as any);
+
+      await expect(service.handleCallback('code', 'state-fail', makeProvider()))
+        .rejects.toThrow(/Token exchange failed \(400\)/);
+    });
+
     it('rejects nonce mismatch', async () => {
       const token = signToken(validClaims('real-nonce'));
       await expect(service.validateIdToken(token, makeProvider(), discovery, 'wrong-nonce'))
@@ -342,7 +391,144 @@ describe('OidcAdapterService', () => {
       expect.arrayContaining(['RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'ES512', 'PS256']),
     );
   });
-});
+
+  // ── JWKS refresh orchestration ─────────────────────────────────────────
+
+  describe('JWKS refresh orchestration', () => {
+    it('refreshJwks refreshes the issuer JWKS via its discovery jwks_uri', async () => {
+      const discovery = makeDiscovery();
+      service = new OidcAdapterService({ refresh: jest.fn().mockResolvedValue({ keys: new Map() }) } as any, {
+        discoveryTtlMs: 60_000,
+      });
+      global.fetch = jest.fn().mockResolvedValueOnce({ ok: true, json: async () => discovery } as any);
+
+      await service.refreshJwks('https://idp.example.com');
+      expect((service as any).jwksCache.refresh).toHaveBeenCalledWith(
+        discovery.jwks_uri,
+        'https://idp.example.com',
+      );
+    });
+
+    it('getTrackedJwksIssuers delegates to the cache', () => {
+      const jwksCache = { getTrackedIssuers: jest.fn().mockReturnValue(['a', 'b']) } as any;
+      service = new OidcAdapterService(jwksCache);
+      expect(service.getTrackedJwksIssuers()).toEqual(['a', 'b']);
+      expect(jwksCache.getTrackedIssuers).toHaveBeenCalledTimes(1);
+    });
+
+    it('refreshAllJwks refreshes every tracked issuer and reports partial failures', async () => {
+      const jwksCache = {
+        getTrackedIssuers: jest.fn().mockReturnValue(['https://a.example.com', 'https://b.example.com']),
+      } as any;
+      const adapter = new OidcAdapterService(jwksCache);
+      adapter.refreshJwks = jest.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('timeout'));
+
+      const result = await adapter.refreshAllJwks();
+      expect(result).toEqual({
+        refreshed: ['https://a.example.com'],
+        failed: [{ issuer: 'https://b.example.com', error: 'timeout' }],
+      });
+    });
+
+    it('refreshAllJwks returns empty results when no issuers are tracked', async () => {
+      const adapter = new OidcAdapterService({ getTrackedIssuers: jest.fn().mockReturnValue([]) } as any);
+      adapter.refreshJwks = jest.fn();
+      expect(await adapter.refreshAllJwks()).toEqual({ refreshed: [], failed: [] });
+      expect(adapter.refreshJwks).not.toHaveBeenCalled();
+    });
+
+    it('refreshAllJwks stringifies non-Error rejections', async () => {
+      const adapter = new OidcAdapterService({
+        getTrackedIssuers: jest.fn().mockReturnValue(['https://a.example.com']),
+      } as any);
+      adapter.refreshJwks = jest.fn().mockRejectedValueOnce('raw string failure');
+      const result = await adapter.refreshAllJwks();
+      expect(result.failed).toEqual([{ issuer: 'https://a.example.com', error: 'raw string failure' }]);
+    });
+  });
+
+  // ── Adapter edge cases (branch completeness) ───────────────────────────
+
+  describe('adapter edge cases', () => {
+    it('honours a valid OIDC_DISCOVERY_TTL_MS override and ignores invalid values', () => {
+      const prev = process.env.OIDC_DISCOVERY_TTL_MS;
+      process.env.OIDC_DISCOVERY_TTL_MS = '42000';
+      expect((new OidcAdapterService({} as any) as any).discoveryTtlMs).toBe(42000);
+      process.env.OIDC_DISCOVERY_TTL_MS = '-5';
+      expect((new OidcAdapterService({} as any) as any).discoveryTtlMs).toBe(60 * 60 * 1000);
+      process.env.OIDC_DISCOVERY_TTL_MS = 'not-a-number';
+      expect((new OidcAdapterService({} as any) as any).discoveryTtlMs).toBe(60 * 60 * 1000);
+      if (prev === undefined) delete process.env.OIDC_DISCOVERY_TTL_MS;
+      else process.env.OIDC_DISCOVERY_TTL_MS = prev;
+    });
+
+    it('handleCallback rejects when the flow-state tenant mismatches the provider', async () => {
+      const adapter = new OidcAdapterService({ getKey: jest.fn() } as any);
+      (adapter as any).flowStates.set('state-tenant-x', {
+        tenantId: 'tenant-a',
+        codeVerifier: 'v',
+        nonce: 'n',
+        redirectUri: 'u',
+        expiresAt: Date.now() + 60_000,
+      });
+      await expect(adapter.handleCallback('code', 'state-tenant-x', makeProvider()))
+        .rejects.toThrow('State tenant mismatch');
+    });
+
+    it('exchangeCode includes client_secret when the provider has one', async () => {
+      const adapter = new OidcAdapterService({ getKey: jest.fn() } as any);
+      let sentBody = '';
+      global.fetch = jest.fn().mockImplementation(async (_url: string, opts: any) => {
+        sentBody = opts.body as string;
+        return { ok: true, json: async () => ({ access_token: 'at', id_token: 'it', expires_in: 300 }) } as any;
+      });
+      const flowState = {
+        tenantId: 'acme',
+        codeVerifier: 'cv',
+        nonce: 'n',
+        redirectUri: 'https://app.example.com/callback',
+        expiresAt: Date.now() + 60_000,
+      };
+      const tokens = await (adapter as any).exchangeCode('c', flowState, makeProvider({ client_secret: 'shh' }), makeDiscovery());
+      expect(sentBody).toContain('client_secret=shh');
+      expect(tokens.access_token).toBe('at');
+    });
+
+    it('rejects an ID token missing the kid header', async () => {
+      const h = Buffer.from(JSON.stringify({ alg: 'RS256' })).toString('base64url');
+      const p = Buffer.from(JSON.stringify(validClaims('n-kid'))).toString('base64url');
+      await expect(service.validateIdToken(`${h}.${p}.sig`, makeProvider(), makeDiscovery(), 'n-kid'))
+        .rejects.toThrow('ID token missing kid header');
+    });
+
+    it('retries ID token verification when jwt.verify reports "unable to verify"', async () => {
+      const jwt = require('jsonwebtoken') as { verify: unknown };
+      const spy = jest.spyOn(jwt as { verify: (...a: unknown[]) => unknown }, 'verify')
+        .mockImplementationOnce(() => { throw new Error('unable to verify'); })
+        .mockImplementation(() => validClaims('n-unable') as any);
+      try {
+        const claims = await service.validateIdToken(signToken(validClaims('n-unable')), makeProvider(), makeDiscovery(), 'n-unable');
+        expect(claims.sub).toBe('user-42');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('rejects an ID token when jwt.verify throws a non-Error value', async () => {
+      const jwt = require('jsonwebtoken') as { verify: unknown };
+      const spy = jest.spyOn(jwt as { verify: (...a: unknown[]) => unknown }, 'verify')
+        .mockImplementationOnce(() => { throw 'boom'; });
+      try {
+        await expect(service.validateIdToken(signToken(validClaims('n-boom')), makeProvider(), makeDiscovery(), 'n-boom'))
+          .rejects.toThrow('ID token validation failed: boom');
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+ });
 
 // ── JwksCacheService ───────────────────────────────────────────────────────
 
@@ -485,7 +671,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter,
       oidcProviderRepo,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const token = signLogoutToken({
@@ -529,7 +715,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter,
       oidcProviderRepo,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const token = signLogoutToken({
@@ -555,7 +741,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter: {} as any,
       oidcProviderRepo: {} as any,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const res = await request(app).post('/api/auth/oidc/logout').send({});
@@ -570,7 +756,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter: {} as any,
       oidcProviderRepo: {} as any,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const res = await request(app)
@@ -591,7 +777,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter: {} as any,
       oidcProviderRepo: {} as any,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const res = await request(app)
@@ -612,7 +798,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter: {} as any,
       oidcProviderRepo,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const token = signLogoutToken({
@@ -651,7 +837,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter,
       oidcProviderRepo,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const token = signLogoutToken({
@@ -690,7 +876,7 @@ describe('createOidcRouter OIDC logout', () => {
     app.use(createOidcRouter({
       oidcAdapter,
       oidcProviderRepo,
-      requireAdmin: (req, _res, next) => { req.user = { id: 'admin' }; next(); },
+      requireAdmin: (req: AuthenticatedRequest, _res: express.Response, next: express.NextFunction) => { req.user = { id: 'admin' }; next(); },
     }));
 
     const token = signLogoutToken({
@@ -714,61 +900,362 @@ describe('createOidcRouter OIDC logout', () => {
 
 // ── OIDC route: JWKS refresh ────────────────────────────────────────────
 
-describe('createOidcRouter JWKS refresh', () => {
-  it('requires admin dual confirmation before refreshing JWKS', async () => {
+describe('createOidcRouter JWKS refresh (dual-control)', () => {
+  const issuerA = 'https://idp.example.com';
+  const issuerB = 'https://idp2.example.com';
+  const uriA = 'https://idp.example.com/.well-known/jwks.json';
+  const uriB = 'https://idp2.example.com/.well-known/jwks.json';
+
+  function makeApp(overrides: Partial<Parameters<typeof createOidcRouter>[0]> = {}) {
     const oidcAdapter = {
       getDiscovery: jest.fn(),
       refreshJwks: jest.fn().mockResolvedValue(undefined),
+      refreshAllJwks: jest.fn().mockResolvedValue({ refreshed: [issuerA], failed: [] }),
+      getTrackedJwksIssuers: jest.fn().mockReturnValue([issuerA]),
     } as any;
     const oidcProviderRepo = {} as any;
     const auditRefresh = jest.fn();
     const requireAdmin = (req: any, _res: any, next: () => void) => {
-      req.user = { id: 'admin-1' };
+      req.user = { id: req.get('x-admin-id') ?? 'admin-1' };
       next();
     };
-
+    // Dedicated rate-limit store per router instance: the shared default store
+    // would let buckets accumulate across tests in the same worker.
     const app = express();
     app.use(express.json());
-    app.use(createOidcRouter({ oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh }));
+    app.use(
+      createOidcRouter({
+        oidcAdapter,
+        oidcProviderRepo,
+        requireAdmin,
+        auditRefresh,
+        ...overrides,
+        rateLimitOptions: {
+          store: new InMemoryRateLimitStore(),
+          ...overrides.rateLimitOptions,
+        },
+      }),
+    );
+    return { app, oidcAdapter, auditRefresh };
+  }
 
-    const missingConfirmation = await request(app)
-      .post('/api/auth/oidc/jwks/refresh')
-      .set('x-revora-oidc-jwks-confirmation', 'true')
-      .send({ confirmation: false, issuerUrl: 'https://idp.example.com' });
+  const propose = (app: express.Express, body: Record<string, unknown> = {}, user = 'admin-1') =>
+    request(app).post('/auth/oidc/jwks/refresh').set('x-admin-id', user).send(body);
 
-    expect(missingConfirmation.status).toBe(400);
+  it('requires dual-control: a single admin proposal alone does not refresh', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(202);
+    expect(res.body.status).toBe('pending_second_approval');
+    expect(res.body.approvalId).toBeTruthy();
+    expect(res.body.proposer).toBe('admin-1');
     expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
-    expect(auditRefresh).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }));
+    expect(oidcAdapter.refreshAllJwks).not.toHaveBeenCalled();
   });
 
-  it('rate-limits repeated refresh attempts for the same actor', async () => {
-    const oidcAdapter = {
-      getDiscovery: jest.fn(),
-      refreshJwks: jest.fn().mockResolvedValue(undefined),
+  it('executes the refresh only after a distinct admin approves', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const step1 = await propose(app, { issuer: issuerA });
+    expect(step1.status).toBe(202);
+
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(200);
+    expect(step2.body.status).toBe('approved');
+    expect(step2.body.refreshedIssuers).toEqual([issuerA]);
+    expect(oidcAdapter.refreshJwks).toHaveBeenCalledWith(issuerA);
+  });
+
+  it('rejects self-approval by the proposing admin (dual-control collusion guard)', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const step1 = await propose(app, { issuer: issuerA });
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-1');
+    expect(step2.status).toBe(403);
+    expect(step2.body.message).toMatch(/self-approve/i);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+  });
+
+  it('refreshes all tracked issuers when no issuer is specified', async () => {
+    const { app, oidcAdapter, auditRefresh } = makeApp();
+    oidcAdapter.getTrackedJwksIssuers.mockReturnValue([issuerA, issuerB]);
+    oidcAdapter.refreshAllJwks.mockResolvedValue({ refreshed: [issuerA, issuerB], failed: [] });
+
+    const step1 = await propose(app, {});
+    expect(step1.status).toBe(202);
+    expect(step1.body.scope).toBe('*');
+    expect(step1.body.issuer).toBeNull();
+
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(200);
+    expect(oidcAdapter.refreshAllJwks).toHaveBeenCalledTimes(1);
+    expect(step2.body.refreshedIssuers).toEqual([issuerA, issuerB]);
+    expect(auditRefresh).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'success',
+        proposerId: 'admin-1',
+        approverId: 'admin-2',
+        issuers: [issuerA, issuerB],
+      }),
+    );
+  });
+
+  it('rejects a duplicate proposal for the same scope and surfaces the pending approvalId', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const step1 = await propose(app, { issuer: issuerA });
+    const dup = await propose(app, { issuer: issuerA }, 'admin-2');
+    expect(dup.status).toBe(409);
+    expect(dup.body.details?.approvalId).toBe(step1.body.approvalId);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown approvalId', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const res = await propose(app, { approvalId: 'does-not-exist' }, 'admin-2');
+    expect(res.status).toBe(404);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+  });
+
+  it('rejects an expired approval and does not refresh', async () => {
+    const { app, oidcAdapter } = makeApp({ approvalGate: new JwksRefreshApprovalGate({ ttlMs: 60_000 }) });
+    const step1 = await propose(app, { issuer: issuerA });
+    jest.useFakeTimers({ now: Date.now() });
+    jest.advanceTimersByTime(60_001);
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(409);
+    expect(step2.body.message).toMatch(/expired/i);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+    jest.useRealTimers();
+  });
+
+  it('executes exactly one refresh when two admins race to approve the same proposal', async () => {
+    const { app, oidcAdapter } = makeApp();
+    const step1 = await propose(app, { issuer: issuerA });
+
+    const [first, second] = await Promise.all([
+      propose(app, { approvalId: step1.body.approvalId }, 'admin-2'),
+      propose(app, { approvalId: step1.body.approvalId }, 'admin-3'),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    expect(oidcAdapter.refreshJwks).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns 502 when a refresh-all fails for every tracked issuer', async () => {
+    const { app, oidcAdapter } = makeApp();
+    oidcAdapter.refreshAllJwks.mockResolvedValue({
+      refreshed: [],
+      failed: [{ issuer: issuerA, error: 'JWKS fetch failed: 503 Service Unavailable' }],
+    });
+
+    const step1 = await propose(app, {});
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(502);
+    expect(step2.body.failed).toEqual([expect.objectContaining({ issuer: issuerA })]);
+  });
+
+  it('returns partial success when only some tracked issuers refresh', async () => {
+    const { app, oidcAdapter } = makeApp();
+    oidcAdapter.refreshAllJwks.mockResolvedValue({
+      refreshed: [issuerA],
+      failed: [{ issuer: issuerB, error: 'timeout' }],
+    });
+
+    const step1 = await propose(app, {});
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(200);
+    expect(step2.body.refreshedIssuers).toEqual([issuerA]);
+    expect(step2.body.failed).toEqual([expect.objectContaining({ issuer: issuerB })]);
+  });
+
+  it('audits every step with timestamps and actor identities', async () => {
+    const { app, auditRefresh } = makeApp();
+    await propose(app, { issuer: issuerA });
+
+    const proposeEvent = auditRefresh.mock.calls[0][0];
+    expect(proposeEvent).toMatchObject({
+      action: 'jwks_refresh',
+      actorId: 'admin-1',
+      proposerId: 'admin-1',
+      issuer: issuerA,
+      scope: issuerA,
+      status: 'pending_second_approval',
+    });
+    expect(proposeEvent.timestamp).toEqual(expect.any(String));
+
+    const step1 = await propose(app, { issuer: issuerA }); // duplicate → blocked audit
+    expect(step1.status).toBe(409);
+    const blockedEvent = auditRefresh.mock.calls[1][0];
+    expect(blockedEvent).toMatchObject({ status: 'blocked', reason: 'duplicate_proposal' });
+
+    const step2 = await propose(app, { approvalId: proposeEvent.approvalId }, 'admin-2');
+    expect(step2.status).toBe(200);
+    const successEvent = auditRefresh.mock.calls[2][0];
+    expect(successEvent).toMatchObject({
+      status: 'success',
+      proposerId: 'admin-1',
+      approverId: 'admin-2',
+      issuers: [issuerA],
+    });
+  });
+
+  it('rejects non-admin callers before touching the approval gate', async () => {
+    const requireAdmin = (req: any, res: any, next: () => void) => {
+      res.status(403).json({ error: 'Forbidden', message: 'Forbidden: admin role required' });
+    };
+    const { app } = makeApp({ requireAdmin });
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(403);
+  });
+
+  it('rate-limits force-refresh requests per admin identity', async () => {
+    const { app, oidcAdapter } = makeApp({ rateLimitOptions: { limit: 1, windowMs: 60_000 } });
+    const first = await propose(app, { issuer: issuerA });
+    expect(first.status).toBe(202);
+    const second = await propose(app, { issuer: issuerA });
+    expect(second.status).toBe(429);
+    expect(oidcAdapter.refreshJwks).not.toHaveBeenCalled();
+  });
+
+  it('rate-limit buckets are isolated per admin identity', async () => {
+    const { app } = makeApp({ rateLimitOptions: { limit: 1, windowMs: 60_000 } });
+    const adminA = await propose(app, { issuer: issuerA }, 'admin-1');
+    expect(adminA.status).toBe(202);
+    // different admin + different scope — own rate-limit bucket and own proposal
+    const adminB = await propose(app, { issuer: issuerB }, 'admin-2');
+    expect(adminB.status).toBe(202);
+  });
+
+  it('concurrent force-refresh of the same issuer coalesces into a single upstream fetch', async () => {
+    const metrics = { setGauge: jest.fn() };
+    const cache = new JwksCacheService({ metrics: metrics as any });
+    let resolveFetch: (v: any) => void;
+    const pending = new Promise<any>((resolve) => { resolveFetch = resolve; });
+    global.fetch = jest.fn(() => pending);
+
+    const p1 = cache.refresh(uriA, issuerA);
+    const p2 = cache.refresh(uriA, issuerA);
+    resolveFetch!({ ok: true, json: async () => ({ keys: [] }) } as any);
+    await Promise.all([p1, p2]);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(cache.getTrackedIssuers()).toEqual([issuerA]);
+  });
+
+  it('coalesces force-refresh across different issuers sharing one jwks_uri', async () => {
+    const cache = new JwksCacheService();
+    let resolveFetch: (v: any) => void;
+    const pending = new Promise<any>((resolve) => { resolveFetch = resolve; });
+    global.fetch = jest.fn(() => pending);
+
+    const p1 = cache.refresh(uriA, issuerA);
+    const p2 = cache.refresh(uriA, issuerB);
+    resolveFetch!({ ok: true, json: async () => ({ keys: [] }) } as any);
+    await Promise.all([p1, p2]);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(cache.getTrackedIssuers().sort()).toEqual([issuerA, issuerB].sort());
+  });
+
+  it('audits a failed single-issuer refresh and surfaces the error', async () => {
+    const { app, oidcAdapter, auditRefresh } = makeApp();
+    oidcAdapter.refreshJwks.mockRejectedValue(new Error('JWKS fetch failed: 503 Service Unavailable'));
+
+    const step1 = await propose(app, { issuer: issuerA });
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+
+    expect(step2.status).toBe(500);
+    expect(auditRefresh).toHaveBeenLastCalledWith(
+      expect.objectContaining({ status: 'failed', reason: expect.stringContaining('503') }),
+    );
+  });
+
+  it('audits an unknown gate error without leaking internal details', async () => {
+    const brokenGate = {
+      propose: () => {
+        throw new Error('gate exploded');
+      },
     } as any;
-    const oidcProviderRepo = {} as any;
-    const auditRefresh = jest.fn();
+    const { app, auditRefresh } = makeApp({ approvalGate: brokenGate });
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(500);
+    expect(auditRefresh).not.toHaveBeenCalled(); // unclassified gate errors are not audited as blocked events
+  });
+
+  it('rethrows unclassified approval-step errors to the error handler', async () => {
+    const gate = new JwksRefreshApprovalGate();
+    const realApprove = gate.approve.bind(gate);
+    gate.approve = ((approvalId: string, actor: string) => {
+      if (actor === 'admin-2') throw new Error('gate exploded');
+      return realApprove(approvalId, actor);
+    }) as any;
+    const { app } = makeApp({ approvalGate: gate });
+    const step1 = await propose(app, { issuer: issuerA });
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(500);
+  });
+
+  it('endpoint works on the /api/auth/oidc/jwks/refresh alias too', async () => {
+    const { app } = makeApp();
+    const res = await request(app)
+      .post('/api/auth/oidc/jwks/refresh')
+      .send({ issuer: issuerA });
+    expect(res.status).toBe(202);
+  });
+
+  it('keeps an existing rate-limit subject when the admin already sets req.user.sub', async () => {
+    // When requireAdmin attaches `sub`, fillRateLimitSubject must leave it
+    // untouched — admins sharing a sub share the bucket.
     const requireAdmin = (req: any, _res: any, next: () => void) => {
-      req.user = { id: 'admin-2' };
+      req.user = { id: 'admin-1', sub: 'fixed-bucket' };
       next();
     };
+    const { app } = makeApp({ requireAdmin, rateLimitOptions: { limit: 1, windowMs: 60_000 } });
+    const first = await propose(app, { issuer: issuerA }, 'admin-1');
+    expect(first.status).toBe(202);
+    const secondAdmin = await propose(app, { issuer: issuerA }, 'admin-2');
+    expect(secondAdmin.status).toBe(429);
+  });
 
-    const app = express();
-    app.use(express.json());
-    app.use(createOidcRouter({ oidcAdapter, oidcProviderRepo, requireAdmin, auditRefresh }));
+  it('falls back to req.user.sub when the admin has no id', async () => {
+    const requireAdmin = (req: any, _res: any, next: () => void) => {
+      req.user = { sub: 'sub-only-admin' };
+      next();
+    };
+    const { app, auditRefresh } = makeApp({ requireAdmin });
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(202);
+    expect(auditRefresh.mock.calls[0][0]).toMatchObject({ actorId: 'sub-only-admin' });
+  });
 
-    const first = await request(app)
-      .post('/api/auth/oidc/jwks/refresh')
-      .set('x-revora-oidc-jwks-confirmation', 'true')
-      .send({ confirmation: true, issuerUrl: 'https://idp.example.com' });
+  it('falls back to the request IP when no admin identity is attached', async () => {
+    const requireAdmin = (_req: any, _res: any, next: () => void) => next();
+    const { app, auditRefresh } = makeApp({ requireAdmin });
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(202);
+    expect(auditRefresh.mock.calls[0][0].actorId).toContain('127.0.0.1');
+  });
 
-    const second = await request(app)
-      .post('/api/auth/oidc/jwks/refresh')
-      .set('x-revora-oidc-jwks-confirmation', 'true')
-      .send({ confirmation: true, issuerUrl: 'https://idp.example.com' });
+  it('falls back to "anonymous" when neither identity nor IP is available', async () => {
+    const requireAdmin = (req: any, _res: any, next: () => void) => {
+      Object.defineProperty(req, 'ip', { value: undefined, configurable: true });
+      next();
+    };
+    const { app, auditRefresh } = makeApp({ requireAdmin });
+    const res = await propose(app, { issuer: issuerA });
+    expect(res.status).toBe(202);
+    expect(auditRefresh.mock.calls[0][0]).toMatchObject({ actorId: 'anonymous' });
+  });
 
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(429);
-    expect(oidcAdapter.refreshJwks).toHaveBeenCalledTimes(1);
+  it('records a non-Error refresh execution failure in the audit trail', async () => {
+    const { app, oidcAdapter, auditRefresh } = makeApp();
+    oidcAdapter.refreshAllJwks.mockRejectedValue('backend exploded');
+    const step1 = await propose(app);
+    const step2 = await propose(app, { approvalId: step1.body.approvalId }, 'admin-2');
+    expect(step2.status).toBe(500);
+    const calls = auditRefresh.mock.calls;
+    expect(calls[calls.length - 1][0]).toMatchObject({
+      status: 'failed',
+      reason: 'backend exploded',
+      approverId: 'admin-2',
+    });
   });
 });

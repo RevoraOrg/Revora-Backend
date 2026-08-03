@@ -17,6 +17,13 @@ const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
 const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
 
+export interface JwksRefreshAllResult {
+  /** Issuers whose JWKS bundles were reloaded successfully. */
+  refreshed: string[];
+  /** Issuers whose reload failed, with the sanitized error message. */
+  failed: Array<{ issuer: string; error: string }>;
+}
+
 interface DiscoveryCacheEntry {
   doc: OidcDiscoveryDocument;
   cachedUntil: number;
@@ -52,7 +59,7 @@ export class OidcAdapterService {
   /** SHA-256 hex digest of the last accepted discovery document, keyed by issuer URL. */
   private readonly discoveryDigests = new Map<string, string>();
   private readonly flowStates = new Map<string, OidcFlowState>();
-  /** Set of already-consumed logout token JTIs with their exp timestamps for replay protection. */
+  /** `jti` values already consumed by backchannel-logout tokens, with their expiry (epoch ms). */
   private readonly consumedJtis = new Map<string, number>();
   private readonly discoveryTtlMs: number;
   private readonly metrics: OidcDiscoveryMetrics;
@@ -211,6 +218,36 @@ export class OidcAdapterService {
   async refreshJwks(issuerUrl: string): Promise<void> {
     const discovery = await this.getDiscovery(issuerUrl);
     await this.jwksCache.refresh(discovery.jwks_uri, issuerUrl);
+  }
+
+  /** Issuers for which the JWKS cache has recorded at least one successful refresh. */
+  getTrackedJwksIssuers(): string[] {
+    return this.jwksCache.getTrackedIssuers();
+  }
+
+  /**
+   * Force-refresh the JWKS bundle of every tracked issuer. Runs each issuer
+   * independently (partial success is possible and reported) so one failing
+   * provider cannot block an incident reload of the rest.
+   */
+  async refreshAllJwks(): Promise<JwksRefreshAllResult> {
+    const issuers = this.getTrackedJwksIssuers();
+    const settled = await Promise.allSettled(
+      issuers.map((issuerUrl) => this.refreshJwks(issuerUrl)),
+    );
+
+    const refreshed: string[] = [];
+    const failed: Array<{ issuer: string; error: string }> = [];
+    settled.forEach((result, index) => {
+      const issuer = issuers[index];
+      if (result.status === 'fulfilled') {
+        refreshed.push(issuer);
+      } else {
+        const error = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        failed.push({ issuer, error });
+      }
+    });
+    return { refreshed, failed };
   }
 
   // ── ID Token validation ───────────────────────────────────────────────
