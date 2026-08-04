@@ -1080,6 +1080,36 @@ if (require.main === module && env.NODE_ENV !== "test") {
     console.log("[server] PayoutDriftDetector started");
   }
 
+  // FX quorum variance guard (#704) — opt-in via FX_QUORUM_ENABLED=true.
+  // When enabled with at least one provider env stub, the router enforces K-of-N.
+  if (process.env.FX_QUORUM_ENABLED === 'true') {
+    try {
+      const { bootstrapFxQuorumRouter } = require('./services/fxQuorumBootstrap');
+      const { InMemoryRateProvider } = require('./services/fxConversionEngine');
+      // Placeholder providers for boot smoke; production injects real RateProviders.
+      const primary = new InMemoryRateProvider();
+      const secondary = new InMemoryRateProvider();
+      const boot = bootstrapFxQuorumRouter({
+        providers: [
+          { id: 'primary', provider: primary },
+          { id: 'secondary', provider: secondary },
+        ],
+        metrics: metricsCollector,
+        quorum: {
+          k: parseInt(process.env.FX_QUORUM_K || '2', 10),
+          tolerance: parseFloat(process.env.FX_QUORUM_TOLERANCE || '0.005'),
+        },
+      });
+      (global as any).__fxQuorumRouter = boot.router;
+      console.log('[server] FX quorum router bootstrapped', {
+        k: boot.evaluator.getConfig().k,
+        tolerance: boot.evaluator.getConfig().tolerance,
+      });
+    } catch (err) {
+      console.error('[server] FX quorum bootstrap failed', err);
+    }
+  }
+
   // --- Hot-path services (only for "api" and "all" roles) ---
 
   if (roleConfig.webhookQueue) {
