@@ -229,6 +229,48 @@ export class OfferingRepository {
     return this.mapOffering(result.rows[0]);
   }
 
+  /**
+   * Persist a deferred cron-expression schedule for an offering.
+   * Callers MUST run CronWindowValidator before invoking this method.
+   */
+  async updateCronSchedule(
+    id: string,
+    cronExpression: string | null,
+    distributionTimezone: string = 'UTC'
+  ): Promise<Offering | null> {
+    const query = `
+      UPDATE offerings
+      SET cron_expression = $1,
+          distribution_timezone = $2,
+          updated_at = NOW()
+      WHERE id = $3
+      RETURNING *
+    `;
+    const result: QueryResult<Offering> = await this.db.query(query, [
+      cronExpression,
+      distributionTimezone,
+      id,
+    ]);
+    if (result.rows.length === 0) {
+      return null;
+    }
+    return this.mapOffering(result.rows[0]);
+  }
+
+  /**
+   * List all offerings that have a persisted cron_expression (for overlap checks).
+   */
+  async listWithCronSchedules(): Promise<Offering[]> {
+    const query = `
+      SELECT *
+      FROM offerings
+      WHERE cron_expression IS NOT NULL
+      ORDER BY created_at ASC
+    `;
+    const result: QueryResult<Offering> = await this.db.query(query);
+    return result.rows.map((row) => this.mapOffering(row));
+  }
+
   async updateStatus(id: string, status: OfferingStatus): Promise<Offering | null> {
     const query = `
       UPDATE offerings

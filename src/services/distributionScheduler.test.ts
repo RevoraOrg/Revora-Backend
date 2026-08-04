@@ -1,4 +1,15 @@
-import { DistributionScheduler } from './distributionScheduler';
+import {
+  DistributionScheduler,
+  CronWindowValidator,
+  CronWindowDefinition,
+  validateCronSyntax,
+  STELLAR_MAINTENANCE_WINDOWS,
+  normalizeScheduleTimezone,
+  assertValidScheduleTimezone,
+  findNextCronWindow,
+  computeTimezoneWindow,
+  deduplicateWindowKey,
+} from './distributionScheduler';
 import { HolidayCalendarService } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
 import { InMemorySecurityAuditRepository } from '../security/audit';
@@ -457,25 +468,6 @@ describe('DistributionScheduler', () => {
         })) as any
       );
 
-      it('does not trigger red-alert when backlog equals the threshold', async () => {
-  revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
-    Array.from({ length: 10 }, (_, i) => ({
-      id: `r-${i}`,
-      offering_id: 'off-1',
-    })) as any
-  );
-
-  const s = new DistributionScheduler(engine, revenueReportRepo, {
-    catchupMax: 10,
-    catchupBacklogAlertThreshold: 10,
-  });
-
-  const result = await s.catchUpMissedWindows();
-
-  expect(result.totalMissed).toBe(10);
-  expect(result.backlogExceededCeiling).toBe(false);
-});
-
       const mockLogger = { info: jest.fn(), error: jest.fn(), warn: jest.fn() };
       const s = new DistributionScheduler(engine, revenueReportRepo, {
         catchupMax: 5,
@@ -490,6 +482,25 @@ describe('DistributionScheduler', () => {
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.stringContaining('[RED-ALERT]')
       );
+    });
+
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
     });
 
     it('works correctly without metrics collector (no gauge emitted)', async () => {
@@ -896,11 +907,18 @@ describe('CronWindowValidator', () => {
       expect(result.stellarConflict).toBeDefined();
     });
 
-    it('rejects an expression that fires at the monthly upgrade window (Mon 02:00 UTC)', () => {
+    it('rejects an expression that fires at the monthly upgrade window (1st Monday 02:00 UTC)', () => {
       const result = validator.validate({ ...validDef(), expression: '0 2 * * 1' });
       expect(result.valid).toBe(false);
       expect(result.stellarConflict).toBeDefined();
       expect(result.stellarConflict!.windowLabel).toMatch(/monthly upgrade/);
+    });
+
+    it('accepts Mondays after the first week (DOM 15–31) at 02:00 UTC', () => {
+      // firstWeekdayOfMonth constraint must NOT reject 2nd/3rd/4th Mondays
+      const result = validator.validate({ ...validDef(), expression: '0 2 15-31 * 1' });
+      expect(result.valid).toBe(true);
+      expect(result.stellarConflict).toBeUndefined();
     });
 
     it('accepts an expression that fires outside all maintenance windows (Tue 03:00 UTC)', () => {
@@ -1055,6 +1073,18 @@ describe('CronWindowValidator', () => {
       const result = validator.validate({ ...validDef(), expression: '*/0 3 * * 2' });
       expect(result.valid).toBe(false);
     });
+
+    it('handles an expression that skips a year (annual Jan 1 fire past the date)', () => {
+      // Evaluated after Jan 1 within the default 60-day horizon → no fire → still valid
+      // (no Stellar conflict possible if it never fires in the horizon)
+      const result = validator.validate({
+        expression: '0 0 1 1 *', // Jan 1 00:00 only
+        timezone: 'UTC',
+        offeringId: 'off-annual',
+      });
+      expect(typeof result.valid).toBe('boolean');
+      expect(result.valid).toBe(true);
+    });
   });
 });
 
@@ -1117,6 +1147,19 @@ describe('findNextCronWindow', () => {
     // Feb 30 never exists
     const result = findNextCronWindow({ expression: '0 3 30 2 *', timezone: 'UTC' }, after);
     expect(result).toBeNull();
+  });
+
+  it('finds a year-skipping annual expression when lookahead covers the next year', () => {
+    // After Jan 2 2026, next Jan 1 fire is 2027 — requires ≥365 day lookahead
+    const after = new Date('2026-01-02T00:00:00Z');
+    const missed = findNextCronWindow({ expression: '0 0 1 1 *', timezone: 'UTC' }, after, 60);
+    expect(missed).toBeNull();
+
+    const found = findNextCronWindow({ expression: '0 0 1 1 *', timezone: 'UTC' }, after, 400);
+    expect(found).not.toBeNull();
+    expect(found!.start.getUTCFullYear()).toBe(2027);
+    expect(found!.start.getUTCMonth()).toBe(0);
+    expect(found!.start.getUTCDate()).toBe(1);
   });
 
   it('evaluates expression in the provided IANA timezone', () => {

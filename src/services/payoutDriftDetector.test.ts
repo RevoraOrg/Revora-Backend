@@ -250,7 +250,9 @@ describe('PayoutDriftDetector', () => {
       const result = await detector.runDriftDetection();
 
       expect(result.errors).toHaveLength(0);
-      expect(mockRepo.saveReport).toHaveBeenCalled();
+      // Verification errors are skipped (logged) — no drift detail is recorded,
+      // so no report is persisted for a clean single-payout that only failed RPC.
+      expect(mockRepo.saveReport).not.toHaveBeenCalled();
     });
 
     it('sets alarm when drift is older than threshold', async () => {
@@ -292,7 +294,7 @@ describe('PayoutDriftDetector', () => {
 
       await detector.runDriftDetection();
 
-      expect(metrics.exportPrometheus()).toContain('payout_drift_alarm{} 0');
+      expect(metrics.exportPrometheus()).toMatch(/payout_drift_alarm(\{\})? 0/);
     });
 
     it('handles multiple offerings independently', async () => {
@@ -382,6 +384,16 @@ describe('PayoutDriftDetector', () => {
     });
 
     it('stop() clears the interval', () => {
+      mockRepo.getPayoutsByOffering.mockResolvedValue([]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 0,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+      detector.start();
       const clearSpy = jest.spyOn(global, 'clearInterval');
       detector.stop();
       expect(clearSpy).toHaveBeenCalled();

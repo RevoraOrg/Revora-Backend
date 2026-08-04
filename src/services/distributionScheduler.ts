@@ -143,11 +143,15 @@ export const STELLAR_MAINTENANCE_WINDOWS = [
     /**  min  hr  dom  month  dow(0=Sun) */
     cron: '0   6   *    *      0',
     durationMinutes: 60,
+    /** When true, only the first weekday occurrence of the month matches (DOM 1–7). */
+    firstWeekdayOfMonth: false,
   },
   {
     label: 'Stellar monthly upgrade window (1st Monday 02:00–04:00 UTC)',
+    /** Monday 02:00 UTC — constrained to DOM 1–7 via firstWeekdayOfMonth. */
     cron: '0   2   *    *      1',
     durationMinutes: 120,
+    firstWeekdayOfMonth: true,
   },
 ] as const;
 
@@ -168,6 +172,9 @@ function normalizeTimezone(tz: string): string {
     PST: 'America/Los_Angeles',
     PDT: 'America/Los_Angeles',
     GMT: 'UTC',
+    'Etc/UTC': 'UTC',
+    'Etc/GMT': 'UTC',
+    Z: 'UTC',
   };
   return aliases[tz.trim()] ?? tz.trim();
 }
@@ -302,27 +309,27 @@ export class CronWindowValidator {
     to: Date
   ): { windowLabel: string; conflictAt: string } | null {
     const tz = normalizeScheduleTimezone(def.timezone);
+    const stepMs = cronScanStepMs(def.expression, tz);
     let cursor = new Date(from);
+    // Align to minute boundary
+    cursor.setUTCSeconds(0, 0);
     while (cursor <= to) {
-      if (evaluateCronAt(def.expression, cursor, tz)) {
+      const fireAt = snapCronCandidate(def.expression, cursor, tz) ?? cursor;
+      if (fireAt >= from && fireAt <= to && evaluateCronAt(def.expression, fireAt, tz)) {
         for (const maint of STELLAR_MAINTENANCE_WINDOWS) {
           const maintCron = maint.cron.replace(/\s+/g, ' ').trim();
-          // Check if the firing minute falls inside the maintenance window
-          const maintStart = new Date(cursor);
-          if (evaluateCronAt(maintCron, cursor, 'UTC')) {
-            return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+          if (matchesMaintenanceAt(maintCron, fireAt, maint)) {
+            return { windowLabel: maint.label, conflictAt: fireAt.toISOString() };
           }
-          // Also check if cursor falls within an already-started maintenance window
-          // by scanning backwards up to durationMinutes
           for (let back = 1; back <= maint.durationMinutes; back++) {
-            const candidate = new Date(cursor.getTime() - back * 60_000);
-            if (evaluateCronAt(maintCron, candidate, 'UTC')) {
-              return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+            const candidate = new Date(fireAt.getTime() - back * 60_000);
+            if (matchesMaintenanceAt(maintCron, candidate, maint)) {
+              return { windowLabel: maint.label, conflictAt: fireAt.toISOString() };
             }
           }
         }
       }
-      cursor = new Date(cursor.getTime() + 60_000);
+      cursor = new Date((snapCronCandidate(def.expression, cursor, tz) ?? cursor).getTime() + stepMs);
     }
     return null;
   }
@@ -335,15 +342,23 @@ export class CronWindowValidator {
   ): string | null {
     const tzA = normalizeScheduleTimezone(a.timezone);
     const tzB = normalizeScheduleTimezone(b.timezone);
+    const stepMs = Math.min(cronScanStepMs(a.expression, tzA), cronScanStepMs(b.expression, tzB));
     let cursor = new Date(from);
+    cursor.setUTCSeconds(0, 0);
     while (cursor <= to) {
+      const candidate =
+        snapCronCandidate(a.expression, cursor, tzA) ??
+        snapCronCandidate(b.expression, cursor, tzB) ??
+        cursor;
       if (
-        evaluateCronAt(a.expression, cursor, tzA) &&
-        evaluateCronAt(b.expression, cursor, tzB)
+        candidate >= from &&
+        candidate <= to &&
+        evaluateCronAt(a.expression, candidate, tzA) &&
+        evaluateCronAt(b.expression, candidate, tzB)
       ) {
-        return cursor.toISOString();
+        return candidate.toISOString();
       }
-      cursor = new Date(cursor.getTime() + 60_000);
+      cursor = new Date((snapCronCandidate(a.expression, cursor, tzA) ?? cursor).getTime() + stepMs);
     }
     return null;
   }
@@ -473,6 +488,69 @@ function matchesCronField(value: number, field: string): boolean {
   return false;
 }
 
+/**
+ * Choose a scan step for cron horizon walks.
+ * - Concrete minute+hour in UTC → 1 day
+ * - Concrete minute (any tz) → 1 hour (caller should snap to :MM)
+ * - Otherwise → 1 minute
+ */
+function cronScanStepMs(expression: string, tz: string): number {
+  const fields = expression.trim().split(/\s+/);
+  if (fields.length !== 5) return 60_000;
+  const concreteMin = /^\d+$/.test(fields[0]!);
+  const concreteHour = /^\d+$/.test(fields[1]!);
+  if (tz === 'UTC' && concreteMin && concreteHour) return 24 * 60 * 60 * 1000;
+  if (concreteMin) return 60 * 60 * 1000;
+  return 60_000;
+}
+
+/**
+ * Snap `cursor` toward the next plausible fire candidate for concrete fields.
+ * UTC + concrete HH:MM → that UTC instant on the cursor's day.
+ * Concrete minute only → same hour with that minute.
+ */
+function snapCronCandidate(expression: string, cursor: Date, tz: string): Date | null {
+  const fields = expression.trim().split(/\s+/);
+  if (fields.length !== 5) return null;
+  const minConcrete = /^\d+$/.test(fields[0]!) ? parseInt(fields[0]!, 10) : null;
+  const hourConcrete = /^\d+$/.test(fields[1]!) ? parseInt(fields[1]!, 10) : null;
+
+  if (tz === 'UTC' && minConcrete !== null && hourConcrete !== null) {
+    return new Date(Date.UTC(
+      cursor.getUTCFullYear(),
+      cursor.getUTCMonth(),
+      cursor.getUTCDate(),
+      hourConcrete,
+      minConcrete,
+      0,
+      0
+    ));
+  }
+
+  if (minConcrete !== null) {
+    const snapped = new Date(cursor);
+    snapped.setUTCSeconds(0, 0);
+    snapped.setUTCMinutes(minConcrete);
+    return snapped;
+  }
+
+  return null;
+}
+
+/**
+ * Returns true when `date` (UTC) falls on a maintenance start matching `maintCron`,
+ * honouring the optional first-weekday-of-month constraint.
+ */
+function matchesMaintenanceAt(
+  maintCron: string,
+  date: Date,
+  maint: { firstWeekdayOfMonth?: boolean }
+): boolean {
+  if (!evaluateCronAt(maintCron, date, 'UTC')) return false;
+  if (maint.firstWeekdayOfMonth && date.getUTCDate() > 7) return false;
+  return true;
+}
+
 function evaluateCronAt(cron: string, date: Date, tz: string): boolean {
   const fields = cron.trim().split(/\s+/);
   if (fields.length !== 5) return false;
@@ -546,8 +624,8 @@ export function computeTimezoneWindow(
   };
 }
 
-export function deduplicateWindowKey(window: TimezoneWindow): string {
-  return `${window.utcStart.getTime()}:${window.utcEnd.getTime()}`;
+export function deduplicateWindowKey(window: TimezoneWindow, offeringId?: string): string {
+  return `${offeringId ?? ''}:${window.utcStart.getTime()}:${window.utcEnd.getTime()}`;
 }
 
 export function formatWindowForAudit(window: TimezoneWindow): Record<string, string> {
@@ -560,22 +638,89 @@ export function formatWindowForAudit(window: TimezoneWindow): Record<string, str
   };
 }
 
+/**
+ * Find the next wall-clock fire of a cron schedule after `afterDate`.
+ *
+ * @param schedule Cron expression + IANA timezone
+ * @param afterDate Exclusive lower bound (search starts at the next minute)
+ * @param lookaheadDays How far ahead to scan (default 60; use ≥366 for annual exprs)
+ * @returns Window start/end or null when the expression never fires in the horizon
+ *
+ * @dev When minute + hour are concrete integers the scan advances one day at a
+ *      time (checking the candidate HH:MM), which keeps year-skip lookups O(days)
+ *      instead of O(minutes).
+ */
 export function findNextCronWindow(
   schedule: CronSchedule,
-  afterDate: Date
+  afterDate: Date,
+  lookaheadDays = 60
 ): { start: Date; end: Date } | null {
   const tz = normalizeScheduleTimezone(schedule.timezone);
-  const lookaheadDays = 60;
-  const lookaheadMs = lookaheadDays * 24 * 60 * 60 * 1000;
+  const days = Number.isFinite(lookaheadDays) && lookaheadDays > 0 ? lookaheadDays : 60;
+  const lookaheadMs = days * 24 * 60 * 60 * 1000;
   const horizon = new Date(afterDate.getTime() + lookaheadMs);
 
-  let cursor = new Date(afterDate);
+  const fields = schedule.expression.trim().split(/\s+/);
+  const concreteMin = fields.length === 5 && /^\d+$/.test(fields[0]!) ? parseInt(fields[0]!, 10) : null;
+  const concreteHour = fields.length === 5 && /^\d+$/.test(fields[1]!) ? parseInt(fields[1]!, 10) : null;
+  // Daily snap is only safe for UTC (local HH:MM == UTC HH:MM). Other zones
+  // keep the minute scan so DST offsets are handled by evaluateCronAt.
+  const dailyFastPath =
+    tz === 'UTC' && concreteMin !== null && concreteHour !== null;
+
+  let cursor: Date;
+  if (dailyFastPath) {
+    cursor = new Date(afterDate.getTime());
+    cursor.setUTCSeconds(0, 0);
+  } else {
+    cursor = new Date(afterDate.getTime());
+    cursor.setUTCSeconds(0, 0);
+  }
+
   while (cursor <= horizon) {
+    if (dailyFastPath) {
+      // Snap to concrete HH:MM on the current UTC day, then step days.
+      const candidate = new Date(Date.UTC(
+        cursor.getUTCFullYear(),
+        cursor.getUTCMonth(),
+        cursor.getUTCDate(),
+        concreteHour!,
+        concreteMin!,
+        0,
+        0
+      ));
+      if (candidate >= afterDate && candidate <= horizon && evaluateCronAt(schedule.expression, candidate, tz)) {
+        return { start: candidate, end: new Date(candidate.getTime() + 24 * 60 * 60 * 1000) };
+      }
+      // Advance to next day after the candidate (or cursor if candidate is before afterDate)
+      const base = candidate < afterDate ? afterDate : candidate;
+      cursor = new Date(Date.UTC(
+        base.getUTCFullYear(),
+        base.getUTCMonth(),
+        base.getUTCDate() + 1,
+        concreteHour!,
+        concreteMin!,
+        0,
+        0
+      ));
+      continue;
+    }
+
     if (evaluateCronAt(schedule.expression, cursor, tz)) {
-      const windowEnd = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
-      return { start: cursor, end: windowEnd };
+      return { start: cursor, end: new Date(cursor.getTime() + 24 * 60 * 60 * 1000) };
     }
     cursor = new Date(cursor.getTime() + 60_000);
+  }
+
+  // Only warn for long-horizon searches (year-skip / annual expressions). Short
+  // lookbacks used as deferred-gate probes are expected to miss frequently.
+  if (days >= 60) {
+    globalLogger.warn('findNextCronWindow: expression never fires within lookahead', {
+      expression: schedule.expression,
+      timezone: tz,
+      afterDate: afterDate.toISOString(),
+      lookaheadDays: days,
+    });
   }
   return null;
 }
@@ -667,6 +812,31 @@ export class DistributionScheduler {
       let claim: typeof report | null = null;
 
       try {
+        const timezone = this.resolveOfferingTimezone(
+          (report.distribution_timezone as string | undefined) ??
+            (report.offering_timezone as string | undefined)
+        );
+        const cronExpression = report.cron_expression as string | undefined | null;
+
+        // Deferred cron gate (pre-claim): skip until a fire window is open.
+        // Uses a 24h lookback so a delayed scheduler tick still processes the day-of fire.
+        if (cronExpression) {
+          const schedule: CronSchedule = { expression: cronExpression, timezone };
+          const now = new Date();
+          const lookback = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          const openWindow = findNextCronWindow(schedule, lookback, 2);
+          if (!openWindow || now < openWindow.start) {
+            this.logger.info('Deferring distribution until cron window opens', {
+              reportId: report.id,
+              offeringId: report.offering_id,
+              nextFireAt: openWindow?.start.toISOString() ?? null,
+              expression: cronExpression,
+              timezone,
+            });
+            continue;
+          }
+        }
+
         claim = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
 
         if (!claim) {
@@ -680,8 +850,6 @@ export class DistributionScheduler {
           throw Errors.badRequest(`Report ${claim.id} is missing critical data (period or amount)`);
         }
 
-        const timezone = this.resolveOfferingTimezone(claim.offering_timezone as string | undefined);
-
         const { window, dstTransition } = computeTimezoneWindow(
           claim.offering_id,
           claim.period_start,
@@ -689,11 +857,11 @@ export class DistributionScheduler {
           timezone
         );
 
-        if (this.isWindowAlreadyCompleted(window)) {
+        if (this.isWindowAlreadyCompleted(window, claim.offering_id)) {
           this.logger.info('Skipping already-completed timezone window', {
             reportId: claim.id,
             offeringId: claim.offering_id,
-            windowKey: deduplicateWindowKey(window),
+            windowKey: deduplicateWindowKey(window, claim.offering_id),
           });
           continue;
         }
@@ -704,6 +872,7 @@ export class DistributionScheduler {
           amount: claim.amount,
           dstTransition,
           window: formatWindowForAudit(window),
+          cronExpression: cronExpression ?? null,
         });
 
         let periodEnd = claim.period_end;
@@ -737,7 +906,7 @@ export class DistributionScheduler {
         );
 
         await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
-        this.markWindowCompleted(window);
+        this.markWindowCompleted(window, claim.offering_id);
 
         summary.successful++;
         this.logger.info('Automated distribution successful', {
@@ -857,18 +1026,30 @@ export class DistributionScheduler {
 
   // ── Window de-duplication ──────────────────────────────────────────────────
 
-  private isWindowAlreadyCompleted(window: TimezoneWindow): boolean {
-    return this.completedWindows.has(deduplicateWindowKey(window));
+  /** @notice Returns true when this UTC window was already processed in-process. */
+  isWindowAlreadyCompleted(window: TimezoneWindow, offeringId?: string): boolean {
+    return this.completedWindows.has(deduplicateWindowKey(window, offeringId));
   }
 
-  private markWindowCompleted(window: TimezoneWindow): void {
-    this.completedWindows.add(deduplicateWindowKey(window));
+  /** @notice Mark a UTC window as completed so fall-back DST ticks are idempotent. */
+  markWindowCompleted(window: TimezoneWindow, offeringId?: string): void {
+    this.completedWindows.add(deduplicateWindowKey(window, offeringId));
   }
 
-  // ── Timezone resolution ────────────────────────────────────────────────────
+  // ── Timezone / cron helpers ────────────────────────────────────────────────
 
-  private resolveOfferingTimezone(tz: string | undefined): string {
+  /** @notice Resolve an offering timezone, falling back to UTC for invalid values. */
+  resolveOfferingTimezone(tz: string | undefined): string {
     return normalizeScheduleTimezone(tz);
+  }
+
+  /**
+   * @notice Evaluate whether `expression` matches `date` in `timezone`.
+   * @dev Returns false for syntactically invalid expressions (never throws).
+   */
+  evaluateCron(expression: string, date: Date, timezone: string): boolean {
+    if (validateCronSyntax(expression)) return false;
+    return evaluateCronAt(expression, date, normalizeScheduleTimezone(timezone));
   }
 }
 

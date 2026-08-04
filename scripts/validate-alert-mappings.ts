@@ -26,6 +26,7 @@ export const KNOWN_ALERTS: AlertEntry[] = [
   { name: 'fx_provider_health_score', source: 'src/services/providerHealthScorer.ts' },
   { name: 'provider_demoted', source: 'docs/fx-provider-health-scoring.md' },
   { name: 'provider_degraded', source: 'docs/fx-provider-health-scoring.md' },
+  { name: 'fx_quorum_failed_total', source: 'src/services/fxQuorumEvaluator.ts' },
   { name: 'MultiRegionFailover', source: 'docs/runbooks/multi-region-failover.md' },
   { name: 'contract_upgrade_auto_rollback', source: 'docs/contract-upgrade-auto-rollback.md' },
   { name: 'migration_failed', source: 'src/db/migrations/safety/monitoring.ts' },
