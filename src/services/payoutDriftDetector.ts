@@ -35,6 +35,10 @@ const METRIC_ALARM = 'payout_drift_alarm';
 const METRIC_OLDEST_AGE = 'payout_drift_oldest_age_hours';
 const METRIC_RUN_DURATION = 'payout_drift_run_duration_ms';
 
+/** Canonical runbook URL embedded in PagerDuty / alert descriptions. */
+export const PAYOUT_RECONCILIATION_RUNBOOK_URL =
+  'https://github.com/RevoraOrg/Revora-Backend/blob/master/docs/runbooks/payout-reconciliation.md';
+
 export class PayoutDriftDetector {
   private intervalId?: NodeJS.Timeout;
   private readonly intervalMs: number;
@@ -138,6 +142,27 @@ export class PayoutDriftDetector {
           {},
           '1 when non-zero payout drift is older than threshold hours'
         );
+        // Structured alert annotation for PagerDuty / ops tooling.
+        // Cross-links every PayoutDriftClass count to the runbook playbook.
+        this.logger.error('payout_drift_alarm raised', {
+          alert: 'payout_drift_alarm',
+          severity: result.totalDuplicateTx > 0 || result.oldestDriftHours > 72
+            ? 'SEV-1'
+            : 'SEV-2',
+          runbook_url: PAYOUT_RECONCILIATION_RUNBOOK_URL,
+          pagerduty_description:
+            `Payout drift unresolved > ${this.driftThresholdHours}h. ` +
+            `missing=${result.totalMissing} underfunded=${result.totalUnderfunded} ` +
+            `overfunded=${result.totalOverfunded} duplicate_tx=${result.totalDuplicateTx}. ` +
+            `Runbook: ${PAYOUT_RECONCILIATION_RUNBOOK_URL}`,
+          drift_classes: {
+            missing: result.totalMissing,
+            underfunded: result.totalUnderfunded,
+            overfunded: result.totalOverfunded,
+            duplicate_tx: result.totalDuplicateTx,
+          },
+          oldestDriftHours: result.oldestDriftHours,
+        });
       } else {
         this.metrics.setGauge(METRIC_ALARM, 0, {});
       }

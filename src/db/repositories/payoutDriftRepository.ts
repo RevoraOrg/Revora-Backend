@@ -19,12 +19,22 @@ export interface PayoutDriftReport {
   created_at: Date;
 }
 
+/**
+ * Canonical drift classification used by PayoutDriftDetector and the
+ * payout-reconciliation runbook (issue #666).
+ */
+export type PayoutDriftClass =
+  | 'missing'
+  | 'underfunded'
+  | 'overfunded'
+  | 'duplicate_tx';
+
 export interface DriftDetail {
   payout_id: string;
   investor_id: string;
   amount: string;
   tx_hash: string | null;
-  drift_type: 'missing' | 'underfunded' | 'overfunded' | 'duplicate_tx';
+  drift_type: PayoutDriftClass;
   expected_amount: string;
   actual_amount: string;
   discrepancy: string;

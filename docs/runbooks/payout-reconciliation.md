@@ -2,7 +2,8 @@
 
 **Owner:** Backend Platform Team (on-call: #revora-backend)  
 **Severity Rubric:** See [Severity Definitions](#severity-rubric)  
-**Last Updated:** 2026-06-24
+**Last Updated:** 2026-08-01  
+**PagerDuty runbook URL:** embed `runbook_url` from `payoutDriftDetector` alarm logs
 
 ---
 
@@ -10,17 +11,20 @@
 
 1. [Overview](#overview)
 2. [Severity Rubric](#severity-rubric)
-3. [Automated Drift Detection](#automated-drift-detection)
-4. [Triage Steps](#triage-steps)
-5. [Missing Payments](#missing-payments)
-6. [Duplicated Payments](#duplicated-payments)
-7. [Under-funded / Over-funded Payments](#under-funded--over-funded-payments)
-8. [Asset Issuer Changes Mid-Period](#asset-issuer-changes-mid-period)
-9. [Partial Fills](#partial-fills)
-10. [Replay Procedure](#replay-procedure)
-11. [Metrics and Alarms](#metrics-and-alarms)
-12. [Postmortems](#postmortems)
-13. [Related Code](#related-code)
+3. [SEV-1 in 15 Minutes](#sev-1-in-15-minutes)
+4. [PayoutDriftClass Playbook Matrix](#payoutdriftclass-playbook-matrix)
+5. [Automated Drift Detection](#automated-drift-detection)
+6. [Triage Steps](#triage-steps)
+7. [Missing Payments](#missing-payments)
+8. [Duplicated Payments](#duplicated-payments)
+9. [Under-funded / Over-funded Payments](#under-funded--over-funded-payments)
+10. [Asset Issuer Changes Mid-Period](#asset-issuer-changes-mid-period)
+11. [Partial Fills](#partial-fills)
+12. [Replay Procedure](#replay-procedure)
+13. [Grafana Screenshots-of-Truth](#grafana-screenshots-of-truth)
+14. [Metrics and Alarms](#metrics-and-alarms)
+15. [Postmortems](#postmortems)
+16. [Related Code](#related-code)
 
 ---
 
@@ -43,6 +47,43 @@ The Distribution Engine records payouts in the `distribution_payouts` table and 
 | **HIGH** | Drift $1,000–$10,000; missing tx_hash on processed payouts > 24h old; duplicate tx_hash detected | 1 hour | 50 payouts marked processed without Stellar submission |
 | **MEDIUM** | Drift $100–$1,000; under-funded payment < 1% of expected; reconciliation alarm older than 24h | 4 hours | Single payout missing $200 due to rounding |
 | **LOW** | Drift < $100; isolated missing tx_hash < 1h old; cosmetic issues in drift report | Next business day | Stale drift report from previous night |
+
+---
+
+## SEV-1 in 15 Minutes
+
+Use this table when `payout_drift_alarm` fires with `severity: SEV-1` (duplicate_tx > 0 **or** oldest drift > 72h).
+
+| Minute | Action | Owner (on-call rotation) | Rollback / lever |
+|--------|--------|--------------------------|------------------|
+| 0–2 | Ack PagerDuty; open runbook URL from alert `runbook_url` | **Primary:** Backend Platform on-call (`revora-backend-primary`) | Freeze new distribution runs: pause offering via `DistributionStateManager` |
+| 2–5 | Pull latest drift report + Grafana panels below | **Primary** + **Secondary:** Treasury ops (`revora-treasury-oncall`) | — |
+| 5–10 | Classify dominant `PayoutDriftClass`; stop scheduler if duplicate_tx | **Primary** | Kill switch: set offering schedule paused / disable worker role `payoutDrift` |
+| 10–15 | Execute class-specific rollback from matrix; page compliance if > $10k | **Primary** + **Compliance on-call** (`revora-compliance-oncall`) | Replay only after on-chain verify; never replay confirmed duplicates |
+| 15+ | Escalate to incident commander if unresolved | **IC:** Eng Manager rotation (`revora-ic`) | Full distribution freeze across tenants |
+
+Named rotations (PagerDuty schedules):
+- `revora-backend-primary` — Backend Platform SEV-1/SEV-2
+- `revora-treasury-oncall` — Treasury / settlement
+- `revora-compliance-oncall` — Compliance dual-control for monetary corrections
+- `revora-ic` — Incident commander (eng manager)
+
+---
+
+## PayoutDriftClass Playbook Matrix
+
+Every `PayoutDriftClass` (`src/db/repositories/payoutDriftRepository.ts`) maps to a triage owner, ETA, and rollback lever.
+
+| PayoutDriftClass | Symptom | Triage owner | ETA target | Rollback / lever |
+|------------------|---------|--------------|------------|------------------|
+| `missing` | `status=processed` but `tx_hash IS NULL` | Backend Platform (`revora-backend-primary`) | SEV-2: 1h / SEV-1: 15m if >24h & >$10k | Reset payout to `pending`, replay via DistributionEngine; pause offering if systemic |
+| `duplicate_tx` | Multiple payouts share one `tx_hash` | Backend Platform + Compliance | **SEV-1: 15m** | Freeze offering; dedupe DB rows; **do not** resubmit on-chain; file correction ticket |
+| `underfunded` | On-chain amount < DB amount beyond tolerance | Treasury (`revora-treasury-oncall`) | 1h (HIGH) / 4h (MEDIUM) | Supplemental payment for delta; if fee artifact < $0.01, accept & annotate |
+| `overfunded` | On-chain amount > DB amount beyond tolerance | Treasury + Compliance | 1h | Record surplus; compliance dual-control before clawback; update drift `details` |
+
+Operational scenarios not emitted as `PayoutDriftClass` but covered below:
+- **Issuer change mid-period** — Treasury; do not replay settled txs
+- **Partial fills** — Treasury; accept within slippage or re-submit residual
 
 ---
 
@@ -291,11 +332,58 @@ The `payout_drift_alarm` gauge is set to `1` when:
 - Any drift type count > 0 AND
 - `oldest_drift_age_hours > 24`
 
+`PayoutDriftDetector` also emits a structured log with:
+- `alert: payout_drift_alarm`
+- `runbook_url` → this document
+- `pagerduty_description` including per-class counts
+
 Configure your monitoring system (PagerDuty / Opsgenie) to trigger on:
 ```
-payout_drift_alarm{offering_id!=""} > 0
+payout_drift_alarm > 0
 ```
 Recommended evaluation interval: 5 minutes, with a 5-minute trigger window to avoid flapping.
+
+**PagerDuty alert description template** (paste into PD service):
+```
+{{pagerduty_description}}
+Runbook: https://github.com/RevoraOrg/Revora-Backend/blob/master/docs/runbooks/payout-reconciliation.md
+```
+
+---
+
+## Grafana Screenshots-of-Truth
+
+Use these PromQL queries as the dashboard panels of record. Capture screenshots into the
+incident channel when acknowledging a SEV-1.
+
+### Panel A — Alarm gauge
+```promql
+payout_drift_alarm
+```
+
+### Panel B — Drift by class (rate)
+```promql
+sum by (offering_id) (increase(payout_drift_missing_total[24h]))
+sum by (offering_id) (increase(payout_drift_underfunded_total[24h]))
+sum by (offering_id) (increase(payout_drift_overfunded_total[24h]))
+sum by (offering_id) (increase(payout_drift_duplicate_tx_total[24h]))
+```
+
+### Panel C — Oldest unresolved drift age
+```promql
+payout_drift_oldest_age_hours
+```
+
+### Panel D — Detector run health
+```promql
+histogram_quantile(0.95, sum(rate(payout_drift_run_duration_ms_bucket[1h])) by (le, status))
+```
+
+Screenshot checklist (attach to PD incident):
+1. Panel A showing `payout_drift_alarm == 1`
+2. Panel B highlighting the dominant `PayoutDriftClass`
+3. Panel C with age > threshold
+4. SQL dump of latest `payout_drift_reports.details` for the offering
 
 ### Automated Resolution
 
