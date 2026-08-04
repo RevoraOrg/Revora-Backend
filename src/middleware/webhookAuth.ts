@@ -281,6 +281,14 @@ export function kycWebhookAuth(options: Partial<WebhookAuthOptions> = {}): Reque
   const nextSecretExpiry = options.nextSecretExpiry ?? process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY;
   const metricName = options.metricName ?? 'kyc.webhook.verified_by_key';
 
+  // Fail closed: a dual-key window without a hard deadline would leave the
+  // secondary key accepted forever (issue #676).
+  if (nextSecret && (nextSecretExpiry === undefined || nextSecretExpiry === '')) {
+    throw new Error(
+      'KYC_WEBHOOK_KEY_NEXT_EXPIRY is required when KYC_WEBHOOK_KEY_NEXT is set'
+    );
+  }
+
   return webhookAuth({
     secret,
     nextSecret,

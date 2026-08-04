@@ -726,6 +726,13 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount taxation routes for per-lot cost-basis tax reporting
   app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
 
+  // KYC vendor webhooks — dual-key signature rotation (#676)
+  // Only mount when a primary secret is configured so local/test boots stay quiet.
+  if (process.env.KYC_WEBHOOK_SECRET || process.env.KYC_WEBHOOK_KEY) {
+    const { createKycWebhookRouter } = require('./routes/kycWebhooks');
+    app.use(API_VERSION_PREFIX + '/webhooks/kyc', createKycWebhookRouter());
+  }
+
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);

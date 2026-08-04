@@ -359,7 +359,16 @@ export function verifyWebhookPayloadDualKey(
 
   if (config.nextSecret) {
     const expiryMs = parseExpiryTimestamp(config.nextSecretExpiry);
-    const isExpired = expiryMs !== undefined && Date.now() > expiryMs;
+    // Fail closed: secondary key without a parseable expiry is treated as expired
+    // so old-key acceptance cannot linger indefinitely (issue #676).
+    if (expiryMs === undefined) {
+      if (verifyWebhookPayload(config.nextSecret, payload, signature)) {
+        return { valid: false, expired: true };
+      }
+      return { valid: false };
+    }
+
+    const isExpired = Date.now() > expiryMs;
 
     if (!isExpired && verifyWebhookPayload(config.nextSecret, payload, signature)) {
       return { valid: true, verifiedByKey: 'next' };

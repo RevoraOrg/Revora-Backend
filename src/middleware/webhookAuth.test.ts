@@ -1403,6 +1403,7 @@ describe('kycWebhookAuth & Dual-Key Signature Rotation', () => {
   it('should reject when signature does not match primary or next key', () => {
     process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
     process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY = String(Date.now() + 86400000);
 
     const signature = signWebhookPayload('bogus-secret', TEST_PAYLOAD_STRING);
     mockReq.headers['x-revora-signature'] = signature;
@@ -1412,6 +1413,14 @@ describe('kycWebhookAuth & Dual-Key Signature Rotation', () => {
 
     expect(mockNext).not.toHaveBeenCalled();
     expect(mockRes.status).toHaveBeenCalledWith(403);
+  });
+
+  it('should throw when next key is set without a hard expiry deadline', () => {
+    process.env.KYC_WEBHOOK_SECRET = PRIMARY_KEY;
+    process.env.KYC_WEBHOOK_KEY_NEXT = NEXT_KEY;
+    delete process.env.KYC_WEBHOOK_KEY_NEXT_EXPIRY;
+
+    expect(() => kycWebhookAuth()).toThrow(/KYC_WEBHOOK_KEY_NEXT_EXPIRY/);
   });
 
   it('should support provider returning dual-key configuration object', async () => {
