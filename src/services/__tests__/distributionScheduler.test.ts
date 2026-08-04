@@ -157,7 +157,8 @@ describe('deduplicateWindowKey', () => {
       timezone: 'UTC',
     };
     const key = deduplicateWindowKey(w);
-    expect(key).toBe(`${utcStart.getTime()}:${utcEnd.getTime()}`);
+    expect(key).toBe(`:${utcStart.getTime()}:${utcEnd.getTime()}`);
+    expect(deduplicateWindowKey(w, 'off-1')).toBe(`off-1:${utcStart.getTime()}:${utcEnd.getTime()}`);
   });
 });
 

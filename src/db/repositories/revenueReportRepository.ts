@@ -188,9 +188,14 @@ export class RevenueReportRepository {
    */
   async findApprovedWithoutDistribution(): Promise<RevenueReport[]> {
     const query = `
-      SELECT r.*
+      SELECT
+        r.*,
+        o.cron_expression,
+        o.distribution_timezone,
+        COALESCE(o.distribution_timezone, o.timezone) AS offering_timezone
       FROM revenue_reports r
       LEFT JOIN distributions d ON d.period_id = r.id
+      LEFT JOIN offerings o ON o.id = r.offering_id
       WHERE r.status = 'approved'
         AND (d.id IS NULL OR d.status != 'completed')
         AND (
