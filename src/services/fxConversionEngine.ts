@@ -254,7 +254,7 @@ export class FxConversionEngine {
 
     // Record audit event and metrics when a fallback was used
     if (fallbackUsed && fallbackReason) {
-      this.metrics?.recordHistogram(METRIC_STALE_FALLBACK_STALENESS_MS, this.rateAgeMs(rate), { from, to });
+      this.metrics?.recordHistogram(METRIC_STALE_FALLBACK_STALENESS_MS, this.rateAgeMs(activeRate), { from, to });
 
       if (this.auditRepository) {
         const auditEvent: AuditEvent = {
@@ -267,8 +267,8 @@ export class FxConversionEngine {
           details: {
             pair: `${from}/${to}`,
             reason: fallbackReason,
-            substituteRateId: rate.id,
-            rateAgeMs: this.rateAgeMs(rate),
+            substituteRateId: activeRate.id,
+            rateAgeMs: this.rateAgeMs(activeRate),
             maxAgeMs: maxAge,
           },
           securityContext: {

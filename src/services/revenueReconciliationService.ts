@@ -140,9 +140,9 @@ export class RevenueReconciliationService {
     offeringId: string,
     periodStart: Date,
     periodEnd: Date,
-    options: ReconciliationOptions = {},
-    horizonFixtureUrl?: string
+    options: ReconciliationOptions = {}
   ): Promise<ReconciliationResult> {
+    const horizonFixtureUrl = options.horizonFixtureUrl;
     const fixtureHash = horizonFixtureUrl ? await this.horizonFixtureAdapter?.getFixtureHash(horizonFixtureUrl) : undefined;
     const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
     const discrepancies: ReconciliationDiscrepancy[] = [];
@@ -396,8 +396,6 @@ if (this.stellarClient || horizonFixtureUrl) {
         return this.horizonFixtureAdapter.signReport(result);
       }
       
-      return result;
-
       return result;
     } catch (error) {
       this.logger.error('Reconciliation process failed', {

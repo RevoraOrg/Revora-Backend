@@ -677,14 +677,14 @@ export class MetricsCollector {
         const bucketLabel = labelStr
           ? `{${labelStr.slice(1, -1)},le="${bucket.le}"}`
           : `{le="${bucket.le}"}`;
-        lines.push(`${name}${bucketLabel} ${bucket.count} ${timestamp}`);
+        lines.push(`${name}_bucket${bucketLabel} ${bucket.count} ${timestamp}`);
       }
       
       // Export +Inf bucket
       const infLabel = labelStr
         ? `{${labelStr.slice(1, -1)},le="+Inf"}`
         : `{le="+Inf"}`;
-      lines.push(`${name}${infLabel} ${data.count} ${timestamp}`);
+      lines.push(`${name}_bucket${infLabel} ${data.count} ${timestamp}`);
       
       // Export sum and count
       lines.push(`${name}_sum${labelStr} ${data.sum} ${timestamp}`);

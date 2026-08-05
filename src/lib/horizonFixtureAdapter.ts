@@ -1,9 +1,8 @@
-import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
-import { SecurityAuditRepository } from '../security/types';
+import { AuditEvent, SecurityAuditRepository } from '../security/types';
 import { OnChainRevenueState, StellarRevenueClient } from '../services/revenueReconciliationService';
-import { createHash } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 
 interface SignedReport {
   offeringId: string;
@@ -35,54 +34,114 @@ export class HorizonFixtureAdapter implements StellarRevenueClient {
   }
 
   async getRevenueState(fixtureUrl: string): Promise<OnChainRevenueState> {
-    // In a real implementation, this would fetch the fixture from the URL
-    // and parse it to get the revenue state
-    // For now, we'll return a mock response
-    
-    // Record the fixture URL access in security audit logs
+    let responseBody: string;
+    try {
+      const response = await fetch(fixtureUrl);
+      if (!response.ok) {
+        throw new Error(
+          `Fixture URL returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`
+        );
+      }
+      responseBody = await response.text();
+      if (!responseBody || responseBody.trim().length === 0) {
+        throw new Error(`Fixture URL "${fixtureUrl}" returned an empty response body`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('HTTP')) throw err;
+      throw new Error(
+        `Failed to fetch fixture from "${fixtureUrl}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(responseBody);
+    } catch {
+      throw new Error(
+        `Fixture URL "${fixtureUrl}" returned non-JSON content. ` +
+        'Ensure the URL points to a valid Horizon snapshot JSON file.'
+      );
+    }
+
     if (this.securityAuditRepo) {
-      await this.securityAuditRepo.logAuditEvent({
-        eventType: 'HORIZON_FIXTURE_ACCESS',
+      await this.securityAuditRepo.record({
+        id: randomUUID(),
+        type: 'AUTHENTICATION',
+        action: 'HORIZON_FIXTURE_ACCESS',
+        resource: `horizon_fixture:${fixtureUrl}`,
+        outcome: 'SUCCESS',
         details: {
           fixtureUrl,
           timestamp: new Date().toISOString(),
         },
+        securityContext: {
+          requestId: 'horizon-fixture-adapter',
+          ipAddress: '0.0.0.0',
+          userAgent: 'horizon-fixture-adapter/1.0',
+          timestamp: new Date(),
+        },
+        timestamp: new Date(),
       });
     }
 
-    // Emit a metric for fixture access
     this.metrics?.incrementCounter('horizon_fixture_access_total', {
       fixtureUrl,
     });
 
-    // Mock response - in a real implementation, this would be parsed from the fixture
     return {
-      totalDistributed: '1000.00', // Mock value
+      totalDistributed: String(data.totalDistributed ?? '0.00'),
     };
   }
 
   async getFixtureHash(fixtureUrl: string): Promise<string> {
-    // In a real implementation, this would compute the SHA-256 hash of the fixture
-    // For now, we'll return a mock hash
-    
-    // Record the fixture hash computation in security audit logs
+    let responseBody: string;
+    try {
+      const response = await fetch(fixtureUrl);
+      if (!response.ok) {
+        throw new Error(
+          `Fixture URL returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`
+        );
+      }
+      responseBody = await response.text();
+      if (!responseBody || responseBody.trim().length === 0) {
+        throw new Error(`Fixture URL "${fixtureUrl}" returned an empty response body`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('HTTP')) throw err;
+      throw new Error(
+        `Failed to fetch fixture from "${fixtureUrl}" for hashing: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
+    const hash = createHash('sha256').update(responseBody, 'utf8').digest('hex');
+
     if (this.securityAuditRepo) {
-      await this.securityAuditRepo.logAuditEvent({
-        eventType: 'HORIZON_FIXTURE_HASH',
+      await this.securityAuditRepo.record({
+        id: randomUUID(),
+        type: 'AUTHENTICATION',
+        action: 'HORIZON_FIXTURE_HASH',
+        resource: `horizon_fixture:${fixtureUrl}`,
+        outcome: 'SUCCESS',
         details: {
           fixtureUrl,
+          hash,
           timestamp: new Date().toISOString(),
         },
+        securityContext: {
+          requestId: 'horizon-fixture-adapter',
+          ipAddress: '0.0.0.0',
+          userAgent: 'horizon-fixture-adapter/1.0',
+          timestamp: new Date(),
+        },
+        timestamp: new Date(),
       });
     }
 
-    // Emit a metric for fixture hash computation
     this.metrics?.incrementCounter('horizon_fixture_hash_total', {
       fixtureUrl,
     });
 
-    // Mock hash - in a real implementation, this would be computed from the fixture
-    return 'mock-hash-1234567890';
+    return hash;
   }
 
   async signReport(report: any): Promise<SignedReport> {
@@ -90,23 +149,32 @@ export class HorizonFixtureAdapter implements StellarRevenueClient {
       throw Errors.internal('Signing key not configured');
     }
 
-    const reportString = JSON.stringify(report);
-    const signature = createHash('sha256')
-      .update(reportString + this.signingKey)
-      .digest('hex');
+    const canonical = JSON.stringify(report);
+    const hmac = createHmac('sha256', this.signingKey);
+    hmac.update(canonical);
+    const signature = `sha256=${hmac.digest('hex')}`;
 
-    // Record the report signing in security audit logs
     if (this.securityAuditRepo) {
-      await this.securityAuditRepo.logAuditEvent({
-        eventType: 'REPORT_SIGNING',
+      await this.securityAuditRepo.record({
+        id: randomUUID(),
+        type: 'AUTHENTICATION',
+        action: 'REPORT_SIGNING',
+        resource: `report:${report.offeringId}`,
+        outcome: 'SUCCESS',
         details: {
           reportId: report.offeringId,
           timestamp: new Date().toISOString(),
         },
+        securityContext: {
+          requestId: 'horizon-fixture-adapter',
+          ipAddress: '0.0.0.0',
+          userAgent: 'horizon-fixture-adapter/1.0',
+          timestamp: new Date(),
+        },
+        timestamp: new Date(),
       });
     }
 
-    // Emit a metric for report signing
     this.metrics?.incrementCounter('report_signing_total', {
       reportId: report.offeringId,
     });
