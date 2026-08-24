@@ -318,10 +318,10 @@ describe('ContractUpgradeOrchestratorService — startCanary', () => {
     ).rejects.toThrow(/dry-run simulation/);
   });
 
-  it('rejects empty canary_offering_id', async () => {
+  it('rejects when no canary offering is configured or supplied', async () => {
     await expect(
-      service.startCanary('upgrade-canary-1', { canary_offering_id: '   ', actor_id: 'op' }),
-    ).rejects.toThrow(/canary_offering_id is required/);
+      service.startCanary('upgrade-canary-1', { actor_id: 'op' }),
+    ).rejects.toThrow(/No canary offering is configured/);
   });
 
   it('rejects negative hold_period_seconds', async () => {

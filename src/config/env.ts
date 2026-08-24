@@ -23,6 +23,8 @@ import { z } from "zod";
  * | STELLAR_SERVER_SECRET       | Yes      | (empty)                 | Secret key of the Stellar server account         |
  * | STELLAR_TIMEOUT             | No       | 30000                   | Timeout in ms for Stellar operations             |
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
+ * | CANARY_OFFERING_ID_TESTNET  | No       | (empty)                 | Shadow offering used for testnet canary rollouts |
+ * | CANARY_OFFERING_ID_MAINNET  | No       | (empty)                 | Shadow offering used for public canary rollouts   |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
@@ -71,6 +73,8 @@ const envSchema = z.object({
   STELLAR_SERVER_SECRET: z.string().min(1).optional(),
   STELLAR_TIMEOUT: z.coerce.number().int().positive().max(300000).default(30000),
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
+  CANARY_OFFERING_ID_TESTNET: z.string().trim().min(1).optional(),
+  CANARY_OFFERING_ID_MAINNET: z.string().trim().min(1).optional(),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
@@ -95,7 +99,6 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

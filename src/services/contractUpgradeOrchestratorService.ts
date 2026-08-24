@@ -98,7 +98,7 @@ export interface CanaryMetrics {
 
 export interface StartCanaryInput {
   /** ID of the shadow/canary offering to route traffic to. Configurable per network. */
-  canary_offering_id: string;
+  canary_offering_id?: string;
   /**
    * Minimum hold period in seconds before promotion is allowed.
    * Defaults to 300 (5 minutes) if omitted.
@@ -149,6 +149,9 @@ const DEFAULT_CANARY_THRESHOLDS: CanaryMetricThresholds = {
   max_p99_latency_ms: 2000,    // 2 s
   max_failed_tx_count: 0,      // zero tolerance
 };
+
+const DEFAULT_HOLD_PERIOD_SECONDS = 300;
+const MAX_HOLD_PERIOD_SECONDS = 30 * 24 * 60 * 60;
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
@@ -477,9 +480,9 @@ export class ContractUpgradeOrchestratorService {
   async applyUpgrade(upgradeId: string, actor_id: string): Promise<ContractUpgrade> {
     const upgrade = await this.getUpgradeOrThrow(upgradeId);
 
-    if (upgrade.status !== 'approved') {
+    if (upgrade.status !== 'approved' && upgrade.status !== 'canary_passed') {
       throw Errors.conflict(
-        `Cannot apply upgrade with status '${upgrade.status}' — must be 'approved'`,
+        `Cannot apply upgrade with status '${upgrade.status}' — must be 'approved' or 'canary_passed'`,
         { upgrade_id: upgradeId },
       );
     }
@@ -589,13 +592,17 @@ export class ContractUpgradeOrchestratorService {
    * for actually routing traffic; this service records the intent and timestamps.
    */
   async startCanary(upgradeId: string, input: StartCanaryInput): Promise<ContractUpgrade> {
-    const { canary_offering_id, hold_period_seconds = 300, actor_id } = input;
+    const configuredOfferingId = env.STELLAR_NETWORK === 'public'
+      ? env.CANARY_OFFERING_ID_MAINNET
+      : env.CANARY_OFFERING_ID_TESTNET;
+    const canary_offering_id = input.canary_offering_id?.trim() || configuredOfferingId;
+    const { hold_period_seconds = DEFAULT_HOLD_PERIOD_SECONDS, actor_id } = input;
 
-    if (!canary_offering_id || canary_offering_id.trim() === '') {
-      throw Errors.badRequest('canary_offering_id is required and must be non-empty');
+    if (!canary_offering_id) {
+      throw Errors.badRequest('No canary offering is configured for the active network');
     }
-    if (hold_period_seconds < 0) {
-      throw Errors.badRequest('hold_period_seconds must be a non-negative integer');
+    if (!Number.isSafeInteger(hold_period_seconds) || hold_period_seconds < 0 || hold_period_seconds > MAX_HOLD_PERIOD_SECONDS) {
+      throw Errors.badRequest(`hold_period_seconds must be a non-negative integer between 0 and ${MAX_HOLD_PERIOD_SECONDS}`);
     }
 
     const upgrade = await this.getUpgradeOrThrow(upgradeId);
@@ -623,7 +630,7 @@ export class ContractUpgradeOrchestratorService {
               updated_at         = NOW()
         WHERE id = $3
         RETURNING *`,
-      [canary_offering_id.trim(), hold_period_seconds, upgradeId],
+      [canary_offering_id, hold_period_seconds, upgradeId],
     );
 
     const updated = mapRow(result.rows[0]);
@@ -686,6 +693,17 @@ export class ContractUpgradeOrchestratorService {
       throw Errors.badRequest(
         'metrics.error_rate, p99_latency_ms, and failed_tx_count must be non-negative numbers',
       );
+    }
+
+    if (!Number.isFinite(metrics.error_rate) || !Number.isFinite(metrics.p99_latency_ms) || !Number.isFinite(metrics.failed_tx_count)) {
+      throw Errors.badRequest('canary metrics must be finite numbers');
+    }
+    if (
+      !Number.isFinite(thresholds.max_error_rate) || thresholds.max_error_rate < 0 ||
+      !Number.isFinite(thresholds.max_p99_latency_ms) || thresholds.max_p99_latency_ms < 0 ||
+      !Number.isFinite(thresholds.max_failed_tx_count) || thresholds.max_failed_tx_count < 0
+    ) {
+      throw Errors.badRequest('canary thresholds must be finite, non-negative numbers');
     }
 
     const breachReasons: string[] = [];
@@ -789,6 +807,14 @@ export class ContractUpgradeOrchestratorService {
     actor_id: string,
     thresholds: CanaryMetricThresholds = DEFAULT_CANARY_THRESHOLDS,
   ): Promise<ContractUpgrade> {
+    if (
+      !Number.isFinite(thresholds.max_error_rate) || thresholds.max_error_rate < 0 ||
+      !Number.isFinite(thresholds.max_p99_latency_ms) || thresholds.max_p99_latency_ms < 0 ||
+      !Number.isFinite(thresholds.max_failed_tx_count) || thresholds.max_failed_tx_count < 0
+    ) {
+      throw Errors.badRequest('canary thresholds must be finite, non-negative numbers');
+    }
+
     const upgrade = await this.getUpgradeOrThrow(upgradeId);
 
     if (upgrade.status !== 'hold_period') {

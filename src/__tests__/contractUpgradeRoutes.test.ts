@@ -192,11 +192,24 @@ describe('Contract Upgrade Routes — canary/start endpoint', () => {
     expect(res.body.upgrade.canary_offering_id).toBe('offering-shadow-1');
   });
 
-  it('returns 400 when canary_offering_id is missing', async () => {
+  it('allows the service to use the configured network offering', async () => {
+    mockContractUpgradeService.startCanary = jest.fn().mockResolvedValue(canaryUpgrade);
     const app = buildApp();
     const res = await request(app)
       .post('/api/v1/contract-upgrades/upgrade-canary-1/canary/start')
       .send({ actor_id: 'op-1' });
+    expect(res.status).toBe(200);
+    expect(mockContractUpgradeService.startCanary).toHaveBeenCalledWith(
+      'upgrade-canary-1',
+      { canary_offering_id: undefined, actor_id: 'op-1', hold_period_seconds: undefined },
+    );
+  });
+
+  it('returns 400 when canary_offering_id is blank', async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/v1/contract-upgrades/upgrade-canary-1/canary/start')
+      .send({ canary_offering_id: '', actor_id: 'op-1' });
     expect(res.status).toBe(400);
     expect(res.body.code).toBe('BAD_REQUEST');
   });
