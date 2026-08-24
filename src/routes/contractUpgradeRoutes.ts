@@ -66,11 +66,11 @@ export function createContractUpgradeRouter(
             ? Number(body.hold_period_seconds)
             : undefined;
 
-        if (!canary_offering_id) {
-          return next(Errors.badRequest('canary_offering_id is required'));
-        }
         if (!actor_id) {
           return next(Errors.badRequest('actor_id is required'));
+        }
+        if (canary_offering_id !== undefined && canary_offering_id.trim() === '') {
+          return next(Errors.badRequest('canary_offering_id must be non-empty when provided'));
         }
         if (
           hold_period_seconds !== undefined &&

@@ -48,14 +48,15 @@ failed  (auto-rollback)
 
 ## Canary Offering Configuration
 
-The `canary_offering_id` is passed per-request and should correspond to the shadow offering
-configured for the target network.  Recommended practice is to store this mapping in tenant
-settings or environment config so it is consistent across upgrade proposals.
+The service selects the shadow offering from environment configuration for the active network:
+`CANARY_OFFERING_ID_TESTNET` for testnet and `CANARY_OFFERING_ID_MAINNET` for public network.
+An explicit `canary_offering_id` request value may override that default for controlled operational
+use, but production callers should rely on the configured value.
 
 | Network  | Recommended config key                         |
 |----------|------------------------------------------------|
 | testnet  | `CANARY_OFFERING_ID_TESTNET`                   |
-| mainnet  | `CANARY_OFFERING_ID_MAINNET`                   |
+| public   | `CANARY_OFFERING_ID_MAINNET`                   |
 
 ---
 
@@ -158,6 +159,9 @@ Pre-conditions:
 
 **Response** `200 OK` — returns upgrade with `status: "canary_passed"`, or `status: "rolled_back"` if
 metrics were dirty at promote time.
+
+After `canary_passed`, `applyUpgrade` is permitted to perform the general rollout. Direct apply from
+`approved` remains supported for upgrades that intentionally bypass canary orchestration.
 
 ---
 
