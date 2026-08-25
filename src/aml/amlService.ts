@@ -10,6 +10,7 @@ import { AMLRuleRepository } from './amlRuleRepository';
 import { AMLAlertRepository } from './amlAlertRepository';
 import { OFACReviewRepository } from './ofacReviewRepository';
 import { RuleEvaluator } from './ruleEvaluator';
+import { PgVelocityRepository } from './velocityRepository';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
 import {
@@ -52,6 +53,18 @@ export class AMLService {
 
     for (const result of results) {
       if (result.triggered) {
+        const linkedInvestmentIds = result.details.linked_investment_ids;
+        const existingAlerts = Array.isArray(linkedInvestmentIds)
+          ? await this.alertRepo.findByInvestment(context.investment_id)
+          : [];
+        const alreadyAlerted = existingAlerts.some(alert =>
+          alert.rule_id === result.rule_id && alert.investment_id === context.investment_id &&
+          alert.rule_version.major === result.rule_version.major &&
+          alert.rule_version.minor === result.rule_version.minor &&
+          alert.rule_version.patch === result.rule_version.patch,
+        );
+        if (alreadyAlerted) continue;
+
         const alert = await this.alertRepo.create({
           investment_id: context.investment_id,
           investor_id: context.investor_id,
@@ -476,7 +489,7 @@ export function createAMLService(db: Pool, auditRepo: SecurityAuditRepository, u
   const ruleRepo = new AMLRuleRepository(db);
   const alertRepo = new AMLAlertRepository(db);
   const ofacReviewRepo = new OFACReviewRepository(db);
-  const evaluator = new RuleEvaluator(investmentRepo);
+  const evaluator = new RuleEvaluator(investmentRepo, { velocityRepo: new PgVelocityRepository(db) });
 
   return new AMLService(ruleRepo, alertRepo, evaluator, auditRepo, userId, ofacReviewRepo);
 }

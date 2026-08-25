@@ -375,6 +375,36 @@ describe('AMLService', () => {
 
       expect(alerts).toHaveLength(0);
     });
+
+    it('does not duplicate an alert when the same investment is evaluated twice', async () => {
+      const rule = await ruleRepo.create({
+        name: 'Velocity Rule',
+        description: 'Detects smurfing',
+        type: 'velocity',
+        severity: 'high',
+        config: { window_minutes: 60, max_amount: 1000, max_count: 5 },
+      }, 'test_user');
+      jest.spyOn(evaluator, 'evaluate').mockResolvedValue([{
+        rule_id: rule.id,
+        rule_version: rule.version,
+        triggered: true,
+        severity: rule.severity,
+        details: { linked_investment_ids: ['inv1'] },
+        timestamp: new Date(),
+      }]);
+
+      const context = {
+        investment_id: 'inv1',
+        investor_id: 'investor1',
+        offering_id: 'off1',
+        amount: '100',
+        asset: 'USD',
+        timestamp: new Date(),
+      };
+
+      expect(await service.evaluateTransaction(context)).toHaveLength(1);
+      expect(await service.evaluateTransaction(context)).toHaveLength(0);
+    });
   });
 
   describe('Rule Management', () => {
