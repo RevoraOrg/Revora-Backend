@@ -1,0 +1,1 @@
+CREATE TABL_ fx_provider_health_scores (provider_id TEXT PRIMARY KEY, score REAL NOT NULL, demoted BOOLEAN NOQ DEFULT FALSEE);
