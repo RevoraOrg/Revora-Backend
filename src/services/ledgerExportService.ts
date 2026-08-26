@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { signCursor, verifyCursor, CursorPayload } from '../lib/pagination';
 
 export interface LedgerEntry {
@@ -23,6 +24,15 @@ export interface LedgerExportResponse {
   totals: TotalsRow;
   next_cursor?: string;
   has_more: boolean;
+  /** SHA-256 hash of the deterministic export (only present in snapshot mode) */
+  content_sha256?: string;
+}
+
+export interface SnapshotExportOptions {
+  /** Enable snapshot mode for byte-for-byte reproducible exports */
+  snapshot?: boolean;
+  /** Optional snapshot cutoff timestamp - entries after this time are excluded */
+  cutoff_at?: string;
 }
 
 export interface LedgerExportRepository {
@@ -30,6 +40,7 @@ export interface LedgerExportRepository {
     glAccount: string,
     limit: number,
     afterId?: string,
+    options?: SnapshotExportOptions,
   ): Promise<{ entries: LedgerEntry[]; total: number; hasMore: boolean }>;
 }
 
@@ -67,6 +78,37 @@ function computeTotals(entries: LedgerEntry[]): TotalsRow {
   };
 }
 
+/**
+ * Compute SHA-256 hash of deterministic export content.
+ * Deterministic ordering: entries sorted by (entry_date ASC, id ASC).
+ * Format: one JSON object per line (JSONL), no trailing newline in hash input.
+ *
+ * @param entries The ledger entries to hash
+ * @returns SHA-256 hash as hex string
+ */
+export function computeExportHash(entries: LedgerEntry[]): string {
+  // Deterministic sort: by entry_date first, then by id for tie-breaking
+  const sorted = [...entries].sort((a, b) => {
+    const dateCompare = a.entry_date.localeCompare(b.entry_date);
+    if (dateCompare !== 0) return dateCompare;
+    return a.id.localeCompare(b.id);
+  });
+
+  const lines = sorted.map((entry) => JSON.stringify(entry));
+  const canonical = lines.join('\n');
+  return createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Validate snapshot cutoff timestamp format (ISO 8601).
+ * Returns true if valid, false otherwise.
+ */
+export function isValidCutoffTimestamp(cutoff: string): boolean {
+  if (!cutoff || cutoff.trim().length === 0) return false;
+  const date = new Date(cutoff);
+  return !isNaN(date.getTime());
+}
+
 export class LedgerExportService {
   constructor(private readonly repo: LedgerExportRepository) {}
 
@@ -74,6 +116,7 @@ export class LedgerExportService {
     glAccount: string,
     limit: number,
     cursor?: string,
+    options?: SnapshotExportOptions,
   ): Promise<LedgerExportResponse> {
     let afterId: string | undefined;
     if (cursor) {
@@ -84,7 +127,22 @@ export class LedgerExportService {
       afterId = payload.id;
     }
 
-    const { entries, total, hasMore } = await this.repo.findByGlAccount(glAccount, limit, afterId);
+    // Build snapshot options with validation
+    const snapshotOptions: SnapshotExportOptions = {};
+    if (options?.snapshot) {
+      snapshotOptions.snapshot = true;
+      if (options.cutoff_at) {
+        if (!isValidCutoffTimestamp(options.cutoff_at)) {
+          throw Object.assign(new Error('Invalid cutoff_at timestamp format'), {
+            statusCode: 400,
+            code: 'INVALID_CUTOFF',
+          });
+        }
+        snapshotOptions.cutoff_at = options.cutoff_at;
+      }
+    }
+
+    const { entries, total, hasMore } = await this.repo.findByGlAccount(glAccount, limit, afterId, snapshotOptions);
     const totals = computeTotals(entries);
 
     let next_cursor: string | undefined;
@@ -98,12 +156,19 @@ export class LedgerExportService {
       next_cursor = signCursor(payload);
     }
 
-    return {
+    const response: LedgerExportResponse = {
       entries,
       totals,
       next_cursor,
       has_more: hasMore,
     };
+
+    // In snapshot mode, compute and include the SHA-256 hash
+    if (snapshotOptions.snapshot && entries.length > 0) {
+      response.content_sha256 = computeExportHash(entries);
+    }
+
+    return response;
   }
 }
 
@@ -124,10 +189,30 @@ export class InMemoryLedgerRepository implements LedgerExportRepository {
     glAccount: string,
     limit: number,
     afterId?: string,
+    options?: SnapshotExportOptions,
   ): Promise<{ entries: LedgerEntry[]; total: number; hasMore: boolean }> {
-    const filtered = this.entries
-      .filter((e) => e.gl_account === glAccount)
-      .sort((a, b) => a.id.localeCompare(b.id));
+    let filtered = this.entries
+      .filter((e) => e.gl_account === glAccount);
+
+    // In snapshot mode, filter out entries after cutoff
+    if (options?.snapshot && options.cutoff_at) {
+      const cutoffDate = new Date(options.cutoff_at).toISOString();
+      filtered = filtered.filter((e) => {
+        const recordedAt = new Date(e.recorded_at).toISOString();
+        return recordedAt <= cutoffDate;
+      });
+    }
+
+    // In snapshot mode, use deterministic sort (entry_date ASC, id ASC)
+    if (options?.snapshot) {
+      filtered = filtered.sort((a, b) => {
+        const dateCompare = a.entry_date.localeCompare(b.entry_date);
+        if (dateCompare !== 0) return dateCompare;
+        return a.id.localeCompare(b.id);
+      });
+    } else {
+      filtered = filtered.sort((a, b) => a.id.localeCompare(b.id));
+    }
 
     const afterIndex = afterId
       ? filtered.findIndex((e) => e.id === afterId) + 1
