@@ -1,4 +1,4 @@
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
 import { Errors } from '../lib/errors';
 import {
   DeviceKeyStore,
@@ -22,6 +22,8 @@ import {
 export interface MobileCompanionDependencies {
   /** Shared key store – reuse across router instances for a single source of truth. */
   keyStore?: DeviceKeyStore;
+  /** Optional version-gate middleware applied before device auth on protected routes. */
+  versionGateMiddleware?: RequestHandler;
 }
 
 export function createMobileCompanionRouter(
@@ -85,8 +87,17 @@ export function createMobileCompanionRouter(
 
   const deviceAuth = createDeviceSignatureMiddleware({ keyStore, replayCache });
 
+  // Apply version gate before device auth if provided.
+  // The version gate runs first because an outdated client should be
+  // rejected before any signature verification work is done.
+  const protectedMiddlewares: RequestHandler[] = [];
+  if (deps.versionGateMiddleware) {
+    protectedMiddlewares.push(deps.versionGateMiddleware);
+  }
+  protectedMiddlewares.push(deviceAuth);
+
   // GET /mobile/ping – authenticated ping for connection health check
-  router.get('/ping', deviceAuth, (_req: Request, res: Response) => {
+  router.get('/ping', ...protectedMiddlewares, (_req: Request, res: Response) => {
     const { installId } = (_req as AuthenticatedDeviceRequest).deviceAuth!;
     res.json({ status: 'ok', installId });
   });
