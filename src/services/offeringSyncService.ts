@@ -24,6 +24,12 @@ export interface OnChainOfferingState {
   last_updated_ledger?: number;
 }
 
+export interface StellarAccount {
+  account_id: string;
+  sequence: string;
+  subentry_count: number;
+}
+
 export interface StellarClient {
   getOfferingState(contractAddress: string): Promise<OnChainOfferingState>;
   getAccountInfo(publicKey: string): Promise<StellarAccount>;
@@ -156,19 +162,30 @@ export class OfferingSyncService {
           contractAddress: '',
           success: false,
           updated: false,
-          error: 'Offering not found',
+          error: `Offering ${offeringId} not found`,
         };
       }
 
       return this.syncOfferingRecord(offering);
     } catch (error) {
-      this.logger.error('Failed to sync offering', { offeringId, error });
+      const failure = classifyStellarRPCFailure(error, {
+        operation: 'syncOffering',
+        offeringId,
+      });
+
+      this.logger.error('Failed to sync offering', {
+        offeringId,
+        error: error instanceof Error ? error.message : String(error),
+        failureClass: failure.class,
+      });
+
       return {
         offeringId,
         contractAddress: '',
         success: false,
         updated: false,
-        error: 'Offering not found',
+        error: 'Unable to sync offering from Stellar',
+        failureClass: failure.class,
       };
     }
   }
@@ -188,8 +205,6 @@ export class OfferingSyncService {
           offering,
           error: 'Offering is not configured for on-chain sync',
         };
-        this.logger.warn('Offering missing contract address', { offeringId: offering.id });
-        return result;
       }
 
       const contractAddress = offering.contract_address;
@@ -297,7 +312,10 @@ export class OfferingSyncService {
       };
       return result;
     } catch (error) {
-      const failure = classifyStellarRPCFailure(error);
+      const failure = classifyStellarRPCFailure(error, {
+        operation: 'syncOfferingRecord',
+        offeringId: offering.id,
+      });
 
       this.logger.error('Offering sync failed against Stellar dependency', {
         offeringId: offering.id,
@@ -318,6 +336,74 @@ export class OfferingSyncService {
     }
   }
 
+  async getSyncStats(): Promise<SyncStats> {
+    const offerings = await this.offeringRepository.listAll();
+    const staleThreshold = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24h default
+
+    return {
+      totalOfferings: offerings.length,
+      syncedOfferings: offerings.filter((o) => o.contract_address).length,
+      staleOfferings: 0, // Would need last sync timestamps to compute
+      lastSyncTime: null,
+      staleThreshold,
+    };
+  }
+
+  async recoverStaleCatalog(config: StaleCatalogConfig): Promise<StaleCatalogResult> {
+    const startTime = Date.now();
+    const offerings = await this.offeringRepository.listAll();
+    const batchSize = config.batchSize ?? 10;
+    const threshold = config.staleThresholdHours ?? 24;
+    const staleThreshold = new Date(Date.now() - threshold * 60 * 60 * 1000);
+
+    const staleOfferings = offerings.filter((o) => {
+      if (!o.contract_address) return false;
+      const updatedAt = o.updated_at ?? o.created_at;
+      return updatedAt && updatedAt < staleThreshold;
+    });
+
+    const toProcess = staleOfferings.slice(0, batchSize);
+    const errors: StaleCatalogError[] = [];
+    let updated = 0;
+    let failed = 0;
+
+    for (const offering of toProcess) {
+      try {
+        const result = await this.syncOfferingRecord(offering);
+        if (result.success && result.updated) {
+          updated++;
+        } else if (!result.success) {
+          failed++;
+          errors.push({
+            offeringId: offering.id,
+            error: result.error ?? 'Unknown error',
+            failureClass: result.failureClass ?? 'UNKNOWN',
+          });
+        }
+      } catch (error) {
+        failed++;
+        const failure = classifyStellarRPCFailure(error, {
+          operation: 'recoverStaleCatalog',
+          offeringId: offering.id,
+        });
+        errors.push({
+          offeringId: offering.id,
+          error: 'Sync failed',
+          failureClass: failure.class,
+        });
+      }
+    }
+
+    return {
+      totalProcessed: toProcess.length,
+      staleFound: staleOfferings.length,
+      updated,
+      failed,
+      errors,
+      duration: Date.now() - startTime,
+    };
+  }
+
   async syncAll(): Promise<SyncResult[]> {
     const offerings = await this.offeringRepository.listAll();
     const results = await Promise.allSettled(
@@ -330,7 +416,10 @@ export class OfferingSyncService {
       }
 
       const offering = offerings[index];
-      const failure = classifyStellarRPCFailure(result.reason);
+      const failure = classifyStellarRPCFailure(result.reason, {
+        operation: 'syncAll',
+        offeringId: offering.id,
+      });
 
       this.logger.error('Offering sync task failed unexpectedly', {
         offeringId: offering.id,
@@ -350,6 +439,35 @@ export class OfferingSyncService {
       };
     });
   }
+}
+
+export interface StaleCatalogConfig {
+  staleThresholdHours?: number;
+  batchSize?: number;
+  autoUpdate?: boolean;
+}
+
+export interface StaleCatalogError {
+  offeringId: string;
+  error: string;
+  failureClass: string;
+}
+
+export interface StaleCatalogResult {
+  totalProcessed: number;
+  staleFound: number;
+  updated: number;
+  failed: number;
+  errors: StaleCatalogError[];
+  duration: number;
+}
+
+export interface SyncStats {
+  totalOfferings: number;
+  syncedOfferings: number;
+  staleOfferings: number;
+  lastSyncTime: Date | null;
+  staleThreshold: Date;
 }
 
 export function getSynchronizedOffering(

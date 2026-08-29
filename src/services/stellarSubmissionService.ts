@@ -27,6 +27,8 @@ export class StellarSubmissionService {
   private keypair: StellarSdk.Keypair;
   private logger = globalLogger.child({ service: 'stellar-submission' });
   private submittedTransactionHashes = new Set<string>();
+  private idempotencyResults = new Map<string, StellarSdk.rpc.Api.SendTransactionResponse>();
+  private inFlightIdempotencyKeys = new Map<string, Promise<StellarSdk.rpc.Api.SendTransactionResponse>>();
   private maxRetries = 3;
   private baseDelayMs = 1000;
   private maxDelayMs = 30000;
@@ -79,15 +81,67 @@ export class StellarSubmissionService {
     if (!amount || typeof amount !== 'string') {
       throw Errors.validationError('Amount must be a non-empty string');
     }
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '')) {
+      throw Errors.validationError('Idempotency key must be a non-empty string when provided');
+    }
+
+    const normalizedIdempotencyKey = idempotencyKey?.trim();
+    if (normalizedIdempotencyKey) {
+      const cachedResult = this.idempotencyResults.get(normalizedIdempotencyKey);
+      if (cachedResult) {
+        this.logger.info('Returning cached Stellar transaction submission result', {
+          operation: 'submit_payment',
+          hasIdempotencyKey: true,
+          transactionHash: cachedResult.hash,
+        });
+        return cachedResult;
+      }
+
+      const inFlight = this.inFlightIdempotencyKeys.get(normalizedIdempotencyKey);
+      if (inFlight) {
+        this.logger.info('Joining in-flight Stellar transaction submission', {
+          operation: 'submit_payment',
+          hasIdempotencyKey: true,
+        });
+        return inFlight;
+      }
+
+      const submission = this.submitPaymentOnce(to, amount, asset, normalizedIdempotencyKey);
+      this.inFlightIdempotencyKeys.set(normalizedIdempotencyKey, submission);
+
+      try {
+        const result = await submission;
+        this.idempotencyResults.set(normalizedIdempotencyKey, result);
+        return result;
+      } finally {
+        this.inFlightIdempotencyKeys.delete(normalizedIdempotencyKey);
+      }
+    }
+
+    return this.submitPaymentOnce(to, amount, asset);
+  }
+
+  private async submitPaymentOnce(
+    to: string,
+    amount: string,
+    asset: StellarSdk.Asset,
+    idempotencyKey?: string,
+  ): Promise<StellarSdk.rpc.Api.SendTransactionResponse> {
 
     this.logger.info('Submitting payment transaction', {
       to,
       amount,
       asset: asset.isNative() ? 'XLM' : asset.code,
+      hasIdempotencyKey: Boolean(idempotencyKey),
     });
 
     try {
-      const sourceAccount = await this.server.getAccount(this.keypair.publicKey());
+      const sourceAccount = await this.getAccountWithRetry(this.keypair.publicKey(), {
+        operation: 'get_account',
+        network: env.STELLAR_NETWORK,
+        attemptCount: 1,
+        idempotencyKey,
+      });
 
       const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
         fee: env.STELLAR_MAX_FEE.toString(),
@@ -113,7 +167,7 @@ export class StellarSubmissionService {
       if (this.submittedTransactionHashes.has(transactionHash)) {
         logger.warn('Duplicate transaction submission prevented', {
           transactionHash,
-          idempotencyKey,
+          hasIdempotencyKey: Boolean(idempotencyKey),
           operation: 'submit_payment',
         });
         throw Errors.conflict('Transaction already submitted', {
@@ -140,17 +194,19 @@ export class StellarSubmissionService {
 
       return result;
     } catch (error) {
-      this.logger.error('Payment transaction failed', {
-        to,
-        amount,
-        error: error,
-      });
-
       if (error instanceof Error && error.name === 'AppError') {
         throw error;
       }
 
-      throw Errors.serviceUnavailable('Failed to submit payment transaction');
+      const failure = classifyStellarRPCFailure(error, {
+        operation: 'submit_payment',
+        network: env.STELLAR_NETWORK,
+        attemptCount: this.maxRetries,
+        idempotencyKey,
+      });
+
+      this.logStellarFailure(failure);
+      throw this.createAppErrorFromFailure(failure);
     }
   }
 
@@ -270,9 +326,39 @@ export class StellarSubmissionService {
             transactionHash,
           });
         } else if (result.status === 'TRY_AGAIN_LATER') {
-          throw Errors.serviceUnavailable('Transaction rate limited, try again later');
+          const failure = classifyStellarRPCFailure(
+            { status: 429, statusText: 'TRY_AGAIN_LATER' },
+            {
+              ...context,
+              operation: 'send_transaction',
+              attemptCount,
+              transactionHash,
+            }
+          );
+
+          if (!shouldRetryStellarRPCFailure(failure, this.maxRetries)) {
+            throw this.createAppErrorFromFailure(failure);
+          }
+
+          this.logStellarFailure(failure);
+          const delayMs = this.calculateRetryDelay(failure.suggestedRetryDelayMs, attemptCount);
+          logger.debug('Retrying Stellar transaction submission', {
+            transactionHash,
+            attemptCount,
+            delayMs,
+            nextAttempt: attemptCount + 1,
+            failureClass: failure.class,
+          });
+
+          await this.delay(delayMs);
+          attemptCount++;
+          continue;
         } else {
-          throw new Error(`Transaction failed: ${result.status}`);
+          throw {
+            code: 'TRANSACTION_FAILED',
+            status: result.status,
+            hash: result.hash,
+          };
         }
       } catch (error) {
         // Re-throw AppErrors immediately without classification
@@ -342,6 +428,12 @@ export class StellarSubmissionService {
       
       case StellarRPCFailureClass.BAD_SEQUENCE:
         return Errors.badRequest(errorResponse.message, errorResponse.details);
+
+      case StellarRPCFailureClass.TX_RESULT_CODE:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
+
+      case StellarRPCFailureClass.OP_RESULT_CODE:
+        return Errors.badRequest(errorResponse.message, errorResponse.details);
       
       case StellarRPCFailureClass.SIGNING_ERROR:
         return Errors.internal(errorResponse.message, errorResponse.details);
@@ -366,6 +458,7 @@ export class StellarSubmissionService {
       contractId: failure.context.contractId,
       functionName: failure.context.functionName,
       transactionHash: failure.context.transactionHash,
+      hasIdempotencyKey: Boolean(failure.context.idempotencyKey),
     });
   }
 
@@ -401,6 +494,8 @@ export class StellarSubmissionService {
    */
   clearTransactionCache(): void {
     this.submittedTransactionHashes.clear();
+    this.idempotencyResults.clear();
+    this.inFlightIdempotencyKeys.clear();
     logger.debug('Stellar transaction cache cleared');
   }
 

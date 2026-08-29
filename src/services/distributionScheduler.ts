@@ -655,6 +655,10 @@ export class DistributionScheduler {
    * Scans for pending distributions and processes them.
    * @returns A summary of the processing run.
    */
+  // NOTE (#869): per-report idempotency is enforced by claimApprovedReportForDistribution,
+  // which atomically sets `distribution_status = 'in_progress'` (with a 15-minute lease)
+  // so an already-claimed report is skipped and a missed tick cannot double-run it.
+  // This guard already exists in main; no functional change is required here.
   async processPendingDistributions(): Promise<{
     processed: number;
     successful: number;

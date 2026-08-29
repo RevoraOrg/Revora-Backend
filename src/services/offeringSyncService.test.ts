@@ -33,6 +33,8 @@ describe('OfferingSyncService', () => {
 
     mockStellarClient = {
       getOfferingState: jest.fn(),
+      getAccountInfo: jest.fn(),
+      validateContractAddress: jest.fn(),
     };
 
     service = new OfferingSyncService(
@@ -51,7 +53,7 @@ describe('OfferingSyncService', () => {
       offeringId: 'missing-id',
       success: false,
       updated: false,
-      error: 'Offering not found',
+      error: 'Offering missing-id not found',
     });
   });
 
@@ -92,6 +94,7 @@ describe('OfferingSyncService', () => {
     expect(mockOfferingRepo.updateState).toHaveBeenCalledWith('offering-1', {
       status: 'closed',
       total_raised: '9000.00',
+      max_investor_share_bps: null,
     });
   });
 
