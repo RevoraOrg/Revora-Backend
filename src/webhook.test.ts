@@ -83,6 +83,9 @@ describe('WebhookQueue Durable Delivery', () => {
   });
 
   afterEach(() => {
+    // Restore spies (e.g. processDelivery mocks) so implementations do not
+    // leak into later tests — clearAllMocks only clears call history.
+    jest.restoreAllMocks();
     jest.useRealTimers();
   });
 

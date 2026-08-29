@@ -145,42 +145,32 @@ export class OfferingSyncService {
   }
 
   async syncOffering(offeringId: string): Promise<SyncResult> {
-    const startTime = Date.now();
     this.logger.info('Starting offering sync', { offeringId });
 
     try {
       const offering = await this.offeringRepository.findById(offeringId);
       if (!offering) {
-        const result: SyncResult = {
+        this.logger.warn('Offering not found for sync', { offeringId });
+        return {
           offeringId,
           contractAddress: '',
           success: false,
           updated: false,
-          error: `Offering ${offeringId} not found`,
-          duration: Date.now() - startTime,
+          error: 'Offering not found',
         };
-        this.logger.warn('Offering not found for sync', { offeringId });
-        return result;
       }
 
-      return this.syncFromChain(offering, startTime);
+      return this.syncOfferingRecord(offering);
     } catch (error) {
-      const result: SyncResult = {
+      this.logger.error('Failed to sync offering', { offeringId, error });
+      return {
         offeringId,
         contractAddress: '',
         success: false,
         updated: false,
         error: 'Offering not found',
       };
-      this.logger.error('Failed to sync offering', {
-        offeringId,
-        error: result.error,
-        failureClass: result.failureClass,
-      });
-      return result;
     }
-
-    return this.syncOfferingRecord(offering);
   }
 
   async syncOfferingRecord(offering: Offering): Promise<SyncResult> {
@@ -246,10 +236,11 @@ export class OfferingSyncService {
         };
       }
 
+      const chainMaxInvestorShareBps = onChain.max_investor_share_bps ?? null;
       const hasChanged =
         normalizedChainStatus !== normalizedLocalStatus ||
         onChain.total_raised !== offering.total_raised ||
-        onChain.max_investor_share_bps !== (offering.max_investor_share_bps as number | null | undefined);
+        chainMaxInvestorShareBps !== (offering.max_investor_share_bps ?? null);
 
       if (!hasChanged) {
         const result: SyncResult = {
@@ -270,11 +261,18 @@ export class OfferingSyncService {
         return result;
       }
 
-      const update: UpdateOfferingStateInput = {
-        status: normalizedChainStatus,
-        total_raised: onChain.total_raised,
-        max_investor_share_bps: onChain.max_investor_share_bps ?? null,
-      };
+      // Write only the fields that actually changed so unchanged columns are
+      // not needlessly dirtied (and so callers can rely on exact payloads).
+      const update: Partial<UpdateOfferingStateInput> = {};
+      if (normalizedChainStatus !== normalizedLocalStatus) {
+        update.status = normalizedChainStatus;
+      }
+      if (onChain.total_raised !== offering.total_raised) {
+        update.total_raised = onChain.total_raised;
+      }
+      if (chainMaxInvestorShareBps !== (offering.max_investor_share_bps ?? null)) {
+        update.max_investor_share_bps = chainMaxInvestorShareBps;
+      }
 
       const updatedOffering =
         (await this.offeringRepository.updateState(offering.id, update)) ?? {
@@ -299,12 +297,12 @@ export class OfferingSyncService {
       };
       return result;
     } catch (error) {
-      const failureClass = classifyStellarRPCFailure(error);
+      const failure = classifyStellarRPCFailure(error);
 
       this.logger.error('Offering sync failed against Stellar dependency', {
         offeringId: offering.id,
         contractAddress: offering.contract_address ?? '',
-        failureClass,
+        failureClass: failure.class,
         error,
       });
 
@@ -315,18 +313,8 @@ export class OfferingSyncService {
         updated: false,
         offering,
         error: 'Unable to sync offering from Stellar',
-        failureClass,
+        failureClass: failure.class,
       };
-      
-      this.logger.error('Failed to sync offering from chain', {
-        offeringId: offering.id,
-        contractAddress: offering.contract_address,
-        error: result.error,
-        failureClass: result.failureClass,
-        duration: result.duration,
-      });
-      
-      return result;
     }
   }
 
@@ -342,12 +330,12 @@ export class OfferingSyncService {
       }
 
       const offering = offerings[index];
-      const failureClass = classifyStellarRPCFailure(result.reason);
+      const failure = classifyStellarRPCFailure(result.reason);
 
       this.logger.error('Offering sync task failed unexpectedly', {
         offeringId: offering.id,
         contractAddress: offering.contract_address ?? '',
-        failureClass,
+        failureClass: failure.class,
         error: result.reason,
       });
 
@@ -358,7 +346,7 @@ export class OfferingSyncService {
         updated: false,
         offering,
         error: 'Unable to sync offering from Stellar',
-        failureClass,
+        failureClass: failure.class,
       };
     });
   }

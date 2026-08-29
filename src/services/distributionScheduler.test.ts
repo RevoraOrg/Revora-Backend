@@ -1,4 +1,15 @@
-import { DistributionScheduler } from './distributionScheduler';
+import {
+  DistributionScheduler,
+  validateCronSyntax,
+  CronWindowValidator,
+  normalizeScheduleTimezone,
+  assertValidScheduleTimezone,
+  findNextCronWindow,
+  computeTimezoneWindow,
+  deduplicateWindowKey,
+  STELLAR_MAINTENANCE_WINDOWS,
+  type CronWindowDefinition,
+} from './distributionScheduler';
 import { HolidayCalendarService } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
 import { InMemorySecurityAuditRepository } from '../security/audit';
@@ -457,25 +468,6 @@ describe('DistributionScheduler', () => {
         })) as any
       );
 
-      it('does not trigger red-alert when backlog equals the threshold', async () => {
-  revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
-    Array.from({ length: 10 }, (_, i) => ({
-      id: `r-${i}`,
-      offering_id: 'off-1',
-    })) as any
-  );
-
-  const s = new DistributionScheduler(engine, revenueReportRepo, {
-    catchupMax: 10,
-    catchupBacklogAlertThreshold: 10,
-  });
-
-  const result = await s.catchUpMissedWindows();
-
-  expect(result.totalMissed).toBe(10);
-  expect(result.backlogExceededCeiling).toBe(false);
-});
-
       const mockLogger = { info: jest.fn(), error: jest.fn(), warn: jest.fn() };
       const s = new DistributionScheduler(engine, revenueReportRepo, {
         catchupMax: 5,
@@ -490,6 +482,25 @@ describe('DistributionScheduler', () => {
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.stringContaining('[RED-ALERT]')
       );
+    });
+
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
     });
 
     it('works correctly without metrics collector (no gauge emitted)', async () => {
