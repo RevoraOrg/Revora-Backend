@@ -136,6 +136,34 @@ export class BalanceSnapshotRepository {
   }
 
   /**
+   * Get all snapshots for a given holder across offerings for a period.
+   * Used by the investor-statement generator to resolve a holder's positions
+   * (deterministically ordered by snapshot_at so re-runs are stable).
+   * @param holderAddressOrId Holder Stellar address or internal investor ID
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of snapshots
+   */
+  async findByHolderAndPeriod(
+    holderAddressOrId: string,
+    periodId: string
+  ): Promise<TokenBalanceSnapshot[]> {
+    const query = `
+      SELECT *
+      FROM token_balance_snapshots
+      WHERE holder_address_or_id = $1
+        AND period_id = $2
+      ORDER BY snapshot_at ASC, created_at ASC, id ASC
+    `;
+
+    const result: QueryResult<TokenBalanceSnapshot> = await this.db.query(
+      query,
+      [holderAddressOrId, periodId]
+    );
+
+    return result.rows.map((row: any) => this.mapSnapshot(row));
+  }
+
+  /**
    * Get all snapshots for a given offering
    * @param offeringId Offering ID
    * @returns Array of snapshots

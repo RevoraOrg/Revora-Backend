@@ -67,6 +67,10 @@ import { createComplianceRouter } from './routes/compliance';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
 import taxationRouter from './routes/taxation';
+import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository';
+import { InMemoryStatementPdfStorage } from './services/statementPdfService';
+import createStatementsRouter from './routes/statements';
+import { createRequireAuth } from './middleware/auth';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -722,6 +726,23 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const ledgerRepo = new InMemoryLedgerRepository();
   const ledgerExportService = new LedgerExportService(ledgerRepo);
   apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
+
+  // Investor statements (Issue #874): the fetch endpoint re-verifies the
+  // persisted sha256 before serving. Storage defaults to in-memory — replace
+  // with the S3-backed adapter when one is deployed so completed renders are
+  // retrievable across instances. Without a storage adapter, requests simply
+  // 404 (no artifacts exist), which is fail-safe.
+  const statementStorage = new InMemoryStatementPdfStorage();
+  const pdfRenderJobRepo = new PdfRenderJobRepository(pool);
+  const sessionRepo = new SessionRepository(pool);
+  apiRouter.use(
+    "/statements",
+    createStatementsRouter({
+      jobRepo: pdfRenderJobRepo,
+      storage: statementStorage,
+      verifyJWT: createRequireAuth(sessionRepo),
+    }),
+  );
 
   // Mount taxation routes for per-lot cost-basis tax reporting
   app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);

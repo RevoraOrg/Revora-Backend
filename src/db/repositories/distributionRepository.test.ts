@@ -176,4 +176,71 @@ describe('DistributionRepository', () => {
       );
     });
   });
+
+  describe('listByPeriod', () => {
+    it('lists distribution runs for a period ordered by run_at ascending', async () => {
+      const runs = [
+        {
+          id: 'run-1',
+          offering_id: 'off-1',
+          period_id: '2026-07',
+          total_amount: '500.00',
+          status: 'completed',
+          run_at: new Date('2026-07-14T00:00:00.000Z'),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ];
+      mockPool.query.mockResolvedValueOnce({ rows: runs });
+      const result = await repository.listByPeriod('2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/FROM\s+distributions\s+WHERE\s+period_id\s+=\s+\$1/i),
+        ['2026-07']
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].total_amount).toBe('500.00');
+    });
+
+    it('returns empty array when no runs exist for the period', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+      expect(await repository.listByPeriod('1999-01')).toEqual([]);
+    });
+  });
+
+  describe('listPayoutsByInvestorForPeriod', () => {
+    it('joins payouts to distributions on period_id', async () => {
+      const payouts = [
+        {
+          id: 'p1',
+          distribution_id: 'run-1',
+          investor_id: 'inv-1',
+          amount: '120.00',
+          status: 'processed',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ];
+      mockPool.query.mockResolvedValueOnce({ rows: payouts });
+      const result = await repository.listPayoutsByInvestorForPeriod('inv-1', '2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/INNER\s+JOIN\s+distributions\s+d\s+ON\s+d\.id\s+=\s+p\.distribution_id/i),
+        ['inv-1', '2026-07']
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('120.00');
+    });
+  });
+
+  describe('listPayoutsByPeriod', () => {
+    it('lists all payouts for a period', async () => {
+      const payouts = [{ id: 'p1', amount: '10.00' }, { id: 'p2', amount: '20.00' }];
+      mockPool.query.mockResolvedValueOnce({ rows: payouts });
+      const result = await repository.listPayoutsByPeriod('2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/WHERE\s+d\.period_id\s+=\s+\$1/i),
+        ['2026-07']
+      );
+      expect(result).toHaveLength(2);
+    });
+  });
 });
