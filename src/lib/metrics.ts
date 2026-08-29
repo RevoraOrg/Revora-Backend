@@ -605,6 +605,37 @@ export class MetricsCollector {
   }
 
   /**
+   * Helper that computes p99 latency from a MetricsCollector snapshot for a specific route.
+   * This is useful for asserting latency budgets in tests.
+   * 
+   * @param method HTTP method (e.g., 'GET')
+   * @param route Route path (e.g., '/health')
+   * @returns p99 latency in milliseconds, or 0 if no observations
+   */
+  computeP99Latency(method: string, route: string): number {
+    let p99 = 0;
+    
+    // Normalize route using the same logic as metricsMiddleware if needed, 
+    // but tests typically pass the exact normalized route.
+    
+    for (const [key, observations] of this.histograms.entries()) {
+      if (key.startsWith('http_request_duration_ms')) {
+        const { labels } = this.parseMetricKey(key);
+        if (labels && labels.method === method && labels.route === route) {
+          if (observations.length === 0) return 0;
+          const sorted = [...observations].sort((a, b) => a - b);
+          // Calculate 99th percentile index
+          const idx = Math.max(0, Math.ceil(0.99 * sorted.length) - 1);
+          p99 = sorted[idx];
+          break; // Found the matching histogram
+        }
+      }
+    }
+    
+    return p99;
+  }
+
+  /**
    * Reset all metrics (useful for testing)
    */
   reset(): void {
