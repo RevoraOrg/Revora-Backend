@@ -33,6 +33,9 @@ import { SocialAuthService } from './auth/social/socialAuthService';
 import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
 import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
 import { createReconciliationMetricsHandler } from './routes/reconciliationRoutes';
+import { AuditLogRepository } from './db/repositories/auditLogRepository';
+import { createAdminAuditLogRouter } from './routes/adminAuditLog';
+import { createAuditLogPurgeScheduler } from './jobs/auditLogPurgeScheduler';
 
 // Adapter to convert database User to login service UserRecord
 class UserRepositoryAdapter implements IUserRepository {
@@ -240,6 +243,33 @@ export function createApp() {
 
   // Offering sync routes
   app.use('/api/v1/offerings', createOfferingSyncRouter());
+
+  // Admin audit log signed CSV export (Ed25519), gated behind admin role.
+  // The router enforces admin authorization and streams a signed manifest
+  // header so auditors can verify integrity offline with the documented
+  // public key. Route: GET /admin/audit-log/export.csv
+  const auditLogRepo = new AuditLogRepository(pool);
+  app.use(
+    '/admin/audit-log',
+    createAdminAuditLogRouter({ repo: auditLogRepo, requireAuth }),
+  );
+
+  // Scheduled retention purge. Retention window is configurable via
+  // AUDIT_RETENTION_DAYS (defaults to 90 days). The scheduler invokes
+  // AuditLogRepository.purgeBefore(date) and surfaces its run state
+  // (last run, rows purged, failures) through the metrics collector.
+  const auditRetentionDays = Number(process.env.AUDIT_RETENTION_DAYS ?? 90);
+  const auditLogPurgeScheduler = createAuditLogPurgeScheduler({
+    repo: auditLogRepo,
+    retentionDays: auditRetentionDays,
+    metrics,
+    logger,
+  });
+  // Avoid starting background timers during tests to keep runs deterministic
+  // and prevent leaked handles; production/development start the scheduler.
+  if (process.env.NODE_ENV !== 'test') {
+    auditLogPurgeScheduler.start();
+  }
 
   // Global error handler — must be mounted after all routes
   app.use(errorHandler);
