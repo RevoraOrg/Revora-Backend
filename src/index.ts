@@ -39,6 +39,9 @@ import { EmailDeliverabilityService } from "./services/emailDeliverabilityServic
 import { EmailDeliverabilityRepository } from "./db/repositories/emailDeliverabilityRepository";
 import { createEmailWebhooksRouter } from "./routes/emailWebhooks";
 import { createAdminRouter } from "./routes/admin";
+import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
+import { AccountingLedgerService } from "./services/accountingLedgerService";
+import { DistributionRepository } from "./db/repositories/distributionRepository";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { TenantSettingsRepository } from "./db/repositories/tenantSettingsRepository";
@@ -700,6 +703,16 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount admin router
   apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
+
+  // Mount admin ledger double-entry export (RBAC + audited)
+  apiRouter.use(
+    "/admin/ledger",
+    createAdminLedgerExportRouter({
+      distributionAccountRepo: new DistributionRepository(pool),
+      accountingLedger: new AccountingLedgerService(),
+      auditLogRepo,
+    }),
+  );
 
   if (contractUpgradeService) {
     apiRouter.use(

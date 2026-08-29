@@ -176,4 +176,65 @@ describe('DistributionRepository', () => {
       );
     });
   });
+
+  describe('listForAccountingExport', () => {
+    it('returns runs with their payouts for an offering', async () => {
+      mockPool.query
+        .mockResolvedValueOnce({
+          rows: [
+            { id: 'run-1', offering_id: 'off-1', period_id: 'period-1', total_amount: '100.00', status: 'completed', run_at: new Date(), created_at: new Date(), updated_at: new Date() },
+          ],
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '100.00', status: 'processed', created_at: new Date(), updated_at: new Date() },
+          ],
+        });
+
+      const result = await repository.listForAccountingExport('off-1');
+
+      expect(mockPool.query).toHaveBeenCalledTimes(2);
+      expect(mockPool.query).toHaveBeenNthCalledWith(
+        1,
+        expect.stringMatching(/WHERE\s+offering_id\s+=\s+\$1/i),
+        expect.arrayContaining(['off-1']),
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].payouts).toHaveLength(1);
+      expect(result[0].payouts[0].id).toBe('p-1');
+    });
+
+    it('filters by period when periodId is provided', async () => {
+      mockPool.query
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+
+      await repository.listForAccountingExport('off-1', 'period-9');
+
+      expect(mockPool.query).toHaveBeenNthCalledWith(
+        1,
+        expect.stringMatching(/offering_id\s+=\s+\$1\s+AND\s+period_id\s+=\s+\$2/i),
+        ['off-1', 'period-9'],
+      );
+    });
+
+    it('returns empty list with no payout query when there are no runs', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+      const result = await repository.listForAccountingExport('off-1');
+      expect(result).toHaveLength(0);
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('handles runs that have no payouts', async () => {
+      mockPool.query
+        .mockResolvedValueOnce({
+          rows: [{ id: 'run-1', offering_id: 'off-1', period_id: 'period-1', total_amount: '1.00', status: 'pending', run_at: new Date(), created_at: new Date(), updated_at: new Date() }],
+        })
+        .mockResolvedValueOnce({ rows: [] });
+
+      const result = await repository.listForAccountingExport('off-1');
+      expect(result).toHaveLength(1);
+      expect(result[0].payouts).toHaveLength(0);
+    });
+  });
 });
