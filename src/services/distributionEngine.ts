@@ -11,6 +11,7 @@
  * @see {@link file://../../docs/distribution-advisory-lock.md | Advisory Lock}
  * @see {@link file://../../docs/distribution-engine-atomic-transactions.md | Atomic Transactions}
  * @see {@link file://../../docs/distribution-engine-safety.md | Engine Safety}
+ * @see {@link file://../../docs/runbooks/payout-reconciliation.md | Payout Reconciliation Runbook}
  */
 import { Logger, globalLogger } from '../lib/logger';
 import { Errors, AppError } from '../lib/errors';
