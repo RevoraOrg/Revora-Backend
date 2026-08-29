@@ -27,7 +27,7 @@ describe('ErrorCode', () => {
 describe('AppError', () => {
   describe('constructor', () => {
     it('sets all properties', () => {
-      const err = new AppError(ErrorCode.NOT_FOUND, 'thing not found', 404);
+      const err = new AppError(ErrorCode.NOT_FOUND, 404, 'thing not found');
       expect(err.code).toBe(ErrorCode.NOT_FOUND);
       expect(err.message).toBe('thing not found');
       expect(err.statusCode).toBe(404);
@@ -54,7 +54,7 @@ describe('AppError', () => {
 
   describe('toResponse()', () => {
     it('returns code and message without details when details is undefined', () => {
-      const err = new AppError(ErrorCode.UNAUTHORIZED, 'not logged in', 401);
+      const err = new AppError(ErrorCode.UNAUTHORIZED, 401, 'not logged in');
       const response: ErrorResponse = err.toResponse();
       expect(response).toEqual({ code: 'UNAUTHORIZED', message: 'not logged in' });
       expect(Object.prototype.hasOwnProperty.call(response, 'details')).toBe(false);
@@ -62,7 +62,7 @@ describe('AppError', () => {
 
     it('includes details when present', () => {
       const details = { ids: ['a', 'b'] };
-      const err = new AppError(ErrorCode.CONFLICT, 'duplicate', 409, details);
+      const err = new AppError(ErrorCode.CONFLICT, 409, 'duplicate', details);
       expect(err.toResponse()).toEqual({
         code: 'CONFLICT',
         message: 'duplicate',
