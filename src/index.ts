@@ -67,6 +67,8 @@ import { createComplianceRouter } from './routes/compliance';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
 import taxationRouter from './routes/taxation';
+import { SanctionsListRepository } from './db/repositories/sanctionsListRepository';
+import { startSanctionsRefreshJob } from './jobs/refreshSanctionsListsJob';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -1078,6 +1080,28 @@ if (require.main === module && env.NODE_ENV !== "test") {
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
     console.log("[server] PayoutDriftDetector started");
+  }
+
+  // --- Daily sanctions list refresh (only for "batch" and "all" roles) ---
+
+  if (
+    workerRole === 'batch' ||
+    workerRole === 'all'
+  ) {
+    const loader = new OfacSanctionsLoader({
+      listUrl: env.OFAC_LIST_URL,
+      sigUrl: env.OFAC_SIG_URL,
+      trustAnchorBase64: env.OFAC_TRUST_ANCHOR_BASE64,
+      fetchTimeoutMs: env.OFAC_FETCH_TIMEOUT_MS,
+    });
+    const sanctionsRepo = new SanctionsListRepository(pool);
+    const stopRefresh = startSanctionsRefreshJob({
+      loader,
+      repo: sanctionsRepo,
+      version: new Date().toISOString().slice(0, 10), // daily publication date
+    });
+    backgroundStopFns.push(stopRefresh);
+    console.log("[server] Sanctions refresh job started");
   }
 
   // --- Hot-path services (only for "api" and "all" roles) ---

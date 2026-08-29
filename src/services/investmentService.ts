@@ -2,9 +2,15 @@ import { Pool } from 'pg';
 import { InvestmentRepository, CreateInvestmentInput, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { UserRepository } from '../db/repositories/userRepository';
+import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Errors, AppError, ErrorCode } from '../lib/errors';
 import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
+import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
+import { sanitizeReviewLink } from '../lib/reviewLink';
+
+/** Relative path to the OFAC dual-control review queue for compliance staff. */
+const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
 import {
   DEFAULT_KYC_RISK_TIER,
   evaluateInvestmentAgainstCap,
@@ -20,6 +26,8 @@ export interface CreateInvestmentRequest {
   offering_id: string;
   amount: string;
   asset: string;
+  /** Optional beneficial-owner names (e.g. UBOs) to screen alongside the investor. */
+  beneficial_owners?: string[];
 }
 
 /**
@@ -32,6 +40,8 @@ export class InvestmentService {
     private offeringRepo: OfferingRepository,
     private amlService?: AMLService,
     private userRepo?: UserRepository,
+    private screeningService?: SanctionsScreeningService,
+    private auditLogRepo?: AuditLogRepository,
   ) {}
 
   /**
@@ -80,7 +90,27 @@ export class InvestmentService {
       ),
     });
 
-    // 6. Create investment record
+    // 6. OFAC / EU / UK sanctions screening (blocking, fail-closed) before persistence
+    const screening = await this.screenInvestment(input);
+    if (screening && !screening.cleared) {
+      // Failure to obtain a verified list, or a confirmed hit → reject.
+      const blocked = screening.matches.length > 0;
+      await this.recordScreenBlocked(input, screening, blocked);
+      if (blocked) {
+        throw new AppError(
+          ErrorCode.FORBIDDEN,
+          403,
+          'Investment blocked: investor or beneficial owner matched a sanctions list entry.',
+          this.screeningDetails(screening),
+        );
+      }
+      throw Errors.serviceUnavailable(
+        'Investment blocked: sanctions list unavailable; screening could not complete (fail-closed).',
+        this.screeningDetails(screening),
+      );
+    }
+
+    // 7. Create investment record
     const investmentInput: CreateInvestmentInput = {
       investor_id: input.investor_id,
       offering_id: input.offering_id,
@@ -88,6 +118,19 @@ export class InvestmentService {
       asset: input.asset,
       status: 'pending', // Default status until Stellar transaction is submitted
     };
+
+    if (screening) {
+      investmentInput.screening_status = 'passed';
+      investmentInput.screening_list_version =
+        screening.versions['ofac'] ?? null;
+      investmentInput.screening_result = {
+        complete: screening.complete,
+        cleared: true,
+        matches: [],
+        versions: screening.versions,
+        screened_at: new Date().toISOString(),
+      };
+    }
 
     const investment = await this.investmentRepo.create(investmentInput);
 
@@ -115,6 +158,74 @@ export class InvestmentService {
     }
 
     return investment;
+  }
+
+  /**
+   * Run sanctions screening for the investor and any known beneficial owners.
+   * Returns null when no screening service is configured (opt-in).
+   */
+  private async screenInvestment(
+    input: CreateInvestmentRequest,
+  ): Promise<SanctionsScreenResult | null> {
+    if (!this.screeningService) return null;
+
+    const name = await this.resolveInvestorName(input.investor_id);
+    const identityNames = [name, ...(input.beneficial_owners ?? [])]
+      .filter((n) => typeof n === 'string' && n.trim().length > 0);
+
+    return this.screeningService.screen(identityNames);
+  }
+
+  /** Resolve the investor's display name via the user repository (if available). */
+  private async resolveInvestorName(investorId: string): Promise<string> {
+    if (this.userRepo) {
+      const user = await this.userRepo.findById(investorId);
+      if (user?.name) return user.name;
+    }
+    return investorId;
+  }
+
+  /**
+   * Persist an audit-log entry describing a blocked (or fail-closed) submission
+   * with the reason and a reviewer queue link for the OFAC dual-control queue.
+   */
+  private async recordScreenBlocked(
+    input: CreateInvestmentRequest,
+    screening: SanctionsScreenResult,
+    blocked: boolean,
+  ): Promise<void> {
+    if (!this.auditLogRepo) return;
+    const reason = blocked
+      ? 'sanctions_hit'
+      : 'sanctions_list_unavailable';
+    const reviewerLink = sanitizeReviewLink(OFAC_REVIEWS_ROUTE);
+    const details: Record<string, unknown> = {
+      investor_id: input.investor_id,
+      offering_id: input.offering_id,
+      amount: input.amount,
+      asset: input.asset,
+      screening_status: blocked ? 'blocked' : 'error',
+      versions: screening.versions,
+      matches: screening.matches,
+      reviewer_queue_link: reviewerLink,
+      blocked,
+    };
+    await this.auditLogRepo.createAuditLog({
+      user_id: input.investor_id,
+      action: 'investment_sanctions_screening_blocked',
+      resource: `investment_offering/${input.offering_id}`,
+      details: JSON.stringify(details),
+      ip_address: null,
+      user_agent: 'investment-service',
+    });
+  }
+
+  private screeningDetails(screening: SanctionsScreenResult): Record<string, unknown> {
+    return {
+      cleared: screening.cleared,
+      matches: screening.matches,
+      versions: screening.versions,
+    };
   }
 
   /**
@@ -179,11 +290,18 @@ export class InvestmentService {
 /**
  * Factory function to create InvestmentService with dependencies
  */
-export function createInvestmentService(db: Pool, amlService?: AMLService): InvestmentService {
+export function createInvestmentService(
+  db: Pool,
+  amlService?: AMLService,
+  screeningService?: SanctionsScreeningService,
+  auditLogRepo?: AuditLogRepository,
+): InvestmentService {
   return new InvestmentService(
     new InvestmentRepository(db),
     new OfferingRepository(db),
     amlService,
     new UserRepository(db),
+    screeningService,
+    auditLogRepo,
   );
 }
