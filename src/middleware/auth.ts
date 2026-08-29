@@ -278,7 +278,15 @@ export function requireAdmin(req: Request, _res: Response, next: NextFunction): 
       next(Errors.forbidden('Forbidden: admin role required'));
       return;
     }
-    (req as AuthenticatedRequest).user = { id: payload.sub, role: 'admin' };
+    // Attribute admin actions (e.g. signed audit-log CSV export) to a concrete
+    // principal. `sub` is populated alongside `id` for parity with the other
+    // auth middlewares so downstream audit logging can record the acting admin.
+    (req as AuthenticatedRequest).user = {
+      sub: payload.sub,
+      id: payload.sub,
+      role: 'admin',
+      ...(payload.sid ? { sessionToken: payload.sid } : {}),
+    };
     next();
   } catch (error) {
     globalLogger.warn('Auth failed: Admin token verification failed', {
