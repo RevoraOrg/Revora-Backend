@@ -33,7 +33,7 @@ const I128_MIN = -170141183460469231731687303715884105728n; // -2^127
  * and interoperability with Soroban's i128 type.
  */
 export class Decimal {
-  private readonly _value: BigInt; // Scaled integer value
+  private readonly _value: bigint; // Scaled integer value
   private readonly _scale: number; // Number of decimal places
 
   /**
@@ -46,8 +46,8 @@ export class Decimal {
     if (!DECIMAL_REGEX.test(decimalString)) {
       throw new AppError(
         ErrorCode.VALIDATION_ERROR,
-        `Invalid decimal string format: "${decimalString}". Must be a numeric string with up to 18 decimal places.`,
         400,
+        `Invalid decimal string format: "${decimalString}". Must be a numeric string with up to 18 decimal places.`,
         { field: 'amount', value: decimalString }
       );
     }
@@ -95,16 +95,16 @@ export class Decimal {
    * @returns The scaled BigInt.
    * @throws {AppError} if the value exceeds Soroban i128 limits after scaling.
    */
-  toSorobanI128(targetScale: number, roundingMode: 'round' | 'floor' | 'ceil' | 'truncate' = 'round'): BigInt {
+  toSorobanI128(targetScale: number, roundingMode: 'round' | 'floor' | 'ceil' | 'truncate' = 'round'): bigint {
     if (targetScale < 0 || targetScale > 18) { // Common max scale for Stellar is 7, but 18 is max for input.
       throw new AppError(
         ErrorCode.INTERNAL_ERROR,
-        `Invalid target scale for Soroban i128 conversion: ${targetScale}. Must be between 0 and 18.`,
-        500
+        500,
+        `Invalid target scale for Soroban i128 conversion: ${targetScale}. Must be between 0 and 18.`
       );
     }
 
-    let scaledValue: BigInt;
+    let scaledValue: bigint;
     if (this._scale === targetScale) {
       scaledValue = this._value;
     } else if (this._scale < targetScale) {
@@ -159,7 +159,7 @@ export class Decimal {
    * @returns A Decimal instance.
    * @throws {AppError} if the scale is invalid.
    */
-  static fromScaledBigInt(scaledValue: BigInt, scale: number): Decimal {
+  static fromScaledBigInt(scaledValue: bigint, scale: number): Decimal {
     if (scale < 0 || scale > 18) {
       throw Errors.internal(`Invalid scale for Decimal.fromScaledBigInt: ${scale}. Must be between 0 and 18.`);
     }
@@ -239,7 +239,7 @@ export class Decimal {
    */
   divide(other: Decimal): Decimal {
     if (other._value === 0n) {
-      throw new AppError(ErrorCode.BAD_REQUEST, 'Division by zero', 400);
+      throw new AppError(ErrorCode.BAD_REQUEST, 400, 'Division by zero');
     }
 
     // To maintain precision, scale up the numerator before division.
