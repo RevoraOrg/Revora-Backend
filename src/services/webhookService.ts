@@ -126,8 +126,25 @@ export class WebhookService {
 
   /**
    * Emits a webhook event to all subscribed endpoints (fire-and-forget).
+   *
+   * Exact-once variant: when `client` (a transactional PoolClient from inside
+   * `withTransaction`) is supplied, the event is written to the transactional
+   * outbox instead of being dispatched directly. The outbox row commits or
+   * rolls back atomically with the producing transaction and the stable
+   * `event_id` is returned so the caller can correlate later deliveries.
+   *
+   * @param event  Webhook event type.
+   * @param data   Event payload.
+   * @param client Optional transactional client. When provided, requires
+   *               `outboxRepo` to be configured; otherwise this throws so an
+   *               event is never silently emitted outside the transaction.
+   * @returns      The stable event_id when emitted through the outbox, else void.
    */
-  async emit<T>(event: WebhookEventType, data: T): Promise<void> {
+  async emit<T>(event: WebhookEventType, data: T, client?: PoolClient): Promise<string | void> {
+    if (client) {
+      return this.emitToOutbox(client, event, data);
+    }
+
     let endpoints: WebhookEndpointRecord[];
     try {
       endpoints = await this.endpointRepo.listActiveByEvent(event);

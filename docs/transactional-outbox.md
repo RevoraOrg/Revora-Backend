@@ -57,6 +57,21 @@ const eventId = await webhookService.emitToOutbox(client, event, data);
 
 Writes an outbox row inside the caller's transaction. Returns the stable `event_id`. Requires `outboxRepo` to be passed in `WebhookServiceOptions`.
 
+`WebhookService.emit()` is also transactional-capable: pass the producing transaction's `PoolClient` as the third argument and the event is written to the outbox atomically instead of being fire-and-forgotten:
+
+```typescript
+await withTransaction(pool, async (client) => {
+  await client.query('UPDATE payouts SET status = $1', ['completed']);
+  await webhookService.emit(
+    WebhookEventType.PAYOUT_COMPLETED,
+    { payout_id: 'p-1' },
+    client, // ← atomic capture inside the producing transaction
+  );
+});
+```
+
+`emit(event, data, client)` throws when `client` is given but the service has no `outboxRepo` (fail-closed), so an event is never silently emitted outside the transaction. The legacy two-argument `emit(event, data)` keeps its fire-and-forget behaviour for backward compatibility.
+
 **Usage inside a producing transaction:**
 
 ```typescript
@@ -69,6 +84,12 @@ await withTransaction(pool, async (client) => {
 });
 // Both the payout row and the outbox row commit or roll back together.
 ```
+
+For producers that emit several events, `transaction.ts` exposes
+`enqueueWebhookOutboxEvents(client, outboxRepo, events)` which inserts a batch
+of outbox rows through the same transactional client and returns their
+`event_id`s. If the surrounding transaction rolls back, all of those rows are
+discarded with it.
 
 ### `OutboxDispatcher` (`src/services/outboxDispatcher.ts`)
 
@@ -88,6 +109,27 @@ dispatcher.start();
 1. Looks up active endpoints subscribed to the event type.
 2. Constructs the webhook payload with `id: row.event_id` (stable across retries).
 3. Calls `processDelivery` for each endpoint.
+
+### `WebhookQueue` idempotency-key propagation (`src/index.ts`)
+
+`WebhookQueue` is the durable delivery layer the outbox hands rows to. When the
+payload passed to `processDelivery` carries an `id` — the outbox `event_id` —
+that id is forwarded verbatim as the delivered payload `id`. This guarantees
+the receiver's `webhookEventOrdering` middleware sees the **same** `event_id`
+on every retry of the same outbox row, even when a crash forces the dispatcher
+to start a fresh delivery row. Payloads without an `id` (legacy producers) fall
+back to the delivery row id, preserving prior behaviour.
+
+### Running the dispatcher
+
+The drain worker runs out of process from the producer. In production it is
+started with `WebhookQueue` by setting `OUTBOX_DISPATCHER_ENABLED=true` (roles
+`api` and `all`). Rows are claimed with `SELECT … FOR UPDATE SKIP LOCKED`, so
+multiple worker instances never process the same row twice.
+
+```bash
+OUTBOX_DISPATCHER_ENABLED=true npm start
+```
 
 ## Idempotency on the Receiver
 

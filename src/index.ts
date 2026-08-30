@@ -31,6 +31,8 @@ import {
   WebhookPayload,
   WebhookEventType,
 } from "./services/webhookService";
+import { OutboxRepository } from "./db/repositories/outboxRepository";
+import { OutboxDispatcher, makeWebhookDispatchFn } from "./services/outboxDispatcher";
 import { pool } from "./db/pool";
 import { globalMetrics } from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
@@ -941,8 +943,11 @@ export class WebhookQueue {
   ): Promise<boolean> {
     const currentAttempt = delivery.attempts + 1;
 
+    // Propagate the transactional outbox event_id when present (idempotency key
+    // the receiver's webhookEventOrdering relies on to deduplicate retries), and
+    // fall back to the delivery row id for legacy callers.
     const webhookPayload: WebhookPayload = {
-      id: delivery.id,
+      id: (payload?.id as string) || delivery.id,
       event: (payload as any).event || WebhookEventType.OFFERING_UPDATED,
       payload: (payload as any).payload || payload,
       timestamp: new Date().toISOString(),
@@ -1097,10 +1102,30 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   if (roleConfig.webhookQueue) {
     const repo = new WebhookEndpointRepository(pool);
-    const service = new WebhookService(repo);
+    const service = new WebhookService(repo, {
+      outboxRepo: env.OUTBOX_DISPATCHER_ENABLED ? new OutboxRepository(pool) : undefined,
+    });
     WebhookQueue.init(repo, service);
     void WebhookQueue.resumePending();
     console.log("[server] WebhookQueue started");
+
+    // Drain the transactional outbox in a separate polling worker. Every
+    // outbox row was written atomically with the transaction that produced
+    // the event; retries reuse the same event_id so receivers can deduplicate
+    // via webhookEventOrdering (exactly-once).
+    if (env.OUTBOX_DISPATCHER_ENABLED) {
+      const outboxRepo = new OutboxRepository(pool);
+      const dispatcher = new OutboxDispatcher(
+        outboxRepo,
+        makeWebhookDispatchFn(
+          WebhookQueue.processDelivery.bind(WebhookQueue),
+          (event) => repo.listActiveByEvent(event),
+        ),
+      );
+      dispatcher.start();
+      backgroundStopFns.push(() => dispatcher.stop());
+      console.log("[server] OutboxDispatcher started");
+    }
   }
 
   for (const stopFn of backgroundStopFns) {
