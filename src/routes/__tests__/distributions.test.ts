@@ -4,6 +4,7 @@ import createDistributionsRouter, { OfferingRepo } from '../distributions';
 import { errorHandler } from '../../middleware/errorHandler';
 import { DistributionStateManager } from '../../services/distributionScheduler';
 import { InMemorySecurityAuditRepository } from '../../security/audit';
+import { Errors } from '../../lib/errors';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -299,5 +300,249 @@ describe('POST /api/v1/distributions/:id/resume', () => {
     expect(resumeEvent!.userId).toBe('user-1');
     expect(resumeEvent!.details).toMatchObject({ distributionId: 'dist-1' });
     expect(resumeEvent!.outcome).toBe('SUCCESS');
+  });
+});
+
+// --- Deferred distribution scheduling endpoints ------------------------------
+
+describe('Deferred distribution scheduling endpoints', () => {
+  function createScheduleApp(
+    userOverrides?: Record<string, string>,
+    repoOverrides: Record<string, unknown> = {},
+    offeringRepoOverride?: OfferingRepo,
+  ) {
+    const app = express();
+    app.use(express.json());
+
+    const verifyJWT: express.RequestHandler = (req, _res, next) => {
+      (req as any).user = { id: 'user-1', role: 'admin', ...userOverrides };
+      next();
+    };
+
+    const scheduledDistributionRepo = {
+      create: jest.fn().mockResolvedValue({
+        id: 'sched-1',
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        total_amount: '1000.00',
+        run_at: new Date('2026-08-01T00:00:00Z'),
+        status: 'scheduled',
+        created_by: 'user-1',
+      }),
+      findByOffering: jest.fn().mockResolvedValue([
+        {
+          id: 'sched-1',
+          offering_id: 'off-1',
+          period_id: 'period-1',
+          total_amount: '1000.00',
+          run_at: new Date('2026-08-01T00:00:00Z'),
+          status: 'scheduled',
+          attempts: 0,
+          error_message: null,
+          executed_at: null,
+          created_by: 'user-1',
+        },
+      ]),
+      findAll: jest.fn().mockResolvedValue([]),
+      markCancelled: jest.fn().mockResolvedValue({
+        id: 'sched-1',
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        status: 'cancelled',
+      }),
+      ...repoOverrides,
+    };
+
+    const router = createDistributionsRouter({
+      distributionEngine: { distribute: jest.fn(), previewRun: jest.fn() },
+      offeringRepo: offeringRepoOverride ?? makeOfferingRepo(),
+      verifyJWT,
+      scheduledDistributionRepo: scheduledDistributionRepo as any,
+    });
+
+    app.use('/api/v1', router);
+    app.use(errorHandler);
+    return { app, scheduledDistributionRepo };
+  }
+
+  it('enqueues a deferred distribution run', async () => {
+    const { app, scheduledDistributionRepo } = createScheduleApp();
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: 1000,
+        period_start: '2026-06-01T00:00:00Z',
+        period_end: '2026-07-01T00:00:00Z',
+      })
+      .expect(201);
+
+    expect(res.body.id).toBe('sched-1');
+    expect(res.body.status).toBe('scheduled');
+    expect(scheduledDistributionRepo.create).toHaveBeenCalledWith({
+      offering_id: 'off-1',
+      period_id: 'period-1',
+      period_start: new Date('2026-06-01T00:00:00Z'),
+      period_end: new Date('2026-07-01T00:00:00Z'),
+      total_amount: 1000,
+      run_at: new Date('2026-08-01T00:00:00Z'),
+      created_by: 'user-1',
+    });
+  });
+
+  it('rejects a duplicate enqueue with 409 conflict', async () => {
+    const { app } = createScheduleApp({}, {
+      create: jest.fn().mockRejectedValue(
+        Errors.conflict('A scheduled distribution for this offering and period already exists'),
+      ),
+    });
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: 1000,
+      })
+      .expect(409);
+
+    expect(res.body.code).toBe('CONFLICT');
+  });
+
+  it('rejects schedule requests from non-admin users', async () => {
+    const { app } = createScheduleApp({ role: 'startup' });
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: 1000,
+      })
+      .expect(403);
+
+    expect(res.body.code).toBe('FORBIDDEN');
+  });
+
+  it('rejects missing run_at', async () => {
+    const { app } = createScheduleApp();
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({ offering_id: 'off-1', period_id: 'period-1', total_amount: 1000 })
+      .expect(400);
+
+    expect(res.body.code).toBe('BAD_REQUEST');
+  });
+
+  it('rejects a non-positive total_amount', async () => {
+    const { app } = createScheduleApp();
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: -5,
+      })
+      .expect(400);
+
+    expect(res.body.code).toBe('BAD_REQUEST');
+  });
+
+  it('rejects an end date that is not after the start date', async () => {
+    const { app } = createScheduleApp();
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: 1000,
+        period_start: '2026-07-01T00:00:00Z',
+        period_end: '2026-06-01T00:00:00Z',
+      })
+      .expect(400);
+
+    expect(res.body.code).toBe('BAD_REQUEST');
+  });
+
+  it('returns 404 when the offering does not exist', async () => {
+    const { app } = createScheduleApp(
+      {},
+      {},
+      { getById: jest.fn().mockResolvedValue(null) },
+    );
+
+    const res = await request(app)
+      .post('/api/v1/distributions/schedule')
+      .send({
+        offering_id: 'missing',
+        period_id: 'period-1',
+        run_at: '2026-08-01T00:00:00Z',
+        total_amount: 1000,
+      })
+      .expect(404);
+
+    expect(res.body.code).toBe('NOT_FOUND');
+  });
+
+  it('lists scheduled distributions with an offering filter', async () => {
+    const { app, scheduledDistributionRepo } = createScheduleApp();
+
+    const res = await request(app)
+      .get('/api/v1/distributions/schedule?offering_id=off-1')
+      .expect(200);
+
+    expect(res.body.scheduled_distributions).toHaveLength(1);
+    expect(scheduledDistributionRepo.findByOffering).toHaveBeenCalledWith('off-1');
+  });
+
+  it('lists scheduled distributions without a filter', async () => {
+    const { app, scheduledDistributionRepo } = createScheduleApp();
+
+    await request(app).get('/api/v1/distributions/schedule').expect(200);
+
+    expect(scheduledDistributionRepo.findAll).toHaveBeenCalled();
+  });
+
+  it('forbids non-admins from listing scheduled distributions', async () => {
+    const { app } = createScheduleApp({ role: 'startup' });
+
+    const res = await request(app)
+      .get('/api/v1/distributions/schedule')
+      .expect(403);
+
+    expect(res.body.code).toBe('FORBIDDEN');
+  });
+
+  it('cancels a pending scheduled distribution', async () => {
+    const { app, scheduledDistributionRepo } = createScheduleApp();
+
+    const res = await request(app)
+      .delete('/api/v1/distributions/schedule/sched-1')
+      .expect(200);
+
+    expect(res.body.status).toBe('cancelled');
+    expect(scheduledDistributionRepo.markCancelled).toHaveBeenCalledWith('sched-1');
+  });
+
+  it('returns 404 when cancelling a run that cannot be cancelled', async () => {
+    const { app } = createScheduleApp({}, {
+      markCancelled: jest.fn().mockResolvedValue(null),
+    });
+
+    const res = await request(app)
+      .delete('/api/v1/distributions/schedule/sched-1')
+      .expect(404);
+
+    expect(res.body.code).toBe('NOT_FOUND');
   });
 });
