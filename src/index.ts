@@ -40,6 +40,7 @@ import { EmailDeliverabilityRepository } from "./db/repositories/emailDeliverabi
 import { createEmailWebhooksRouter } from "./routes/emailWebhooks";
 import { createAdminRouter } from "./routes/admin";
 import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
+import { createAdminWebhookRouter } from "./routes/adminWebhooks";
 import { AccountingLedgerService } from "./services/accountingLedgerService";
 import { DistributionRepository } from "./db/repositories/distributionRepository";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
@@ -703,6 +704,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount admin router
   apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
+
+  // Mount admin webhook dead-letter routes
+  const webhookEndpointRepo = new WebhookEndpointRepository(pool);
+  apiRouter.use("/admin/webhooks", createAdminWebhookRouter({ webhookEndpointRepo }));
 
   // Mount admin ledger double-entry export (RBAC + audited)
   apiRouter.use(
