@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { timingSafeEqual } from "crypto";
 import express, {
   NextFunction,
   Request,
@@ -55,6 +56,8 @@ import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
+import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
+import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
@@ -117,6 +120,50 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
+}
+
+/**
+ * Bearer-token guard for the reconciliation metrics endpoint.
+ *
+ * Security assumptions:
+ *  - In production a `METRICS_TOKEN` MUST be set; otherwise the endpoint is
+ *    down (503) rather than exposed unauthenticated.
+ *  - Token comparison uses a constant-time compare to avoid timing oracles.
+ *  - In `development`/`test` the guard is bypassed for operator convenience,
+ *    mirroring the existing Prometheus `/metrics` endpoint behaviour.
+ */
+function createMetricsAuthMiddleware(): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const metricsToken = process.env.METRICS_TOKEN;
+    const nodeEnv = process.env.NODE_ENV;
+
+    if (nodeEnv === "development" || nodeEnv === "test") {
+      next();
+      return;
+    }
+    if (!metricsToken) {
+      res.status(503).json({
+        error: "Metrics endpoint not configured",
+        message: "METRICS_TOKEN environment variable must be set",
+      });
+      return;
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized", message: "Bearer token required" });
+      return;
+    }
+    const token = authHeader.substring(7);
+    const matches =
+      token.length === metricsToken.length &&
+      timingSafeEqual(Buffer.from(token), Buffer.from(metricsToken));
+    if (!matches) {
+      res.status(401).json({ error: "Unauthorized", message: "Invalid token" });
+      return;
+    }
+    next();
+  };
 }
 
 interface OfferingValidationPayload {
@@ -739,6 +786,14 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Mount taxation routes for per-lot cost-basis tax reporting
   app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
 
+  // Expose reconciliation alarms and discrepancy metrics (OpenMetrics subset).
+  // Guards alarms via bearer token in production; bypassed in dev/test.
+  app.get(
+    "/metrics/reconciliation",
+    createMetricsAuthMiddleware(),
+    createReconciliationMetricsHandler(globalMetrics),
+  );
+
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);
@@ -1091,6 +1146,17 @@ if (require.main === module && env.NODE_ENV !== "test") {
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
     console.log("[server] PayoutDriftDetector started");
+  }
+
+  if (roleConfig.reconciliation) {
+    const reconciliationScheduler = createReconciliationSchedulerRuntime({
+      db: pool,
+      metrics: globalMetrics,
+      logger: undefined,
+    });
+    reconciliationScheduler.start();
+    backgroundStopFns.push(() => reconciliationScheduler.stop());
+    console.log("[server] ReconciliationScheduler started");
   }
 
   // --- Hot-path services (only for "api" and "all" roles) ---
