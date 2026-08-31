@@ -165,15 +165,18 @@ export const STELLAR_MAINTENANCE_WINDOWS = [
  */
 function normalizeTimezone(tz: string): string {
   const aliases: Record<string, string> = {
-    EST: "America/New_York",
-    EDT: "America/New_York",
-    CST: "America/Chicago",
-    CDT: "America/Chicago",
-    MST: "America/Denver",
-    MDT: "America/Denver",
-    PST: "America/Los_Angeles",
-    PDT: "America/Los_Angeles",
-    GMT: "UTC",
+    EST: 'America/New_York',
+    EDT: 'America/New_York',
+    CST: 'America/Chicago',
+    CDT: 'America/Chicago',
+    MST: 'America/Denver',
+    MDT: 'America/Denver',
+    PST: 'America/Los_Angeles',
+    PDT: 'America/Los_Angeles',
+    GMT: 'UTC',
+    'Etc/UTC': 'UTC',
+    'Etc/GMT': 'UTC',
+    Z: 'UTC',
   };
   return aliases[tz.trim()] ?? tz.trim();
 }
@@ -682,6 +685,14 @@ export class DistributionScheduler {
   }
 
   /**
+   * Evaluates whether `cron` matches `date` in the given IANA timezone.
+   * Malformed expressions (or a step of zero) evaluate to `false`, never throw.
+   */
+  evaluateCron(cron: string, date: Date, tz: string): boolean {
+    return evaluateCronAt(cron, date, tz);
+  }
+
+  /**
    * Scans for pending distributions and processes them.
    * @returns A summary of the processing run.
    */
@@ -746,8 +757,8 @@ export class DistributionScheduler {
           timezone,
         );
 
-        if (this.isWindowAlreadyCompleted(window)) {
-          this.logger.info("Skipping already-completed timezone window", {
+        if (this.isWindowAlreadyCompleted(window, claim.offering_id)) {
+          this.logger.info('Skipping already-completed timezone window', {
             reportId: claim.id,
             offeringId: claim.offering_id,
             windowKey: deduplicateWindowKey(window),
@@ -799,7 +810,7 @@ export class DistributionScheduler {
         );
 
         await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
-        this.markWindowCompleted(window);
+        this.markWindowCompleted(window, claim.offering_id);
 
         summary.successful++;
         this.logger.info("Automated distribution successful", {
@@ -973,12 +984,26 @@ export class DistributionScheduler {
 
   // ── Window de-duplication ──────────────────────────────────────────────────
 
-  private isWindowAlreadyCompleted(window: TimezoneWindow): boolean {
-    return this.completedWindows.has(deduplicateWindowKey(window));
+  /**
+   * De-duplication is scoped per offering: two different offerings may
+   * legitimately share the same window dates (e.g. after holiday shifts) and
+   * must both be distributed. When `offeringId` is omitted (legacy callers)
+   * the raw window key is used.
+   */
+  private isWindowAlreadyCompleted(window: TimezoneWindow, offeringId?: string): boolean {
+    const key =
+      offeringId !== undefined
+        ? `${offeringId}:${deduplicateWindowKey(window)}`
+        : deduplicateWindowKey(window);
+    return this.completedWindows.has(key);
   }
 
-  private markWindowCompleted(window: TimezoneWindow): void {
-    this.completedWindows.add(deduplicateWindowKey(window));
+  private markWindowCompleted(window: TimezoneWindow, offeringId?: string): void {
+    const key =
+      offeringId !== undefined
+        ? `${offeringId}:${deduplicateWindowKey(window)}`
+        : deduplicateWindowKey(window);
+    this.completedWindows.add(key);
   }
 
   // ── Timezone resolution ────────────────────────────────────────────────────

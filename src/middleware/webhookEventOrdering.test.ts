@@ -203,28 +203,33 @@ describe('EventOrderingTracker', () => {
 
   describe('cleanupStaleEvents', () => {
     it('should remove events older than maxWaitTimeMs', () => {
-      const shortWaitTracker = new EventOrderingTracker({
-        maxWaitTimeMs: 100,
-        logger: mockLogger,
-      });
+      jest.useFakeTimers();
+      try {
+        const shortWaitTracker = new EventOrderingTracker({
+          maxWaitTimeMs: 100,
+          logger: mockLogger,
+        });
 
-      shortWaitTracker.markProcessed('entity-1', 0);
-      
-      // Buffer an event
-      const oldTimestamp = new Date(Date.now() - 200);
-      shortWaitTracker.shouldProcessEvent('entity-1', 'event-old', 2, oldTimestamp);
-      
-      // Clean up
-      const cleaned = shortWaitTracker.cleanupStaleEvents();
+        shortWaitTracker.markProcessed('entity-1', 0);
 
-      expect(cleaned).toBe(1);
-      expect(mockLogger.warn).toHaveBeenCalledWith(
-        'Removing stale buffered event',
-        expect.objectContaining({
-          entityId: 'entity-1',
-          eventId: 'event-old',
-        })
-      );
+        // Buffer a fresh event, then age it past maxWaitTimeMs
+        shortWaitTracker.shouldProcessEvent('entity-1', 'event-old', 2, new Date());
+        jest.advanceTimersByTime(200);
+
+        // Clean up
+        const cleaned = shortWaitTracker.cleanupStaleEvents();
+
+        expect(cleaned).toBe(1);
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          'Removing stale buffered event',
+          expect.objectContaining({
+            entityId: 'entity-1',
+            eventId: 'event-old',
+          })
+        );
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('should not remove recent events', () => {
@@ -240,23 +245,28 @@ describe('EventOrderingTracker', () => {
     });
 
     it('should handle multiple entities', () => {
-      const shortWaitTracker = new EventOrderingTracker({
-        maxWaitTimeMs: 100,
-        logger: mockLogger,
-      });
+      jest.useFakeTimers();
+      try {
+        const shortWaitTracker = new EventOrderingTracker({
+          maxWaitTimeMs: 100,
+          logger: mockLogger,
+        });
 
-      shortWaitTracker.markProcessed('entity-1', 0);
-      shortWaitTracker.markProcessed('entity-2', 0);
-      
-      // Buffer old events for both
-      const oldTimestamp = new Date(Date.now() - 200);
-      shortWaitTracker.shouldProcessEvent('entity-1', 'event-1-old', 2, oldTimestamp);
-      shortWaitTracker.shouldProcessEvent('entity-2', 'event-2-old', 2, oldTimestamp);
-      
-      // Clean up
-      const cleaned = shortWaitTracker.cleanupStaleEvents();
+        shortWaitTracker.markProcessed('entity-1', 0);
+        shortWaitTracker.markProcessed('entity-2', 0);
 
-      expect(cleaned).toBe(2);
+        // Buffer fresh events for both, then age them past maxWaitTimeMs
+        shortWaitTracker.shouldProcessEvent('entity-1', 'event-1-old', 2, new Date());
+        shortWaitTracker.shouldProcessEvent('entity-2', 'event-2-old', 2, new Date());
+        jest.advanceTimersByTime(200);
+
+        // Clean up
+        const cleaned = shortWaitTracker.cleanupStaleEvents();
+
+        expect(cleaned).toBe(2);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 

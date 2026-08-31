@@ -99,10 +99,6 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  OFAC_LIST_URL: z.string().url().optional(),
-  OFAC_SIG_URL: z.string().url().optional(),
-  OFAC_TRUST_ANCHOR_BASE64: z.string().optional(),
-  OFAC_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(30000),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

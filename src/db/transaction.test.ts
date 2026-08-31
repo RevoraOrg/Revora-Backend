@@ -182,7 +182,7 @@ describe('Repository Transaction Boundaries', () => {
         .mockRejectedValueOnce(new Error('Query failed'))
         .mockRejectedValueOnce(new Error('Rollback failed')); // ROLLBACK fails
 
-      const stderrSpy = jest.spyOn(process.stderr, 'write').mockImplementation();
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       try {
         await withTransaction(mockPool, async (client) => {
@@ -193,11 +193,12 @@ describe('Repository Transaction Boundaries', () => {
         expect(error).toBeInstanceOf(TransactionError);
         expect((error as TransactionError).rollbackSucceeded).toBe(false);
         expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining('Rollback failed')
+          expect.stringContaining('Rollback failed'),
+          expect.anything(),
         );
       }
 
-      stderrSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
     });
   });
 
