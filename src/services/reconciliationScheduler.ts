@@ -64,6 +64,8 @@ export interface ReconciliationRunSummary {
   isBalanced: boolean;
   discrepancyCount: number;
   discrepancyAmount: string;
+  /** Timestamp when the current drift condition was first observed; null when balanced. */
+  driftFirstDetectedAt?: Date | null;
 }
 
 /** Storage interface for run summaries (keyed by offeringId + periodId + startedAt). */
@@ -86,6 +88,11 @@ export interface ReconciliationSchedulerOptions {
    * Default: 50.
    */
   cardinalityLimit?: number;
+  /**
+   * Age threshold after which unresolved (non-zero) drift escalates to a pager
+   * alarm. Default: 24 hours (as required by the reconciliation runbook).
+   */
+  pagerThresholdMs?: number;
   logger?: Logger;
 }
 
@@ -95,6 +102,7 @@ export interface SchedulerRunResult {
   failed: number;
   alarmRaised: number;
   alarmCleared: number;
+  pagerRaised: number;
   errors: Array<{ offeringId: string; error: string }>;
 }
 
@@ -107,6 +115,7 @@ const METRIC_ALARM_OPEN = 'reconciliation_alarm_open';
 const METRIC_DRIFT_AMOUNT = 'reconciliation_drift_amount';
 const METRIC_LAST_RUN_TIMESTAMP = 'reconciliation_last_run_timestamp';
 const METRIC_ERRORS_TOTAL = 'reconciliation_errors_total';
+const METRIC_PAGER_ALARM = 'reconciliation_pager_alarm';
 
 // ─── ReconciliationScheduler ──────────────────────────────────────────────────
 
@@ -114,6 +123,7 @@ export class ReconciliationScheduler {
   private readonly lookbackMs: number;
   private readonly tolerance: number;
   private readonly cardinalityLimit: number;
+  private readonly pagerThresholdMs: number;
   private readonly logger: Logger;
 
   constructor(
@@ -126,6 +136,7 @@ export class ReconciliationScheduler {
     this.lookbackMs = options.lookbackMs ?? 30 * 24 * 60 * 60 * 1000;
     this.tolerance = options.tolerance ?? 0.01;
     this.cardinalityLimit = options.cardinalityLimit ?? 50;
+    this.pagerThresholdMs = options.pagerThresholdMs ?? 24 * 60 * 60 * 1000;
     this.logger = options.logger ?? globalLogger;
   }
 
@@ -154,6 +165,7 @@ export class ReconciliationScheduler {
       failed: 0,
       alarmRaised: 0,
       alarmCleared: 0,
+      pagerRaised: 0,
       errors: [],
     };
 
@@ -167,7 +179,8 @@ export class ReconciliationScheduler {
           : 'overflow';
 
       try {
-        const { periodStart, periodEnd } = await this.determinePeriod(offering.id);
+        const lastRun = await this.runStore.getLastRun(offering.id);
+        const { periodStart, periodEnd } = this.determinePeriod(lastRun);
         const startedAt = new Date();
 
         this.logger.info('ReconciliationScheduler: reconciling offering', {
@@ -185,6 +198,14 @@ export class ReconciliationScheduler {
 
         const completedAt = new Date();
 
+        // Carry forward the earliest detection timestamp so we can escalate to a
+        // pager alarm when non-zero drift persists beyond pagerThresholdMs (24h).
+        const driftFirstDetectedAt: Date | null = reconcileResult.isBalanced
+          ? null
+          : lastRun && !lastRun.isBalanced && lastRun.driftFirstDetectedAt
+            ? lastRun.driftFirstDetectedAt
+            : startedAt;
+
         // Persist run summary
         const summary: ReconciliationRunSummary = {
           offeringId: offering.id,
@@ -194,11 +215,12 @@ export class ReconciliationScheduler {
           isBalanced: reconcileResult.isBalanced,
           discrepancyCount: reconcileResult.discrepancies.length,
           discrepancyAmount: reconcileResult.summary.discrepancyAmount,
+          driftFirstDetectedAt,
         };
         await this.runStore.saveRun(summary);
 
         // Emit metrics
-        this.emitMetrics(metricLabel, reconcileResult, result);
+        this.emitMetrics(metricLabel, reconcileResult, result, driftFirstDetectedAt);
 
         result.successful++;
       } catch (err) {
@@ -243,10 +265,9 @@ export class ReconciliationScheduler {
    * timestamp (so no gaps between runs — "missed run resumes").
    * Otherwise the window starts `lookbackMs` ago.
    */
-  private async determinePeriod(
-    offeringId: string
-  ): Promise<{ periodStart: Date; periodEnd: Date }> {
-    const lastRun = await this.runStore.getLastRun(offeringId);
+  private determinePeriod(
+    lastRun: ReconciliationRunSummary | null
+  ): { periodStart: Date; periodEnd: Date } {
     const periodEnd = new Date();
     const periodStart = lastRun
       ? lastRun.completedAt
@@ -264,7 +285,8 @@ export class ReconciliationScheduler {
   private emitMetrics(
     label: string,
     reconcileResult: ReconciliationResult,
-    runResult: SchedulerRunResult
+    runResult: SchedulerRunResult,
+    driftFirstDetectedAt: Date | null = null
   ): void {
     const labels = { offering_id: label };
 
@@ -303,9 +325,25 @@ export class ReconciliationScheduler {
         'Dead-letter alarm: 1 when reconciliation found discrepancies or errored'
       );
       runResult.alarmRaised++;
+
+      // Escalate to a pager alarm when non-zero drift has persisted longer than
+      // the configured threshold (default 24h), per the reconciliation runbook.
+      const driftAgeMs = driftFirstDetectedAt
+        ? Date.now() - driftFirstDetectedAt.getTime()
+        : 0;
+      const pager = driftAgeMs >= this.pagerThresholdMs ? 1 : 0;
+      this.metrics.setGauge(
+        METRIC_PAGER_ALARM,
+        pager,
+        labels,
+        'Pager alarm: 1 when non-zero drift has persisted longer than pagerThresholdMs (default 24h)'
+      );
+      if (pager) runResult.pagerRaised++;
     } else {
       // Clear the alarm — a balanced run always silences any prior alarm.
       this.metrics.setGauge(METRIC_ALARM_OPEN, 0, labels);
+      // A balanced run also clears any pending pager escalation.
+      this.metrics.setGauge(METRIC_PAGER_ALARM, 0, labels);
       runResult.alarmCleared++;
     }
   }

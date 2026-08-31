@@ -77,4 +77,21 @@ describe('BalanceSnapshotRepository', () => {
       expect(results).toHaveLength(1);
     });
   });
+
+  describe('findByHolderAndPeriod', () => {
+    it('returns snapshots for a holder across offerings in a period, ordered ascending', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [mockSnapshot, mockSnapshot] });
+      const results = await repo.findByHolderAndPeriod('holder-abc', 'period-1');
+      expect(results).toHaveLength(2);
+      expect(mockQuery).toHaveBeenCalledWith(expect.any(String), ['holder-abc', 'period-1']);
+      const sql = mockQuery.mock.calls[0][0] as string;
+      expect(sql).toContain('ORDER BY snapshot_at ASC, created_at ASC, id ASC');
+    });
+
+    it('returns empty array when the holder has no snapshots in the period', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+      const results = await repo.findByHolderAndPeriod('holder-x', 'period-9');
+      expect(results).toHaveLength(0);
+    });
+  });
 });

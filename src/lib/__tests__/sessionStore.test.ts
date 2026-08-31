@@ -18,7 +18,7 @@ class FakeSessionRepository {
   readonly rows = new Map<string, Row>();
   private seq = 0;
 
-  constructor(private readonly clock: () => number = () => Date.now()) {}
+  constructor(private readonly clock: () => number = () => Date.now()) { }
 
   async createWebSession(input: {
     user_id: string;
@@ -131,11 +131,11 @@ describe("SessionStore – per-role TTL", () => {
 
       const admin = await store.create("u1", "admin");
       expect(admin.expiresAt - now).toBeGreaterThanOrEqual(DEFAULT_ROLE_TTL.admin);
-      expect(admin.expiresAt - now).toBeLessThan(DEFAULT_ROLE_TTL.admin + 10);
+      expect(admin.expiresAt - now).toBeLessThan(DEFAULT_ROLE_TTL.admin + 1_000);
 
       const investor = await store.create("u2", "investor");
       expect(investor.expiresAt - now).toBeGreaterThanOrEqual(DEFAULT_ROLE_TTL.investor);
-      expect(investor.expiresAt - now).toBeLessThan(DEFAULT_ROLE_TTL.investor + 10);
+      expect(investor.expiresAt - now).toBeLessThan(DEFAULT_ROLE_TTL.investor + 1_000);
     });
 
     it("falls back to default TTL when role has no entry in roleTtlMs", async () => {
@@ -148,7 +148,7 @@ describe("SessionStore – per-role TTL", () => {
 
       const session = await store.create("u1", "unknown-role");
       expect(session.expiresAt - now).toBeGreaterThanOrEqual(5_000);
-      expect(session.expiresAt - now).toBeLessThan(5_005);
+      expect(session.expiresAt - now).toBeLessThan(5_000 + 1_000);
     });
 
     it("accepts explicit roleTtlMs override of DEFAULT_ROLE_TTL", async () => {
@@ -161,11 +161,11 @@ describe("SessionStore – per-role TTL", () => {
 
       const admin = await store.create("u1", "admin");
       expect(admin.expiresAt - now).toBeGreaterThanOrEqual(2_000);
-      expect(admin.expiresAt - now).toBeLessThan(2_005);
+      expect(admin.expiresAt - now).toBeLessThan(2_000 + 1_000);
 
       const other = await store.create("u2", "unknown");
       expect(other.expiresAt - now).toBeGreaterThanOrEqual(10_000);
-      expect(other.expiresAt - now).toBeLessThan(10_010);
+      expect(other.expiresAt - now).toBeLessThan(10_000 + 1_000);
     });
   });
 

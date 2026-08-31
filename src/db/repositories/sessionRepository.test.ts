@@ -23,7 +23,7 @@
  *    column keys (id vs user_id) to prevent cross-user deletion.
  */
 
-import { Pool, QueryResult } from 'pg';
+import { Pool, QueryResult, QueryResultRow } from 'pg';
 import { SessionRepository, Session, CreateSessionInput } from './sessionRepository';
 
 // ─── Shared fixture ───────────────────────────────────────────────────────────
@@ -38,7 +38,7 @@ const BASE_SESSION: Session = {
   revoked_at: undefined,
 };
 
-function makeQueryResult<T>(rows: T[]): QueryResult<T> {
+function makeQueryResult<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
@@ -394,6 +394,184 @@ describe('SessionRepository', () => {
       mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
 
       await expect(repository.deleteAllSessionsByUserId('nobody')).resolves.toBeUndefined();
+    });
+  });
+
+  // ── setSessionConsumed & findByIdForUpdate ───────────────────────────────
+
+  describe('setSessionConsumed', () => {
+    it('updates token_consumed_at to NOW() for the session id', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+      await repository.setSessionConsumed('session-123');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE sessions SET token_consumed_at = NOW() WHERE id = $1'),
+        ['session-123'],
+      );
+    });
+  });
+
+  describe('findByIdForUpdate', () => {
+    it('executes SELECT FOR UPDATE query', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([BASE_SESSION]));
+      const result = await repository.findByIdForUpdate('session-123', mockPool as unknown as Pool);
+      expect(result).not.toBeNull();
+      expect(result!.id).toBe('session-123');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('FOR UPDATE'),
+        ['session-123'],
+      );
+    });
+
+    it('returns null when not found', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([]));
+      const result = await repository.findByIdForUpdate('ghost', mockPool as unknown as Pool);
+      expect(result).toBeNull();
+    });
+  });
+
+  // ── Web session repository methods ────────────────────────────────────────
+
+  describe('createWebSession', () => {
+    it('creates web session with generated id when id is omitted', async () => {
+      const row: Session = { ...BASE_SESSION, role: 'admin' };
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([row]));
+
+      const res = await repository.createWebSession({
+        user_id: 'u1',
+        role: 'admin',
+        token_hash: 'hash-abc',
+        expires_at: new Date('2099-01-01'),
+      });
+
+      expect(res.role).toBe('admin');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO sessions (id, user_id, role, token_hash, expires_at, created_at)'),
+        expect.arrayContaining(['u1', 'admin', 'hash-abc']),
+      );
+    });
+
+    it('creates web session with explicit id when provided', async () => {
+      const row: Session = { ...BASE_SESSION, id: 'explicit-web-id', role: 'investor' };
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([row]));
+
+      const res = await repository.createWebSession({
+        id: 'explicit-web-id',
+        user_id: 'u1',
+        role: 'investor',
+        token_hash: 'hash-abc',
+        expires_at: new Date('2099-01-01'),
+      });
+
+      expect(res.id).toBe('explicit-web-id');
+    });
+
+    it('throws when DB returns empty rows', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([]));
+      await expect(
+        repository.createWebSession({
+          user_id: 'u1',
+          role: 'admin',
+          token_hash: 'hash-abc',
+          expires_at: new Date('2099-01-01'),
+        }),
+      ).rejects.toThrow('Failed to create session');
+    });
+  });
+
+  describe('findByTokenHash', () => {
+    it('returns the session row matching token_hash', async () => {
+      const row: Session = { ...BASE_SESSION, role: 'admin' };
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([row]));
+
+      const res = await repository.findByTokenHash('hash-abc');
+      expect(res).not.toBeNull();
+      expect(res!.token_hash).toBe('abc123hash');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE token_hash = $1'),
+        ['hash-abc'],
+      );
+    });
+
+    it('returns null when no row matches token_hash', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([]));
+      const res = await repository.findByTokenHash('unknown-hash');
+      expect(res).toBeNull();
+    });
+  });
+
+  describe('deleteByTokenHash', () => {
+    it('executes DELETE query by token_hash', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+      await repository.deleteByTokenHash('hash-abc');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('DELETE FROM sessions WHERE token_hash = $1'),
+        ['hash-abc'],
+      );
+    });
+  });
+
+  describe('touchExpiryByTokenHash', () => {
+    it('updates expires_at for the token_hash', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
+      const newExpiry = new Date('2099-12-31');
+      await repository.touchExpiryByTokenHash('hash-abc', newExpiry);
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('UPDATE sessions SET expires_at = $1 WHERE token_hash = $2'),
+        [newExpiry, 'hash-abc'],
+      );
+    });
+  });
+
+  describe('deleteExpired', () => {
+    it('deletes expired sessions and returns count', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 5 } as any);
+      const count = await repository.deleteExpired();
+      expect(count).toBe(5);
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('DELETE FROM sessions WHERE expires_at <= NOW()'),
+      );
+    });
+  });
+
+  describe('countActive', () => {
+    it('returns active sessions count', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: 12 }], rowCount: 1 } as any);
+      const count = await repository.countActive();
+      expect(count).toBe(12);
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('WHERE expires_at > NOW() AND revoked_at IS NULL'),
+      );
+    });
+  });
+
+  describe('getOldestCompactedSessionDate, purgeOlderThan, vacuumSessions', () => {
+    it('getOldestCompactedSessionDate returns oldest date', async () => {
+      const oldestDate = new Date('2023-01-01');
+      mockPool.query.mockResolvedValueOnce({ rows: [{ oldest: oldestDate }], rowCount: 1 } as any);
+      const res = await repository.getOldestCompactedSessionDate(new Date('2024-01-01'));
+      expect(res).toEqual(oldestDate);
+    });
+
+    it('getOldestCompactedSessionDate returns null when no rows match', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
+      const res = await repository.getOldestCompactedSessionDate(new Date('2024-01-01'));
+      expect(res).toBeNull();
+    });
+
+    it('purgeOlderThan deletes batch and returns count', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 20 } as any);
+      const count = await repository.purgeOlderThan(new Date('2024-01-01'), 100);
+      expect(count).toBe(20);
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('DELETE FROM sessions'),
+        [new Date('2024-01-01'), 100],
+      );
+    });
+
+    it('vacuumSessions calls VACUUM sessions', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as any);
+      await repository.vacuumSessions();
+      expect(mockPool.query).toHaveBeenCalledWith('VACUUM sessions;');
     });
   });
 

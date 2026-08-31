@@ -69,6 +69,7 @@ const envSchema = z.object({
   JWT_CLOCK_TOLERANCE_SECONDS: z.coerce.number().int().nonnegative().optional(),
   STELLAR_NETWORK: z.enum(["testnet", "public"]).default("testnet"),
   STELLAR_HORIZON_URL: z.string().url().optional(),
+  STELLAR_HORIZON_URLS: z.string().optional(),
   STELLAR_NETWORK_PASSPHRASE: z.string().optional(),
   STELLAR_SERVER_SECRET: z.string().min(1).optional(),
   STELLAR_TIMEOUT: z.coerce.number().int().positive().max(300000).default(30000),
@@ -99,7 +100,6 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
@@ -133,7 +133,10 @@ const envSchema = z.object({
   return true;
 }, { message: "AUDIT_EXPORT_SIGNING_KEY is required in production to sign audit log exports", path: ["AUDIT_EXPORT_SIGNING_KEY"] });
 
-export type Config = z.infer<typeof envSchema> & { ALLOWED_ORIGINS_ARRAY: string[] };
+export type Config = z.infer<typeof envSchema> & { 
+  ALLOWED_ORIGINS_ARRAY: string[];
+  STELLAR_HORIZON_URLS_ARRAY: string[];
+};
 
 export function buildConfig(): Config {
   const result = envSchema.safeParse(process.env);
@@ -160,9 +163,26 @@ export function buildConfig(): Config {
       .filter((origin) => origin.length > 0);
   }
 
+  let horizonUrlsArray: string[] = [];
+  if (cfg.STELLAR_HORIZON_URLS) {
+    horizonUrlsArray = cfg.STELLAR_HORIZON_URLS
+      .split(",")
+      .map(url => url.trim())
+      .filter(url => url.length > 0);
+  } else if (cfg.STELLAR_HORIZON_URL) {
+    horizonUrlsArray = [cfg.STELLAR_HORIZON_URL];
+  } else {
+    horizonUrlsArray = [
+      cfg.STELLAR_NETWORK === 'public'
+        ? 'https://horizon.stellar.org'
+        : 'https://horizon-testnet.stellar.org',
+    ];
+  }
+
   return {
     ...cfg,
-    ALLOWED_ORIGINS_ARRAY: allowedOriginsArray
+    ALLOWED_ORIGINS_ARRAY: allowedOriginsArray,
+    STELLAR_HORIZON_URLS_ARRAY: horizonUrlsArray
   };
 }
 

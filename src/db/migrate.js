@@ -128,9 +128,9 @@ async function runMigrations() {
                 return;
             }
 
-            // Load and resolve migrations with relaxed options for the pre-existing production folder
+            // Load and resolve migrations with strict options
             const allFiles = fs.readdirSync(migrationsDir);
-            const files = resolveMigrations(allFiles, { allowDuplicates: true, allowOutOfBand: true, strictExtensions: false });
+            const files = resolveMigrations(allFiles);
 
             let appliedCount = 0;
 

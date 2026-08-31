@@ -475,4 +475,67 @@ describe('PdfRenderJobRepository', () => {
   it('checksumPayload hashes bytes deterministically', () => {
     expect(checksumPayload('abc')).toBe(checksumPayload(Buffer.from('abc')));
   });
+
+  it('findCompletedByInvestorAndPeriod returns the completed job with checksum', async () => {
+    const query = jest.fn().mockResolvedValue({
+      rows: [
+        {
+          id: 'stmt-1',
+          batch_id: 'b1',
+          investor_id: 'inv-1',
+          period_id: '2026-06',
+          status: 'completed',
+          attempts: 1,
+          available_at: new Date(),
+          claimed_at: null,
+          storage_key: 'statements/2026-06/inv-1.pdf',
+          checksum: 'abc123',
+          error: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ],
+    });
+    const repo = new PdfRenderJobRepository(makePool({ query }));
+    const job = await repo.findCompletedByInvestorAndPeriod('inv-1', '2026-06');
+    expect(job?.id).toBe('stmt-1');
+    expect(job?.checksum).toBe('abc123');
+    expect(job?.storage_key).toBe('statements/2026-06/inv-1.pdf');
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("status = 'completed'"),
+      ['inv-1', '2026-06'],
+    );
+  });
+
+  it('findCompletedByInvestorAndPeriod returns null when no completed job exists', async () => {
+    const query = jest.fn().mockResolvedValue({ rows: [] });
+    const repo = new PdfRenderJobRepository(makePool({ query }));
+    expect(await repo.findCompletedByInvestorAndPeriod('inv-1', '2026-06')).toBeNull();
+  });
+
+  it('findCompletedByInvestorAndPeriod maps nullable checksum/storage_key', async () => {
+    const query = jest.fn().mockResolvedValue({
+      rows: [
+        {
+          id: 'stmt-2',
+          batch_id: 'b1',
+          investor_id: 'inv-2',
+          period_id: '2026-06',
+          status: 'completed',
+          attempts: 1,
+          available_at: new Date(),
+          claimed_at: new Date(),
+          storage_key: null,
+          checksum: null,
+          error: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ],
+    });
+    const repo = new PdfRenderJobRepository(makePool({ query }));
+    const job = await repo.findCompletedByInvestorAndPeriod('inv-2', '2026-06');
+    expect(job?.storage_key).toBeNull();
+    expect(job?.checksum).toBeNull();
+  });
 });

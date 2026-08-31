@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
 import { InvestmentService, createInvestmentService } from '../services/investmentService';
+import { createInvestmentServiceWithScreening } from '../services/investmentServiceSetup';
 import { AppError } from '../lib/errors';
 import { createIdempotencyMiddleware } from '../middleware/idempotency';
 import { requireMobileAttestation } from '../security/mobileAttestation';
@@ -46,7 +47,7 @@ function requireIdempotencyKey(req: Request, res: Response, next: NextFunction):
 export function createInvestmentsRouter(db: Pool): Router {
   const router = Router();
   const investmentRepo = new InvestmentRepository(db);
-  const investmentService: InvestmentService = createInvestmentService(db);
+  const investmentService: InvestmentService = createInvestmentServiceWithScreening(db);
 
   // Create idempotency middleware with request body fingerprinting
   const idempotencyMiddleware = createIdempotencyMiddleware({
@@ -88,6 +89,14 @@ export function createInvestmentsRouter(db: Pool): Router {
     const amount = String(body.amount) || undefined;
     const asset = String(body.asset) || undefined;
 
+    // Optional beneficial-owner names to screen alongside the investor.
+    const beneficial_owners =
+      Array.isArray(body.beneficial_owners)
+        ? body.beneficial_owners
+            .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+            .map((v) => v.trim())
+        : undefined;
+
     // Validate required fields
     if (!offering_id) {
       res.status(400).json({ error: 'offering_id is required' });
@@ -110,6 +119,7 @@ export function createInvestmentsRouter(db: Pool): Router {
         offering_id,
         amount,
         asset,
+        beneficial_owners,
       });
 
       res.status(201).json({ data: investment });
