@@ -32,8 +32,10 @@
  * same offering IS balanced. No manual intervention required.
  */
 
+import { Pool } from 'pg';
 import { Logger, globalLogger } from '../lib/logger';
 import { MetricsCollector } from '../lib/metrics';
+import { OfferingRepository } from '../db/repositories/offeringRepository';
 import {
   RevenueReconciliationService,
   ReconciliationResult,
@@ -250,7 +252,7 @@ export class ReconciliationScheduler {
       }
     }
 
-    this.logger.info('ReconciliationScheduler: tick complete', result);
+    this.logger.info('ReconciliationScheduler: tick complete', { ...result });
     return result;
   }
 
@@ -388,4 +390,214 @@ export class InMemoryReconciliationRunStore implements ReconciliationRunStore {
   getAllRuns(): ReconciliationRunSummary[] {
     return [...this.store.values()];
   }
+}
+
+// ─── PostgresReconciliationRunStore ───────────────────────────────────────────
+
+/**
+ * PostgreSQL-backed implementation of ReconciliationRunStore.
+ *
+ * Persists each scheduler run to the `reconciliation_run_summaries` table
+ * (migration `013_create_reconciliation_run_summaries.sql`). The table has a
+ * natural composite primary key `(offering_id, period_id, started_at)` so
+ * concurrent multi-instance writes for the same run are de-duplicated by the
+ * constraint rather than silently overwritten.
+ *
+ * `getLastRun` reads the most-recent run per offering via the
+ * `idx_rrs_offering_started` index (ORDER BY started_at DESC LIMIT 1), giving a
+ * stable resume point so a missed tick does not double-reconcile a window.
+ *
+ * Security / safety:
+ * - Values are bound parameters (parameterised queries) — no string
+ *   interpolation into SQL, protecting against injection.
+ * - On `INSERT ... ON CONFLICT DO NOTHING`, the return value may be empty; we
+ *   treat that as an idempotent no-op (the row already exists).
+ */
+export class PostgresReconciliationRunStore implements ReconciliationRunStore {
+  constructor(private readonly db: Pool) {}
+
+  async saveRun(summary: ReconciliationRunSummary): Promise<void> {
+    await this.db.query(
+      `
+      INSERT INTO reconciliation_run_summaries (
+        offering_id,
+        period_id,
+        started_at,
+        completed_at,
+        is_balanced,
+        discrepancy_count,
+        discrepancy_amount
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (offering_id, period_id, started_at) DO NOTHING
+      `,
+      [
+        summary.offeringId,
+        summary.periodId,
+        summary.startedAt,
+        summary.completedAt,
+        summary.isBalanced,
+        summary.discrepancyCount,
+        summary.discrepancyAmount,
+      ]
+    );
+  }
+
+  async getLastRun(offeringId: string): Promise<ReconciliationRunSummary | null> {
+    const result = await this.db.query(
+      `
+      SELECT
+        offering_id,
+        period_id,
+        started_at,
+        completed_at,
+        is_balanced,
+        discrepancy_count,
+        discrepancy_amount
+      FROM reconciliation_run_summaries
+      WHERE offering_id = $1
+      ORDER BY started_at DESC
+      LIMIT 1
+      `,
+      [offeringId]
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+      offeringId: row.offering_id,
+      periodId: row.period_id,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      isBalanced: row.is_balanced,
+      discrepancyCount: row.discrepancy_count,
+      discrepancyAmount: String(row.discrepancy_amount ?? '0'),
+    };
+  }
+}
+
+// ─── Scheduler runtime (interval wrapper) ─────────────────────────────────────
+
+export const DEFAULT_RECONCILIATION_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+export const RECONCILIATION_INTERVAL_ENV = 'RECONCILIATION_INTERVAL_MS';
+
+/**
+ * Resolve the scheduler cadence (ms).
+ *
+ * Precedence: RECONCILIATION_INTERVAL_MS env > SCHEDULER_RECONCILIATION_INTERVAL_MS
+ * env > explicit option > DEFAULT_RECONCILIATION_INTERVAL_MS. Non-positive /
+ * non-finite values fall back to the explicit option or default (fail-safe, so a
+ * misconfigured env cannot disable or crash the scheduler cadence).
+ */
+export function resolveSchedulerInterval(
+  env: Record<string, string | undefined>,
+  explicitIntervalMs?: number
+): number {
+  const raw =
+    env[RECONCILIATION_INTERVAL_ENV] ??
+    env['SCHEDULER_RECONCILIATION_INTERVAL_MS'];
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return explicitIntervalMs ?? DEFAULT_RECONCILIATION_INTERVAL_MS;
+}
+
+export interface CreateReconciliationSchedulerRuntimeOptions {
+  /** PostgreSQL pool backing both reconciliation and run-summary persistence. */
+  db: Pool;
+  /** Metrics collector used by the scheduler AND the /metrics/reconciliation endpoint. */
+  metrics: MetricsCollector;
+  logger?: Logger;
+  /** Default cadence between ticks (ms). Overridden by RECONCILIATION_INTERVAL_MS. */
+  intervalMs?: number;
+  /** Forwarded to ReconciliationScheduler. */
+  tolerance?: number;
+  /** Forwarded to ReconciliationScheduler (label cardinality cap). */
+  cardinalityLimit?: number;
+  /** Run-summary store. Defaults to PostgresReconciliationRunStore. */
+  runStore?: ReconciliationRunStore;
+  /** Active-offering repository. Defaults to OfferingRepository (listAll). */
+  offeringRepo?: ActiveOfferingRepository;
+  /** Underlying scheduler. Defaults to a ReconciliationScheduler built from db + metrics. */
+  scheduler?: ReconciliationScheduler;
+}
+
+/**
+ * Build an interval-driven ReconciliationScheduler runtime.
+ *
+ * Returns a `{ start, stop, isRunning }` handle so app bootstrap can start the
+ * cadence in production/development and keep tests deterministic (no timers).
+ *
+ * Concurrency safety: a tick is never started while a previous tick is still
+ * in flight (`running` guard), so overlapping ticks cannot double-reconcile an
+ * offering. A tick that throws is caught and logged rather than crashing the
+ * process, and the dead-letter alarm stays open until a later balanced run.
+ */
+export function createReconciliationSchedulerRuntime(
+  options: CreateReconciliationSchedulerRuntimeOptions
+): { start: () => void; stop: () => void; isRunning: () => boolean } {
+  const logger = options.logger ?? globalLogger;
+  const runStore = options.runStore ?? new PostgresReconciliationRunStore(options.db);
+
+  const scheduler =
+    options.scheduler ??
+    new ReconciliationScheduler(
+      new RevenueReconciliationService(options.db),
+      options.offeringRepo ?? (new OfferingRepository(options.db) as unknown as ActiveOfferingRepository),
+      runStore,
+      options.metrics,
+      {
+        tolerance: options.tolerance,
+        cardinalityLimit: options.cardinalityLimit,
+        logger,
+      }
+    );
+
+  let timer: NodeJS.Timeout | null = null;
+  let running = false;
+
+  const resolveInterval = (): number =>
+    resolveSchedulerInterval(process.env, options.intervalMs);
+
+  const tick = async (): Promise<void> => {
+    if (running) {
+      logger.warn('ReconciliationScheduler: skipping tick — previous tick still running');
+      return;
+    }
+    running = true;
+    try {
+      await scheduler.runScheduledReconciliation();
+    } catch (err) {
+      logger.error('ReconciliationScheduler: unhandled tick error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      running = false;
+    }
+  };
+
+  return {
+    start(): void {
+      if (timer) return; // already running
+      // Run once on startup for immediate drift detection, then on cadence.
+      void tick();
+      timer = setInterval(() => void tick(), resolveInterval());
+      timer.unref?.();
+      logger.info('ReconciliationScheduler: started', {
+        intervalMs: resolveInterval(),
+      });
+    },
+    stop(): void {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      logger.info('ReconciliationScheduler: stopped');
+    },
+    isRunning(): boolean {
+      return timer !== null;
+    },
+  };
 }
