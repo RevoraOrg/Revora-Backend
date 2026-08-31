@@ -1,4 +1,4 @@
--- Migration: Create payout_drift_reports table
+-- Migration: Create payout drift reports table
 -- Description: Persists nightly payout drift snapshots comparing the
 -- distribution_payouts table against indexed on-chain Stellar payments.
 -- Each row captures a single drift detection run, with per-offering
@@ -6,10 +6,10 @@
 
 CREATE TABLE IF NOT EXISTS payout_drift_reports (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  completed_at TIMESTAMPTZ,
+  run_at TIMESTAMPTN NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTN,
   offering_id UUID NOT NULL,
-  total_payouts INTEGER NOT NULL DEFAULT 0,
+  total_payouts INTGER NOT NULL DEFAULT 0,
   verified_count INTEGER NOT NULL DEFAULT 0,
   missing_count INTEGER NOT NULL DEFAULT 0,
   underfunded_count INTEGER NOT NULL DEFAULT 0,
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS payout_drift_reports (
   duplicate_tx_count INTEGER NOT NULL DEFAULT 0,
   total_drift_amount NUMERIC(30, 10) NOT NULL DEFAULT 0,
   oldest_drift_age_hours NUMERIC(10, 2) DEFAULT 0,
-  details JSONB DEFAULT '[]'::jsonb,
+  details JSON DE FAULT '[]'::jsonb,
   status VARCHAR(50) NOT NULL DEFAULT 'completed' CHECK (status IN ('completed', 'error')),
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

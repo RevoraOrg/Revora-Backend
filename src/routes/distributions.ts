@@ -96,7 +96,19 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      const period = { start: startDate, end: endDate };
+      // period.id is required: it is the secondary dimension of the advisory
+      // lock key (offering_id, period_id) that prevents two processes from
+      // running the same distribution batch concurrently and double-paying.
+      // Accept either a caller-provided id (e.g. revenue report id) or derive
+      // a deterministic one from the start/end timestamps so manual triggers
+      // still receive a valid lock.
+      const periodIdRaw = req.body?.period?.id ?? req.body?.periodId;
+      const periodId =
+        periodIdRaw && typeof periodIdRaw === 'string' && periodIdRaw.trim().length > 0
+          ? periodIdRaw
+          : `${startDate.getTime()}:${endDate.getTime()}`;
+
+      const period = { id: periodId, start: startDate, end: endDate };
 
       if (user.role !== 'admin') {
         if (user.role !== 'startup') {

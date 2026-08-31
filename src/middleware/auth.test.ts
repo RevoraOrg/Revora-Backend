@@ -212,7 +212,8 @@ describe('authMiddleware', () => {
 
   describe('expired token', () => {
     it('calls next with 401 AppError for expired token', () => {
-      const token = issueToken({ subject: 'user-123', expiresIn: '-1s' });
+      // Must be expired beyond the default 30s clock-skew tolerance.
+      const token = issueToken({ subject: 'user-123', expiresIn: '-60s' });
       const req = { headers: { authorization: `Bearer ${token}` } } as Request;
       const res = mockRes();
       const next = jest.fn();
@@ -373,9 +374,9 @@ describe('requireInvestor', () => {
 
     requireInvestor(req, mockRes(), next);
 
-    expect(next).toHaveBeenCalledWith(expect.objectContaining({
-      statusCode: 500,
-      message: 'Server configuration error',
-    }));
+    // Token signed with the previous secret must verify successfully.
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith();
+    expect((req as AuthenticatedRequest).user).toEqual({ id: 'investor-1', role: 'investor' });
   });
 });

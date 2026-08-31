@@ -13,7 +13,9 @@ jest.mock('../db/repositories/revenueReportRepository');
 
 jest.mock('../middleware/validate', () => ({
   validateParams: () => (req: any, res: any, next: any) => next(),
-  validateBody: () => (req: any, res: any, next: any) => next()
+  validateBody: () => (req: any, res: any, next: any) => next(),
+  validateZodBody: () => (req: any, res: any, next: any) => next(),
+  validateZodParams: () => (req: any, res: any, next: any) => next()
 }));
 
 // Mock Auth Middleware

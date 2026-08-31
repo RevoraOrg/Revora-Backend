@@ -438,7 +438,7 @@ describe('OutboxHmacRotationService — audit event', () => {
   });
 
   it('includes resource label when configured', async () => {
-    const { audit } = makeAuditSink();
+    const audit = makeAuditSink();
     const kms = makeMockKms(['sec-a']);
     const svc = new OutboxHmacRotationService({
       kmsClient: kms,
@@ -495,7 +495,7 @@ describe('OutboxHmacRotationService — scheduler lifecycle', () => {
   });
 
   it('start() does not re-rotate when initialSecret already loaded', async () => {
-    const { audit } = makeAuditSink();
+    const audit = makeAuditSink();
     const kms = makeMockKms(['sec-new']);
     const svc = new OutboxHmacRotationService({
       kmsClient: kms,

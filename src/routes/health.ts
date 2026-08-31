@@ -7,6 +7,8 @@ import {
   StellarRPCFailureClass,
 } from "../lib/stellarRpcFailure";
 import { DbHealthResult, PoolMetrics } from "../db/client";
+import { env } from '../config/env';
+import { StellarRpcClient } from '../lib/stellarRpcClient';
 
 export type HealthDependency = "database" | "stellar-horizon" | "db-pool";
 
@@ -297,76 +299,62 @@ export function mapHealthDependencyFailure(
   return Errors.serviceUnavailable("Dependency unavailable", details);
 }
 
-async function checkStellarHorizon(): Promise<DependencyHealth> {
+async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<DependencyHealth> {
   const start = Date.now();
-  const horizonUrl =
-    process.env.STELLAR_HORIZON_URL || "https://horizon.stellar.org";
+  const endpoints = env.STELLAR_HORIZON_URLS_ARRAY;
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), HORIZON_TIMEOUT_MS);
-
-    const response = await fetch(horizonUrl, { signal: controller.signal });
-    clearTimeout(timeoutId);
-
-    const latencyMs = Date.now() - start;
-
-    if (!response.ok) {
-      const failureClass = classifyStellarRPCFailure(
-        {
-          status: response.status,
-        },
-        { operation: "health-check" },
-      ).class;
-      logHealthCheck("error", "Stellar Horizon health check failed", {
-        dependency: "stellar-horizon",
-        status: response.status,
-        failureClass,
-        latencyMs,
-      });
-
-      return {
-        name: "stellar-horizon",
-        status: "down",
-        latencyMs,
-        healthy: false,
-        dependsOn: [],
-        details: {
-          failureClass,
-          upstreamStatus: response.status,
-          url: horizonUrl,
-        },
-      };
-    }
-
-    logHealthCheck("info", "Stellar Horizon health check passed", {
-      dependency: "stellar-horizon",
-      latencyMs,
-      status: response.status,
-    });
-
+  if (!endpoints || endpoints.length === 0) {
     return {
       name: "stellar-horizon",
-      status: "up",
-      latencyMs,
-      healthy: true,
+      status: "down",
+      latencyMs: 0,
+      healthy: false,
       dependsOn: [],
-      details: {
-        url: horizonUrl,
-        statusCode: response.status,
-      },
+      details: {},
+      error: "no_endpoints_configured"
     };
-  } catch (error) {
-    const latencyMs = Date.now() - start;
-    const failureClass = classifyStellarRPCFailure(error, {
-      operation: "health-check",
-    }).class;
+  }
 
-    logHealthCheck("error", "Stellar Horizon health check error", {
+  let healthy = false;
+  let activeUrl = "";
+  let lastStatus = 0;
+  let lastError: any = null;
+
+  for (const horizonUrl of endpoints) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), HORIZON_TIMEOUT_MS);
+
+      const response = await fetch(horizonUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        healthy = true;
+        activeUrl = horizonUrl;
+        lastStatus = response.status;
+        break; // found a healthy endpoint
+      }
+      lastStatus = response.status;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const latencyMs = Date.now() - start;
+  const breakerStates = rpcClient?.getBreakerStates();
+
+  if (!healthy) {
+    const failureClass = classifyStellarRPCFailure(
+      lastError || { status: lastStatus },
+      { operation: "health-check" },
+    ).class;
+    
+    logHealthCheck("error", "Stellar Horizon health check failed", {
       dependency: "stellar-horizon",
+      status: lastStatus,
       failureClass,
       latencyMs,
-      error: error instanceof Error ? error.name : "Unknown",
+      error: lastError instanceof Error ? lastError.name : "Unknown",
     });
 
     return {
@@ -377,14 +365,35 @@ async function checkStellarHorizon(): Promise<DependencyHealth> {
       dependsOn: [],
       details: {
         failureClass,
-        url: horizonUrl,
+        upstreamStatus: lastStatus,
+        breakerStates
       },
-      error:
-        failureClass === StellarRPCFailureClass.TIMEOUT
-          ? "timeout"
-          : "connection_error",
+      error: failureClass === StellarRPCFailureClass.TIMEOUT ? "timeout" : "connection_error",
     };
   }
+
+  const isDegraded = activeUrl !== endpoints[0];
+
+  logHealthCheck("info", "Stellar Horizon health check passed", {
+    dependency: "stellar-horizon",
+    latencyMs,
+    status: lastStatus,
+    activeUrl,
+    isDegraded
+  });
+
+  return {
+    name: "stellar-horizon",
+    status: isDegraded ? "degraded" : "up",
+    latencyMs,
+    healthy: true,
+    dependsOn: [],
+    details: {
+      url: activeUrl,
+      statusCode: lastStatus,
+      breakerStates
+    },
+  };
 }
 
 async function checkDatabase(
@@ -446,14 +455,14 @@ function evaluateOverallStatus(
 }
 
 export const healthRootHandler =
-  (dbHealth: DbHealthChecker) =>
+  (dbHealth: DbHealthChecker, rpcClient?: StellarRpcClient) =>
   async (req: Request, res: Response): Promise<void> => {
     const requestId = req.headers["x-request-id"] as string | undefined;
 
     try {
       const [dbCheck, stellarCheck] = await Promise.all([
         checkDatabase(dbHealth),
-        checkStellarHorizon(),
+        checkStellarHorizon(rpcClient),
       ]);
 
       const checks = [dbCheck, stellarCheck];
@@ -628,11 +637,12 @@ export const createHealthRouter = (
   dbHealth: DbHealthChecker,
   metrics?: MetricsCollector,
   region?: string,
+  rpcClient?: StellarRpcClient,
 ): Router => {
   const router = Router();
-  router.get("/", healthRootHandler(dbHealth));
+  router.get("/", healthRootHandler(dbHealth, rpcClient));
   router.get("/live", healthLiveHandler());
-  router.get("/ready", healthReadyHandler(db, metrics));
+  router.get("/ready", healthReadyHandler(db, metrics)); // Could update this similarly if needed
   router.get("/startup", healthStartupHandler(dbHealth));
   router.get("/region", healthRegionHandler(region));
   return router;

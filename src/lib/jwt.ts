@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import { globalLogger } from "./logger";
 
 /**
@@ -35,8 +36,8 @@ export interface JwtPayload {
   email?: string;
   iat?: number;
   exp?: number;
-  nbf?: number;            // Not Before
-  iss?: string;            // Issuer
+  nbf?: number; // Not Before
+  iss?: string; // Issuer
   aud?: string | string[]; // Audience
   [key: string]: unknown;
 }
@@ -148,23 +149,27 @@ export function validateClaims(
   const now = Math.floor(Date.now() / 1000);
 
   // sub: must be present and a non-empty string
-  if (!payload.sub || typeof payload.sub !== 'string' || payload.sub.trim() === '') {
-    throw new Error('Token is missing required subject (sub) claim');
+  if (
+    !payload.sub ||
+    typeof payload.sub !== "string" ||
+    payload.sub.trim() === ""
+  ) {
+    throw new Error("Token is missing required subject (sub) claim");
   }
 
   // exp: explicit check (jsonwebtoken already checks this; here for standalone use)
   if (payload.exp !== undefined && payload.exp < now - tolerance) {
-    throw new Error('Token has expired');
+    throw new Error("Token has expired");
   }
 
   // iat: issued-at must not be in the future (beyond tolerance)
   if (payload.iat !== undefined && payload.iat > now + tolerance) {
-    throw new Error('Token iat claim is in the future');
+    throw new Error("Token iat claim is in the future");
   }
 
   // nbf: not-before — token must be valid by now (beyond tolerance)
   if (payload.nbf !== undefined && payload.nbf > now + tolerance) {
-    throw new Error('Token is not yet valid (nbf claim)');
+    throw new Error("Token is not yet valid (nbf claim)");
   }
 
   // iss: issuer — validated only when an expected issuer is configured
@@ -176,7 +181,9 @@ export function validateClaims(
   if (options?.audience !== undefined) {
     const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
     if (!audiences.includes(options.audience)) {
-      throw new Error(`Token audience mismatch: expected "${options.audience}"`);
+      throw new Error(
+        `Token audience mismatch: expected "${options.audience}"`,
+      );
     }
   }
 }
@@ -274,7 +281,8 @@ export function issueToken(options: TokenOptions): string {
 
   const signOptions: jwt.SignOptions = {
     algorithm,
-    expiresIn: (options.expiresIn || TOKEN_EXPIRY) as jwt.SignOptions["expiresIn"],
+    expiresIn: (options.expiresIn ||
+      TOKEN_EXPIRY) as jwt.SignOptions["expiresIn"],
     ...(options.issuer && { issuer: options.issuer }),
     ...(options.audience && { audience: options.audience }),
     header: { kid: currentKey.kid, alg: algorithm },
@@ -344,23 +352,23 @@ export function verifyToken(
   try {
     decodedHeader = jwt.decode(token, { complete: true })?.header ?? null;
   } catch (err: unknown) {
-    throw new Error('Token decoding failed');
+    throw new Error("Token decoding failed");
   }
 
   if (!decodedHeader) {
-    throw new Error('Token header is missing');
+    throw new Error("Token header is missing");
   }
 
   const kid = decodedHeader.kid;
-  if (!kid || typeof kid !== 'string') {
-    globalLogger.warn('JWT verification failed: missing or invalid kid header');
-    throw new Error('Token is missing required kid (key ID) header');
+  if (!kid || typeof kid !== "string") {
+    globalLogger.warn("JWT verification failed: missing or invalid kid header");
+    throw new Error("Token is missing required kid (key ID) header");
   }
 
   // Look up the secret by kid
   const secret = getSecretByKid(kid);
   if (!secret) {
-    globalLogger.warn('JWT verification failed: unknown kid', { kid });
+    globalLogger.warn("JWT verification failed: unknown kid", { kid });
     throw new Error(`Token signed with unknown key ID: ${kid}`);
   }
 
@@ -376,7 +384,7 @@ export function verifyToken(
     }) as JwtPayload;
   } catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err));
-    globalLogger.warn('JWT signature verification failed', {
+    globalLogger.warn("JWT signature verification failed", {
       kid,
       error: error.message,
     });
@@ -386,13 +394,263 @@ export function verifyToken(
   // Log key rotation usage for operational visibility
   const currentKid = getCurrentKeyId();
   if (kid !== currentKid) {
-    globalLogger.info('JWT verified with previous key (key rotation in progress)', {
-      kid,
-      currentKid,
-    });
+    globalLogger.info(
+      "JWT verified with previous key (key rotation in progress)",
+      {
+        kid,
+        currentKid,
+      },
+    );
   }
 
   validateClaims(payload, options);
 
   return payload;
+}
+
+// ── Ed25519 admin-signature utilities ────────────────────────────────────────
+
+export interface AdminEd25519PublicKey {
+  kid: string;
+  publicKeyPem: string;
+}
+
+export interface AdminSignedStatusTransitionPayload {
+  action: "approve" | "reject" | "publish" | "archive" | "close" | "cancel";
+  offeringId: string;
+  nonce: string;
+  timestamp: number;
+}
+
+export interface AdminSignatureVerificationResult {
+  valid: boolean;
+  kid?: string;
+  payload?: AdminSignedStatusTransitionPayload;
+  error?: string;
+}
+
+/**
+ * @notice Generate a new Ed25519 keypair for admin signing.
+ * @dev Outputs PEM-encoded keys. Operators store the private key securely;
+ *      the public key is registered via ADMIN_ED25519_PUBKEYS.
+ * @returns Object with PEM-encoded privateKey and publicKey.
+ */
+export function generateAdminEd25519Keypair(): {
+  privateKey: string;
+  publicKey: string;
+} {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  return {
+    privateKey: privateKey.export({ type: "pkcs8", format: "pem" }) as string,
+    publicKey: publicKey.export({ type: "spki", format: "pem" }) as string,
+  };
+}
+
+/**
+ * @notice Build the canonical signing payload for admin status transitions.
+ * @dev Produces a deterministic JSON string with sorted keys so that clients
+ *      and servers always byte-for-byte agree on the signed message.
+ *      Includes the action, offeringId, nonce, and Unix timestamp.
+ * @param payload Structured fields to be signed.
+ * @returns Deterministic JSON string suitable for Ed25519 signing.
+ */
+export function buildAdminStatusTransitionCanonicalPayload(
+  payload: AdminSignedStatusTransitionPayload,
+): string {
+  const sortedKeys = ["action", "nonce", "offeringId", "timestamp"] as const;
+  const canonical: Record<string, unknown> = {};
+  for (const k of sortedKeys) {
+    canonical[k] = payload[k];
+  }
+  return JSON.stringify(canonical);
+}
+
+/**
+ * @notice Sign a status-transition payload with an Ed25519 private key.
+ * @param payload Structured status-transition fields.
+ * @param privateKeyPem PEM-encoded Ed25519 private key.
+ * @returns base64url-encoded signature string.
+ */
+export function signAdminStatusTransition(
+  payload: AdminSignedStatusTransitionPayload,
+  privateKeyPem: string,
+): string {
+  const canonical = buildAdminStatusTransitionCanonicalPayload(payload);
+  const keyObj = crypto.createPrivateKey(privateKeyPem);
+  const signature = crypto.sign(
+    null as any,
+    Buffer.from(canonical, "utf8"),
+    keyObj as any,
+  );
+  return signature.toString("base64url");
+}
+
+/**
+ * @notice Load registered admin Ed25519 public keys from the environment.
+ * @dev ADMIN_ED25519_PUBKEYS is a JSON object: `{ "<kid>": "<pem-public-key>", ... }`.
+ *      Keys are validated for well-formed PEM at load time.
+ * @returns Map of kid → PEM public key.
+ * @throws {Error} If the env var is missing, malformed, or contains invalid keys.
+ */
+export function loadAdminEd25519PublicKeys(): Map<
+  string,
+  AdminEd25519PublicKey
+> {
+  const raw = process.env.ADMIN_ED25519_PUBKEYS;
+  if (!raw) {
+    throw new Error("ADMIN_ED25519_PUBKEYS environment variable is not set");
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("ADMIN_ED25519_PUBKEYS is not valid JSON");
+  }
+  const result = new Map<string, AdminEd25519PublicKey>();
+  for (const [kid, value] of Object.entries(parsed)) {
+    if (
+      typeof value !== "string" ||
+      !value.startsWith("-----BEGIN PUBLIC KEY-----")
+    ) {
+      throw new Error(
+        `ADMIN_ED25519_PUBKEYS entry for kid "${kid}" is not a valid PEM public key`,
+      );
+    }
+    result.set(kid, { kid, publicKeyPem: value });
+  }
+  if (result.size === 0) {
+    throw new Error("ADMIN_ED25519_PUBKEYS contains no entries");
+  }
+  return result;
+}
+
+/**
+ * @notice Verify an Ed25519 signature for a status-transition payload.
+ * @dev Validates signature against a specific kid's public key.
+ *      Does NOT perform timestamp/nonce replay checks – those are handled
+ *      by the middleware layer.
+ * @param payload Structured fields that were signed.
+ * @param signatureB64 base64url-encoded signature.
+ * @param kid Key identifier.
+ * @param knownKeys Map of registered admin public keys (from loadAdminEd25519PublicKeys).
+ * @returns AdminSignatureVerificationResult with valid flag and diagnostics.
+ */
+export function verifyAdminStatusTransitionSignature(
+  payload: AdminSignedStatusTransitionPayload,
+  signatureB64: string,
+  kid: string,
+  knownKeys: Map<string, AdminEd25519PublicKey>,
+): AdminSignatureVerificationResult {
+  if (!kid) {
+    return { valid: false, error: "Missing key identifier (x-admin-kid)" };
+  }
+  if (!signatureB64) {
+    return { valid: false, error: "Missing signature (x-admin-signature)" };
+  }
+  const entry = knownKeys.get(kid);
+  if (!entry) {
+    globalLogger.warn(
+      "[AdminEd25519] Signature verification failed: unknown kid",
+      { kid },
+    );
+    return { valid: false, kid, error: "Unknown admin key identifier" };
+  }
+  if (
+    !payload.action ||
+    !payload.offeringId ||
+    !payload.nonce ||
+    !payload.timestamp
+  ) {
+    return {
+      valid: false,
+      kid,
+      error:
+        "Signed payload missing required fields (action, offeringId, nonce, timestamp)",
+    };
+  }
+  const canonical = buildAdminStatusTransitionCanonicalPayload(payload);
+  try {
+    const sigBuffer = Buffer.from(signatureB64, "base64url");
+    const keyObj = crypto.createPublicKey(entry.publicKeyPem);
+    const ok = crypto.verify(
+      null as any,
+      Buffer.from(canonical, "utf8"),
+      keyObj as any,
+      sigBuffer as any,
+    );
+    if (!ok) {
+      globalLogger.warn("[AdminEd25519] Signature mismatch", {
+        kid,
+        action: payload.action,
+        offeringId: payload.offeringId,
+      });
+      return { valid: false, kid, error: "Invalid Ed25519 signature" };
+    }
+    return { valid: true, kid, payload };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    globalLogger.warn("[AdminEd25519] Verification threw", {
+      kid,
+      error: message,
+    });
+    return {
+      valid: false,
+      kid,
+      error: `Signature verification error: ${message}`,
+    };
+  }
+}
+
+// ── Replay protection for admin signatures ──────────────────────────────────
+
+export interface AdminSignatureReplayCache {
+  /** Returns true if (kid, nonce) was already seen; marks it seen atomically. */
+  checkAndMark(kid: string, nonce: string, timestamp: number): boolean;
+}
+
+export class InMemoryAdminSignatureReplayCache implements AdminSignatureReplayCache {
+  private readonly seen = new Map<string, number>();
+
+  constructor(
+    private readonly maxAgeSeconds = 300,
+    private readonly evictThreshold = 10_000,
+  ) {}
+
+  checkAndMark(kid: string, nonce: string, timestamp: number): boolean {
+    const now = Math.floor(Date.now() / 1000);
+    if (this.seen.size > this.evictThreshold) {
+      for (const [k, ts] of this.seen) {
+        if (now - ts > this.maxAgeSeconds) this.seen.delete(k);
+      }
+    }
+    const key = `${kid}:${nonce}`;
+    if (this.seen.has(key)) return true;
+    this.seen.set(key, timestamp);
+    return false;
+  }
+
+  clear(): void {
+    this.seen.clear();
+  }
+
+  size(): number {
+    return this.seen.size;
+  }
+}
+
+export const ADMIN_SIGNATURE_ALLOWED_CLOCK_SKEW_SECONDS = 30;
+
+/**
+ * @notice Validate the timestamp window for a signed admin request.
+ * @param timestamp Request-provided Unix timestamp (seconds).
+ * @param allowedSkewSeconds Tolerance in seconds (default 30).
+ * @returns true iff timestamp is within ±allowedSkewSeconds of server time.
+ */
+export function isAdminSignatureTimestampFresh(
+  timestamp: number,
+  allowedSkewSeconds = ADMIN_SIGNATURE_ALLOWED_CLOCK_SKEW_SECONDS,
+): boolean {
+  if (!Number.isFinite(timestamp)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  return Math.abs(now - timestamp) <= allowedSkewSeconds;
 }
