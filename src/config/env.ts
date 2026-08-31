@@ -99,7 +99,6 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;

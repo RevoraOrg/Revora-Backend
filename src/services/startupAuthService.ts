@@ -119,7 +119,9 @@ export class StartupAuthService {
             return {
                 success: false,
                 error: 'Password does not meet strength requirements',
-                details: strengthCheck.errors,
+                // Expose only human-readable messages (never raw internal codes
+                // or stack traces) to the client.
+                details: strengthCheck.errors.map((e) => e.message),
                 statusCode: 400,
             };
         }
