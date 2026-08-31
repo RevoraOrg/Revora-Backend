@@ -25,6 +25,8 @@ import { z } from "zod";
  * | STELLAR_MAX_FEE             | No       | 100000                  | Maximum fee in stroops for Stellar transactions  |
  * | ALLOWED_ORIGINS             | No       | localhost:3000          | Comma-separated list of allowed CORS origins     |
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
+ * | AUDIT_EXPORT_SIGNING_KEY    | Yes/Prod | (empty)                 | Base64-encoded Ed25519 private key (32-byte seed) for signing audit CSV exports |
+ * | AUDIT_EXPORT_PUBLIC_KEY     | No       | (empty)                 | Base64-encoded Ed25519 public key, documented so auditors can verify exports offline |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
@@ -73,6 +75,8 @@ const envSchema = z.object({
   STELLAR_MAX_FEE: z.coerce.number().int().positive().max(10000000).default(100000),
   ALLOWED_ORIGINS: z.string().optional(),
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  AUDIT_EXPORT_SIGNING_KEY: z.string().min(1).optional(),
+  AUDIT_EXPORT_PUBLIC_KEY: z.string().min(1).optional(),
   SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
@@ -95,7 +99,6 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(50),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
@@ -123,7 +126,11 @@ const envSchema = z.object({
 .refine(data => {
   if (data.NODE_ENV === "production" && data.EMAIL_PROVIDER === "mock") return false;
   return true;
-}, { message: "EMAIL_PROVIDER=mock is not permitted in production", path: ["EMAIL_PROVIDER"] });
+}, { message: "EMAIL_PROVIDER=mock is not permitted in production", path: ["EMAIL_PROVIDER"] })
+.refine(data => {
+  if (data.NODE_ENV === "production" && !data.AUDIT_EXPORT_SIGNING_KEY) return false;
+  return true;
+}, { message: "AUDIT_EXPORT_SIGNING_KEY is required in production to sign audit log exports", path: ["AUDIT_EXPORT_SIGNING_KEY"] });
 
 export type Config = z.infer<typeof envSchema> & { ALLOWED_ORIGINS_ARRAY: string[] };
 

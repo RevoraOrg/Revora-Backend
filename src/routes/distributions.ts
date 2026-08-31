@@ -11,7 +11,20 @@ import { Errors } from '../lib/errors';
 import { globalLogger as logger } from '../lib/logger';
 import { globalMetrics } from '../lib/metrics';
 import { DistributionStateManager } from '../services/distributionScheduler';
+import { AccountingLedgerService, DistributionRunLedger } from '../services/accountingLedgerService';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
+
+/**
+ * Minimal repository surface the distributions router depends on for the
+ * double-entry accounting export. Defined locally to keep the router
+ * decoupled from the full repository class and preserve test compatibility.
+ */
+export interface DistributionAccountRepo {
+  listForAccountingExport(
+    offeringId: string,
+    periodId?: string,
+  ): Promise<DistributionRunLedger[]>;
+}
 
 export interface OfferingRepo {
   getById: (id: string) => Promise<Offering | null>;
@@ -35,6 +48,8 @@ export function createDistributionHandlers(
   offeringRepo?: OfferingRepo,
   distributionStateManager?: DistributionStateManager,
   auditRepository?: SecurityAuditRepository,
+  distributionAccountRepo?: DistributionAccountRepo,
+  accountingLedger?: AccountingLedgerService,
 ) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
     const requestId = (req as any).id;
@@ -79,7 +94,19 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      const period = { start: startDate, end: endDate };
+      // period.id is required: it is the secondary dimension of the advisory
+      // lock key (offering_id, period_id) that prevents two processes from
+      // running the same distribution batch concurrently and double-paying.
+      // Accept either a caller-provided id (e.g. revenue report id) or derive
+      // a deterministic one from the start/end timestamps so manual triggers
+      // still receive a valid lock.
+      const periodIdRaw = req.body?.period?.id ?? req.body?.periodId;
+      const periodId =
+        periodIdRaw && typeof periodIdRaw === 'string' && periodIdRaw.trim().length > 0
+          ? periodIdRaw
+          : `${startDate.getTime()}:${endDate.getTime()}`;
+
+      const period = { id: periodId, start: startDate, end: endDate };
 
       if (user.role !== 'admin') {
         if (user.role !== 'startup') {
@@ -392,7 +419,101 @@ export function createDistributionHandlers(
     }
   }
 
-  return { triggerDistribution, previewDistribution, pauseDistribution, resumeDistribution };
+  /**
+   * GET /offerings/:id/ledger/export
+   *
+   * Returns a stable, deterministic double-entry ledger of distributions and
+   * payouts for the offering, together with a trailing checksum and export-id
+   * for downstream accounting (e.g. NetSuite) and replay detection.
+   *
+   * Authorization is identical to distribution execution: an admin may export
+   * any offering; a startup may only export an offering they issued.
+   *
+   * @dev Backed by DistributionAccountRepo.listForAccountingExport via the
+   *      AccountingLedgerService. When the feature is not wired (no repo or
+   *      ledger service provided) the handler returns 404 to preserve
+   *      backward compatibility for existing deployers.
+   */
+  async function exportDistributionLedger(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      if (!user || !user.id) {
+        throw Errors.unauthorized();
+      }
+
+      const offeringId = String(req.params.id || '');
+      if (!offeringId) {
+        throw Errors.badRequest('Missing offering id');
+      }
+
+      if (!distributionAccountRepo || !accountingLedger) {
+        throw Errors.notFound('Accounting export is not available');
+      }
+
+      const periodId = req.query.period_id ? String(req.query.period_id) : undefined;
+      if (periodId !== undefined && periodId.trim().length === 0) {
+        throw Errors.badRequest('period_id cannot be empty');
+      }
+
+      logger.info('Requesting distribution ledger export', {
+        offeringId,
+        userId: user.id,
+        role: user.role,
+        periodId,
+        requestId,
+      });
+
+      // Authorization: same level as real distribution.
+      if (user.role !== 'admin') {
+        if (user.role !== 'startup') {
+          throw Errors.forbidden('Forbidden: startup role required');
+        }
+        if (!offeringRepo || typeof offeringRepo.getById !== 'function') {
+          throw Errors.forbidden('Forbidden: cannot verify issuer');
+        }
+        const offering = await offeringRepo.getById(offeringId);
+        if (!offering) {
+          throw Errors.notFound('Offering not found');
+        }
+        if (offering.issuer_id !== user.id) {
+          throw Errors.forbidden();
+        }
+      }
+
+      const runs = await distributionAccountRepo.listForAccountingExport(
+        offeringId,
+        periodId,
+      );
+      const ledger = accountingLedger.buildExport(
+        accountingLedger.buildDistributionLedgerLines(runs),
+      );
+
+      logger.info('Distribution ledger export completed', {
+        offeringId,
+        exportId: ledger.export_id,
+        lineCount: ledger.totals.line_count,
+        requestId,
+      });
+
+      return res.status(200).json(ledger);
+    } catch (err) {
+      logger.error('Distribution ledger export failed', {
+        offeringId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  return {
+    triggerDistribution,
+    previewDistribution,
+    pauseDistribution,
+    resumeDistribution,
+    exportDistributionLedger,
+  };
 }
 
 export default function createDistributionsRouter(opts: {
@@ -401,6 +522,8 @@ export default function createDistributionsRouter(opts: {
   verifyJWT: express.RequestHandler;
   distributionStateManager?: DistributionStateManager;
   auditRepository?: SecurityAuditRepository;
+  distributionAccountRepo?: DistributionAccountRepo;
+  accountingLedger?: AccountingLedgerService;
 }) {
   const router = express.Router();
   const handlers = createDistributionHandlers(
@@ -408,10 +531,13 @@ export default function createDistributionsRouter(opts: {
     opts.offeringRepo,
     opts.distributionStateManager,
     opts.auditRepository,
+    opts.distributionAccountRepo,
+    opts.accountingLedger,
   );
 
   router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
   router.post('/offerings/:id/distribute/preview', opts.verifyJWT, handlers.previewDistribution);
+  router.get('/offerings/:id/ledger/export', opts.verifyJWT, handlers.exportDistributionLedger);
   router.post('/distributions/:id/pause', opts.verifyJWT, handlers.pauseDistribution);
   router.post('/distributions/:id/resume', opts.verifyJWT, handlers.resumeDistribution);
 

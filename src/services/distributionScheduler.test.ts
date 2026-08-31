@@ -504,6 +504,25 @@ describe('DistributionScheduler', () => {
       );
     });
 
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
+    });
+
     it('works correctly without metrics collector (no gauge emitted)', async () => {
       revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
         Array.from({ length: 3 }, (_, i) => ({

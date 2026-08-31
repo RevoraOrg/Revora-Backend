@@ -233,9 +233,8 @@ describe('PushExperimentsService', () => {
 
       mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
       mockRepo.findVariantsByExperiment.mockResolvedValue([mockVariant]);
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
+      mockRepo.findAssignmentByUser.mockResolvedValueOnce(null).mockResolvedValue(mockAssignment);
       mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
 
       const result = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1', { name: 'John' });
 
@@ -382,9 +381,8 @@ describe('PushExperimentsService', () => {
 
       mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
       mockRepo.findVariantsByExperiment.mockResolvedValue([mockVariant]);
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
+      mockRepo.findAssignmentByUser.mockResolvedValueOnce(null).mockResolvedValue(mockAssignment);
       mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
 
       const result = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1', { name: 'John' });
 
@@ -544,9 +542,10 @@ describe('PushExperimentsService', () => {
 
       mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
       mockRepo.findVariantsByExperiment.mockResolvedValue(mockVariants);
+      // Always return null so deterministic selectVariant drives allocation on
+      // both calls (otherwise the second call hits the unmocked findVariantById).
       mockRepo.findAssignmentByUser.mockResolvedValue(null);
       mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
 
       const result1 = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1');
       const result2 = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1');
