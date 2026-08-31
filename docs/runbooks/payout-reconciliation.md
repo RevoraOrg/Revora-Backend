@@ -2,7 +2,7 @@
 
 **Owner:** Backend Platform Team (on-call: #revora-backend)  
 **Severity Rubric:** See [Severity Definitions](#severity-rubric)  
-**Last Updated:** 2026-06-24
+**Last Updated:** 2026-08-29
 
 ---
 
@@ -57,6 +57,14 @@ The **PayoutDriftDetector** runs nightly (every 24 hours) and:
    - **On-chain verification:** for payouts with tx_hash, queries Stellar Horizon to confirm amount matches
 3. Persists results to `payout_drift_reports`
 4. Emits Prometheus metrics (see [Metrics and Alarms](#metrics-and-alarms))
+
+**Failure & retry behavior:** Horizon/Soroban queries use a bounded timeout
+(default 10s) with up to 3 retries and exponential backoff. If on-chain
+verification for a payout still fails after retries, that payout is recorded in
+the drift report with `drift_type = 'unverified'` rather than being silently
+skipped, and the run is marked `status = 'partial'`. A run that cannot persist
+its report at all is marked `status = 'failed'`, retried on the next schedule,
+and never clears an existing `payout_drift_alarm` gauge.
 
 **Alarm:** `payout_drift_alarm` gauge = 1 when any non-zero drift is older than 24 hours. This should trigger a pager notification.
 
@@ -224,6 +232,7 @@ Use this procedure when payouts need to be re-submitted to Stellar:
 - You have identified the specific payouts to replay (see triage sections above)
 - The Stellar account has sufficient funds (XLM for fees + asset for payments)
 - The offering is still active or you have override permissions
+- No concurrent DistributionEngine run or replay is active for the same offering + period. Acquire the `distribution_run` advisory lock (or confirm no in-flight run) before replaying to prevent duplicate submissions from racing schedulers.
 
 ### Steps
 
