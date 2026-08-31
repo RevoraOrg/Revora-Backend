@@ -13,6 +13,7 @@ import {
   WEBHOOK_EVENT_HEADER,
 } from '../lib/webhookSignature';
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
+import type { PoolClient } from 'pg';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -274,6 +275,67 @@ describe('WebhookService.emit', () => {
     expect(mockFetch).toHaveBeenCalledWith(ep2.url, expect.anything());
 
     jest.restoreAllMocks();
+  });
+});
+
+// ─── WebhookService.emit (transactional outbox path) ────────────────────────
+
+describe('WebhookService.emit with transactional client', () => {
+  function makeOutboxRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
+    return {
+      id: 'row-1',
+      event_id: 'stable-uuid',
+      event_type: WebhookEventType.DISTRIBUTION_COMPLETED,
+      payload: {},
+      status: 'pending',
+      attempts: 0,
+      available_at: new Date(),
+      created_at: new Date(),
+      updated_at: new Date(),
+      ...overrides,
+    };
+  }
+
+  it('writes an outbox row atomically via the provided client and returns the event_id', async () => {
+    const mockClient = {} as unknown as PoolClient;
+    const outboxRepo = {
+      insert: jest.fn().mockResolvedValue(makeOutboxRow({ event_id: 'event-abc' })),
+    } as unknown as jest.Mocked<OutboxRepository>;
+    const repo = makeRepo();
+    const svc = new WebhookService(repo, { outboxRepo });
+
+    const eventId = await svc.emit(WebhookEventType.DISTRIBUTION_COMPLETED, { run_id: 'r1' }, mockClient);
+
+    expect(eventId).toBe('event-abc');
+    expect(outboxRepo.insert).toHaveBeenCalledWith(
+      expect.objectContaining({ event_type: WebhookEventType.DISTRIBUTION_COMPLETED }),
+      mockClient,
+    );
+    // No direct fire-and-forget delivery occurs on the transactional path.
+    expect(repo.listActiveByEvent).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('throws when a transactional client is supplied but outboxRepo is not configured', async () => {
+    const svc = new WebhookService(makeRepo());
+    await expect(
+      svc.emit(WebhookEventType.PAYOUT_FAILED, { reason: 'x' }, {} as unknown as PoolClient)
+    ).rejects.toThrow('outboxRepo is required');
+  });
+
+  it('keeps legacy fire-and-forget behaviour when no client is supplied', async () => {
+    const ep = makeEndpoint();
+    const repo = makeRepo([ep]);
+    const svc = new WebhookService(repo, { initialDelayMs: 0 });
+    mockFetch.mockClear();
+    mockFetch.mockResolvedValue(makeOkResponse());
+
+    const result = await svc.emit(WebhookEventType.OFFERING_CREATED, { id: 'offer-1' });
+    await flushPromises();
+
+    expect(result).toBeUndefined();
+    expect(repo.listActiveByEvent).toHaveBeenCalledWith(WebhookEventType.OFFERING_CREATED);
+    expect(mockFetch).toHaveBeenCalledWith(ep.url, expect.anything());
   });
 });
 

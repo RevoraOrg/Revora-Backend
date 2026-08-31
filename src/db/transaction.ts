@@ -1,5 +1,7 @@
-import { Pool, PoolClient } from "pg";
-import { globalLogger } from "../lib/logger";
+import { Pool, PoolClient } from 'pg';
+import { globalLogger } from '../lib/logger';
+import { WebhookEventType } from '../services/webhookService';
+import { OutboxRepository } from './repositories/outboxRepository';
 
 /**
  * Transaction options for controlling transaction behavior
@@ -418,4 +420,85 @@ export async function withAdvisoryLock<T>(
     },
     options,
   );
+}
+
+/**
+ * A webhook event to be captured by the transactional outbox as part of the
+ * producing database transaction.
+ */
+export interface WebhookOutboxEvent {
+  /** Webhook event type (e.g. `distribution.completed`, `payout.failed`). */
+  event: WebhookEventType;
+  /** Arbitrary JSON-serialisable event payload. */
+  data: unknown;
+  /** Stable idempotency key; a UUID v4 is generated when omitted. */
+  eventId?: string;
+}
+
+/**
+ * Insert webhook events into the transactional outbox using the caller's
+ * transactional `client`.
+ *
+ * Because every row is written through the same `PoolClient` as the domain
+ * change that produced the event, the rows commit or roll back atomically with
+ * the surrounding `withTransaction` block:
+ *
+ * - **Commit**  → the rows become visible and are picked up by the
+ *   `OutboxDispatcher` drain worker.
+ * - **Rollback** → the rows are discarded with the transaction, so a failed
+ *   producer never emits a phantom webhook event.
+ *
+ * Each row carries a stable `event_id` (the caller-supplied idempotency key or
+ * a fresh UUID v4). The dispatcher forwards that id as the webhook payload `id`
+ * on every delivery attempt, so the receiver's `webhookEventOrdering`
+ * middleware can deduplicate retries — exactly-once delivery.
+ *
+ * @example
+ * ```typescript
+ * await withTransaction(pool, async (client) => {
+ *   await client.query('UPDATE payouts SET status = $1 ...', ['completed', payoutId]);
+ *   await enqueueWebhookOutboxEvents(client, outboxRepo, [{
+ *     event: WebhookEventType.PAYOUT_COMPLETED,
+ *     data: { payout_id: payoutId },
+ *   }]);
+ * });
+ * ```
+ *
+ * @param client    Transactional PoolClient from the producing transaction.
+ * @param outboxRepo OutboxRepository wrapping the `webhook_outbox` table.
+ * @param events    List of events to capture atomically.
+ * @returns         The stable `event_id` written for each event, in order.
+ * @throws {TransactionError} when `client`, `outboxRepo` or the events list
+ *         is invalid.
+ */
+export async function enqueueWebhookOutboxEvents(
+  client: PoolClient,
+  outboxRepo: OutboxRepository,
+  events: WebhookOutboxEvent[],
+): Promise<string[]> {
+  if (!client) {
+    throw new TransactionError('PoolClient is required to enqueue webhook outbox events');
+  }
+  if (!outboxRepo) {
+    throw new TransactionError('OutboxRepository is required to enqueue webhook outbox events');
+  }
+  if (!Array.isArray(events)) {
+    throw new TransactionError('Outbox events must be provided as an array');
+  }
+  if (events.length === 0) {
+    return [];
+  }
+
+  const eventIds: string[] = [];
+  for (const entry of events) {
+    if (!entry || typeof entry !== 'object' || !entry.event) {
+      throw new TransactionError('Each outbox event must include a valid event type');
+    }
+    const row = await outboxRepo.insert(
+      { event_type: entry.event, payload: entry.data, event_id: entry.eventId },
+      client,
+    );
+    eventIds.push(row.event_id);
+  }
+  return eventIds;
 }
