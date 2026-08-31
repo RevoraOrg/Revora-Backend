@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { timingSafeEqual } from "crypto";
 import express, {
   NextFunction,
   Request,
@@ -34,7 +35,11 @@ import {
 import { OutboxRepository } from "./db/repositories/outboxRepository";
 import { OutboxDispatcher, makeWebhookDispatchFn } from "./services/outboxDispatcher";
 import { pool } from "./db/pool";
-import { globalMetrics } from "./lib/metrics";
+import {
+  globalMetrics,
+  WEBHOOK_QUEUE_DEPTH_GAUGE,
+  WEBHOOK_QUEUE_SHED_TOTAL,
+} from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
 import { EmailDeliverabilityService } from "./services/emailDeliverabilityService";
@@ -42,6 +47,7 @@ import { EmailDeliverabilityRepository } from "./db/repositories/emailDeliverabi
 import { createEmailWebhooksRouter } from "./routes/emailWebhooks";
 import { createAdminRouter } from "./routes/admin";
 import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
+import { createAdminWebhookRouter } from "./routes/adminWebhooks";
 import { AccountingLedgerService } from "./services/accountingLedgerService";
 import { DistributionRepository } from "./db/repositories/distributionRepository";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
@@ -57,6 +63,8 @@ import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
+import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
+import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
@@ -72,6 +80,10 @@ import { createComplianceRouter } from './routes/compliance';
 import { createScimRouter } from './routes/scim';
 import { UserRepository } from './db/repositories/userRepository';
 import taxationRouter from './routes/taxation';
+import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository';
+import { InMemoryStatementPdfStorage } from './services/statementPdfService';
+import createStatementsRouter from './routes/statements';
+import { createRequireAuth } from './middleware/auth';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -119,6 +131,50 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
+}
+
+/**
+ * Bearer-token guard for the reconciliation metrics endpoint.
+ *
+ * Security assumptions:
+ *  - In production a `METRICS_TOKEN` MUST be set; otherwise the endpoint is
+ *    down (503) rather than exposed unauthenticated.
+ *  - Token comparison uses a constant-time compare to avoid timing oracles.
+ *  - In `development`/`test` the guard is bypassed for operator convenience,
+ *    mirroring the existing Prometheus `/metrics` endpoint behaviour.
+ */
+function createMetricsAuthMiddleware(): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const metricsToken = process.env.METRICS_TOKEN;
+    const nodeEnv = process.env.NODE_ENV;
+
+    if (nodeEnv === "development" || nodeEnv === "test") {
+      next();
+      return;
+    }
+    if (!metricsToken) {
+      res.status(503).json({
+        error: "Metrics endpoint not configured",
+        message: "METRICS_TOKEN environment variable must be set",
+      });
+      return;
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized", message: "Bearer token required" });
+      return;
+    }
+    const token = authHeader.substring(7);
+    const matches =
+      token.length === metricsToken.length &&
+      timingSafeEqual(Buffer.from(token), Buffer.from(metricsToken));
+    if (!matches) {
+      res.status(401).json({ error: "Unauthorized", message: "Invalid token" });
+      return;
+    }
+    next();
+  };
 }
 
 interface OfferingValidationPayload {
@@ -706,6 +762,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
 
+  // Mount admin webhook dead-letter routes
+  const webhookEndpointRepo = new WebhookEndpointRepository(pool);
+  apiRouter.use("/admin/webhooks", createAdminWebhookRouter({ webhookEndpointRepo }));
+
   // Mount admin ledger double-entry export (RBAC + audited)
   apiRouter.use(
     "/admin/ledger",
@@ -738,8 +798,33 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const ledgerExportService = new LedgerExportService(ledgerRepo);
   apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
 
+  // Investor statements (Issue #874): the fetch endpoint re-verifies the
+  // persisted sha256 before serving. Storage defaults to in-memory — replace
+  // with the S3-backed adapter when one is deployed so completed renders are
+  // retrievable across instances. Without a storage adapter, requests simply
+  // 404 (no artifacts exist), which is fail-safe.
+  const statementStorage = new InMemoryStatementPdfStorage();
+  const pdfRenderJobRepo = new PdfRenderJobRepository(pool);
+  const sessionRepo = new SessionRepository(pool);
+  apiRouter.use(
+    "/statements",
+    createStatementsRouter({
+      jobRepo: pdfRenderJobRepo,
+      storage: statementStorage,
+      verifyJWT: createRequireAuth(sessionRepo),
+    }),
+  );
+
   // Mount taxation routes for per-lot cost-basis tax reporting
   app.use(API_VERSION_PREFIX + '/taxation', taxationRouter);
+
+  // Expose reconciliation alarms and discrepancy metrics (OpenMetrics subset).
+  // Guards alarms via bearer token in production; bypassed in dev/test.
+  app.get(
+    "/metrics/reconciliation",
+    createMetricsAuthMiddleware(),
+    createReconciliationMetricsHandler(globalMetrics),
+  );
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
@@ -836,7 +921,9 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
  * @notice When in-flight count reaches WEBHOOK_QUEUE_MAX_DEPTH the delivery is
  *         persisted as 'deferred' (never dropped) and webhook_queue_shed_total
  *         is incremented. Call resumeDeferred() to re-enqueue them once capacity
- *         is available.
+ *         is available. Shedding is idempotent per delivery: re-enqueueing an
+ *         already-deferred row at capacity reuses the row and does not
+ *         double-count the metric.
  */
 export class WebhookQueue {
   private static repo: WebhookEndpointRepository;
@@ -875,6 +962,33 @@ export class WebhookQueue {
     return this.INITIAL_DELAY * Math.pow(2, retryCount);
   }
 
+  /**
+   * Count a shed delivery. Invoked only when a delivery first transitions to
+   * deferred so the counter is idempotent across retries of the same row.
+   */
+  private static recordShed(endpointId: string): void {
+    globalMetrics.incrementCounter(
+      WEBHOOK_QUEUE_SHED_TOTAL,
+      { endpoint: endpointId },
+      1,
+      'Total webhook deliveries deferred due to queue depth limit',
+    );
+  }
+
+  /**
+   * Attempt delivery of a webhook payload to an active endpoint.
+   *
+   * @dev Back-pressure contract: when the bounded queue is at capacity the
+   *      delivery is persisted with status 'deferred' (never dropped) and the
+   *      webhook_queue_shed_total counter is incremented exactly once per
+   *      status transition. When a retry is re-enqueued with `deliveryId`, the
+   *      same row is deferred instead of a duplicate being inserted, so retries
+   *      are idempotent and preserve the attempt counter.
+   * @param url        Webhook endpoint URL (SSRF validation precedes any write)
+   * @param payload    Event payload to deliver
+   * @param deliveryId Existing delivery row to reuse (retry path)
+   * @returns true when delivered, false when deferred/failed/absent endpoint
+   */
   static async processDelivery(
     url: string,
     payload: any,
@@ -898,20 +1012,41 @@ export class WebhookQueue {
 
     // --- Back-pressure: defer when at capacity ---
     if (this.inFlight >= this.maxDepth) {
-      const deferred = await this.repo.createDelivery({
-        endpoint_id: endpoint.id,
-        payload,
-        status: 'deferred',
-        attempts: 0,
-      });
-      globalMetrics.incrementCounter(
-        'webhook_queue_shed_total',
-        { endpoint: endpoint.id },
-        1,
-        'Total webhook deliveries deferred due to queue depth limit',
+      // When a retry is re-enqueued (deliveryId known), defer that same row
+      // instead of inserting a duplicate so attempts/backoff state are kept and
+      // the shed counter stays idempotent across retries of the same delivery.
+      let deferred: WebhookDelivery | null = deliveryId
+        ? await this.repo.findDeliveryById(deliveryId)
+        : null;
+
+      let deferredId: string;
+      if (!deferred) {
+        deferred = await this.repo.createDelivery({
+          endpoint_id: endpoint.id,
+          payload,
+          status: 'deferred',
+          attempts: 0,
+        });
+        deferredId = deferred.id;
+        this.recordShed(endpoint.id);
+      } else {
+        deferredId = deferred.id;
+        if (deferred.status !== 'deferred') {
+          await this.repo.updateDelivery(deferred.id, {
+            status: 'deferred',
+          });
+          this.recordShed(endpoint.id);
+        }
+      }
+
+      globalMetrics.setGauge(
+        WEBHOOK_QUEUE_DEPTH_GAUGE,
+        this.inFlight,
+        {},
+        'Current in-flight webhook deliveries when the queue sheds a delivery',
       );
       console.warn(
-        `[WebhookQueue] Queue full (${this.inFlight}/${this.maxDepth}), deferred delivery ${deferred.id}`,
+        `[WebhookQueue] Queue full (${this.inFlight}/${this.maxDepth}), deferred delivery ${deferredId}`,
       );
       return false;
     }
@@ -1016,6 +1151,9 @@ export class WebhookQueue {
     if (!this.repo) return;
     const pending = await this.repo.getPendingDeliveries();
     for (const delivery of pending) {
+      // Honour the same bounded-depth contract as resumeDeferred; excess rows
+      // stay pending and are picked up on the next resume cycle.
+      if (this.inFlight >= this.maxDepth) break;
       const endpoint = await this.repo.findById(delivery.endpoint_id);
       if (endpoint) {
         void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
@@ -1096,6 +1234,17 @@ if (require.main === module && env.NODE_ENV !== "test") {
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
     console.log("[server] PayoutDriftDetector started");
+  }
+
+  if (roleConfig.reconciliation) {
+    const reconciliationScheduler = createReconciliationSchedulerRuntime({
+      db: pool,
+      metrics: globalMetrics,
+      logger: undefined,
+    });
+    reconciliationScheduler.start();
+    backgroundStopFns.push(() => reconciliationScheduler.stop());
+    console.log("[server] ReconciliationScheduler started");
   }
 
   // --- Hot-path services (only for "api" and "all" roles) ---

@@ -24,7 +24,7 @@ export interface ErrorResponse {
 /**
  * Creates a structured error object.
  */
-function createError(
+export function createError(
   code: ErrorCode,
   message: string,
   statusCode: number,
@@ -141,6 +141,20 @@ export function throwError(
   throw createError(code, message, statusCode, details, options);
 }
 
+/**
+ * Forwards an AppError into the express error-handling chain.
+ * @dev Express treats a 4-argument middleware as an error handler; calling
+ *      next(err) routes the error to that handler (or the default one), which
+ *      formats it into a standard ErrorResponse. This helper exists to make the
+ *      forwarding intent explicit and unit-testable.
+ */
+export function sendAppError(
+  next: (err?: unknown) => void,
+  err: AppError | Error,
+): void {
+  next(err);
+}
+
 export class BadRequestError extends AppError {
   constructor(message: string = 'Bad Request') {
     super(ErrorCode.BAD_REQUEST, 400, message);
@@ -152,7 +166,7 @@ export class UniqueConstraintError extends Error {
   public readonly field: string;
 
   constructor(field: string) {
-    super(`Unique constraint violation on ${field}`);
+    super(`Duplicate value for field: ${field}`);
     Object.setPrototypeOf(this, new.target.prototype);
     this.name = 'UniqueConstraintError';
     this.field = field;

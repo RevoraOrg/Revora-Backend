@@ -32,8 +32,10 @@
  * same offering IS balanced. No manual intervention required.
  */
 
+import { Pool } from 'pg';
 import { Logger, globalLogger } from '../lib/logger';
 import { MetricsCollector } from '../lib/metrics';
+import { OfferingRepository } from '../db/repositories/offeringRepository';
 import {
   RevenueReconciliationService,
   ReconciliationResult,
@@ -62,6 +64,8 @@ export interface ReconciliationRunSummary {
   isBalanced: boolean;
   discrepancyCount: number;
   discrepancyAmount: string;
+  /** Timestamp when the current drift condition was first observed; null when balanced. */
+  driftFirstDetectedAt?: Date | null;
 }
 
 /** Storage interface for run summaries (keyed by offeringId + periodId + startedAt). */
@@ -84,6 +88,11 @@ export interface ReconciliationSchedulerOptions {
    * Default: 50.
    */
   cardinalityLimit?: number;
+  /**
+   * Age threshold after which unresolved (non-zero) drift escalates to a pager
+   * alarm. Default: 24 hours (as required by the reconciliation runbook).
+   */
+  pagerThresholdMs?: number;
   logger?: Logger;
 }
 
@@ -93,6 +102,7 @@ export interface SchedulerRunResult {
   failed: number;
   alarmRaised: number;
   alarmCleared: number;
+  pagerRaised: number;
   errors: Array<{ offeringId: string; error: string }>;
 }
 
@@ -105,6 +115,7 @@ const METRIC_ALARM_OPEN = 'reconciliation_alarm_open';
 const METRIC_DRIFT_AMOUNT = 'reconciliation_drift_amount';
 const METRIC_LAST_RUN_TIMESTAMP = 'reconciliation_last_run_timestamp';
 const METRIC_ERRORS_TOTAL = 'reconciliation_errors_total';
+const METRIC_PAGER_ALARM = 'reconciliation_pager_alarm';
 
 // ─── ReconciliationScheduler ──────────────────────────────────────────────────
 
@@ -112,6 +123,7 @@ export class ReconciliationScheduler {
   private readonly lookbackMs: number;
   private readonly tolerance: number;
   private readonly cardinalityLimit: number;
+  private readonly pagerThresholdMs: number;
   private readonly logger: Logger;
 
   constructor(
@@ -124,6 +136,7 @@ export class ReconciliationScheduler {
     this.lookbackMs = options.lookbackMs ?? 30 * 24 * 60 * 60 * 1000;
     this.tolerance = options.tolerance ?? 0.01;
     this.cardinalityLimit = options.cardinalityLimit ?? 50;
+    this.pagerThresholdMs = options.pagerThresholdMs ?? 24 * 60 * 60 * 1000;
     this.logger = options.logger ?? globalLogger;
   }
 
@@ -152,6 +165,7 @@ export class ReconciliationScheduler {
       failed: 0,
       alarmRaised: 0,
       alarmCleared: 0,
+      pagerRaised: 0,
       errors: [],
     };
 
@@ -165,7 +179,8 @@ export class ReconciliationScheduler {
           : 'overflow';
 
       try {
-        const { periodStart, periodEnd } = await this.determinePeriod(offering.id);
+        const lastRun = await this.runStore.getLastRun(offering.id);
+        const { periodStart, periodEnd } = this.determinePeriod(lastRun);
         const startedAt = new Date();
 
         this.logger.info('ReconciliationScheduler: reconciling offering', {
@@ -183,6 +198,14 @@ export class ReconciliationScheduler {
 
         const completedAt = new Date();
 
+        // Carry forward the earliest detection timestamp so we can escalate to a
+        // pager alarm when non-zero drift persists beyond pagerThresholdMs (24h).
+        const driftFirstDetectedAt: Date | null = reconcileResult.isBalanced
+          ? null
+          : lastRun && !lastRun.isBalanced && lastRun.driftFirstDetectedAt
+            ? lastRun.driftFirstDetectedAt
+            : startedAt;
+
         // Persist run summary
         const summary: ReconciliationRunSummary = {
           offeringId: offering.id,
@@ -192,11 +215,12 @@ export class ReconciliationScheduler {
           isBalanced: reconcileResult.isBalanced,
           discrepancyCount: reconcileResult.discrepancies.length,
           discrepancyAmount: reconcileResult.summary.discrepancyAmount,
+          driftFirstDetectedAt,
         };
         await this.runStore.saveRun(summary);
 
         // Emit metrics
-        this.emitMetrics(metricLabel, reconcileResult, result);
+        this.emitMetrics(metricLabel, reconcileResult, result, driftFirstDetectedAt);
 
         result.successful++;
       } catch (err) {
@@ -228,7 +252,7 @@ export class ReconciliationScheduler {
       }
     }
 
-    this.logger.info('ReconciliationScheduler: tick complete', result);
+    this.logger.info('ReconciliationScheduler: tick complete', { ...result });
     return result;
   }
 
@@ -241,10 +265,9 @@ export class ReconciliationScheduler {
    * timestamp (so no gaps between runs — "missed run resumes").
    * Otherwise the window starts `lookbackMs` ago.
    */
-  private async determinePeriod(
-    offeringId: string
-  ): Promise<{ periodStart: Date; periodEnd: Date }> {
-    const lastRun = await this.runStore.getLastRun(offeringId);
+  private determinePeriod(
+    lastRun: ReconciliationRunSummary | null
+  ): { periodStart: Date; periodEnd: Date } {
     const periodEnd = new Date();
     const periodStart = lastRun
       ? lastRun.completedAt
@@ -262,7 +285,8 @@ export class ReconciliationScheduler {
   private emitMetrics(
     label: string,
     reconcileResult: ReconciliationResult,
-    runResult: SchedulerRunResult
+    runResult: SchedulerRunResult,
+    driftFirstDetectedAt: Date | null = null
   ): void {
     const labels = { offering_id: label };
 
@@ -301,9 +325,25 @@ export class ReconciliationScheduler {
         'Dead-letter alarm: 1 when reconciliation found discrepancies or errored'
       );
       runResult.alarmRaised++;
+
+      // Escalate to a pager alarm when non-zero drift has persisted longer than
+      // the configured threshold (default 24h), per the reconciliation runbook.
+      const driftAgeMs = driftFirstDetectedAt
+        ? Date.now() - driftFirstDetectedAt.getTime()
+        : 0;
+      const pager = driftAgeMs >= this.pagerThresholdMs ? 1 : 0;
+      this.metrics.setGauge(
+        METRIC_PAGER_ALARM,
+        pager,
+        labels,
+        'Pager alarm: 1 when non-zero drift has persisted longer than pagerThresholdMs (default 24h)'
+      );
+      if (pager) runResult.pagerRaised++;
     } else {
       // Clear the alarm — a balanced run always silences any prior alarm.
       this.metrics.setGauge(METRIC_ALARM_OPEN, 0, labels);
+      // A balanced run also clears any pending pager escalation.
+      this.metrics.setGauge(METRIC_PAGER_ALARM, 0, labels);
       runResult.alarmCleared++;
     }
   }
@@ -350,4 +390,214 @@ export class InMemoryReconciliationRunStore implements ReconciliationRunStore {
   getAllRuns(): ReconciliationRunSummary[] {
     return [...this.store.values()];
   }
+}
+
+// ─── PostgresReconciliationRunStore ───────────────────────────────────────────
+
+/**
+ * PostgreSQL-backed implementation of ReconciliationRunStore.
+ *
+ * Persists each scheduler run to the `reconciliation_run_summaries` table
+ * (migration `013_create_reconciliation_run_summaries.sql`). The table has a
+ * natural composite primary key `(offering_id, period_id, started_at)` so
+ * concurrent multi-instance writes for the same run are de-duplicated by the
+ * constraint rather than silently overwritten.
+ *
+ * `getLastRun` reads the most-recent run per offering via the
+ * `idx_rrs_offering_started` index (ORDER BY started_at DESC LIMIT 1), giving a
+ * stable resume point so a missed tick does not double-reconcile a window.
+ *
+ * Security / safety:
+ * - Values are bound parameters (parameterised queries) — no string
+ *   interpolation into SQL, protecting against injection.
+ * - On `INSERT ... ON CONFLICT DO NOTHING`, the return value may be empty; we
+ *   treat that as an idempotent no-op (the row already exists).
+ */
+export class PostgresReconciliationRunStore implements ReconciliationRunStore {
+  constructor(private readonly db: Pool) {}
+
+  async saveRun(summary: ReconciliationRunSummary): Promise<void> {
+    await this.db.query(
+      `
+      INSERT INTO reconciliation_run_summaries (
+        offering_id,
+        period_id,
+        started_at,
+        completed_at,
+        is_balanced,
+        discrepancy_count,
+        discrepancy_amount
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (offering_id, period_id, started_at) DO NOTHING
+      `,
+      [
+        summary.offeringId,
+        summary.periodId,
+        summary.startedAt,
+        summary.completedAt,
+        summary.isBalanced,
+        summary.discrepancyCount,
+        summary.discrepancyAmount,
+      ]
+    );
+  }
+
+  async getLastRun(offeringId: string): Promise<ReconciliationRunSummary | null> {
+    const result = await this.db.query(
+      `
+      SELECT
+        offering_id,
+        period_id,
+        started_at,
+        completed_at,
+        is_balanced,
+        discrepancy_count,
+        discrepancy_amount
+      FROM reconciliation_run_summaries
+      WHERE offering_id = $1
+      ORDER BY started_at DESC
+      LIMIT 1
+      `,
+      [offeringId]
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+      offeringId: row.offering_id,
+      periodId: row.period_id,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      isBalanced: row.is_balanced,
+      discrepancyCount: row.discrepancy_count,
+      discrepancyAmount: String(row.discrepancy_amount ?? '0'),
+    };
+  }
+}
+
+// ─── Scheduler runtime (interval wrapper) ─────────────────────────────────────
+
+export const DEFAULT_RECONCILIATION_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+export const RECONCILIATION_INTERVAL_ENV = 'RECONCILIATION_INTERVAL_MS';
+
+/**
+ * Resolve the scheduler cadence (ms).
+ *
+ * Precedence: RECONCILIATION_INTERVAL_MS env > SCHEDULER_RECONCILIATION_INTERVAL_MS
+ * env > explicit option > DEFAULT_RECONCILIATION_INTERVAL_MS. Non-positive /
+ * non-finite values fall back to the explicit option or default (fail-safe, so a
+ * misconfigured env cannot disable or crash the scheduler cadence).
+ */
+export function resolveSchedulerInterval(
+  env: Record<string, string | undefined>,
+  explicitIntervalMs?: number
+): number {
+  const raw =
+    env[RECONCILIATION_INTERVAL_ENV] ??
+    env['SCHEDULER_RECONCILIATION_INTERVAL_MS'];
+  if (raw !== undefined && raw !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return explicitIntervalMs ?? DEFAULT_RECONCILIATION_INTERVAL_MS;
+}
+
+export interface CreateReconciliationSchedulerRuntimeOptions {
+  /** PostgreSQL pool backing both reconciliation and run-summary persistence. */
+  db: Pool;
+  /** Metrics collector used by the scheduler AND the /metrics/reconciliation endpoint. */
+  metrics: MetricsCollector;
+  logger?: Logger;
+  /** Default cadence between ticks (ms). Overridden by RECONCILIATION_INTERVAL_MS. */
+  intervalMs?: number;
+  /** Forwarded to ReconciliationScheduler. */
+  tolerance?: number;
+  /** Forwarded to ReconciliationScheduler (label cardinality cap). */
+  cardinalityLimit?: number;
+  /** Run-summary store. Defaults to PostgresReconciliationRunStore. */
+  runStore?: ReconciliationRunStore;
+  /** Active-offering repository. Defaults to OfferingRepository (listAll). */
+  offeringRepo?: ActiveOfferingRepository;
+  /** Underlying scheduler. Defaults to a ReconciliationScheduler built from db + metrics. */
+  scheduler?: ReconciliationScheduler;
+}
+
+/**
+ * Build an interval-driven ReconciliationScheduler runtime.
+ *
+ * Returns a `{ start, stop, isRunning }` handle so app bootstrap can start the
+ * cadence in production/development and keep tests deterministic (no timers).
+ *
+ * Concurrency safety: a tick is never started while a previous tick is still
+ * in flight (`running` guard), so overlapping ticks cannot double-reconcile an
+ * offering. A tick that throws is caught and logged rather than crashing the
+ * process, and the dead-letter alarm stays open until a later balanced run.
+ */
+export function createReconciliationSchedulerRuntime(
+  options: CreateReconciliationSchedulerRuntimeOptions
+): { start: () => void; stop: () => void; isRunning: () => boolean } {
+  const logger = options.logger ?? globalLogger;
+  const runStore = options.runStore ?? new PostgresReconciliationRunStore(options.db);
+
+  const scheduler =
+    options.scheduler ??
+    new ReconciliationScheduler(
+      new RevenueReconciliationService(options.db),
+      options.offeringRepo ?? (new OfferingRepository(options.db) as unknown as ActiveOfferingRepository),
+      runStore,
+      options.metrics,
+      {
+        tolerance: options.tolerance,
+        cardinalityLimit: options.cardinalityLimit,
+        logger,
+      }
+    );
+
+  let timer: NodeJS.Timeout | null = null;
+  let running = false;
+
+  const resolveInterval = (): number =>
+    resolveSchedulerInterval(process.env, options.intervalMs);
+
+  const tick = async (): Promise<void> => {
+    if (running) {
+      logger.warn('ReconciliationScheduler: skipping tick — previous tick still running');
+      return;
+    }
+    running = true;
+    try {
+      await scheduler.runScheduledReconciliation();
+    } catch (err) {
+      logger.error('ReconciliationScheduler: unhandled tick error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      running = false;
+    }
+  };
+
+  return {
+    start(): void {
+      if (timer) return; // already running
+      // Run once on startup for immediate drift detection, then on cadence.
+      void tick();
+      timer = setInterval(() => void tick(), resolveInterval());
+      timer.unref?.();
+      logger.info('ReconciliationScheduler: started', {
+        intervalMs: resolveInterval(),
+      });
+    },
+    stop(): void {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      logger.info('ReconciliationScheduler: stopped');
+    },
+    isRunning(): boolean {
+      return timer !== null;
+    },
+  };
 }

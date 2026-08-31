@@ -42,6 +42,8 @@ export interface RoleConfig {
   auditPurge: boolean;
   /** Run nightly payout-drift detection. */
   payoutDrift: boolean;
+  /** Run scheduled RevenueReconciliationService reconciliation ticks. */
+  reconciliation: boolean;
 }
 
 /**
@@ -53,18 +55,21 @@ export const ROLE_MATRIX: Record<WorkerRole, RoleConfig> = {
     webhookQueue: true,
     auditPurge: false,
     payoutDrift: false,
+    reconciliation: false,
   },
   batch: {
     httpServer: false,
     webhookQueue: false,
     auditPurge: true,
     payoutDrift: true,
+    reconciliation: true,
   },
   all: {
     httpServer: true,
     webhookQueue: true,
     auditPurge: true,
     payoutDrift: true,
+    reconciliation: true,
   },
 };
 

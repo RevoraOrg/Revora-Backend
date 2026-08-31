@@ -10,6 +10,7 @@
 import { Logger, globalLogger } from '../lib/logger';
 import DistributionEngine from './distributionEngine';
 import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
+import { ScheduledDistributionRepository } from '../db/repositories/scheduledDistributionRepository';
 import { AppError, Errors } from '../lib/errors';
 import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
 import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
@@ -18,13 +19,30 @@ import { MetricsCollector } from '../lib/metrics';
 export interface DistributionSchedulerOptions {
   logger?: Logger;
   holidayCalendarService?: HolidayCalendarService;
-  resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
+  resolveJurisdiction?: (
+    offeringId: string,
+  ) => Promise<string | null> | string | null;
   /** Maximum reports to enqueue in a single catch-up pass (default: 50). */
   catchupMax?: number;
   /** Backlog size above which a red-alert is emitted (default: 2× catchupMax). */
   catchupBacklogAlertThreshold?: number;
   metrics?: MetricsCollector;
+  /** Repository for the deferred distribution queue (optional for back-compat). */
+  scheduledDistributionRepo?: ScheduledDistributionRepository;
+  /** Lease (ms) after which a stuck `processing` scheduled row is reclaimed (default: 15 min). */
+  staleLeaseMs?: number;
 }
+
+export type ScheduledDispatchResult = {
+  processed: number;
+  successful: number;
+  failed: number;
+  skipped: number;
+  errors: Array<{ id: string; error: string }>;
+};
+
+/** Default lease before a crashed scheduler's `processing` row is reclaimed. */
+export const DEFAULT_STALE_LEASE_MS = 15 * 60 * 1000;
 
 export interface CatchUpResult {
   totalMissed: number;
@@ -54,7 +72,7 @@ export interface TimezoneAuditRecord {
   offeringId: string;
   window: TimezoneWindow;
   evaluatedAt: Date;
-  dstTransition: 'none' | 'fallback' | 'springForward';
+  dstTransition: "none" | "fallback" | "springForward";
   schedule: CronSchedule;
 }
 
@@ -115,7 +133,7 @@ export interface CronWindowValidationResult {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const DEFAULT_TIMEZONE = 'UTC';
+const DEFAULT_TIMEZONE = "UTC";
 
 const FIELD_RANGES: Record<string, { min: number; max: number }> = {
   minute: { min: 0, max: 59 },
@@ -139,14 +157,14 @@ const FIELD_RANGES: Record<string, { min: number; max: number }> = {
  */
 export const STELLAR_MAINTENANCE_WINDOWS = [
   {
-    label: 'Stellar weekly maintenance (Sunday 06:00–07:00 UTC)',
+    label: "Stellar weekly maintenance (Sunday 06:00–07:00 UTC)",
     /**  min  hr  dom  month  dow(0=Sun) */
-    cron: '0   6   *    *      0',
+    cron: "0   6   *    *      0",
     durationMinutes: 60,
   },
   {
-    label: 'Stellar monthly upgrade window (1st Monday 02:00–04:00 UTC)',
-    cron: '0   2   *    *      1',
+    label: "Stellar monthly upgrade window (1st Monday 02:00–04:00 UTC)",
+    cron: "0   2   *    *      1",
     durationMinutes: 120,
   },
 ] as const;
@@ -168,6 +186,9 @@ function normalizeTimezone(tz: string): string {
     PST: 'America/Los_Angeles',
     PDT: 'America/Los_Angeles',
     GMT: 'UTC',
+    'Etc/UTC': 'UTC',
+    'Etc/GMT': 'UTC',
+    Z: 'UTC',
   };
   return aliases[tz.trim()] ?? tz.trim();
 }
@@ -201,11 +222,13 @@ export class CronWindowValidator {
   private readonly metrics?: MetricsCollector;
   private readonly logger: Logger;
 
-  constructor(options: {
-    lookaheadDays?: number;
-    metrics?: MetricsCollector;
-    logger?: Logger;
-  } = {}) {
+  constructor(
+    options: {
+      lookaheadDays?: number;
+      metrics?: MetricsCollector;
+      logger?: Logger;
+    } = {},
+  ) {
     this.lookaheadMs = (options.lookaheadDays ?? 60) * 24 * 60 * 60 * 1_000;
     this.metrics = options.metrics;
     this.logger = options.logger ?? globalLogger;
@@ -239,7 +262,7 @@ export class CronWindowValidator {
     const stellarConflict = this._checkStellarConflict(def, now, horizon);
     if (stellarConflict) {
       reasons.push(
-        `Expression fires during Stellar maintenance: ${stellarConflict.windowLabel} at ${stellarConflict.conflictAt}`
+        `Expression fires during Stellar maintenance: ${stellarConflict.windowLabel} at ${stellarConflict.conflictAt}`,
       );
       this._emitRejected(def, reasons);
       return { valid: false, reasons, stellarConflict };
@@ -255,7 +278,7 @@ export class CronWindowValidator {
    */
   validateAgainstExisting(
     incoming: CronWindowDefinition,
-    existing: CronWindowDefinition[]
+    existing: CronWindowDefinition[],
   ): CronWindowValidationResult {
     // First run base validation
     const base = this.validate(incoming);
@@ -267,7 +290,12 @@ export class CronWindowValidator {
     for (const other of existing) {
       if (other.offeringId === incoming.offeringId) continue;
 
-      const overlap = this._checkExpressionOverlap(incoming, other, now, horizon);
+      const overlap = this._checkExpressionOverlap(
+        incoming,
+        other,
+        now,
+        horizon,
+      );
       if (overlap) {
         const reasons = [
           `Window for offering "${incoming.offeringId}" overlaps with offering "${other.offeringId}" at ${overlap}`,
@@ -278,7 +306,7 @@ export class CronWindowValidator {
           collisionAt: overlap,
         };
         this._emitRejected(incoming, reasons);
-        this.logger.warn('scheduler.window.rejected: overlap detected', {
+        this.logger.warn("scheduler.window.rejected: overlap detected", {
           offeringId: incoming.offeringId,
           collidingOfferingId: other.offeringId,
           collisionAt: overlap,
@@ -299,25 +327,31 @@ export class CronWindowValidator {
   private _checkStellarConflict(
     def: CronWindowDefinition,
     from: Date,
-    to: Date
+    to: Date,
   ): { windowLabel: string; conflictAt: string } | null {
     const tz = normalizeScheduleTimezone(def.timezone);
     let cursor = new Date(from);
     while (cursor <= to) {
       if (evaluateCronAt(def.expression, cursor, tz)) {
         for (const maint of STELLAR_MAINTENANCE_WINDOWS) {
-          const maintCron = maint.cron.replace(/\s+/g, ' ').trim();
+          const maintCron = maint.cron.replace(/\s+/g, " ").trim();
           // Check if the firing minute falls inside the maintenance window
           const maintStart = new Date(cursor);
-          if (evaluateCronAt(maintCron, cursor, 'UTC')) {
-            return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+          if (evaluateCronAt(maintCron, cursor, "UTC")) {
+            return {
+              windowLabel: maint.label,
+              conflictAt: cursor.toISOString(),
+            };
           }
           // Also check if cursor falls within an already-started maintenance window
           // by scanning backwards up to durationMinutes
           for (let back = 1; back <= maint.durationMinutes; back++) {
             const candidate = new Date(cursor.getTime() - back * 60_000);
-            if (evaluateCronAt(maintCron, candidate, 'UTC')) {
-              return { windowLabel: maint.label, conflictAt: cursor.toISOString() };
+            if (evaluateCronAt(maintCron, candidate, "UTC")) {
+              return {
+                windowLabel: maint.label,
+                conflictAt: cursor.toISOString(),
+              };
             }
           }
         }
@@ -331,7 +365,7 @@ export class CronWindowValidator {
     a: CronWindowDefinition,
     b: CronWindowDefinition,
     from: Date,
-    to: Date
+    to: Date,
   ): string | null {
     const tzA = normalizeScheduleTimezone(a.timezone);
     const tzB = normalizeScheduleTimezone(b.timezone);
@@ -349,10 +383,10 @@ export class CronWindowValidator {
   }
 
   private _emitRejected(def: CronWindowDefinition, reasons: string[]): void {
-    this.metrics?.incrementCounter('scheduler_window_rejected_total', {
+    this.metrics?.incrementCounter("scheduler_window_rejected_total", {
       offering_id: def.offeringId,
     });
-    this.logger.warn('scheduler.window.rejected', {
+    this.logger.warn("scheduler.window.rejected", {
       offeringId: def.offeringId,
       expression: def.expression,
       timezone: def.timezone,
@@ -368,7 +402,8 @@ export class CronWindowValidator {
  * or `null` if it passes.
  */
 export function validateCronSyntax(expr: string): string | null {
-  if (!expr || typeof expr !== 'string') return 'Expression must be a non-empty string';
+  if (!expr || typeof expr !== "string")
+    return "Expression must be a non-empty string";
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) {
     return `Expected 5 fields (minute hour dom month dow) but got ${fields.length}`;
@@ -384,23 +419,30 @@ export function validateCronSyntax(expr: string): string | null {
   return null;
 }
 
-function validateCronField(field: string, name: string, min: number, max: number): string | null {
-  if (field === '*') return null;
+function validateCronField(
+  field: string,
+  name: string,
+  min: number,
+  max: number,
+): string | null {
+  if (field === "*") return null;
 
-  if (field.startsWith('*/')) {
+  if (field.startsWith("*/")) {
     const step = parseInt(field.slice(2), 10);
     if (isNaN(step) || step <= 0) return `${name}: invalid step "${field}"`;
-    if (step > max - min + 1) return `${name}: step ${step} exceeds field range ${min}-${max}`;
+    if (step > max - min + 1)
+      return `${name}: step ${step} exceeds field range ${min}-${max}`;
     return null;
   }
 
-  for (const part of field.split(',')) {
-    if (part.includes('-')) {
-      const [rawS, rawE] = part.split('-');
+  for (const part of field.split(",")) {
+    if (part.includes("-")) {
+      const [rawS, rawE] = part.split("-");
       const s = parseInt(rawS!, 10);
       const e = parseInt(rawE!, 10);
       if (isNaN(s) || isNaN(e)) return `${name}: invalid range "${part}"`;
-      if (s < min || e > max) return `${name}: range ${s}-${e} out of bounds [${min},${max}]`;
+      if (s < min || e > max)
+        return `${name}: range ${s}-${e} out of bounds [${min},${max}]`;
       if (s > e) return `${name}: range start ${s} > end ${e}`;
     } else {
       const v = parseInt(part, 10);
@@ -416,57 +458,65 @@ function validateCronField(field: string, name: string, min: number, max: number
 
 function ianaOffset(date: Date, tz: string): number {
   const utcMillis = date.getTime();
-  const localeParts = date.toLocaleString('en-CA', {
+  const localeParts = date.toLocaleString("en-CA", {
     timeZone: tz,
     hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   });
-  const [datePart, timePart] = localeParts.split(', ');
-  const [y, m, d] = datePart.split('-').map(Number);
-  const [hh, mm, ss] = timePart.split(':').map(Number);
+  const [datePart, timePart] = localeParts.split(", ");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm, ss] = timePart.split(":").map(Number);
   const localMillis = Date.UTC(y, m - 1, d, hh, mm, ss);
   return (localMillis - utcMillis) / 60_000;
 }
 
-function ianaDate(date: Date, tz: string): {
-  year: number; month: number; day: number;
-  hour: number; minute: number; second: number;
+function ianaDate(
+  date: Date,
+  tz: string,
+): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
 } {
-  const parts = date.toLocaleString('en-CA', {
+  const parts = date.toLocaleString("en-CA", {
     timeZone: tz,
     hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   });
-  const [datePart, timePart] = parts.split(', ');
-  const [y, m, d] = datePart.split('-').map(Number);
-  const [hh, mm, ss] = timePart.split(':').map(Number);
+  const [datePart, timePart] = parts.split(", ");
+  const [y, m, d] = datePart.split("-").map(Number);
+  const [hh, mm, ss] = timePart.split(":").map(Number);
   return { year: y, month: m, day: d, hour: hh, minute: mm, second: ss };
 }
 
 function matchesCronField(value: number, field: string): boolean {
-  if (field === '*') return true;
-  if (field.startsWith('*/')) {
+  if (field === "*") return true;
+  if (field.startsWith("*/")) {
     const step = parseInt(field.slice(2), 10);
     if (isNaN(step) || step === 0) return false;
     return value % step === 0;
   }
-  const parts = field.split(',');
+  const parts = field.split(",");
   for (const part of parts) {
-    if (part.includes('-')) {
-      const [rawStart, rawEnd] = part.split('-');
+    if (part.includes("-")) {
+      const [rawStart, rawEnd] = part.split("-");
       const start = parseInt(rawStart, 10);
       const end = parseInt(rawEnd, 10);
-      if (!isNaN(start) && !isNaN(end) && value >= start && value <= end) return true;
+      if (!isNaN(start) && !isNaN(end) && value >= start && value <= end)
+        return true;
     }
     if (parseInt(part, 10) === value) return true;
   }
@@ -492,7 +542,9 @@ function evaluateCronAt(cron: string, date: Date, tz: string): boolean {
 
 // ─── Public helpers ───────────────────────────────────────────────────────────
 
-export function normalizeScheduleTimezone(tz: string | null | undefined): string {
+export function normalizeScheduleTimezone(
+  tz: string | null | undefined,
+): string {
   if (!tz) return DEFAULT_TIMEZONE;
   const normalized = normalizeTimezone(tz);
   if (!isValidTimezone(normalized)) return DEFAULT_TIMEZONE;
@@ -503,7 +555,7 @@ export function assertValidScheduleTimezone(tz: string): string {
   const normalized = normalizeTimezone(tz);
   if (!isValidTimezone(normalized)) {
     throw Errors.validationError(
-      `Invalid timezone "${tz}". Must be a supported IANA timezone identifier.`
+      `Invalid timezone "${tz}". Must be a supported IANA timezone identifier.`,
     );
   }
   return normalized;
@@ -513,8 +565,11 @@ export function computeTimezoneWindow(
   offeringId: string,
   periodStart: Date,
   periodEnd: Date,
-  timezone: string
-): { window: TimezoneWindow; dstTransition: 'none' | 'fallback' | 'springForward' } {
+  timezone: string,
+): {
+  window: TimezoneWindow;
+  dstTransition: "none" | "fallback" | "springForward";
+} {
   const tz = normalizeScheduleTimezone(timezone);
 
   const utcStart = new Date(periodStart);
@@ -526,12 +581,12 @@ export function computeTimezoneWindow(
   const wallClockStart = new Date(utcStart.getTime() + offsetStart * 60_000);
   const wallClockEnd = new Date(utcEnd.getTime() + offsetEnd * 60_000);
 
-  let dstTransition: 'none' | 'fallback' | 'springForward' = 'none';
+  let dstTransition: "none" | "fallback" | "springForward" = "none";
 
   if (offsetEnd > offsetStart) {
-    dstTransition = 'springForward';
+    dstTransition = "springForward";
   } else if (offsetEnd < offsetStart) {
-    dstTransition = 'fallback';
+    dstTransition = "fallback";
   }
 
   return {
@@ -550,7 +605,9 @@ export function deduplicateWindowKey(window: TimezoneWindow): string {
   return `${window.utcStart.getTime()}:${window.utcEnd.getTime()}`;
 }
 
-export function formatWindowForAudit(window: TimezoneWindow): Record<string, string> {
+export function formatWindowForAudit(
+  window: TimezoneWindow,
+): Record<string, string> {
   return {
     wall_clock_start: window.wallClockStart.toISOString(),
     wall_clock_end: window.wallClockEnd.toISOString(),
@@ -562,7 +619,7 @@ export function formatWindowForAudit(window: TimezoneWindow): Record<string, str
 
 export function findNextCronWindow(
   schedule: CronSchedule,
-  afterDate: Date
+  afterDate: Date,
 ): { start: Date; end: Date } | null {
   const tz = normalizeScheduleTimezone(schedule.timezone);
   const lookaheadDays = 60;
@@ -597,38 +654,44 @@ export function findNextCronWindow(
 export class DistributionScheduler {
   private readonly logger: Logger;
   private readonly holidayCalendarService?: HolidayCalendarService;
-  private readonly resolveJurisdiction?: (offeringId: string) => Promise<string | null> | string | null;
+  private readonly resolveJurisdiction?: (
+    offeringId: string,
+  ) => Promise<string | null> | string | null;
   private readonly catchupMax: number;
   private readonly catchupBacklogAlertThreshold: number;
   private readonly metrics?: MetricsCollector;
+  private readonly scheduledDistributionRepo?: ScheduledDistributionRepository;
+  private readonly staleLeaseMs: number;
   /** In-process de-duplication set: "utcStart:utcEnd" keys. */
   private readonly completedWindows = new Set<string>();
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
     private readonly revenueReportRepo: RevenueReportRepository,
-    options: DistributionSchedulerOptions = {}
+    options: DistributionSchedulerOptions = {},
   ) {
     this.logger = options.logger ?? globalLogger;
     this.holidayCalendarService = options.holidayCalendarService;
     this.resolveJurisdiction = options.resolveJurisdiction;
     this.metrics = options.metrics;
+    this.scheduledDistributionRepo = options.scheduledDistributionRepo;
+    this.staleLeaseMs =
+      options.staleLeaseMs === undefined
+        ? DEFAULT_STALE_LEASE_MS
+        : options.staleLeaseMs;
 
     // ── catchupMax resolution ─────────────────────────────────────────────────
     if (options.catchupMax !== undefined) {
-      if (
-        !Number.isInteger(options.catchupMax) ||
-        options.catchupMax <= 0
-      ) {
-        throw new Error('catchupMax must be a positive integer');
+      if (!Number.isInteger(options.catchupMax) || options.catchupMax <= 0) {
+        throw new Error("catchupMax must be a positive integer");
       }
       this.catchupMax = options.catchupMax;
     } else {
-      const envVal = process.env['SCHEDULER_CATCHUP_MAX'];
-      if (envVal !== undefined && envVal !== '') {
+      const envVal = process.env["SCHEDULER_CATCHUP_MAX"];
+      if (envVal !== undefined && envVal !== "") {
         const parsed = parseInt(envVal, 10);
         if (isNaN(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
-          throw new Error('SCHEDULER_CATCHUP_MAX must be a positive integer');
+          throw new Error("SCHEDULER_CATCHUP_MAX must be a positive integer");
         }
         this.catchupMax = parsed;
       } else {
@@ -638,6 +701,16 @@ export class DistributionScheduler {
 
     this.catchupBacklogAlertThreshold =
       options.catchupBacklogAlertThreshold ?? this.catchupMax * 2;
+  }
+
+  /**
+   * @notice Evaluate whether a cron expression fires at the given moment in `tz`.
+   * @dev Thin public wrapper over the shared expression evaluator. Returns false
+   *      for syntactically invalid expressions and normalises the timezone to UTC
+   *      aliases (e.g. Etc/UTC → UTC) before evaluating.
+   */
+  evaluateCron(expression: string, date: Date, tz: string): boolean {
+    return evaluateCronAt(expression, date, normalizeScheduleTimezone(tz));
   }
 
   /**
@@ -654,11 +727,14 @@ export class DistributionScheduler {
     failed: number;
     errors: Array<{ reportId: string; error: string }>;
   }> {
-    this.logger.info('Starting automated distribution processing');
-    
-    const pendingReports = await this.revenueReportRepo.findApprovedWithoutDistribution();
-    
-    this.logger.info(`Found ${pendingReports.length} pending reports for distribution`);
+    this.logger.info("Starting automated distribution processing");
+
+    const pendingReports =
+      await this.revenueReportRepo.findApprovedWithoutDistribution();
+
+    this.logger.info(
+      `Found ${pendingReports.length} pending reports for distribution`,
+    );
 
     const summary = {
       processed: pendingReports.length,
@@ -671,38 +747,46 @@ export class DistributionScheduler {
       let claim: typeof report | null = null;
 
       try {
-        claim = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
+        claim = await this.revenueReportRepo.claimApprovedReportForDistribution(
+          report.id,
+        );
 
         if (!claim) {
-          this.logger.info('Skipping report already claimed by another scheduler', {
-            reportId: report.id,
-          });
+          this.logger.info(
+            "Skipping report already claimed by another scheduler",
+            {
+              reportId: report.id,
+            },
+          );
           continue;
         }
 
         if (!claim.period_start || !claim.period_end || !claim.amount) {
-          throw Errors.badRequest(`Report ${claim.id} is missing critical data (period or amount)`);
+          throw Errors.badRequest(
+            `Report ${claim.id} is missing critical data (period or amount)`,
+          );
         }
 
-        const timezone = this.resolveOfferingTimezone(claim.offering_timezone as string | undefined);
+        const timezone = this.resolveOfferingTimezone(
+          claim.offering_timezone as string | undefined,
+        );
 
         const { window, dstTransition } = computeTimezoneWindow(
           claim.offering_id,
           claim.period_start,
           claim.period_end,
-          timezone
+          timezone,
         );
 
-        if (this.isWindowAlreadyCompleted(window)) {
-          this.logger.info('Skipping already-completed timezone window', {
+        if (this.isReportAlreadyProcessed(claim.id)) {
+          this.logger.info('Skipping already-processed report', {
             reportId: claim.id,
             offeringId: claim.offering_id,
-            windowKey: deduplicateWindowKey(window),
           });
           continue;
         }
 
-        this.logger.info('Processing automated distribution', {
+        this.logger.info("Processing automated distribution", {
           reportId: claim.id,
           offeringId: claim.offering_id,
           amount: claim.amount,
@@ -711,14 +795,19 @@ export class DistributionScheduler {
         });
 
         let periodEnd = claim.period_end;
-        const jurisdiction = await this.resolveOfferingJurisdiction(claim.offering_id);
+        const jurisdiction = await this.resolveOfferingJurisdiction(
+          claim.offering_id,
+        );
 
         if (this.holidayCalendarService && jurisdiction) {
-          const shiftDecision = this.holidayCalendarService.getShiftedDate(claim.period_end, [jurisdiction]);
+          const shiftDecision = this.holidayCalendarService.getShiftedDate(
+            claim.period_end,
+            [jurisdiction],
+          );
 
           if (shiftDecision.shifted) {
             periodEnd = shiftDecision.shiftedDate;
-            this.logger.info('Distribution window shifted due to blackout', {
+            this.logger.info("Distribution window shifted due to blackout", {
               reportId: claim.id,
               offeringId: claim.offering_id,
               originalDate: shiftDecision.originalDate.toISOString(),
@@ -737,14 +826,14 @@ export class DistributionScheduler {
             start: claim.period_start,
             end: periodEnd,
           },
-          Number(claim.amount)
+          Number(claim.amount),
         );
 
         await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
-        this.markWindowCompleted(window);
+        this.markReportProcessed(claim.id);
 
         summary.successful++;
-        this.logger.info('Automated distribution successful', {
+        this.logger.info("Automated distribution successful", {
           reportId: claim.id,
           offeringId: claim.offering_id,
           dstTransition,
@@ -752,13 +841,59 @@ export class DistributionScheduler {
         });
       } catch (err) {
         if (claim) {
+          const isLockContention =
+            (err instanceof AppError && (err as any).statusCode === 409) ||
+            err instanceof AdvisoryLockNotAvailableError;
+
+          if (isLockContention) {
+            // Another process holds the advisory lock for this (offering, period).
+            // Do NOT mark the report as failed — release the claim by clearing
+            // distribution_status back to 'approved' (if the repo supports it)
+            // and simply skip this tick; the next scheduler pass will retry.
+            this.logger.info(
+              "Skipping distribution: advisory lock held by another process",
+              {
+                reportId: claim.id,
+                offeringId: claim.offering_id,
+                periodId: claim.id,
+              },
+            );
+            try {
+              if (
+                typeof (this.revenueReportRepo as any)
+                  .releaseDistributionClaim === "function"
+              ) {
+                await (this.revenueReportRepo as any).releaseDistributionClaim(
+                  claim.id,
+                );
+              }
+            } catch (releaseErr) {
+              this.logger.warn(
+                "Failed to release distribution claim after lock contention",
+                {
+                  reportId: claim.id,
+                  error:
+                    releaseErr instanceof Error
+                      ? releaseErr.message
+                      : String(releaseErr),
+                },
+              );
+            }
+            // Counts as neither success nor failure — will be retried next tick.
+            continue;
+          }
+
           try {
             await this.revenueReportRepo.markReportDistributionFailed(claim.id);
           } catch (markErr) {
-            this.logger.error('Failed to update report distribution status after failure', {
-              reportId: claim.id,
-              error: markErr instanceof Error ? markErr.message : String(markErr),
-            });
+            this.logger.error(
+              "Failed to update report distribution status after failure",
+              {
+                reportId: claim.id,
+                error:
+                  markErr instanceof Error ? markErr.message : String(markErr),
+              },
+            );
           }
         }
 
@@ -767,18 +902,18 @@ export class DistributionScheduler {
         }
 
         summary.failed++;
-        
+
         const failure = classifyStellarRPCFailure(err, {
-          operation: 'automatedDistribution',
+          operation: "automatedDistribution",
           offeringId: claim.offering_id,
           periodId: claim.id,
         });
 
         const safeError = `Distribution failed: ${failure.class}`;
-          
+
         summary.errors.push({ reportId: claim.id, error: safeError });
-        
-        this.logger.error('Automated distribution failed', {
+
+        this.logger.error("Automated distribution failed", {
           reportId: claim.id,
           offeringId: claim.offering_id,
           error: err instanceof Error ? err.message : String(err),
@@ -788,11 +923,13 @@ export class DistributionScheduler {
       }
     }
 
-    this.logger.info('Automated distribution processing complete', summary);
+    this.logger.info("Automated distribution processing complete", summary);
     return summary;
   }
 
-  private async resolveOfferingJurisdiction(offeringId: string): Promise<string | null> {
+  private async resolveOfferingJurisdiction(
+    offeringId: string,
+  ): Promise<string | null> {
     if (!this.resolveJurisdiction) return null;
     try {
       const result = this.resolveJurisdiction(offeringId);
@@ -810,22 +947,25 @@ export class DistributionScheduler {
    *         exceeds the configured ceiling.
    */
   async catchUpMissedWindows(): Promise<CatchUpResult> {
-    const pending = await this.revenueReportRepo.findApprovedWithoutDistribution();
+    const pending =
+      await this.revenueReportRepo.findApprovedWithoutDistribution();
     const totalMissed = pending.length;
 
-    this.metrics?.setGauge('scheduler_catchup_backlog', totalMissed);
+    this.metrics?.setGauge("scheduler_catchup_backlog", totalMissed);
 
-    const backlogExceededCeiling = totalMissed > this.catchupBacklogAlertThreshold;
+    const backlogExceededCeiling =
+      totalMissed > this.catchupBacklogAlertThreshold;
     if (backlogExceededCeiling) {
       this.logger.error(
-        `[RED-ALERT] Distribution backlog ${totalMissed} exceeds threshold ${this.catchupBacklogAlertThreshold}`
+        `[RED-ALERT] Distribution backlog ${totalMissed} exceeds threshold ${this.catchupBacklogAlertThreshold}`,
       );
     }
 
     const result: CatchUpResult = {
       totalMissed,
       enqueued: 0,
-      skipped: totalMissed > this.catchupMax ? totalMissed - this.catchupMax : 0,
+      skipped:
+        totalMissed > this.catchupMax ? totalMissed - this.catchupMax : 0,
       errors: [],
       backlogExceededCeiling,
     };
@@ -834,7 +974,10 @@ export class DistributionScheduler {
 
     for (const report of toProcess) {
       try {
-        const claim = await this.revenueReportRepo.claimApprovedReportForDistribution(report.id);
+        const claim =
+          await this.revenueReportRepo.claimApprovedReportForDistribution(
+            report.id,
+          );
         if (!claim) {
           // Another scheduler instance claimed it — counts as skipped
           continue;
@@ -848,7 +991,7 @@ export class DistributionScheduler {
       }
     }
 
-    this.logger.info('catch-up missed windows complete', {
+    this.logger.info("catch-up missed windows complete", {
       totalMissed,
       enqueued: result.enqueued,
       skipped: result.skipped,
@@ -859,14 +1002,158 @@ export class DistributionScheduler {
     return result;
   }
 
-  // ── Window de-duplication ──────────────────────────────────────────────────
+  /**
+   * Dispatch due deferred distribution rows from the `scheduled_distributions`
+   * queue.
+   *
+   * Picks rows whose `run_at` has passed plus any stale `processing` rows whose
+   * claim lease expired (a scheduler that crashed mid-run), claims each
+   * atomically, then runs the DistributionEngine with the stored snapshot
+   * boundary (period_start / period_end) and the queued amount.
+   *
+   * Idempotency across restarts is layered:
+   *   - `completed` rows are never returned by findDueScheduledDistributions, so
+   *     backfill skips already-executed rows.
+   *   - `processing` rows from a crashed run are only reclaimed after the lease;
+   *     when re-run, the engine's findRunByParams short-circuits a completed
+   *     run and returns the cached result, after which the row is marked
+   *     completed.
+   *   - duplicate enqueue is prevented at the table level via UNIQUE
+   *     (offering_id, period_id).
+   *
+   * @param now  Test/determinism hook; defaults to the current time.
+   */
+  async processScheduledDistributions(
+    now: Date = new Date(),
+  ): Promise<ScheduledDispatchResult> {
+    const summary: ScheduledDispatchResult = {
+      processed: 0,
+      successful: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+    };
 
-  private isWindowAlreadyCompleted(window: TimezoneWindow): boolean {
-    return this.completedWindows.has(deduplicateWindowKey(window));
+    if (!this.scheduledDistributionRepo) {
+      this.logger.warn(
+        'processScheduledDistributions called without scheduledDistributionRepo; skipping',
+      );
+      return summary;
+    }
+
+    const due = await this.scheduledDistributionRepo.findDueScheduledDistributions(
+      now,
+      this.staleLeaseMs,
+      this.catchupMax,
+    );
+
+    this.logger.info(`Found ${due.length} due scheduled distributions`);
+    summary.processed = due.length;
+
+    for (const item of due) {
+      let claim: Awaited<
+        ReturnType<ScheduledDistributionRepository['claimScheduledDistribution']>
+      > = null;
+
+      try {
+        claim = await this.scheduledDistributionRepo.claimScheduledDistribution(
+          item.id,
+          this.staleLeaseMs,
+        );
+
+        if (!claim) {
+          // Another scheduler instance claimed it first.
+          summary.skipped++;
+          continue;
+        }
+
+        if (!claim.period_id || claim.total_amount === null || claim.total_amount === '') {
+          throw Errors.badRequest(
+            `Scheduled distribution ${claim.id} is missing critical data (period or amount)`,
+          );
+        }
+
+        const amount = Number(claim.total_amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          throw Errors.badRequest(
+            `Scheduled distribution ${claim.id} has an invalid amount`,
+          );
+        }
+
+        this.logger.info('Processing deferred scheduled distribution', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+          runAt: claim.run_at.toISOString(),
+          amount: claim.total_amount,
+        });
+
+        await this.distributionEngine.distribute(
+          claim.offering_id,
+          {
+            id: claim.period_id,
+            start: claim.period_start ?? claim.run_at,
+            end: claim.period_end ?? claim.run_at,
+          },
+          amount,
+        );
+
+        await this.scheduledDistributionRepo.markCompleted(claim.id);
+
+        summary.successful++;
+        this.logger.info('Deferred scheduled distribution successful', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+        });
+      } catch (err) {
+        if (!claim) {
+          summary.skipped++;
+          continue;
+        }
+
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'scheduledDistribution',
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+        });
+        const safeError = `Distribution failed: ${failure.class}`;
+
+        try {
+          await this.scheduledDistributionRepo.markFailed(claim.id, safeError);
+        } catch (markErr) {
+          this.logger.error('Failed to mark scheduled distribution as failed', {
+            scheduledId: claim.id,
+            error: markErr instanceof Error ? markErr.message : String(markErr),
+          });
+        }
+
+        summary.failed++;
+        summary.errors.push({ id: claim.id, error: safeError });
+
+        this.logger.error('Deferred scheduled distribution failed', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class,
+          isAppError: err instanceof AppError,
+        });
+      }
+    }
+
+    this.logger.info('Deferred scheduled distribution processing complete', summary);
+    return summary;
   }
 
-  private markWindowCompleted(window: TimezoneWindow): void {
-    this.completedWindows.add(deduplicateWindowKey(window));
+  // ── Window de-duplication ──────────────────────────────────────────────────
+
+  private isReportAlreadyProcessed(reportId: string): boolean {
+    return this.processedReportIds.has(reportId);
+  }
+
+  private markReportProcessed(reportId: string): void {
+    this.processedReportIds.add(reportId);
   }
 
   // ── Timezone resolution ────────────────────────────────────────────────────
@@ -878,7 +1165,7 @@ export class DistributionScheduler {
 
 // ─── DistributionStateManager ─────────────────────────────────────────────────
 
-export type DistributionState = 'active' | 'paused' | 'resumed';
+export type DistributionState = "active" | "paused" | "resumed";
 
 export interface DistributionPauseRecord {
   state: DistributionState;
@@ -907,41 +1194,49 @@ export class DistributionStateManager {
 
   pause(distributionId: string, reason: string, actor: string): void {
     if (!reason || reason.trim().length === 0) {
-      throw Errors.badRequest('Reason is required to pause a distribution');
+      throw Errors.badRequest("Reason is required to pause a distribution");
     }
     const existing = this.states.get(distributionId);
-    if (existing && existing.state === 'paused') {
+    if (existing && existing.state === "paused") {
       throw Errors.conflict(`Distribution ${distributionId} is already paused`);
     }
     this.states.set(distributionId, {
-      state: 'paused',
+      state: "paused",
       reason,
       pausedAt: new Date(),
       pausedBy: actor,
     });
-    this.logger.info('Distribution paused', { distributionId, reason, actor });
+    this.logger.info("Distribution paused", { distributionId, reason, actor });
   }
 
-  resume(distributionId: string, actor: string): DistributionPauseRecord | undefined {
+  resume(
+    distributionId: string,
+    actor: string,
+  ): DistributionPauseRecord | undefined {
     const record = this.states.get(distributionId);
-    if (!record || record.state !== 'paused') {
+    if (!record || record.state !== "paused") {
       return undefined;
     }
     const pausedMs = Date.now() - record.pausedAt.getTime();
     try {
-      this.metrics?.recordHistogram('distribution.paused_seconds', pausedMs / 1000, {
-        distribution_id: distributionId,
-      });
+      this.metrics?.recordHistogram(
+        "distribution.paused_seconds",
+        pausedMs / 1000,
+        {
+          distribution_id: distributionId,
+        },
+      );
     } catch (metricsErr) {
-      this.logger.warn('Failed to emit distribution.paused_seconds metric', {
+      this.logger.warn("Failed to emit distribution.paused_seconds metric", {
         distributionId,
-        error: metricsErr instanceof Error ? metricsErr.message : String(metricsErr),
+        error:
+          metricsErr instanceof Error ? metricsErr.message : String(metricsErr),
       });
     }
-    record.state = 'resumed';
+    record.state = "resumed";
     record.resumedAt = new Date();
     record.resumedBy = actor;
-    this.logger.info('Distribution resumed', {
+    this.logger.info("Distribution resumed", {
       distributionId,
       pausedMs,
       actor,
@@ -955,6 +1250,6 @@ export class DistributionStateManager {
 
   isPaused(distributionId: string): boolean {
     const record = this.states.get(distributionId);
-    return record?.state === 'paused';
+    return record?.state === "paused";
   }
 }

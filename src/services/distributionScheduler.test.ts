@@ -1,4 +1,16 @@
-import { DistributionScheduler } from './distributionScheduler';
+import {
+  DistributionScheduler,
+  CronWindowValidator,
+  validateCronSyntax,
+  normalizeScheduleTimezone,
+  assertValidScheduleTimezone,
+  computeTimezoneWindow,
+  deduplicateWindowKey,
+  findNextCronWindow,
+  STELLAR_MAINTENANCE_WINDOWS,
+  CronWindowDefinition,
+  TimezoneWindow,
+} from './distributionScheduler';
 import { HolidayCalendarService } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
 import { InMemorySecurityAuditRepository } from '../security/audit';
@@ -450,31 +462,31 @@ describe('DistributionScheduler', () => {
       expect(gauge?.value).toBe(7);
     });
 
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
+    });
+
     it('emits red-alert when backlog exceeds threshold', async () => {
       revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
         Array.from({ length: 15 }, (_, i) => ({
           id: `r-${i}`, offering_id: 'off-1',
         })) as any
       );
-
-      it('does not trigger red-alert when backlog equals the threshold', async () => {
-  revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
-    Array.from({ length: 10 }, (_, i) => ({
-      id: `r-${i}`,
-      offering_id: 'off-1',
-    })) as any
-  );
-
-  const s = new DistributionScheduler(engine, revenueReportRepo, {
-    catchupMax: 10,
-    catchupBacklogAlertThreshold: 10,
-  });
-
-  const result = await s.catchUpMissedWindows();
-
-  expect(result.totalMissed).toBe(10);
-  expect(result.backlogExceededCeiling).toBe(false);
-});
 
       const mockLogger = { info: jest.fn(), error: jest.fn(), warn: jest.fn() };
       const s = new DistributionScheduler(engine, revenueReportRepo, {
@@ -490,6 +502,25 @@ describe('DistributionScheduler', () => {
       expect(mockLogger.error).toHaveBeenCalledWith(
         expect.stringContaining('[RED-ALERT]')
       );
+    });
+
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
     });
 
     it('works correctly without metrics collector (no gauge emitted)', async () => {
@@ -1188,5 +1219,189 @@ describe('STELLAR_MAINTENANCE_WINDOWS', () => {
       expect(w.durationMinutes).toBeGreaterThan(0);
       expect(validateCronSyntax(w.cron.replace(/\s+/g, ' ').trim())).toBeNull();
     }
+  });
+});
+
+// --- processScheduledDistributions (deferred distribution queue) -------------
+
+describe('processScheduledDistributions', () => {
+  let engine: any;
+  let revenueReportRepo: any;
+  let scheduledDistributionRepo: any;
+  let scheduler: DistributionScheduler;
+
+  function dueRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'sched-1',
+      offering_id: 'off-1',
+      period_id: 'period-1',
+      period_start: new Date('2026-06-01T00:00:00Z'),
+      period_end: new Date('2026-07-01T00:00:00Z'),
+      total_amount: '1000.00',
+      run_at: new Date('2026-08-01T00:00:00Z'),
+      status: 'scheduled',
+      attempts: 0,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    engine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        successfulPayouts: [],
+        failedPayouts: [],
+      }),
+    };
+    revenueReportRepo = {
+      findApprovedWithoutDistribution: jest.fn().mockResolvedValue([]),
+      claimApprovedReportForDistribution: jest.fn(),
+      markReportDistributionCompleted: jest.fn(),
+      markReportDistributionFailed: jest.fn(),
+    };
+    scheduledDistributionRepo = {
+      findDueScheduledDistributions: jest.fn().mockResolvedValue([dueRow()]),
+      claimScheduledDistribution: jest
+        .fn()
+        .mockImplementation(async (id: string) => dueRow({ id, status: 'processing', attempts: 1 })),
+      markCompleted: jest.fn().mockResolvedValue({ id: 'sched-1', status: 'completed' }),
+      markFailed: jest.fn().mockResolvedValue({ id: 'sched-1', status: 'failed' }),
+    };
+    scheduler = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo,
+    });
+  });
+
+  it('dispatches due rows through the engine with the snapshot boundary', async () => {
+    const result = await scheduler.processScheduledDistributions(new Date('2026-08-01T00:00:00Z'));
+
+    expect(result.processed).toBe(1);
+    expect(result.successful).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(scheduledDistributionRepo.findDueScheduledDistributions).toHaveBeenCalledWith(
+      new Date('2026-08-01T00:00:00Z'),
+      15 * 60 * 1000,
+      50,
+    );
+    expect(scheduledDistributionRepo.claimScheduledDistribution).toHaveBeenCalledWith(
+      'sched-1',
+      15 * 60 * 1000,
+    );
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      {
+        id: 'period-1',
+        start: new Date('2026-06-01T00:00:00Z'),
+        end: new Date('2026-07-01T00:00:00Z'),
+      },
+      1000,
+    );
+    expect(scheduledDistributionRepo.markCompleted).toHaveBeenCalledWith('sched-1');
+    expect(scheduledDistributionRepo.markFailed).not.toHaveBeenCalled();
+  });
+
+  it('falls back to run_at as the snapshot boundary when period bounds are absent', async () => {
+    scheduledDistributionRepo.findDueScheduledDistributions.mockResolvedValue([
+      dueRow({ period_start: null, period_end: null }),
+    ]);
+    scheduledDistributionRepo.claimScheduledDistribution.mockImplementation(
+      async (id: string) => dueRow({ id, period_start: null, period_end: null, status: 'processing' }),
+    );
+
+    await scheduler.processScheduledDistributions(new Date('2026-08-01T00:00:00Z'));
+
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      {
+        id: 'period-1',
+        start: new Date('2026-08-01T00:00:00Z'),
+        end: new Date('2026-08-01T00:00:00Z'),
+      },
+      1000,
+    );
+  });
+
+  it('skips rows already claimed by another scheduler', async () => {
+    scheduledDistributionRepo.claimScheduledDistribution.mockResolvedValueOnce(null);
+
+    const result = await scheduler.processScheduledDistributions();
+
+    expect(result.processed).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.successful).toBe(0);
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(scheduledDistributionRepo.markCompleted).not.toHaveBeenCalled();
+  });
+
+  it('marks a row failed and sanitizes the engine error', async () => {
+    engine.distribute.mockRejectedValueOnce(new Error('Sensitive DB Error: connection failed'));
+
+    const result = await scheduler.processScheduledDistributions();
+
+    expect(result.processed).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.successful).toBe(0);
+    expect(scheduledDistributionRepo.markFailed).toHaveBeenCalledWith(
+      'sched-1',
+      expect.stringMatching(/^Distribution failed: /),
+    );
+    expect(result.errors[0].id).toBe('sched-1');
+    expect(result.errors[0].error).toMatch(/^Distribution failed: /);
+    expect(scheduledDistributionRepo.markCompleted).not.toHaveBeenCalled();
+  });
+
+  it('does not abort the run when markFailed itself throws', async () => {
+    engine.distribute.mockRejectedValueOnce(new Error('boom'));
+    scheduledDistributionRepo.markFailed.mockRejectedValueOnce(new Error('mark failed'));
+
+    const result = await scheduler.processScheduledDistributions();
+
+    expect(result.failed).toBe(1);
+    expect(result.errors).toHaveLength(1);
+  });
+
+  it('rejects and marks failed when the queued amount is invalid', async () => {
+    scheduledDistributionRepo.findDueScheduledDistributions.mockResolvedValue([
+      dueRow({ total_amount: '0' }),
+    ]);
+    scheduledDistributionRepo.claimScheduledDistribution.mockImplementation(
+      async (id: string) => dueRow({ id, total_amount: '0', status: 'processing' }),
+    );
+
+    const result = await scheduler.processScheduledDistributions();
+
+    expect(result.failed).toBe(1);
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(scheduledDistributionRepo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+  });
+
+  it('is a safe no-op when no scheduled repo is configured', async () => {
+    scheduler = new DistributionScheduler(engine, revenueReportRepo);
+
+    const result = await scheduler.processScheduledDistributions();
+
+    expect(result).toEqual({
+      processed: 0,
+      successful: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+    });
+    expect(engine.distribute).not.toHaveBeenCalled();
+  });
+
+  it('honours a custom stale lease', async () => {
+    scheduler = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo,
+      staleLeaseMs: 5000,
+    });
+
+    await scheduler.processScheduledDistributions();
+
+    expect(scheduledDistributionRepo.findDueScheduledDistributions).toHaveBeenCalledWith(
+      expect.any(Date),
+      5000,
+      50,
+    );
   });
 });

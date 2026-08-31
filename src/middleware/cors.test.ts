@@ -17,6 +17,7 @@ jest.mock('../lib/logger', () => ({
 jest.mock('../config/env', () => ({
   env: {
     ALLOWED_ORIGINS: [],
+    ALLOWED_ORIGINS_ARRAY: [],
   },
 }));
 
@@ -37,7 +38,7 @@ describe('CORS Middleware', () => {
   function createTestApp(dependencies: { allowedOrigins?: string[]; corsAllowNoOrigin?: string; nodeEnv?: string } = {}) {
     // Mock the env for this test
     const mockEnv = jest.requireMock('../config/env');
-    mockEnv.env.ALLOWED_ORIGINS = dependencies.allowedOrigins || [];
+    mockEnv.env.ALLOWED_ORIGINS_ARRAY = dependencies.allowedOrigins || [];
 
     if (dependencies.corsAllowNoOrigin !== undefined) {
       process.env.CORS_ALLOW_NO_ORIGIN = dependencies.corsAllowNoOrigin;
