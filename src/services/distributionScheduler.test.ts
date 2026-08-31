@@ -1,14 +1,15 @@
 import {
   DistributionScheduler,
-  validateCronSyntax,
   CronWindowValidator,
+  validateCronSyntax,
   normalizeScheduleTimezone,
   assertValidScheduleTimezone,
-  findNextCronWindow,
   computeTimezoneWindow,
   deduplicateWindowKey,
+  findNextCronWindow,
   STELLAR_MAINTENANCE_WINDOWS,
-  type CronWindowDefinition,
+  CronWindowDefinition,
+  TimezoneWindow,
 } from './distributionScheduler';
 import { HolidayCalendarService } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
@@ -459,6 +460,25 @@ describe('DistributionScheduler', () => {
       const gauge = snapshot.custom.find((p) => p.name === 'scheduler_catchup_backlog');
       expect(gauge).toBeDefined();
       expect(gauge?.value).toBe(7);
+    });
+
+    it('does not trigger red-alert when backlog equals the threshold', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce(
+        Array.from({ length: 10 }, (_, i) => ({
+          id: `r-${i}`,
+          offering_id: 'off-1',
+        })) as any
+      );
+
+      const s = new DistributionScheduler(engine, revenueReportRepo, {
+        catchupMax: 10,
+        catchupBacklogAlertThreshold: 10,
+      });
+
+      const result = await s.catchUpMissedWindows();
+
+      expect(result.totalMissed).toBe(10);
+      expect(result.backlogExceededCeiling).toBe(false);
     });
 
     it('emits red-alert when backlog exceeds threshold', async () => {

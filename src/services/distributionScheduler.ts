@@ -648,8 +648,14 @@ export class DistributionScheduler {
   private readonly catchupMax: number;
   private readonly catchupBacklogAlertThreshold: number;
   private readonly metrics?: MetricsCollector;
-  /** In-process de-duplication set: "utcStart:utcEnd" keys. */
-  private readonly completedWindows = new Set<string>();
+  /**
+   * In-process de-duplication set of already-processed report ids. Keyed on the
+   * report id rather than the timezone window so that *distinct* reports which
+   * legitimately share an identical distribution window (e.g. overlapping
+   * jurisdictions) are each distributed exactly once, while duplicate entries of
+   * the *same* report are skipped.
+   */
+  private readonly processedReportIds = new Set<string>();
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
@@ -685,11 +691,13 @@ export class DistributionScheduler {
   }
 
   /**
-   * Evaluates whether `cron` matches `date` in the given IANA timezone.
-   * Malformed expressions (or a step of zero) evaluate to `false`, never throw.
+   * @notice Evaluate whether a cron expression fires at the given moment in `tz`.
+   * @dev Thin public wrapper over the shared expression evaluator. Returns false
+   *      for syntactically invalid expressions and normalises the timezone to UTC
+   *      aliases (e.g. Etc/UTC → UTC) before evaluating.
    */
-  evaluateCron(cron: string, date: Date, tz: string): boolean {
-    return evaluateCronAt(cron, date, tz);
+  evaluateCron(expression: string, date: Date, tz: string): boolean {
+    return evaluateCronAt(expression, date, normalizeScheduleTimezone(tz));
   }
 
   /**
@@ -757,11 +765,10 @@ export class DistributionScheduler {
           timezone,
         );
 
-        if (this.isWindowAlreadyCompleted(window, claim.offering_id)) {
-          this.logger.info('Skipping already-completed timezone window', {
+        if (this.isReportAlreadyProcessed(claim.id)) {
+          this.logger.info('Skipping already-processed report', {
             reportId: claim.id,
             offeringId: claim.offering_id,
-            windowKey: deduplicateWindowKey(window),
           });
           continue;
         }
@@ -810,7 +817,7 @@ export class DistributionScheduler {
         );
 
         await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
-        this.markWindowCompleted(window, claim.offering_id);
+        this.markReportProcessed(claim.id);
 
         summary.successful++;
         this.logger.info("Automated distribution successful", {
@@ -984,26 +991,12 @@ export class DistributionScheduler {
 
   // ── Window de-duplication ──────────────────────────────────────────────────
 
-  /**
-   * De-duplication is scoped per offering: two different offerings may
-   * legitimately share the same window dates (e.g. after holiday shifts) and
-   * must both be distributed. When `offeringId` is omitted (legacy callers)
-   * the raw window key is used.
-   */
-  private isWindowAlreadyCompleted(window: TimezoneWindow, offeringId?: string): boolean {
-    const key =
-      offeringId !== undefined
-        ? `${offeringId}:${deduplicateWindowKey(window)}`
-        : deduplicateWindowKey(window);
-    return this.completedWindows.has(key);
+  private isReportAlreadyProcessed(reportId: string): boolean {
+    return this.processedReportIds.has(reportId);
   }
 
-  private markWindowCompleted(window: TimezoneWindow, offeringId?: string): void {
-    const key =
-      offeringId !== undefined
-        ? `${offeringId}:${deduplicateWindowKey(window)}`
-        : deduplicateWindowKey(window);
-    this.completedWindows.add(key);
+  private markReportProcessed(reportId: string): void {
+    this.processedReportIds.add(reportId);
   }
 
   // ── Timezone resolution ────────────────────────────────────────────────────
