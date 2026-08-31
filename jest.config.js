@@ -23,6 +23,7 @@ module.exports = {
     'src/lib/pressureGauge.ts',
     'src/services/outboxDispatcher.ts',
     'src/lib/metrics.ts',
+    'src/db/repositories/scheduledDistributionRepository.ts',
   ],
   coverageThreshold: {
     global: {

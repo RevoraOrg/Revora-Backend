@@ -7,17 +7,14 @@
  * @see ../docs/holiday-calendar-service.md
  * @see ../docs/distribution-advisory-lock.md
  */
-import { Logger, globalLogger } from "../lib/logger";
-import DistributionEngine from "./distributionEngine";
-import { RevenueReportRepository } from "../db/repositories/revenueReportRepository";
-import { AppError, Errors } from "../lib/errors";
-import { classifyStellarRPCFailure } from "../lib/stellarRpcFailure";
-import {
-  HolidayCalendarService,
-  BlackoutShiftDecision,
-} from "./holidayCalendarService";
-import { MetricsCollector } from "../lib/metrics";
-import { AdvisoryLockNotAvailableError } from "../db/transaction";
+import { Logger, globalLogger } from '../lib/logger';
+import DistributionEngine from './distributionEngine';
+import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
+import { ScheduledDistributionRepository } from '../db/repositories/scheduledDistributionRepository';
+import { AppError, Errors } from '../lib/errors';
+import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
+import { MetricsCollector } from '../lib/metrics';
 
 export interface DistributionSchedulerOptions {
   logger?: Logger;
@@ -30,7 +27,22 @@ export interface DistributionSchedulerOptions {
   /** Backlog size above which a red-alert is emitted (default: 2× catchupMax). */
   catchupBacklogAlertThreshold?: number;
   metrics?: MetricsCollector;
+  /** Repository for the deferred distribution queue (optional for back-compat). */
+  scheduledDistributionRepo?: ScheduledDistributionRepository;
+  /** Lease (ms) after which a stuck `processing` scheduled row is reclaimed (default: 15 min). */
+  staleLeaseMs?: number;
 }
+
+export type ScheduledDispatchResult = {
+  processed: number;
+  successful: number;
+  failed: number;
+  skipped: number;
+  errors: Array<{ id: string; error: string }>;
+};
+
+/** Default lease before a crashed scheduler's `processing` row is reclaimed. */
+export const DEFAULT_STALE_LEASE_MS = 15 * 60 * 1000;
 
 export interface CatchUpResult {
   totalMissed: number;
@@ -648,14 +660,10 @@ export class DistributionScheduler {
   private readonly catchupMax: number;
   private readonly catchupBacklogAlertThreshold: number;
   private readonly metrics?: MetricsCollector;
-  /**
-   * In-process de-duplication set of already-processed report ids. Keyed on the
-   * report id rather than the timezone window so that *distinct* reports which
-   * legitimately share an identical distribution window (e.g. overlapping
-   * jurisdictions) are each distributed exactly once, while duplicate entries of
-   * the *same* report are skipped.
-   */
-  private readonly processedReportIds = new Set<string>();
+  private readonly scheduledDistributionRepo?: ScheduledDistributionRepository;
+  private readonly staleLeaseMs: number;
+  /** In-process de-duplication set: "utcStart:utcEnd" keys. */
+  private readonly completedWindows = new Set<string>();
 
   constructor(
     private readonly distributionEngine: DistributionEngine,
@@ -666,6 +674,11 @@ export class DistributionScheduler {
     this.holidayCalendarService = options.holidayCalendarService;
     this.resolveJurisdiction = options.resolveJurisdiction;
     this.metrics = options.metrics;
+    this.scheduledDistributionRepo = options.scheduledDistributionRepo;
+    this.staleLeaseMs =
+      options.staleLeaseMs === undefined
+        ? DEFAULT_STALE_LEASE_MS
+        : options.staleLeaseMs;
 
     // ── catchupMax resolution ─────────────────────────────────────────────────
     if (options.catchupMax !== undefined) {
@@ -987,6 +1000,150 @@ export class DistributionScheduler {
     });
 
     return result;
+  }
+
+  /**
+   * Dispatch due deferred distribution rows from the `scheduled_distributions`
+   * queue.
+   *
+   * Picks rows whose `run_at` has passed plus any stale `processing` rows whose
+   * claim lease expired (a scheduler that crashed mid-run), claims each
+   * atomically, then runs the DistributionEngine with the stored snapshot
+   * boundary (period_start / period_end) and the queued amount.
+   *
+   * Idempotency across restarts is layered:
+   *   - `completed` rows are never returned by findDueScheduledDistributions, so
+   *     backfill skips already-executed rows.
+   *   - `processing` rows from a crashed run are only reclaimed after the lease;
+   *     when re-run, the engine's findRunByParams short-circuits a completed
+   *     run and returns the cached result, after which the row is marked
+   *     completed.
+   *   - duplicate enqueue is prevented at the table level via UNIQUE
+   *     (offering_id, period_id).
+   *
+   * @param now  Test/determinism hook; defaults to the current time.
+   */
+  async processScheduledDistributions(
+    now: Date = new Date(),
+  ): Promise<ScheduledDispatchResult> {
+    const summary: ScheduledDispatchResult = {
+      processed: 0,
+      successful: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+    };
+
+    if (!this.scheduledDistributionRepo) {
+      this.logger.warn(
+        'processScheduledDistributions called without scheduledDistributionRepo; skipping',
+      );
+      return summary;
+    }
+
+    const due = await this.scheduledDistributionRepo.findDueScheduledDistributions(
+      now,
+      this.staleLeaseMs,
+      this.catchupMax,
+    );
+
+    this.logger.info(`Found ${due.length} due scheduled distributions`);
+    summary.processed = due.length;
+
+    for (const item of due) {
+      let claim: Awaited<
+        ReturnType<ScheduledDistributionRepository['claimScheduledDistribution']>
+      > = null;
+
+      try {
+        claim = await this.scheduledDistributionRepo.claimScheduledDistribution(
+          item.id,
+          this.staleLeaseMs,
+        );
+
+        if (!claim) {
+          // Another scheduler instance claimed it first.
+          summary.skipped++;
+          continue;
+        }
+
+        if (!claim.period_id || claim.total_amount === null || claim.total_amount === '') {
+          throw Errors.badRequest(
+            `Scheduled distribution ${claim.id} is missing critical data (period or amount)`,
+          );
+        }
+
+        const amount = Number(claim.total_amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          throw Errors.badRequest(
+            `Scheduled distribution ${claim.id} has an invalid amount`,
+          );
+        }
+
+        this.logger.info('Processing deferred scheduled distribution', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+          runAt: claim.run_at.toISOString(),
+          amount: claim.total_amount,
+        });
+
+        await this.distributionEngine.distribute(
+          claim.offering_id,
+          {
+            id: claim.period_id,
+            start: claim.period_start ?? claim.run_at,
+            end: claim.period_end ?? claim.run_at,
+          },
+          amount,
+        );
+
+        await this.scheduledDistributionRepo.markCompleted(claim.id);
+
+        summary.successful++;
+        this.logger.info('Deferred scheduled distribution successful', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+        });
+      } catch (err) {
+        if (!claim) {
+          summary.skipped++;
+          continue;
+        }
+
+        const failure = classifyStellarRPCFailure(err, {
+          operation: 'scheduledDistribution',
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+        });
+        const safeError = `Distribution failed: ${failure.class}`;
+
+        try {
+          await this.scheduledDistributionRepo.markFailed(claim.id, safeError);
+        } catch (markErr) {
+          this.logger.error('Failed to mark scheduled distribution as failed', {
+            scheduledId: claim.id,
+            error: markErr instanceof Error ? markErr.message : String(markErr),
+          });
+        }
+
+        summary.failed++;
+        summary.errors.push({ id: claim.id, error: safeError });
+
+        this.logger.error('Deferred scheduled distribution failed', {
+          scheduledId: claim.id,
+          offeringId: claim.offering_id,
+          periodId: claim.period_id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class,
+          isAppError: err instanceof AppError,
+        });
+      }
+    }
+
+    this.logger.info('Deferred scheduled distribution processing complete', summary);
+    return summary;
   }
 
   // ── Window de-duplication ──────────────────────────────────────────────────
