@@ -20,19 +20,19 @@ import {
 const FUTURE = Date.now() + 60_000;
 
 describe("buildSessionCookie", () => {
-  it("always sets HttpOnly, SameSite=Lax by default and Path=/", () => {
+  it("always sets HttpOnly, SameSite=Strict by default and Path=/", () => {
     const cookie = buildSessionCookie("tok123", FUTURE, { isProduction: false });
 
     expect(cookie).toContain(`${SESSION_COOKIE_NAME}=tok123`);
     expect(cookie).toContain("HttpOnly");
-    expect(cookie).toContain("SameSite=Lax");
+    expect(cookie).toContain("SameSite=Strict");
     expect(cookie).toContain("Path=/");
     expect(cookie).toMatch(/Max-Age=\d+/);
   });
 
-  it("can be configured to SameSite=Strict", () => {
-    const cookie = buildSessionCookie("tok123", FUTURE, { isProduction: false, sameSite: 'Strict' });
-    expect(cookie).toContain("SameSite=Strict");
+  it("can be configured to SameSite=Lax", () => {
+    const cookie = buildSessionCookie("tok123", FUTURE, { isProduction: false, sameSite: 'Lax' });
+    expect(cookie).toContain("SameSite=Lax");
   });
 
   it("sets the Secure attribute in production", () => {
@@ -77,6 +77,7 @@ describe("issueSessionCookie", () => {
     expect(appended).toHaveLength(1);
     expect(appended[0][0]).toBe("Set-Cookie");
     expect(appended[0][1]).toContain("HttpOnly");
+    expect(appended[0][1]).toContain("SameSite=Strict");
   });
 
   it("propagates the production refusal (throws, sets nothing)", () => {
@@ -89,17 +90,17 @@ describe("issueSessionCookie", () => {
 });
 
 describe("clearSessionCookie", () => {
-  it("expires the cookie immediately and keeps it HttpOnly + SameSite=Lax by default", () => {
+  it("expires the cookie immediately and keeps it HttpOnly + SameSite=Strict by default", () => {
     const cookie = clearSessionCookie();
     expect(cookie).toContain(`${SESSION_COOKIE_NAME}=;`);
     expect(cookie).toContain("Max-Age=0");
     expect(cookie).toContain("HttpOnly");
-    expect(cookie).toContain("SameSite=Lax");
+    expect(cookie).toContain("SameSite=Strict");
     expect(cookie).toContain("Path=/");
   });
 
-  it("can clear cookie with SameSite=Strict", () => {
-    const cookie = clearSessionCookie({ sameSite: 'Strict' });
-    expect(cookie).toContain("SameSite=Strict");
+  it("can clear cookie with SameSite=Lax", () => {
+    const cookie = clearSessionCookie({ sameSite: 'Lax' });
+    expect(cookie).toContain("SameSite=Lax");
   });
 });
