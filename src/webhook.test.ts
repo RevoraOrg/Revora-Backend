@@ -230,6 +230,71 @@ describe('WebhookQueue Durable Delivery', () => {
       // Each call increments by 1
       shedCalls.forEach(([, , value]) => expect(value).toBe(1));
     });
+
+    test('deferral with a known deliveryId reuses the row instead of duplicating it', async () => {
+      jest.spyOn(repo, 'findDeliveryById').mockResolvedValue(
+        makeDelivery({
+          id: 'delivery-retry-1',
+          status: 'pending',
+          attempts: 2,
+          next_retry_at: new Date(),
+        }),
+      );
+      const createSpy = jest.spyOn(repo, 'createDelivery').mockResolvedValue(makeDelivery());
+      const updateSpy = jest.spyOn(repo, 'updateDelivery').mockResolvedValue(
+        makeDelivery({ id: 'delivery-retry-1', status: 'deferred', attempts: 2 }),
+      );
+
+      const result = await WebhookQueue.processDelivery(
+        'https://example.com/webhook',
+        { x: 1 },
+        'delivery-retry-1',
+      );
+
+      expect(result).toBe(false);
+      // The existing retry row is deferred in place — no duplicate row.
+      expect(updateSpy).toHaveBeenCalledWith('delivery-retry-1', { status: 'deferred' });
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    test('re-shedding an already-deferred delivery does not double-count the metric', async () => {
+      jest.spyOn(repo, 'findDeliveryById').mockResolvedValue(
+        makeDelivery({ id: 'delivery-retry-1', status: 'deferred', attempts: 1 }),
+      );
+      const createSpy = jest.spyOn(repo, 'createDelivery').mockResolvedValue(makeDelivery());
+      const updateSpy = jest.spyOn(repo, 'updateDelivery').mockResolvedValue(makeDelivery());
+      const incrementSpy = jest.spyOn(globalMetrics, 'incrementCounter');
+
+      const result = await WebhookQueue.processDelivery(
+        'https://example.com/webhook',
+        { x: 1 },
+        'delivery-retry-1',
+      );
+
+      expect(result).toBe(false);
+      // Idempotent: no row churn and no additional shed increment.
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(updateSpy).not.toHaveBeenCalled();
+      const shedCalls = incrementSpy.mock.calls.filter(
+        ([name]) => name === 'webhook_queue_shed_total',
+      );
+      expect(shedCalls).toHaveLength(0);
+    });
+
+    test('emits the queue depth gauge alongside the shed counter', async () => {
+      jest.spyOn(repo, 'createDelivery').mockResolvedValue(makeDelivery({ status: 'deferred' }));
+      const gaugeSpy = jest.spyOn(globalMetrics, 'setGauge');
+
+      await WebhookQueue.processDelivery('https://example.com/webhook', { x: 1 });
+
+      expect(gaugeSpy).toHaveBeenCalledWith(
+        'webhook_queue_depth',
+        expect.any(Number),
+        expect.any(Object),
+        expect.any(String),
+      );
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -299,6 +364,57 @@ describe('WebhookQueue Durable Delivery', () => {
       await expect(WebhookQueue.resumeDeferred()).resolves.toBeUndefined();
 
       (WebhookQueue as any).repo = savedRepo;
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // resumePending honours the same bounded-depth contract as resumeDeferred
+  // -------------------------------------------------------------------------
+
+  describe('resumePending back-pressure', () => {
+    test('does not re-enqueue anything when the queue is already at capacity', async () => {
+      const maxDepth = (WebhookQueue as any).maxDepth as number;
+      (WebhookQueue as any).inFlight = maxDepth;
+
+      const pending = [
+        makeDelivery({ id: 'pend-1', status: 'pending', payload: { p: 1 } }),
+        makeDelivery({ id: 'pend-2', status: 'pending', payload: { p: 2 } }),
+      ];
+      jest.spyOn(repo, 'getPendingDeliveries').mockResolvedValue(pending as any);
+      jest.spyOn(repo, 'findById').mockResolvedValue(makeEndpoint() as any);
+      const processSpy = jest.spyOn(WebhookQueue, 'processDelivery').mockResolvedValue(true);
+
+      await WebhookQueue.resumePending();
+
+      expect(processSpy).not.toHaveBeenCalled();
+    });
+
+    test('re-enqueues pending deliveries only up to available capacity', async () => {
+      const maxDepth = (WebhookQueue as any).maxDepth as number;
+      // One slot free: exactly one pending delivery should be picked up.
+      (WebhookQueue as any).inFlight = maxDepth - 1;
+
+      const pending = [
+        makeDelivery({ id: 'pend-1', status: 'pending', payload: { p: 1 } }),
+        makeDelivery({ id: 'pend-2', status: 'pending', payload: { p: 2 } }),
+      ];
+      jest.spyOn(repo, 'getPendingDeliveries').mockResolvedValue(pending as any);
+      jest.spyOn(repo, 'findById').mockResolvedValue(makeEndpoint() as any);
+      // Simulate each re-enqueue occupying a queue slot so the guard can
+      // observe capacity filling up.
+      const processSpy = jest
+        .spyOn(WebhookQueue, 'processDelivery')
+        .mockImplementation(async (_url, _payload, deliveryId) => {
+          if ((WebhookQueue as any).inFlight < maxDepth) {
+            (WebhookQueue as any).inFlight += 1;
+          }
+          return deliveryId === 'pend-1';
+        });
+
+      await WebhookQueue.resumePending();
+
+      expect(processSpy).toHaveBeenCalledTimes(1);
+      expect(processSpy).toHaveBeenCalledWith('https://example.com/webhook', { p: 1 }, 'pend-1');
     });
   });
 

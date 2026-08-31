@@ -154,6 +154,20 @@ export interface MetricsConfig {
 const DEFAULT_HISTOGRAM_BUCKETS = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000];
 
 /**
+ * Webhook queue shed counter: total deliveries deferred — persisted, never
+ * dropped — because the bounded queue was already at capacity.
+ * @see WebhookQueue in src/index.ts
+ */
+export const WEBHOOK_QUEUE_SHED_TOTAL = 'webhook_queue_shed_total';
+
+/**
+ * Webhook queue depth gauge: current number of in-flight deliveries when the
+ * queue sheds a delivery. Emitted alongside {@link WEBHOOK_QUEUE_SHED_TOTAL}.
+ * @see WebhookQueue in src/index.ts
+ */
+export const WEBHOOK_QUEUE_DEPTH_GAUGE = 'webhook_queue_depth';
+
+/**
  * MetricsCollector - Thread-safe metrics aggregation service
  * 
  * Collects and aggregates application metrics in-memory. Designed for
