@@ -121,28 +121,27 @@ describe('Database Migration Ordering and Collision Resolver', () => {
   });
 
   describe('On-Disk Active Migration List Assertions', () => {
-    it('should successfully validate the on-disk migrations directory under production rules', () => {
+    it('should successfully validate the on-disk migrations directory under strict rules', () => {
       const migrationsDir = path.join(__dirname, 'migrations');
       expect(fs.existsSync(migrationsDir)).toBe(true);
 
       const allFiles = fs.readdirSync(migrationsDir);
       
-      // The on-disk list contains duplicates (001, 002, 011) and out-of-band prefix 999.
-      // Therefore, it must succeed when using the Option A fallback options.
-      const resolved = resolveMigrations(allFiles, { allowDuplicates: true, allowOutOfBand: true, strictExtensions: false });
+      // The on-disk list must pass strict validation with no duplicates or out-of-band prefixes.
+      const resolved = resolveMigrations(allFiles);
       
       expect(resolved.length).toBeGreaterThan(0);
-      expect(resolved.some(f => f.startsWith('001_'))).toBe(true);
-      expect(resolved.some(f => f.startsWith('999_'))).toBe(true);
-    });
-
-    it('should fail with duplicate prefix error if duplicates are not allowed on the real on-disk files', () => {
-      const migrationsDir = path.join(__dirname, 'migrations');
-      const allFiles = fs.readdirSync(migrationsDir);
-
-      expect(() => {
-        resolveMigrations(allFiles, { allowDuplicates: false, allowOutOfBand: true, strictExtensions: false });
-      }).toThrow('Duplicate migration prefix detected');
+      
+      let lastPrefixNum = -1;
+      for (const filename of resolved) {
+        const match = filename.match(/^(\d+)_.*\.sql$/);
+        expect(match).not.toBeNull();
+        if (match) {
+          const prefixNum = parseInt(match[1], 10);
+          expect(prefixNum).toBeGreaterThan(lastPrefixNum);
+          lastPrefixNum = prefixNum;
+        }
+      }
     });
   });
 });
