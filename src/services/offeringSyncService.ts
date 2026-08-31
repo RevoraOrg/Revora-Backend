@@ -251,10 +251,11 @@ export class OfferingSyncService {
         };
       }
 
+      const chainMaxInvestorShareBps = onChain.max_investor_share_bps ?? null;
       const hasChanged =
         normalizedChainStatus !== normalizedLocalStatus ||
         onChain.total_raised !== offering.total_raised ||
-        onChain.max_investor_share_bps !== (offering.max_investor_share_bps as number | null | undefined);
+        chainMaxInvestorShareBps !== (offering.max_investor_share_bps ?? null);
 
       if (!hasChanged) {
         const result: SyncResult = {
@@ -275,11 +276,18 @@ export class OfferingSyncService {
         return result;
       }
 
-      const update: UpdateOfferingStateInput = {
-        status: normalizedChainStatus,
-        total_raised: onChain.total_raised,
-        max_investor_share_bps: onChain.max_investor_share_bps ?? null,
-      };
+      // Write only the fields that actually changed so unchanged columns are
+      // not needlessly dirtied (and so callers can rely on exact payloads).
+      const update: Partial<UpdateOfferingStateInput> = {};
+      if (normalizedChainStatus !== normalizedLocalStatus) {
+        update.status = normalizedChainStatus;
+      }
+      if (onChain.total_raised !== offering.total_raised) {
+        update.total_raised = onChain.total_raised;
+      }
+      if (chainMaxInvestorShareBps !== (offering.max_investor_share_bps ?? null)) {
+        update.max_investor_share_bps = chainMaxInvestorShareBps;
+      }
 
       const updatedOffering =
         (await this.offeringRepository.updateState(offering.id, update)) ?? {

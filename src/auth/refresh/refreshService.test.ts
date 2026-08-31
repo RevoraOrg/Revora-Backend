@@ -363,4 +363,105 @@ describe('RefreshService', () => {
         expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(rawToken.substring(0, 10));
         expect(mockWithTransaction).not.toHaveBeenCalled();
     });
+
+    it('revokes session family when stored token hash does not match incoming token', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:different-token');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:stored-token',
+            expires_at: NOW_FUTURE,
+            revoked_at: null,
+            token_consumed_at: null,
+        });
+
+        const result = await service.refresh('refresh-session-0');
+
+        expect(result).toBeNull();
+        expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.createSession).not.toHaveBeenCalled();
+    });
+
+    it('returns null when session is not found during refresh transaction', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-ghost', role: ROLE });
+        repo.findSessionByIdForUpdate.mockResolvedValue(null);
+
+        const result = await service.refresh('refresh-session-ghost');
+
+        expect(result).toBeNull();
+        expect(repo.createSession).not.toHaveBeenCalled();
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+    });
+
+    it('revokes session family when session is already revoked', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_FUTURE,
+            revoked_at: new Date('2025-01-01'),
+            token_consumed_at: null,
+        });
+
+        const result = await service.refresh('refresh-session-0');
+
+        expect(result).toBeNull();
+        expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.createSession).not.toHaveBeenCalled();
+    });
+
+    it('revokes session family when child session already exists (reuse probe)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_FUTURE,
+            revoked_at: null,
+            token_consumed_at: null,
+        });
+        repo.findSessionByParentId.mockResolvedValue({ id: 'session-child', parent_id: 'session-0' });
+
+        const result = await service.refresh('refresh-session-0');
+
+        expect(result).toBeNull();
+        expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.createSession).not.toHaveBeenCalled();
+    });
+
+    it('clears inFlightSessions set and rethrows when transaction fails', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        repo.findSessionByIdForUpdate.mockRejectedValue(new Error('Connection lost'));
+
+        await expect(service.refresh('refresh-session-0')).rejects.toThrow('Connection lost');
+
+        // Verify session can be attempted again (in-flight set was cleared)
+        repo.findSessionByIdForUpdate.mockResolvedValue(null);
+        const retryResult = await service.refresh('refresh-session-0');
+        expect(retryResult).toBeNull();
+    });
 });

@@ -222,7 +222,8 @@ describe('Metrics Endpoint', () => {
       const response = await request(app).get('/metrics');
 
       expect(response.status).toBe(200);
-      expect(response.headers['content-type']).toBe('text/plain; version=0.0.4');
+      // Express appends the charset for text/* string bodies.
+      expect(response.headers['content-type']).toBe('text/plain; charset=utf-8; version=0.0.4');
       expect(response.text).toContain('# TYPE test_counter counter');
       expect(response.text).toContain('test_counter{label="value"} 5');
       expect(response.text).toContain('# TYPE test_gauge gauge');
@@ -248,7 +249,7 @@ describe('Metrics Endpoint', () => {
       const response = await request(app).get('/metrics');
 
       expect(response.status).toBe(200);
-      expect(response.headers['content-type']).toBe('text/plain; version=0.0.4');
+      expect(response.headers['content-type']).toBe('text/plain; charset=utf-8; version=0.0.4');
       expect(response.text).toBe('\n'); // Empty output with trailing newline
     });
 

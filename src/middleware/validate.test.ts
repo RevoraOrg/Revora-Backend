@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
+import { AppError, ErrorCode } from '../lib/errors';
 import { validate } from './validate';
 
 class MockResponse {
@@ -42,9 +43,14 @@ describe('validate middleware', () => {
     const routeLayer = (router as any).stack[0].route.stack[0];
     await routeLayer.handle(req, res, next);
 
-    expect(res.statusCode).toBe(400);
-    expect((res as any).payload?.error).toBe('ValidationError');
-    expect(Array.isArray((res as any).payload?.details)).toBe(true);
+    // The middleware forwards a structured validation AppError to next();
+    // the Express error handler translates it into a 400 response.
+    expect(next).toHaveBeenCalledTimes(1);
+    const err = next.mock.calls[0][0] as AppError;
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.code).toBe(ErrorCode.VALIDATION_ERROR);
+    expect(err.statusCode).toBe(400);
+    expect(err.details).toContain('body.email: required');
   });
 
   it('returns 400 when body field does not match regex pattern', async () => {
@@ -65,9 +71,11 @@ describe('validate middleware', () => {
     let routeLayer = (router as any).stack[0].route.stack[0];
     await routeLayer.handle(req, res, next);
 
-    expect(res.statusCode).toBe(400);
-    expect((res as any).payload?.error).toBe('ValidationError');
-    expect((res as any).payload?.details).toContain('body.amount: invalid format');
+    expect(next).toHaveBeenCalledTimes(1);
+    let err = next.mock.calls[0][0] as AppError;
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(400);
+    expect(err.details).toContain('body.amount: invalid format');
 
     // Test case 2: Invalid format (too many decimals)
     req = { body: { amount: '1.1234567890123456789' } } as unknown as Request;
@@ -77,7 +85,10 @@ describe('validate middleware', () => {
     routeLayer = (router as any).stack[0].route.stack[0];
     await routeLayer.handle(req, res, next);
 
-    expect(res.statusCode).toBe(400);
-    expect((res as any).payload?.details).toContain('body.amount: invalid format');
+    expect(next).toHaveBeenCalledTimes(1);
+    err = next.mock.calls[0][0] as AppError;
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(400);
+    expect(err.details).toContain('body.amount: invalid format');
   });
 });
