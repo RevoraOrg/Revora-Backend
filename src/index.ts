@@ -32,13 +32,21 @@ import {
   WebhookEventType,
 } from "./services/webhookService";
 import { pool } from "./db/pool";
-import { globalMetrics } from "./lib/metrics";
+import {
+  globalMetrics,
+  WEBHOOK_QUEUE_DEPTH_GAUGE,
+  WEBHOOK_QUEUE_SHED_TOTAL,
+} from "./lib/metrics";
 import { createPasswordResetRouter } from "./routes/passwordReset";
 import { emailService } from "./services/emailService";
 import { EmailDeliverabilityService } from "./services/emailDeliverabilityService";
 import { EmailDeliverabilityRepository } from "./db/repositories/emailDeliverabilityRepository";
 import { createEmailWebhooksRouter } from "./routes/emailWebhooks";
 import { createAdminRouter } from "./routes/admin";
+import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
+import { createAdminWebhookRouter } from "./routes/adminWebhooks";
+import { AccountingLedgerService } from "./services/accountingLedgerService";
+import { DistributionRepository } from "./db/repositories/distributionRepository";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { TenantSettingsRepository } from "./db/repositories/tenantSettingsRepository";
@@ -705,6 +713,20 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   apiRouter.use("/admin", createAdminRouter(auditLogRepo, retentionLabelService));
   apiRouter.use("/admin", createAdminKycRiskTierRouter(pool, amlAuditRepo));
 
+  // Mount admin webhook dead-letter routes
+  const webhookEndpointRepo = new WebhookEndpointRepository(pool);
+  apiRouter.use("/admin/webhooks", createAdminWebhookRouter({ webhookEndpointRepo }));
+
+  // Mount admin ledger double-entry export (RBAC + audited)
+  apiRouter.use(
+    "/admin/ledger",
+    createAdminLedgerExportRouter({
+      distributionAccountRepo: new DistributionRepository(pool),
+      accountingLedger: new AccountingLedgerService(),
+      auditLogRepo,
+    }),
+  );
+
   if (contractUpgradeService) {
     apiRouter.use(
       "/contract-upgrades",
@@ -842,7 +864,9 @@ export const setServer = (value: ReturnType<typeof app.listen>) => {
  * @notice When in-flight count reaches WEBHOOK_QUEUE_MAX_DEPTH the delivery is
  *         persisted as 'deferred' (never dropped) and webhook_queue_shed_total
  *         is incremented. Call resumeDeferred() to re-enqueue them once capacity
- *         is available.
+ *         is available. Shedding is idempotent per delivery: re-enqueueing an
+ *         already-deferred row at capacity reuses the row and does not
+ *         double-count the metric.
  */
 export class WebhookQueue {
   private static repo: WebhookEndpointRepository;
@@ -881,6 +905,33 @@ export class WebhookQueue {
     return this.INITIAL_DELAY * Math.pow(2, retryCount);
   }
 
+  /**
+   * Count a shed delivery. Invoked only when a delivery first transitions to
+   * deferred so the counter is idempotent across retries of the same row.
+   */
+  private static recordShed(endpointId: string): void {
+    globalMetrics.incrementCounter(
+      WEBHOOK_QUEUE_SHED_TOTAL,
+      { endpoint: endpointId },
+      1,
+      'Total webhook deliveries deferred due to queue depth limit',
+    );
+  }
+
+  /**
+   * Attempt delivery of a webhook payload to an active endpoint.
+   *
+   * @dev Back-pressure contract: when the bounded queue is at capacity the
+   *      delivery is persisted with status 'deferred' (never dropped) and the
+   *      webhook_queue_shed_total counter is incremented exactly once per
+   *      status transition. When a retry is re-enqueued with `deliveryId`, the
+   *      same row is deferred instead of a duplicate being inserted, so retries
+   *      are idempotent and preserve the attempt counter.
+   * @param url        Webhook endpoint URL (SSRF validation precedes any write)
+   * @param payload    Event payload to deliver
+   * @param deliveryId Existing delivery row to reuse (retry path)
+   * @returns true when delivered, false when deferred/failed/absent endpoint
+   */
   static async processDelivery(
     url: string,
     payload: any,
@@ -904,20 +955,41 @@ export class WebhookQueue {
 
     // --- Back-pressure: defer when at capacity ---
     if (this.inFlight >= this.maxDepth) {
-      const deferred = await this.repo.createDelivery({
-        endpoint_id: endpoint.id,
-        payload,
-        status: 'deferred',
-        attempts: 0,
-      });
-      globalMetrics.incrementCounter(
-        'webhook_queue_shed_total',
-        { endpoint: endpoint.id },
-        1,
-        'Total webhook deliveries deferred due to queue depth limit',
+      // When a retry is re-enqueued (deliveryId known), defer that same row
+      // instead of inserting a duplicate so attempts/backoff state are kept and
+      // the shed counter stays idempotent across retries of the same delivery.
+      let deferred: WebhookDelivery | null = deliveryId
+        ? await this.repo.findDeliveryById(deliveryId)
+        : null;
+
+      let deferredId: string;
+      if (!deferred) {
+        deferred = await this.repo.createDelivery({
+          endpoint_id: endpoint.id,
+          payload,
+          status: 'deferred',
+          attempts: 0,
+        });
+        deferredId = deferred.id;
+        this.recordShed(endpoint.id);
+      } else {
+        deferredId = deferred.id;
+        if (deferred.status !== 'deferred') {
+          await this.repo.updateDelivery(deferred.id, {
+            status: 'deferred',
+          });
+          this.recordShed(endpoint.id);
+        }
+      }
+
+      globalMetrics.setGauge(
+        WEBHOOK_QUEUE_DEPTH_GAUGE,
+        this.inFlight,
+        {},
+        'Current in-flight webhook deliveries when the queue sheds a delivery',
       );
       console.warn(
-        `[WebhookQueue] Queue full (${this.inFlight}/${this.maxDepth}), deferred delivery ${deferred.id}`,
+        `[WebhookQueue] Queue full (${this.inFlight}/${this.maxDepth}), deferred delivery ${deferredId}`,
       );
       return false;
     }
@@ -1019,6 +1091,9 @@ export class WebhookQueue {
     if (!this.repo) return;
     const pending = await this.repo.getPendingDeliveries();
     for (const delivery of pending) {
+      // Honour the same bounded-depth contract as resumeDeferred; excess rows
+      // stay pending and are picked up on the next resume cycle.
+      if (this.inFlight >= this.maxDepth) break;
       const endpoint = await this.repo.findById(delivery.endpoint_id);
       if (endpoint) {
         void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
@@ -1099,6 +1174,28 @@ if (require.main === module && env.NODE_ENV !== "test") {
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
     console.log("[server] PayoutDriftDetector started");
+  }
+
+  // --- Daily sanctions list refresh (only for "batch" and "all" roles) ---
+
+  if (
+    workerRole === 'batch' ||
+    workerRole === 'all'
+  ) {
+    const loader = new OfacSanctionsLoader({
+      listUrl: env.OFAC_LIST_URL,
+      sigUrl: env.OFAC_SIG_URL,
+      trustAnchorBase64: env.OFAC_TRUST_ANCHOR_BASE64,
+      fetchTimeoutMs: env.OFAC_FETCH_TIMEOUT_MS,
+    });
+    const sanctionsRepo = new SanctionsListRepository(pool);
+    const stopRefresh = startSanctionsRefreshJob({
+      loader,
+      repo: sanctionsRepo,
+      version: new Date().toISOString().slice(0, 10), // daily publication date
+    });
+    backgroundStopFns.push(stopRefresh);
+    console.log("[server] Sanctions refresh job started");
   }
 
   // --- Hot-path services (only for "api" and "all" roles) ---

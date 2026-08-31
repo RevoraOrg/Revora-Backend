@@ -4,6 +4,8 @@ import { OfferingRepository, Offering } from '../db/repositories/offeringReposit
 import { UserRepository, User } from '../db/repositories/userRepository';
 import { InvestmentService, CreateInvestmentRequest, createInvestmentService } from './investmentService';
 import { AMLService } from '../aml/amlService';
+import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
+import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -356,6 +358,128 @@ describe('InvestmentService', () => {
 
       await expect(svc.createInvestment(baseInput)).rejects.toThrow(/KYC risk-tier adjusted cap/);
     });
+  });
+});
+
+describe('InvestmentService sanctions screening', () => {
+  const baseInput: CreateInvestmentRequest = {
+    investor_id: 'investor-123',
+    offering_id: 'offering-abc',
+    amount: '1000.00',
+    asset: 'USDC',
+  };
+
+  function buildService(opts: {
+    screenResult: SanctionsScreenResult | null;
+    repoMatches?: boolean;
+    auditCalls?: jest.Mock;
+  }) {
+    const pool = makeMockPool();
+    const invRepo = new InvestmentRepository(pool as unknown as Pool);
+    const offRepo = new OfferingRepository(pool as unknown as Pool);
+    const screening = {
+      screen: jest.fn().mockResolvedValue(opts.screenResult),
+    } as unknown as SanctionsScreeningService;
+    const auditLogFn = opts.auditCalls ?? jest.fn().mockResolvedValue(undefined);
+    const audit = {
+      createAuditLog: auditLogFn,
+    } as unknown as AuditLogRepository;
+    const userRepo = {
+      findById: jest.fn().mockResolvedValue(makeUser({ name: 'Jane Doe' })),
+    } as unknown as UserRepository;
+    const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, screening, audit);
+
+    const offeringRow = makeOfferingRow({ status: 'active' });
+    if (opts.repoMatches) {
+      const investmentRow = makeInvestmentRow();
+      pool.query
+        .mockResolvedValueOnce(mockQueryResult([offeringRow]))
+        .mockResolvedValueOnce({
+          rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [],
+        } as QueryResult<Investment>);
+    } else {
+      pool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+    }
+    return { svc, pool, screening, audit };
+  }
+
+  const blockedResult: SanctionsScreenResult = {
+    complete: true,
+    versions: { ofac: '2026-01-01', eu_consolidated: 'x', uk_hmt: 'y' },
+    matches: [{ source: 'ofac', version: '2026-01-01', listName: 'Eve', matchType: 'exact', matchedName: 'Eve' }],
+    cleared: false,
+  };
+
+  it('rejects and blocks when a sanctions hit is found (no insert)', async () => {
+    const { svc, pool, audit } = buildService({ screenResult: blockedResult });
+    await expect(svc.createInvestment(baseInput)).rejects.toThrow(/sanctions list entry/);
+    const sqls = pool.query.mock.calls.map((c) => String(c[0]));
+    expect(sqls.some((s) => /INSERT\s+INTO\s+investments/i.test(s))).toBe(false);
+    expect(audit.createAuditLog).toHaveBeenCalledTimes(1);
+    const details = JSON.parse((audit.createAuditLog as jest.Mock).mock.calls[0][0].details as string);
+    expect(details.screening_status).toBe('blocked');
+    expect(details.reviewer_queue_link).toBe('/api/v1/aml/ofac-reviews');
+    expect(details.blocked).toBe(true);
+  });
+
+  it('fail-closes (503 path) when list is incomplete — logs audit with error status', async () => {
+    const incomplete: SanctionsScreenResult = {
+      complete: false,
+      versions: { ofac: '2026-01-01' },
+      matches: [],
+      cleared: false,
+    };
+    const { svc, pool, audit } = buildService({ screenResult: incomplete });
+    await expect(svc.createInvestment(baseInput)).rejects.toThrow(/fail-closed/);
+    expect(pool.query).toHaveBeenCalledTimes(1); // only offering lookup, no insert
+    expect(audit.createAuditLog).toHaveBeenCalledTimes(1);
+    const details = JSON.parse((audit.createAuditLog as jest.Mock).mock.calls[0][0].details as string);
+    expect(details.screening_status).toBe('error');
+  });
+
+  it('persists a passed investment with screening metadata on the row', async () => {
+    const passed: SanctionsScreenResult = {
+      complete: true,
+      versions: { ofac: '2026-01-01', eu_consolidated: 'a', uk_hmt: 'b' },
+      matches: [],
+      cleared: true,
+    };
+    const { svc, pool, screening, audit } = buildService({ screenResult: passed, repoMatches: true });
+    const result = await svc.createInvestment(baseInput);
+    expect(result).toBeDefined();
+    expect(screening.screen).toHaveBeenCalledWith(['Jane Doe']);
+    // Verify insert carried screening columns.
+    const insertCall = pool.query.mock.calls.find((c) => /INSERT\s+INTO\s+investments/i.test(String(c[0])));
+    expect(insertCall).toBeDefined();
+    const values = insertCall[1];
+    expect(values).toContain('passed');
+    expect(values).toContain('2026-01-01');
+    expect(audit.createAuditLog).not.toHaveBeenCalled();
+  });
+
+  it('screens beneficial owners alongside the investor, blocking on an owner hit', async () => {
+    const { svc, pool, audit } = buildService({ screenResult: blockedResult });
+    await expect(
+      svc.createInvestment({ ...baseInput, beneficial_owners: ['Eve'] }),
+    ).rejects.toThrow(/sanctions list entry/);
+    expect(pool.query.mock.calls.filter((c) => /INSERT\s+INTO\s+investments/i.test(String(c[0])))).toHaveLength(0);
+    expect(audit.createAuditLog).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips screening entirely when no screening service is configured', async () => {
+    const pool = makeMockPool();
+    const invRepo = new InvestmentRepository(pool as unknown as Pool);
+    const offRepo = new OfferingRepository(pool as unknown as Pool);
+    const svc = new InvestmentService(invRepo, offRepo);
+    const offeringRow = makeOfferingRow({ status: 'active' });
+    const investmentRow = makeInvestmentRow();
+    pool.query
+      .mockResolvedValueOnce(mockQueryResult([offeringRow]))
+      .mockResolvedValueOnce({
+        rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [],
+      } as QueryResult<Investment>);
+    const result = await svc.createInvestment(baseInput);
+    expect(result).toEqual(investmentRow);
   });
 });
 

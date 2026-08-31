@@ -345,6 +345,67 @@ export class DistributionRepository {
   }
 
   /**
+   * Fetch distributions and their payouts for a double-entry accounting export.
+   *
+   * Scope is intentionally additive: this query only READS existing
+   * `distributions` and `distribution_payouts` rows and never mutates state,
+   * so it is safe to call concurrently with distribution execution and
+   * preserves existing API/storage compatibility.
+   *
+   * @param offeringId Offering identifier to scope the export.
+   * @param periodId   Optional period filter; when omitted all periods for the
+   *                   offering are returned.
+   * @returns A stable, deterministic list of runs (each with its payouts)
+   *          ordered by `run_at` then `id`.
+   */
+  async listForAccountingExport(
+    offeringId: string,
+    periodId?: string,
+  ): Promise<Array<DistributionRun & { payouts: Payout[] }>> {
+    const runParams: unknown[] = [offeringId];
+    let runQuery = `
+      SELECT *
+      FROM distributions
+      WHERE offering_id = $1
+    `;
+    if (periodId) {
+      runParams.push(periodId);
+      runQuery += ` AND period_id = $${runParams.length}`;
+    }
+    runQuery += ` ORDER BY run_at ASC, id ASC`;
+
+    const runsResult = await this.db.query<DistributionRun>(runQuery, runParams);
+
+    const accounts: string[] = [];
+    const payoutParams: unknown[] = [];
+    for (const run of runsResult.rows) {
+      payoutParams.push(run.id);
+      accounts.push(`$${payoutParams.length}`);
+    }
+
+    const payoutsByRun = new Map<string, Payout[]>();
+    if (accounts.length > 0) {
+      const payoutQuery = `
+        SELECT *
+        FROM distribution_payouts
+        WHERE distribution_id IN (${accounts.join(', ')})
+        ORDER BY id ASC
+      `;
+      const payoutsResult = await this.db.query<Payout>(payoutQuery, payoutParams);
+      for (const payout of payoutsResult.rows) {
+        const list = payoutsByRun.get(payout.distribution_id) ?? [];
+        list.push(payout);
+        payoutsByRun.set(payout.distribution_id, list);
+      }
+    }
+
+    return runsResult.rows.map((run) => ({
+      ...run,
+      payouts: payoutsByRun.get(run.id) ?? [],
+    }));
+  }
+
+  /**
    * Get aggregate stats for an offering
    * @param offeringId Offering ID
    * @returns Aggregate statistics
