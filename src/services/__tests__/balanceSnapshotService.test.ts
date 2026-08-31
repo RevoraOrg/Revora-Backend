@@ -4,12 +4,12 @@ import {
   HolderBalance,
   SnapshotBalancesInput,
   StellarBalanceClient,
-} from './balanceSnapshotService';
+} from '../balanceSnapshotService';
 import {
   BalanceSnapshotRepository,
   TokenBalanceSnapshot,
-} from '../db/repositories/balanceSnapshotRepository';
-import { OfferingRepository, Offering } from '../db/repositories/offeringRepository';
+} from '../../db/repositories/balanceSnapshotRepository';
+import { OfferingRepository, Offering } from '../../db/repositories/offeringRepository';
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -250,16 +250,18 @@ describe('BalanceSnapshotService', () => {
       ).rejects.toThrow(PERIOD_END.toISOString());
     });
 
-    it('does NOT enforce mismatch guard when neither snapshotAt nor periodEnd is supplied', async () => {
-      // Caller provided no timestamp => non-deterministic mode; guard is intentionally skipped
-      const existing = [makeSnapshot({ snapshot_at: PERIOD_END })];
+    it('throws when in idempotent mode with neither snapshotAt nor periodEnd supplied', async () => {
+      // In idempotent mode, we must have a timestamp for determinism
       mockOfferingRepo.findById.mockResolvedValueOnce(baseOffering);
-      mockSnapshotRepo.findByOfferingAndPeriod.mockResolvedValueOnce(existing);
+      mockSnapshotRepo.findByOfferingAndPeriod.mockResolvedValueOnce([]);
 
-      const result = await serviceWithDb.snapshotBalances(defaultInput);
-
-      expect(mockSnapshotRepo.insertMany).not.toHaveBeenCalled();
-      expect(result.snapshots).toEqual(existing);
+      await expect(
+        serviceWithDb.snapshotBalances({
+          offeringId: 'offering-1',
+          periodId: '2024-01',
+          // no snapshotAt, no periodEnd => error in idempotent mode
+        })
+      ).rejects.toThrow('In idempotent mode (skipIfExists=true)');
     });
 
     it('does NOT throw when re-run supplies matching periodEnd', async () => {
@@ -282,11 +284,14 @@ describe('BalanceSnapshotService', () => {
   // -------------------------------------------------------------------------
   describe('Idempotent Mode (skipIfExists = true)', () => {
     it('returns existing snapshots without inserting new rows', async () => {
-      const existing = [makeSnapshot()];
+      const existing = [makeSnapshot({ snapshot_at: PERIOD_END })];
       mockOfferingRepo.findById.mockResolvedValueOnce(baseOffering);
       mockSnapshotRepo.findByOfferingAndPeriod.mockResolvedValueOnce(existing);
 
-      const result = await serviceWithDb.snapshotBalances(defaultInput);
+      const result = await serviceWithDb.snapshotBalances({
+        ...defaultInput,
+        periodEnd: PERIOD_END, // required in idempotent mode
+      });
 
       expect(mockSnapshotRepo.findByOfferingAndPeriod).toHaveBeenCalledWith(
         'offering-1',
@@ -448,6 +453,44 @@ describe('BalanceSnapshotService', () => {
       await expect(
         service.snapshotBalances({ ...defaultInput, source: 'stellar', skipIfExists: false })
       ).rejects.toThrow('Stellar/Soroban client is not configured');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Idempotent mode determinism enforcement
+  // -------------------------------------------------------------------------
+  describe('Idempotent Mode Determinism Enforcement', () => {
+    it('throws when in idempotent mode with neither snapshotAt nor periodEnd supplied', async () => {
+      mockOfferingRepo.findById.mockResolvedValueOnce(baseOffering);
+      mockSnapshotRepo.findByOfferingAndPeriod.mockResolvedValueOnce([]);
+
+      await expect(
+        serviceWithDb.snapshotBalances({
+          offeringId: 'offering-1',
+          periodId: '2024-01',
+          skipIfExists: true, // explicitly idempotent
+          // no snapshotAt, no periodEnd
+        })
+      ).rejects.toThrow(
+        'In idempotent mode (skipIfExists=true), either snapshotAt or periodEnd must be supplied'
+      );
+    });
+
+    it('allows fallback to new Date() in non-idempotent mode when neither timestamp is supplied', async () => {
+      mockOfferingRepo.findById.mockResolvedValueOnce(baseOffering);
+      mockSnapshotRepo.findByOfferingAndPeriod.mockResolvedValueOnce([]);
+      mockDbProvider.getBalances.mockResolvedValueOnce(defaultHolders);
+      mockSnapshotRepo.insertMany.mockResolvedValueOnce([makeSnapshot()]);
+
+      const result = await serviceWithDb.snapshotBalances({
+        offeringId: 'offering-1',
+        periodId: '2024-01',
+        skipIfExists: false, // non-idempotent
+        // no snapshotAt, no periodEnd => falls back to new Date()
+      });
+
+      expect(result).toBeDefined();
+      expect(mockSnapshotRepo.insertMany).toHaveBeenCalled();
     });
   });
 });

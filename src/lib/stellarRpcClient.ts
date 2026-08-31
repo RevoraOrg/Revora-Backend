@@ -29,6 +29,8 @@ import { globalMetrics } from './metrics';
 export interface StellarRpcClient {
   /** Retrieves the latest ledger sequence number from the Stellar network */
   getLatestLedger(): Promise<{ sequence: number }>;
+  /** Retrieves events from the Stellar network */
+  getEvents(request: StellarSdk.rpc.GetEventsRequest): Promise<StellarSdk.rpc.GetEventsResponse>;
 }
 
 /** Configuration options for the Stellar RPC client */
@@ -155,6 +157,46 @@ export class StellarRpcClientImpl implements StellarRpcClient {
         breaker.recordFailure();
         if (!failure.shouldRetry) {
           continue;
+        }
+        continue;
+      }
+    }
+
+    throw new Error('All Horizon endpoints are unavailable or circuit broken');
+  }
+
+  async getEvents(request: StellarSdk.rpc.GetEventsRequest): Promise<StellarSdk.rpc.GetEventsResponse> {
+    for (let i = 0; i < this.endpoints.length; i++) {
+      const endpoint = this.endpoints[i];
+      const breaker = this.breakers.get(endpoint)!;
+
+      if (!breaker.isClosed()) {
+        continue;
+      }
+
+      const server = this.createServer(endpoint);
+
+      try {
+        const response = await Promise.race([
+          server.getEvents(request),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`RPC request timeout after ${this.timeout}ms`)),
+              this.timeout,
+            ),
+          ),
+        ]);
+
+        breaker.recordSuccess();
+        return response;
+      } catch (rawError) {
+        const failure = classifyStellarRPCFailure(rawError, {
+          operation: 'getEvents',
+          attemptCount: i + 1,
+        });
+        breaker.recordFailure();
+        if (!failure.shouldRetry) {
+          throw rawError;
         }
         continue;
       }
