@@ -5,7 +5,7 @@ import {
 } from '../../middleware/startupRegisterRateLimit';
 import { createRegisterHandler } from './registerHandler';
 import { RegisterService } from './registerService';
-import { IUserRepository } from './types';
+import { IUserRepository, RegisteredUser } from './types';
 
 export interface CreateRegisterRouterDeps {
   userRepository: IUserRepository;
@@ -14,6 +14,11 @@ export interface CreateRegisterRouterDeps {
    * disable the window without touching global state.
    */
   rateLimitOptions?: StartupRegisterRateLimitOptions;
+  /**
+   * Optional post-registration hook (e.g. KYC/AML initiation). Provided by
+   * the composition root when the KYC provider adapter is enabled.
+   */
+  onRegistered?: (user: RegisteredUser) => void | Promise<void>;
 }
 
 /**
@@ -42,6 +47,7 @@ export interface CreateRegisterRouterDeps {
 export const createRegisterRouter = ({
   userRepository,
   rateLimitOptions,
+  onRegistered,
 }: CreateRegisterRouterDeps): Router => {
   const router = Router();
   const registerService = new RegisterService(userRepository);
@@ -50,7 +56,7 @@ export const createRegisterRouter = ({
   router.post(
     '/api/auth/investor/register',
     rateLimitMiddleware,
-    createRegisterHandler(registerService),
+    createRegisterHandler(registerService, { onRegistered }),
   );
 
   return router;

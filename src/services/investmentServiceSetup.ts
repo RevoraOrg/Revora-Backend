@@ -17,10 +17,17 @@ import { AMLService } from '../aml/amlService';
 export function createInvestmentServiceWithScreening(
   db: Pool,
   amlService?: AMLService,
+  kycGateEnabled: boolean = false,
 ): InvestmentService {
   const screeningService = new SanctionsScreeningService(
     new SanctionsListRepository(db),
   );
   const auditLogRepo = new AuditLogRepository(db);
-  return createInvestmentService(db, amlService, screeningService, auditLogRepo);
+  return createInvestmentService(
+    db,
+    amlService,
+    screeningService,
+    auditLogRepo,
+    kycGateEnabled,
+  );
 }

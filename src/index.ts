@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { timingSafeEqual } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import express, {
   NextFunction,
   Request,
@@ -84,6 +84,58 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
+import { KycRouter, RouteTable } from './services/kyc/KycRouter';
+import { KycProvider } from './services/kyc/KycProvider';
+import { ExistingVendorKycProvider } from './services/kyc/providers/ExistingVendorKycProvider';
+import { NullKycProvider } from './services/kyc/providers/NullKycProvider';
+import {
+  createKycProviderAdapter,
+  KycProviderAdapter,
+} from './services/kyc/KycProviderAdapter';
+import { createKycRoutes } from './routes/kyc';
+import { KycVerificationService } from './services/kyc/kycVerificationService';
+import { createKycWebhooksRouter } from './routes/kycWebhooks';
+
+const KYCDIRECT: ReadonlyArray<string> = [
+  'US',
+  'CA',
+  'GB',
+  'AU',
+  'NZ',
+  'IE',
+  'SG',
+  'DE',
+  'FR',
+  'NL',
+  'ES',
+  'IT',
+  'PT',
+  'AT',
+  'BE',
+  'LU',
+  'FI',
+  'SE',
+  'DK',
+  'NO',
+  'CH',
+  'JP',
+  'EU',
+];
+
+/**
+ * Build the default signed jurisdiction → provider route table. When the KYC
+ * provider adapter is disabled the legacy `ExistingVendorKycProvider` is used
+ * for every jurisdiction; when enabled the hardened adapter forwards to the
+ * same vendor through the retry/audit boundary. The table is signed with the
+ * HMAC key shared by the KycRouter so tampered tables are rejected.
+ */
+function buildDefaultKycRouteTable(providerName: string, signingKey: string): RouteTable {
+  const entries = KYCDIRECT.map((jurisdiction) => ({ jurisdiction, providerName }));
+  const signature = createHmac('sha256', signingKey)
+    .update(JSON.stringify({ version: '1.0', entries }))
+    .digest('hex');
+  return { version: '1.0', entries, signature };
+}
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -648,6 +700,37 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   app.use(requestIdMiddleware());
   app.set("trust proxy", 1);
   app.use(createCorsMiddleware() as RequestHandler);
+
+  // ── KYC/AML provider adapter (feature-flagged) ─────────────────────────
+  const kycRouteTableKey = env.KYC_ROUTE_TABLE_SIGNING_KEY ?? 'dev-kyc-route-table-key';
+  const kycProvider: KycProvider = new ExistingVendorKycProvider();
+  const kycAdapter: KycProviderAdapter = createKycProviderAdapter(kycProvider, {
+    enabled: env.KYC_PROVIDER_ADAPTER_ENABLED,
+    maxRetries: env.KYC_ADAPTER_MAX_RETRIES,
+    baseRetryDelayMs: env.KYC_ADAPTER_BASE_RETRY_DELAY_MS,
+  });
+  const kycRouter = new KycRouter(kycRouteTableKey);
+  kycRouter.registerProvider(kycAdapter);
+  kycRouter.registerProvider(new NullKycProvider());
+  kycRouter.loadRouteTable(buildDefaultKycRouteTable(kycAdapter.providerName, kycRouteTableKey));
+
+  if (kycAdapter.enabled) {
+    // Callbacks must be verified against the raw body bytes, so the webhook
+    // router is mounted BEFORE the global JSON parser.
+    app.use(
+      '/api/v1/kyc/webhooks',
+      createKycWebhooksRouter({
+        verificationService: new KycVerificationService(
+          new UserRepository(pool),
+          new AuditLogRepository(pool),
+          { enabled: true },
+        ),
+      }),
+    );
+  }
+  // When the adapter is disabled the webhook path is left unmounted: unknown
+  // callbacks are neither parsed nor stored (fail-closed for an off feature).
+
   app.use(express.json({ limit: "32kb" }));
   app.use(morgan(env.NODE_ENV === "test" ? "tiny" : "dev"));
 
@@ -786,6 +869,9 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // Initialize AML service and routes
   const amlService = createAMLService(pool, amlAuditRepo, 'system');
   apiRouter.use("/aml", createAMLRoutes(amlService));
+
+  // KYC check initiation is always available; callbacks only when flag is on.
+  apiRouter.use("/kyc", createKycRoutes(kycRouter));
 
   // Initialize sanctions list versioning and compliance routes
   const sanctionsVersionsRepo = new SanctionsListVersionsRepository(pool);

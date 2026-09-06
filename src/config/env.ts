@@ -51,6 +51,10 @@ import { z } from "zod";
  * | KYC_CIRCUIT_TRIP_ERRORS     | No       | 3                       | Consecutive failures before KYC circuit breaker trips |
  * | KYC_CIRCUIT_CACHE_TTL_MS    | No       | 300000                  | KYC cache TTL in ms for cached decisions          |
  * | KYC_CIRCUIT_HALF_OPEN_MS    | No       | 30000                   | Wait time in ms before half-open probe            |
+ * | KYC_PROVIDER_ADAPTER_ENABLED| No       | false                   | Enable KYC provider adapter hardening (retry, webhooks, audit, gate) |
+ * | KYC_ADAPTER_MAX_RETRIES     | No       | 3                       | Max attempts for provider calls through the adapter |
+ * | KYC_ADAPTER_BASE_RETRY_DELAY_MS | No   | 250                     | Base exponential-backoff delay (ms) for adapter retries |
+ * | KYC_ROUTE_TABLE_SIGNING_KEY | No       | (dev default)           | HMAC key that signs the KYC jurisdiction route table |
  */
 
 const envSchema = z.object({
@@ -98,6 +102,10 @@ const envSchema = z.object({
   KYC_CIRCUIT_TRIP_ERRORS: z.coerce.number().int().positive().default(3),
   KYC_CIRCUIT_CACHE_TTL_MS: z.coerce.number().int().positive().default(300000),
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
+  KYC_PROVIDER_ADAPTER_ENABLED: z.coerce.boolean().default(false),
+  KYC_ADAPTER_MAX_RETRIES: z.coerce.number().int().positive().default(3),
+  KYC_ADAPTER_BASE_RETRY_DELAY_MS: z.coerce.number().int().nonnegative().default(250),
+  KYC_ROUTE_TABLE_SIGNING_KEY: z.string().optional(),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
   OUTBOX_DISPATCHER_ENABLED: z.coerce.boolean().default(false),
