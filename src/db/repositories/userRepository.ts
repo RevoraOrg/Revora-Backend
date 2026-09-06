@@ -5,6 +5,22 @@ import {
   KycRiskTier,
   parseKycRiskTier,
 } from '../../lib/kycRiskTierCaps';
+import { KycStatus } from '../../services/kyc/KycProvider';
+
+/** Default KYC verification status for a freshly registered investor. */
+export const DEFAULT_KYC_STATUS: KycStatus = 'pending';
+
+/**
+ * Parses a stored `kyc_status` column value, falling back to `pending` on
+ * missing/unknown values (backward compatible with rows written before the
+ * column existed).
+ */
+export function parseKycStatus(value: unknown, fallback: KycStatus = DEFAULT_KYC_STATUS): KycStatus {
+  const statuses: readonly KycStatus[] = ['pending', 'in_review', 'approved', 'rejected'];
+  return typeof value === 'string' && (statuses as readonly string[]).includes(value)
+    ? (value as KycStatus)
+    : fallback;
+}
 
 /**
  * Full user row — password_hash included for internal auth use only.
@@ -18,6 +34,12 @@ export interface User {
   role: 'startup' | 'investor';
   /** KYC risk tier used to scale per-offering investment caps. */
   kyc_risk_tier: KycRiskTier;
+  /** Authoritative KYC/AML verification status reported by the provider. */
+  kyc_status: KycStatus;
+  /** Provider name that last updated the verification status (nullable pre-gate). */
+  kyc_provider?: string | null;
+  /** Provider transaction/reference id that produced the current status. */
+  kyc_reference_id?: string | null;
   last_oidc_groups?: string[] | null;
   created_at: Date;
   updated_at: Date;
@@ -32,6 +54,7 @@ export interface CreateUserInput {
   name?: string;
   role?: 'startup' | 'investor';
   kyc_risk_tier?: KycRiskTier;
+  kyc_status?: KycStatus;
 }
 
 export interface UpdateUserInput {
@@ -41,6 +64,9 @@ export interface UpdateUserInput {
   password_hash?: string;
   role?: 'startup' | 'investor';
   kyc_risk_tier?: KycRiskTier;
+  kyc_status?: KycStatus;
+  kyc_provider?: string | null;
+  kyc_reference_id?: string | null;
   last_oidc_groups?: string[] | null;
 }
 
@@ -66,7 +92,7 @@ export class UserRepository {
    */
   async findById(id: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, kyc_status, kyc_provider, kyc_reference_id, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -85,7 +111,7 @@ export class UserRepository {
    */
   async findByEmail(email: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, kyc_risk_tier, kyc_status, kyc_provider, kyc_reference_id, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE email = $1
       LIMIT 1
@@ -109,8 +135,8 @@ export class UserRepository {
    */
   async createUser(input: CreateUserInput): Promise<User> {
     const query = `
-      INSERT INTO users (email, password_hash, name, role, kyc_risk_tier, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      INSERT INTO users (email, password_hash, name, role, kyc_risk_tier, kyc_status, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
     const values = [
@@ -119,6 +145,7 @@ export class UserRepository {
       input.name ?? null,
       input.role ?? 'startup',
       input.kyc_risk_tier ?? DEFAULT_KYC_RISK_TIER,
+      input.kyc_status ?? DEFAULT_KYC_STATUS,
     ];
     let result: QueryResult<User>;
     try {
@@ -172,6 +199,18 @@ export class UserRepository {
       sets.push(`kyc_risk_tier = $${idx++}`);
       values.push(input.kyc_risk_tier);
     }
+    if (input.kyc_status !== undefined) {
+      sets.push(`kyc_status = $${idx++}`);
+      values.push(input.kyc_status);
+    }
+    if (input.kyc_provider !== undefined) {
+      sets.push(`kyc_provider = $${idx++}`);
+      values.push(input.kyc_provider);
+    }
+    if (input.kyc_reference_id !== undefined) {
+      sets.push(`kyc_reference_id = $${idx++}`);
+      values.push(input.kyc_reference_id);
+    }
     if (input.last_oidc_groups !== undefined) {
       sets.push(`last_oidc_groups = $${idx++}`);
       values.push(input.last_oidc_groups === null ? null : JSON.stringify(input.last_oidc_groups));
@@ -211,6 +250,27 @@ export class UserRepository {
   }
 
   /**
+   * Persist the authoritative KYC/AML verification status reported by a
+   * provider callback, along with the provider name and transaction id so the
+   * user's record remains linked to the external check.
+   *
+   * Being the destination of a verified, replay-protected provider callback,
+   * this method is deliberately narrow — it only touches KYC fields and never
+   * mutates credentials or roles.
+   */
+  async updateKycVerification(
+    userId: string,
+    input: { status: KycStatus; provider: string; referenceId: string },
+  ): Promise<User> {
+    return this.updateUser({
+      id: userId,
+      kyc_status: input.status,
+      kyc_provider: input.provider,
+      kyc_reference_id: input.referenceId,
+    });
+  }
+
+  /**
    * Update a user's password hash directly.
    */
   async updatePasswordHash(userId: string, newPasswordHash: string): Promise<void> {
@@ -230,6 +290,9 @@ export class UserRepository {
       name: row.name ?? undefined,
       role: row.role as 'startup' | 'investor',
       kyc_risk_tier: parseKycRiskTier(row.kyc_risk_tier),
+      kyc_status: parseKycStatus(row.kyc_status),
+      kyc_provider: row.kyc_provider ?? null,
+      kyc_reference_id: row.kyc_reference_id ?? null,
       last_oidc_groups: row.last_oidc_groups ?? null,
       created_at: row.created_at,
       updated_at: row.updated_at,

@@ -49,6 +49,7 @@ function makeUser(override: Partial<User> = {}): User {
     password_hash: 'hash',
     role: 'investor',
     kyc_risk_tier: 'standard',
+    kyc_status: 'pending',
     created_at: new Date('2024-01-01'),
     updated_at: new Date('2024-01-01'),
     ...override,

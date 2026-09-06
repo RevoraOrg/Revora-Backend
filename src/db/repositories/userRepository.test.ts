@@ -31,6 +31,7 @@ const BASE_USER: User = {
   name: 'Alice',
   role: 'investor',
   kyc_risk_tier: 'standard',
+  kyc_status: 'pending',
   created_at: new Date('2024-01-01'),
   updated_at: new Date('2024-01-01'),
 };

@@ -8,6 +8,7 @@ import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
+import { kycNotApprovedError } from './kyc/KycProviderAdapter';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -42,6 +43,12 @@ export class InvestmentService {
     private userRepo?: UserRepository,
     private screeningService?: SanctionsScreeningService,
     private auditLogRepo?: AuditLogRepository,
+    /**
+     * Feature-flagged KYC/AML approval gate. When `true`, investment
+     * submissions are blocked until the investor's `kyc_status` is
+     * `approved`. Defaults to `false` to preserve existing behaviour.
+     */
+    private readonly kycGateEnabled: boolean = false,
   ) {}
 
   /**
@@ -61,6 +68,20 @@ export class InvestmentService {
     const activeStatuses = ['active', 'open'];
     if (!offering.status || !activeStatuses.includes(offering.status)) {
       throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
+    }
+
+    // 2b. KYC/AML approval gate (feature-flagged; fail-closed).
+    // Blocked before any persistence or screening side effects so an
+    // unverified investor can never enter the investment pipeline.
+    if (this.kycGateEnabled) {
+      const user = this.userRepo
+        ? await this.userRepo.findById(input.investor_id)
+        : null;
+      const approved = user?.kyc_status === 'approved';
+      if (!approved) {
+        await this.recordKycGateBlocked(input, user?.kyc_status);
+        throw kycNotApprovedError();
+      }
     }
 
     // 3. Validate amount
@@ -229,6 +250,33 @@ export class InvestmentService {
   }
 
   /**
+   * Persist an audit-log entry when the KYC/AML approval gate blocks a
+   * submission. Fail-open would silently admit unverified investors, so the
+   * block reason is recorded for compliance review.
+   */
+  private async recordKycGateBlocked(
+    input: CreateInvestmentRequest,
+    investorKycStatus: string | undefined,
+  ): Promise<void> {
+    if (!this.auditLogRepo) return;
+    await this.auditLogRepo.createAuditLog({
+      user_id: input.investor_id,
+      action: 'investment_kyc_gate_blocked',
+      resource: `investment_offering/${input.offering_id}`,
+      details: JSON.stringify({
+        investor_id: input.investor_id,
+        offering_id: input.offering_id,
+        amount: input.amount,
+        asset: input.asset,
+        investor_kyc_status: investorKycStatus ?? 'unknown',
+        required_status: 'approved',
+      }),
+      ip_address: null,
+      user_agent: 'investment-service',
+    });
+  }
+
+  /**
    * Resolve the investor's KYC tier and reject the intent when it would exceed
    * the tier-adjusted concentration cap. Existing commitments are never modified.
    */
@@ -295,6 +343,7 @@ export function createInvestmentService(
   amlService?: AMLService,
   screeningService?: SanctionsScreeningService,
   auditLogRepo?: AuditLogRepository,
+  kycGateEnabled: boolean = false,
 ): InvestmentService {
   return new InvestmentService(
     new InvestmentRepository(db),
@@ -303,5 +352,6 @@ export function createInvestmentService(
     new UserRepository(db),
     screeningService,
     auditLogRepo,
+    kycGateEnabled,
   );
 }
