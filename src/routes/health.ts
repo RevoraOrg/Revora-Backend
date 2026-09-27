@@ -366,6 +366,7 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
       details: {
         failureClass,
         upstreamStatus: lastStatus,
+        url: endpoints[0],
         breakerStates
       },
       error: failureClass === StellarRPCFailureClass.TIMEOUT ? "timeout" : "connection_error",

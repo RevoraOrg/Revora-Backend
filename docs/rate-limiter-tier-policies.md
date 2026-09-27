@@ -143,31 +143,40 @@ These headers are set on **every** request, including those that are blocked:
 
 ## Security Assumptions
 
-1. **Identity Assertion**: Tier elevation is gated solely on the `x-revora-tier-secret`
+1. **Untrusted Tier Header**: `x-revora-rate-tier` is treated as **untrusted
+   client input** at all times.  Its value is never acted upon without a
+   corresponding valid `x-revora-tier-secret`.  Any attempt to claim an elevated
+   tier without the secret is silently rejected and the request is handled as
+   `standard`. (Req 10.1)
+
+2. **Identity Assertion**: Tier elevation is gated solely on the `x-revora-tier-secret`
    header.  This is a **shared secret** pattern — it is not a substitute for
    request-level authentication.  Protect the secret with the same care as a
-   signing key.
+   signing key.  Elevated tiers require a valid `x-revora-tier-secret` header
+   matching `process.env.STARTUP_AUTH_TIER_SECRET`. (Req 10.2)
 
-2. **Fail-Safe Downgrade**: An absent, empty, or mismatched secret always results
-   in `standard` tier resolution.  The server never returns an error that
-   distinguishes "wrong secret" from "no secret", preventing oracle attacks.
+3. **Fail-Safe Downgrade**: A missing, empty, or mismatched secret always results
+   in silent downgrade to `standard` tier resolution.  The server never returns
+   an error that distinguishes "wrong secret" from "no secret", preventing oracle
+   attacks. (Req 10.3)
 
-3. **IP-Based Tracking**: Rate limits are tracked per resolved client IP
-   (`req.ip`, with `trust proxy = 1`).  Ensure the Express app is configured
-   correctly behind a load-balancer so `req.ip` reflects the real client IP.
-   A misconfigured proxy could allow a single client to appear as many IPs,
-   bypassing the limit.
+4. **Proxy-Aware IP Tracking**: Rate limits are tracked per resolved client IP
+   (`req.ip`).  The application **must** be deployed with `app.set('trust proxy', 1)`
+   (already configured in `createApp`) so that `req.ip` reflects the real client
+   IP behind a reverse proxy or load-balancer.  A misconfigured proxy could allow
+   a single client to appear as many IPs, bypassing the limit. (Req 10.4)
 
-4. **In-Memory Store**: The current `InMemoryRateLimitStore` is **process-local**.
-   In a multi-instance deployment, counters are not shared between instances,
-   so effective limits are `numInstances × limit`.  Replace the store with a
-   Redis-backed implementation (using `INCR`/`EXPIRE`) before horizontal scale-out.
+5. **In-Memory Store (Process-Local)**: The current `InMemoryRateLimitStore` is
+   **process-local**.  In a multi-instance deployment, counters are not shared
+   between instances, so effective limits are `numInstances × limit`.  Replace
+   the store with a shared implementation (see `RateLimitStore` interface below)
+   before horizontal scale-out. (Req 10.5)
 
-5. **Secret Rotation**: Rotating `STARTUP_AUTH_TIER_SECRET` requires a
+6. **Secret Rotation**: Rotating `STARTUP_AUTH_TIER_SECRET` requires a
    coordinated rolling deploy.  During the rotation window, requests with the
    old secret will be downgraded to `standard`; plan accordingly.
 
-6. **No Per-User Isolation**: The limiter keys by IP, not by user identity.
+7. **No Per-User Isolation**: The limiter keys by IP, not by user identity.
    Authenticated user IDs should be layered on top if per-account isolation is
    required in future tiers.
 
@@ -177,22 +186,103 @@ These headers are set on **every** request, including those that are blocked:
 
 ### Abuse scenarios
 
+The following scenarios are explicitly accounted for in the design. (Req 10.6)
+
 | Scenario | Behaviour | Mitigation |
 | :------- | :-------- | :--------- |
-| Attacker sends `x-revora-rate-tier: trusted` with a wrong secret | Downgraded to `standard` and exhausts the standard counter | No tier privilege gained; attacker burns their own quota |
+| Attacker sends `x-revora-rate-tier: trusted` with a wrong secret | Downgraded to `standard`; request burns a standard-tier slot | No tier privilege gained; attacker exhausts only their own standard quota |
+| Attacker spoofs `x-revora-rate-tier: internal` with invalid secret | Downgraded to `standard`; consumes from the standard counter, not the internal counter | Counter isolation ensures cross-tier exhaustion is not possible |
 | Attacker rotates through multiple IPs to bypass per-IP limit | Each IP gets its own counter; limit applies per IP | Deploy a WAF / IP reputation list upstream for volumetric attacks |
 | Attacker guesses the tier secret by brute-force | Every attempt consumes a standard-tier slot; 5 guesses per 15 min per IP | Keep the secret ≥ 32 random bytes; rotate periodically |
 | Attacker floods with `x-revora-rate-tier: standard` | Exhausts their IP quota after 5 requests | Same as no tier header — intended behaviour |
-| Unknown tier value (e.g. `vip`) | Treated as `standard` | Silently downgraded; no error revealed |
+| Unknown tier value (e.g. `vip`) | Treated as `standard`; silently downgraded | No error revealed; attacker learns nothing about valid tiers |
 
 ### Failure scenarios
 
+The following failure modes are known and the application's behaviour is deterministic. (Req 10.7)
+
 | Failure | Behaviour |
 | :------- | :-------- |
-| `STARTUP_AUTH_TIER_SECRET` env var not set | All elevated tier requests fall back to `standard` (safe default) |
+| `STARTUP_AUTH_TIER_SECRET` env var not set | All elevated-tier requests fall back to `standard` (safe default) |
+| Missing client IP (`req.ip` and `req.socket.remoteAddress` both absent) | Key falls back to `'unknown'`; all such requests share one counter |
 | Process restart | In-memory counters reset; brief window where a fresh burst is possible during rolling deploy |
 | Store `increment()` throws unexpectedly | Uncaught exception propagates to Express error handler → 500 |
 | Upstream load balancer strips custom headers | `x-revora-rate-tier` absent → `standard` tier (safe) |
+
+---
+
+## RateLimitStore Interface
+
+The `InMemoryRateLimitStore` is the default store. For distributed deployments
+you must supply a custom implementation of the `RateLimitStore` interface.
+
+### Interface contract
+
+```typescript
+/**
+ * @notice Pluggable counter store for the fixed-window rate limiter.
+ *
+ * @dev  All implementations must be safe to call concurrently from
+ *       multiple in-flight requests within the same process.  For
+ *       cross-process safety (multi-instance deployments) the
+ *       implementation must use an atomic operation on the backing store
+ *       (e.g. Redis INCR + EXPIRE, DynamoDB conditional writes, etc.).
+ */
+export interface RateLimitStore {
+  /**
+   * @notice Atomically increment the counter for `key` and return the
+   *         updated count and the epoch-ms timestamp at which the window resets.
+   *
+   * @dev    If no window exists for `key`, a new one is started with count = 1
+   *         and resetAt = now + windowMs.  If the window has already expired,
+   *         the counter is reset to 1 and a new resetAt is computed.
+   *
+   * @param  key       Scoped rate-limit key (includes keyPrefix and IP/user).
+   * @param  windowMs  Length of the fixed window in milliseconds.
+   * @return { count, resetAt }
+   */
+  increment(key: string, windowMs: number): { count: number; resetAt: number };
+
+  /**
+   * @notice Reset the counter for a single key.  Safe to call on a
+   *         non-existent key (no-op).  Primarily used in tests.
+   *
+   * @param  key  The key to remove from the store.
+   */
+  reset(key: string): void;
+
+  /**
+   * @notice Remove all counters (optional).  Primarily used in tests or
+   *         for a graceful-reset capability.
+   */
+  clear?(): void;
+}
+```
+
+### Implementation guidance
+
+- **Error handling**: If the backing store is unavailable, implementors SHOULD
+  either throw an `AppError` (which routes to the global error handler → 500) or
+  **fail-open** (return `{ count: 0, resetAt: Date.now() + windowMs }`) with a
+  structured warning log.  Failing-open is safer for availability but removes
+  rate-limit protection during outages — choose based on your threat model.
+
+- **Atomicity**: Use a single round-trip atomic operation where possible.
+  Redis `INCR` + conditional `EXPIRE` (set only if the key is new) is the
+  standard pattern.
+
+- **Clock skew**: `resetAt` values should be derived from the backing store's
+  clock where possible to avoid drift in distributed environments.
+
+- **Injection**: Pass the custom store to `createStartupAuthTierLimiter`:
+
+  ```typescript
+  import { createStartupAuthTierLimiter } from './middleware/startupAuthRateTierPolicy';
+  import { myRedisStore } from './stores/redisRateLimitStore';
+
+  const limiter = createStartupAuthTierLimiter({ store: myRedisStore });
+  apiRouter.post('/startup/register', limiter.middleware, handler);
+  ```
 
 ---
 
@@ -216,23 +306,29 @@ These headers are set on **every** request, including those that are blocked:
 
 ## Test Coverage
 
-All behaviours documented above are covered in:
+All behaviours documented above are covered at **100% statements, branches, functions,
+and lines** across both implementation files. Tests are organised into four suites:
 
 - **Unit tests** (middleware only, no HTTP):
   [`src/middleware/startupAuthRateTierPolicy.test.ts`](../src/middleware/startupAuthRateTierPolicy.test.ts)
-  — 454 lines, covers tier resolution, quota enforcement per tier, header
-  correctness, spoofed-secret downgrade, and store isolation.
+  — covers tier resolution, quota enforcement per tier, header correctness,
+  spoofed-secret downgrade, store isolation, and exact policy constant values.
 
 - **Integration tests** (full HTTP stack via `createApp`):
-  [`src/routes/health.test.ts`](../src/routes/health.test.ts) — `Rate Limiter Tier
-  Policies (BE-011)` describe block covers all three tiers, header presence,
-  downgrade on wrong/absent secret, quota boundary conditions, cross-tier
-  counter isolation, health-endpoint isolation, and 429 body format.
+  [`src/routes/health.test.ts`](../src/routes/health.test.ts) — covers all three
+  tiers, header presence, downgrade on wrong/absent secret, quota boundary
+  conditions, cross-tier counter isolation, health-endpoint isolation, and 429 body
+  format against the real application instance.
 
 - **Core rate-limit engine tests**:
   [`src/middleware/rateLimit.test.ts`](../src/middleware/rateLimit.test.ts)
-  — 380 lines, covers `InMemoryRateLimitStore` lifecycle, per-IP and per-user
-  keying, `Retry-After` header, `keyPrefix` isolation, and IP fallback paths.
+  — covers `InMemoryRateLimitStore` lifecycle, per-IP and per-user keying,
+  `Retry-After` header, `keyPrefix` isolation, and IP fallback paths.
+
+- **Property-based tests** (fast-check):
+  - [`src/middleware/__tests__/rateLimitStore.property.test.ts`](../src/middleware/__tests__/rateLimitStore.property.test.ts) — Properties 1 and 8 (fixed-window determinism, window-expiry reset)
+  - [`src/middleware/__tests__/resolveTier.property.test.ts`](../src/middleware/__tests__/resolveTier.property.test.ts) — Properties 3, 4, 10, 11 (secret mismatch, unknown tier, configurable env var, whitespace trimming)
+  - [`src/middleware/__tests__/rateLimitMiddleware.property.test.ts`](../src/middleware/__tests__/rateLimitMiddleware.property.test.ts) — Properties 2, 5, 6, 7, 9 (counter isolation, header correctness, 429 at limit+1, within-limit pass, IP key namespacing)
 
 ---
 
