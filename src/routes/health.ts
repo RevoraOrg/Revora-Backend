@@ -1,5 +1,4 @@
 import { NextFunction, Request, Response, Router } from 'express';
-import { Pool } from 'pg';
 import { AppError, Errors } from '../lib/errors';
 import { MetricsCollector } from '../lib/metrics';
 import {
@@ -318,7 +317,9 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
   let healthy = false;
   let activeUrl = "";
   let lastStatus = 0;
-  let lastError: any = null;
+  // Typed as `unknown`: every use either narrows via instanceof or forwards
+  // the value to classifyStellarRPCFailure, which accepts unknown causes.
+  let lastError: unknown = null;
   // Last endpoint we attempted, reported in failure details so operators can
   // tell which Horizon endpoint is failing without exposing error internals.
   let lastUrl = "";
