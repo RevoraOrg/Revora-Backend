@@ -319,8 +319,12 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
   let activeUrl = "";
   let lastStatus = 0;
   let lastError: any = null;
+  // Last endpoint we attempted, reported in failure details so operators can
+  // tell which Horizon endpoint is failing without exposing error internals.
+  let lastUrl = "";
 
   for (const horizonUrl of endpoints) {
+    lastUrl = horizonUrl;
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), HORIZON_TIMEOUT_MS);
@@ -366,6 +370,7 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
       details: {
         failureClass,
         upstreamStatus: lastStatus,
+        url: lastUrl,
         breakerStates
       },
       error: failureClass === StellarRPCFailureClass.TIMEOUT ? "timeout" : "connection_error",
