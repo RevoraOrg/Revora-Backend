@@ -14,7 +14,7 @@ import { Pool } from 'pg';
 import { RevenueReconciliationService } from '../services/revenueReconciliationService';
 import { AppError, Errors } from '../lib/errors';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
-import { Logger, LogLevel } from '../lib/logger';
+import { Logger } from '../lib/logger';
 import { MetricsCollector } from '../lib/metrics';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 
@@ -128,8 +128,7 @@ export function createReconciliationHandlers(
           periodStart,
           periodEnd,
           options,
-        },
-        LogLevel.INFO
+        }
       );
 
       const result = await reconciliationService.reconcile(
@@ -165,8 +164,7 @@ export function createReconciliationHandlers(
               userId: user.id,
               offeringId,
               error: auditError instanceof Error ? auditError.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -181,8 +179,7 @@ export function createReconciliationHandlers(
           duration,
           isBalanced: result.isBalanced,
           discrepanciesCount: result.discrepancies.length,
-        },
-        LogLevel.INFO
+        }
       );
 
       res.status(200).json({
@@ -193,7 +190,7 @@ export function createReconciliationHandlers(
       const duration = Date.now() - startTime;
       
       // Log Stellar RPC failures if applicable
-      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+      if (error && classifyStellarRPCFailure(error).class !== StellarRPCFailureClass.UNKNOWN) {
         logger?.warn(
           'Stellar RPC failure in reconciliation',
           {
@@ -202,8 +199,7 @@ export function createReconciliationHandlers(
             offeringId: req.body?.offeringId,
             failureClass: classifyStellarRPCFailure(error),
             duration,
-          },
-          LogLevel.WARN
+          }
         );
       }
 
@@ -215,8 +211,7 @@ export function createReconciliationHandlers(
           offeringId: req.body?.offeringId,
           error: error instanceof Error ? error.message : 'Unknown error',
           duration,
-        },
-        LogLevel.ERROR
+        }
       );
       
       next(error);
@@ -279,8 +274,7 @@ export function createReconciliationHandlers(
           offeringId,
           periodStart: startDate,
           periodEnd: endDate,
-        },
-        LogLevel.INFO
+        }
       );
 
       const result = await reconciliationService.quickBalanceCheck(
@@ -313,8 +307,7 @@ export function createReconciliationHandlers(
               userId: user.id,
               offeringId,
               error: auditError instanceof Error ? auditError.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -329,8 +322,7 @@ export function createReconciliationHandlers(
           duration,
           isBalanced: result.isBalanced,
           difference: result.difference,
-        },
-        LogLevel.INFO
+        }
       );
 
       res.status(200).json({
@@ -341,7 +333,7 @@ export function createReconciliationHandlers(
       const duration = Date.now() - startTime;
       
       // Log Stellar RPC failures if applicable
-      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+      if (error && classifyStellarRPCFailure(error).class !== StellarRPCFailureClass.UNKNOWN) {
         logger?.warn(
           'Stellar RPC failure in balance check',
           {
@@ -350,8 +342,7 @@ export function createReconciliationHandlers(
             offeringId: req.params?.offeringId,
             failureClass: classifyStellarRPCFailure(error),
             duration,
-          },
-          LogLevel.WARN
+          }
         );
       }
 
@@ -363,8 +354,7 @@ export function createReconciliationHandlers(
           offeringId: req.params?.offeringId,
           error: error instanceof Error ? error.message : 'Unknown error',
           duration,
-        },
-        LogLevel.ERROR
+        }
       );
       
       next(error);
@@ -405,8 +395,7 @@ export function createReconciliationHandlers(
           requestId,
           userId: user.id,
           runId,
-        },
-        LogLevel.INFO
+        }
       );
 
       const result = await reconciliationService.verifyDistributionRun(runId);
@@ -434,8 +423,7 @@ export function createReconciliationHandlers(
               userId: user.id,
               runId,
               error: auditError instanceof Error ? auditError.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -450,8 +438,7 @@ export function createReconciliationHandlers(
           duration,
           isValid: result.isValid,
           errorsCount: result.errors.length,
-        },
-        LogLevel.INFO
+        }
       );
 
       res.status(200).json({
@@ -462,7 +449,7 @@ export function createReconciliationHandlers(
       const duration = Date.now() - startTime;
       
       // Log Stellar RPC failures if applicable
-      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+      if (error && classifyStellarRPCFailure(error).class !== StellarRPCFailureClass.UNKNOWN) {
         logger?.warn(
           'Stellar RPC failure in distribution verification',
           {
@@ -471,8 +458,7 @@ export function createReconciliationHandlers(
             runId: req.params?.runId,
             failureClass: classifyStellarRPCFailure(error),
             duration,
-          },
-          LogLevel.WARN
+          }
         );
       }
 
@@ -484,8 +470,7 @@ export function createReconciliationHandlers(
           runId: req.params?.runId,
           error: error instanceof Error ? error.message : 'Unknown error',
           duration,
-        },
-        LogLevel.ERROR
+        }
       );
       
       next(error);
@@ -557,8 +542,7 @@ export function createReconciliationHandlers(
           amount,
           periodStart: startDate,
           periodEnd: endDate,
-        },
-        LogLevel.INFO
+        }
       );
 
       const result = await reconciliationService.validateRevenueReport(
@@ -594,8 +578,7 @@ export function createReconciliationHandlers(
               userId: user.id,
               offeringId,
               error: auditError instanceof Error ? auditError.message : 'Unknown error',
-            },
-            LogLevel.ERROR
+            }
           );
         }
       }
@@ -610,8 +593,7 @@ export function createReconciliationHandlers(
           duration,
           isValid: result.isValid,
           errorsCount: result.errors.length,
-        },
-        LogLevel.INFO
+        }
       );
 
       res.status(200).json({
@@ -622,7 +604,7 @@ export function createReconciliationHandlers(
       const duration = Date.now() - startTime;
       
       // Log Stellar RPC failures if applicable
-      if (error && classifyStellarRPCFailure(error) !== StellarRPCFailureClass.UNKNOWN) {
+      if (error && classifyStellarRPCFailure(error).class !== StellarRPCFailureClass.UNKNOWN) {
         logger?.warn(
           'Stellar RPC failure in revenue report validation',
           {
@@ -631,8 +613,7 @@ export function createReconciliationHandlers(
             offeringId: req.body?.offeringId,
             failureClass: classifyStellarRPCFailure(error),
             duration,
-          },
-          LogLevel.WARN
+          }
         );
       }
 
@@ -644,8 +625,7 @@ export function createReconciliationHandlers(
           offeringId: req.body?.offeringId,
           error: error instanceof Error ? error.message : 'Unknown error',
           duration,
-        },
-        LogLevel.ERROR
+        }
       );
       
       next(error);
