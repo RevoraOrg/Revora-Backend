@@ -24,6 +24,7 @@ const SCRIPT_TAG_RE = /<script[\s\S]*?>[\s\S]*?<\/script>/gi;
 const STYLE_TAG_RE = /<style[\s\S]*?>[\s\S]*?<\/style>/gi;
 const HTML_COMMENT_RE = /<!--([\s\S]*?)-->/g;
 const ANY_TAG_RE = /<\/?[^>]+>/g;
+// eslint-disable-next-line no-control-regex
 const CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
 // SSRF Protection: Block private IP ranges and localhost
@@ -164,8 +165,24 @@ export type FieldRule = SanitizeOptions & {
   type?: 'string' | 'string[]';
 };
 
-function getByPath(obj: Record<string, unknown>, path: string): unknown {
+/**
+ * Traverses a nested object by dot-separated path to retrieve a value.
+ *
+ * Security & Reliability Assumptions:
+ * - Deterministic navigation: safely handles null or undefined intermediate properties
+ *   without throwing TypeError.
+ * - Explicit failure/empty-result contract: if an intermediate property is nullish (`cur == null`),
+ *   traversal terminates early and returns `undefined`.
+ * - Leaf values: if the terminal property is explicitly `null`, it returns `null` (preserving
+ *   distinction between intermediate failure vs explicit leaf null value).
+ *
+ * @param obj - The root object to traverse
+ * @param path - Dot-separated path string (e.g. 'user.profile.bio')
+ * @returns The resolved leaf value, or `undefined` if intermediate property is nullish/missing
+ */
+export function getByPath(obj: Record<string, unknown>, path: string): unknown {
   const parts = path.split('.');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let cur: any = obj;
   for (const p of parts) {
     if (cur == null) return undefined;
@@ -174,8 +191,17 @@ function getByPath(obj: Record<string, unknown>, path: string): unknown {
   return cur;
 }
 
-function setByPath(obj: Record<string, unknown>, path: string, value: unknown): void {
+/**
+ * Sets a value at a dot-separated path within an object, creating nested
+ * container objects along the path if intermediate nodes are missing or non-objects.
+ *
+ * @param obj - Target object to mutate
+ * @param path - Dot-separated path string
+ * @param value - Value to set at the target leaf
+ */
+export function setByPath(obj: Record<string, unknown>, path: string, value: unknown): void {
   const parts = path.split('.');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let cur: any = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     const p = parts[i];
@@ -189,6 +215,7 @@ export function sanitizeObject<T extends Record<string, unknown>>(
   input: T,
   rules: Record<string, FieldRule | true>
 ): T {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const out: any = { ...input };
   for (const [path, rule] of Object.entries(rules)) {
     const r: FieldRule =
