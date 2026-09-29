@@ -32,7 +32,7 @@ const createNext = (): NextFunction => jest.fn();
 
 const createRequest = (overrides: {
   params?: Record<string, string>;
-  query?: Record<string, string | undefined>;
+  query?: Record<string, string | string[] | undefined>;
   userId?: string;
 }): Request => {
   return {
@@ -266,6 +266,28 @@ describe('createListDistributionsByOfferingHandler', () => {
 
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({ error: 'Invalid pagination parameters' });
+    expect(mockDistributionRepository.listByOffering).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { description: 'page is repeated', query: { page: ['1', '2'] } },
+    { description: 'pageSize is repeated', query: { pageSize: ['10', '20'] } },
+    { description: 'page is zero', query: { page: '0' } },
+    { description: 'pageSize is fractional', query: { pageSize: '1.5' } },
+  ])('returns 400 when $description', async ({ query }) => {
+    const handler = createListDistributionsByOfferingHandler({
+      distributionRepository: mockDistributionRepository,
+      offeringOwnershipRepository: mockOfferingOwnershipRepository,
+    });
+
+    const req = createRequest({ userId: 'user-1', query });
+    const res = createResponse();
+
+    await handler(req, res, createNext());
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Invalid pagination parameters' });
+    expect(mockOfferingOwnershipRepository.isOwnedByUser).not.toHaveBeenCalled();
     expect(mockDistributionRepository.listByOffering).not.toHaveBeenCalled();
   });
 
