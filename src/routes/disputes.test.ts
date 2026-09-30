@@ -408,6 +408,11 @@ describe('createDisputeSLAHandlers', () => {
         expect.stringContaining('attachment'),
       );
       expect(res.send).toHaveBeenCalledWith('header1,header2\ndata1,data2');
+      expect(service.exportBurnReportCSV).toHaveBeenCalledWith({
+        startDate: new Date('2025-01-01T00:00:00Z'),
+        endDate: new Date('2025-01-07T00:00:00Z'),
+        jurisdiction: undefined,
+      });
     });
 
     it('should return 400 when startDate is missing', async () => {
@@ -417,6 +422,10 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'startDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
     });
 
     it('should return 400 when endDate is missing', async () => {
@@ -426,6 +435,42 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'endDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 when startDate is not a string', async () => {
+      const req = createMockReq({
+        query: { startDate: ['2025-01-01T00:00:00Z'], endDate: '2025-01-07T00:00:00Z' },
+      });
+      const res = createMockRes();
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'startDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 when endDate is not a string', async () => {
+      const req = createMockReq({
+        query: { startDate: '2025-01-01T00:00:00Z', endDate: ['2025-01-07T00:00:00Z'] },
+      });
+      const res = createMockRes();
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'endDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('should return 400 when startDate is an invalid date string', async () => {
@@ -437,9 +482,11 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith(
-        expect.objectContaining({ error: expect.stringContaining('startDate') }),
-      );
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'startDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('should return 400 when endDate is an invalid date string', async () => {
@@ -451,9 +498,25 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.exportBurnReport(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith(
-        expect.objectContaining({ error: expect.stringContaining('endDate') }),
-      );
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'endDate query parameter is required and must be a valid ISO date',
+      });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    it('should reject a date range with equal start and end dates', async () => {
+      const req = createMockReq({
+        query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-01T00:00:00Z' },
+      });
+      const res = createMockRes();
+
+      await handlers.exportBurnReport(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({ error: 'startDate must be before endDate' });
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('should return 400 when startDate is after endDate', async () => {
@@ -468,6 +531,8 @@ describe('createDisputeSLAHandlers', () => {
       expect(res.json).toHaveBeenCalledWith(
         expect.objectContaining({ error: expect.stringContaining('before') }),
       );
+      expect(service.exportBurnReportCSV).not.toHaveBeenCalled();
+      expect(mockNext).not.toHaveBeenCalled();
     });
 
     it('should validate jurisdiction if provided', async () => {
