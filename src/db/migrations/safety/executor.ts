@@ -57,6 +57,20 @@ export interface MigrationExecutionOptions {
   batchSize?: number;
 }
 
+function validateExecutionOptions(options: MigrationExecutionOptions): void {
+  for (const [name, value] of [
+    ['timeout', options.timeout],
+    ['batchSize', options.batchSize],
+  ] as const) {
+    if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+      throw new MigrationValidationError(
+        `${name} must be a positive integer when provided`,
+        { option: name, value },
+      );
+    }
+  }
+}
+
 /**
  * Migration execution result
  */
@@ -118,6 +132,10 @@ export class HardenedMigrationExecutor {
     const startTime = Date.now();
     
     try {
+      // Reject ambiguous boundary values instead of silently replacing zero,
+      // accepting NaN, or passing a negative batch size deeper into execution.
+      validateExecutionOptions(options);
+
       // Fast-fail obvious authorization issues before touching filesystem.
       const baselinePermission = await this.accessControl.canExecuteMigration(
         securityContext,
