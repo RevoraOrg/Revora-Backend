@@ -10,14 +10,55 @@
  *  - The clear cookie expires the session immediately (Max-Age=0).
  */
 
+import type { Response } from "express";
+
 import {
   buildSessionCookie,
   clearSessionCookie,
   issueSessionCookie,
+  resolveSessionCookieName,
   SESSION_COOKIE_NAME,
 } from "./session";
 
 const FUTURE = Date.now() + 60_000;
+
+const originalCookieName = process.env.SESSION_COOKIE_NAME;
+
+afterEach(() => {
+  if (originalCookieName === undefined) {
+    delete process.env.SESSION_COOKIE_NAME;
+  } else {
+    process.env.SESSION_COOKIE_NAME = originalCookieName;
+  }
+});
+
+describe("SESSION_COOKIE_NAME", () => {
+  it("uses the environment-configured name for issue and clear headers", () => {
+    process.env.SESSION_COOKIE_NAME = "__Host-revora_session";
+
+    expect(buildSessionCookie("tok123", FUTURE, { isProduction: false })).toContain(
+      "__Host-revora_session=tok123",
+    );
+    expect(clearSessionCookie()).toContain("__Host-revora_session=;");
+  });
+
+  it("allows a valid per-call name to override the environment", () => {
+    process.env.SESSION_COOKIE_NAME = "environment-session";
+
+    expect(resolveSessionCookieName("tenant-session")).toBe("tenant-session");
+  });
+
+  it.each(["", "contains space", "session; Path=/", "session\r\nX-Injected: yes"])(
+    "rejects invalid configured name %j",
+    (name) => {
+      process.env.SESSION_COOKIE_NAME = name;
+
+      expect(() => buildSessionCookie("tok123", FUTURE)).toThrow(
+        /SESSION_COOKIE_NAME must be a non-empty RFC 6265 cookie name/,
+      );
+    },
+  );
+});
 
 describe("buildSessionCookie", () => {
   it("always sets HttpOnly, SameSite=Strict by default and Path=/", () => {
@@ -67,21 +108,21 @@ describe("buildSessionCookie", () => {
 
 describe("issueSessionCookie", () => {
   it("appends a Set-Cookie header to the response", () => {
-    const appended: Array<[string, string]> = [];
-    const res = {
-      append: (name: string, value: string) => appended.push([name, value]),
-    } as any;
+    const append = jest.fn();
+    const res = { append } as unknown as Response;
 
     issueSessionCookie(res, "tok123", FUTURE, { isProduction: false });
 
-    expect(appended).toHaveLength(1);
-    expect(appended[0][0]).toBe("Set-Cookie");
-    expect(appended[0][1]).toContain("HttpOnly");
-    expect(appended[0][1]).toContain("SameSite=Strict");
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(append).toHaveBeenCalledWith("Set-Cookie", expect.stringContaining("HttpOnly"));
+    expect(append).toHaveBeenCalledWith(
+      "Set-Cookie",
+      expect.stringContaining("SameSite=Strict"),
+    );
   });
 
   it("propagates the production refusal (throws, sets nothing)", () => {
-    const res = { append: jest.fn() } as any;
+    const res = { append: jest.fn() } as unknown as Response;
     expect(() =>
       issueSessionCookie(res, "tok123", FUTURE, { isProduction: true, secure: false }),
     ).toThrow(/Secure/i);

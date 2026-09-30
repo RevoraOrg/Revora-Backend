@@ -22,18 +22,40 @@
  *    logout returns 401.
  */
 
-import type { Request, Response, NextFunction } from "express";
+import type { Response, NextFunction } from "express";
 import { Router }                               from "express";
 import type { ISessionStore }                   from "../lib/sessionStore";
 import { AuthenticatedRequest }                from "./auth";
 
 // ─── Secure session cookie issuer ──────────────────────────────────────────────
 
-/** Name of the browser session cookie. */
+/** Backward-compatible default name of the browser session cookie. */
 export const SESSION_COOKIE_NAME = "session";
 
+// RFC 6265 cookie-name characters (the HTTP `token` grammar). Rejecting all
+// separators and control characters prevents a configured name from creating
+// a malformed header or injecting an additional cookie/header.
+const COOKIE_NAME_PATTERN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Resolve and validate the cookie name.
+ *
+ * Precedence is an explicit per-call option, then `SESSION_COOKIE_NAME`, then
+ * the public `session` default. Invalid configured names throw a `TypeError`
+ * before any response header is written.
+ */
+export function resolveSessionCookieName(explicitName?: string): string {
+  const name = explicitName ?? process.env.SESSION_COOKIE_NAME ?? SESSION_COOKIE_NAME;
+  if (!COOKIE_NAME_PATTERN.test(name)) {
+    throw new TypeError(
+      "SESSION_COOKIE_NAME must be a non-empty RFC 6265 cookie name.",
+    );
+  }
+  return name;
+}
+
 export interface SessionCookieOptions {
-  /** Cookie name. @default {@link SESSION_COOKIE_NAME} */
+  /** Cookie name. Overrides the `SESSION_COOKIE_NAME` environment variable. */
   name?: string;
   /** Cookie path. @default "/" */
   path?: string;
@@ -67,7 +89,7 @@ export function buildSessionCookie(
 ): string {
   const isProduction = opts.isProduction ?? process.env.NODE_ENV === "production";
   const secure       = opts.secure ?? isProduction;
-  const name         = opts.name ?? SESSION_COOKIE_NAME;
+  const name         = resolveSessionCookieName(opts.name);
   const path         = opts.path ?? "/";
 
   const sameSite     = opts.sameSite ?? "Strict";
@@ -108,7 +130,7 @@ export function issueSessionCookie(
 
 /** Build the `Set-Cookie` header that clears the session cookie (logout). */
 export function clearSessionCookie(opts: SessionCookieOptions = {}): string {
-  const name = opts.name ?? SESSION_COOKIE_NAME;
+  const name = resolveSessionCookieName(opts.name);
   const path = opts.path ?? "/";
   const sameSite = opts.sameSite ?? "Strict";
   return `${name}=; Path=${path}; HttpOnly; SameSite=${sameSite}; Max-Age=0`;
