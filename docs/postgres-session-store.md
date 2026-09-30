@@ -49,7 +49,9 @@ store.startCleanup();           // periodic deletion of expired rows
   unknown tokens. Expired rows are lazily deleted on read and bulk-removed by
   the `cleanupExpired` job.
 - **Cookie hardening.** `buildSessionCookie` always emits `HttpOnly`,
-  `SameSite=Strict`, and `Path=/`. In production (`NODE_ENV=production`) the
+  `SameSite=Strict`, and `Path=/`. The cookie name defaults to `session` and can
+  be changed with `SESSION_COOKIE_NAME`; invalid or header-unsafe names are
+  rejected before a `Set-Cookie` header is written. In production (`NODE_ENV=production`) the
   `Secure` attribute is mandatory — issuing a non-Secure session cookie throws,
   so a session token can never be sent over plaintext HTTP.
 
