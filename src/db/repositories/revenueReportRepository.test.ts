@@ -65,6 +65,7 @@ describe('RevenueReportRepository', () => {
         offering_id: 'offering-1',
         period_id: 'period-1',
         total_revenue: '25000.00',
+        reported_by: 'user-1',
       };
 
       const mockResult: QueryResult<RevenueReportRow> = {
@@ -76,6 +77,17 @@ describe('RevenueReportRepository', () => {
       };
 
       mockPool.query.mockResolvedValueOnce(mockResult);
+
+      await expect(repository.create(input)).rejects.toThrow(
+        'Failed to create revenue report'
+      );
+    });
+
+    it('throws if no valid fields are provided', async () => {
+      const input = {
+        offering_id: undefined,
+        reported_by: undefined,
+      } as unknown as CreateRevenueReportInput;
 
       await expect(repository.create(input)).rejects.toThrow(
         'Failed to create revenue report'
@@ -116,6 +128,84 @@ describe('RevenueReportRepository', () => {
       mockPool.query.mockResolvedValueOnce(mockResult);
 
       const result = await repository.getByOfferingAndPeriod('offering-1', 'period-1');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('findByOfferingAndPeriod', () => {
+    it('returns matching report', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [mockReport],
+        rowCount: 1,
+        command: 'SELECT',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const startDate = new Date('2025-01-01');
+      const endDate = new Date('2025-01-31');
+      const result = await repository.findByOfferingAndPeriod('offering-1', startDate, endDate);
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('FROM revenue_reports'),
+        ['offering-1', startDate, endDate]
+      );
+      expect(result?.id).toBe('report-1');
+    });
+
+    it('returns null when not found', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [],
+        rowCount: 0,
+        command: 'SELECT',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const result = await repository.findByOfferingAndPeriod('offering-1', new Date(), new Date());
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('findOverlappingReport', () => {
+    it('returns matching overlapping report', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [mockReport],
+        rowCount: 1,
+        command: 'SELECT',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const startDate = new Date('2025-01-01');
+      const endDate = new Date('2025-01-31');
+      const result = await repository.findOverlappingReport('offering-1', startDate, endDate);
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('FROM revenue_reports'),
+        ['offering-1', startDate, endDate]
+      );
+      expect(result?.id).toBe('report-1');
+    });
+
+    it('returns null when no overlapping report is found', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [],
+        rowCount: 0,
+        command: 'SELECT',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      const result = await repository.findOverlappingReport('offering-1', new Date(), new Date());
       expect(result).toBeNull();
     });
   });
@@ -209,6 +299,22 @@ describe('RevenueReportRepository', () => {
       );
     });
 
+    it('throws when failing to mark a reported distribution as completed', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [],
+        rowCount: 0,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      await expect(repository.markReportDistributionCompleted('report-nonexistent')).rejects.toThrow(
+        'Failed to mark revenue report report-nonexistent as completed'
+      );
+    });
+
     it('marks a reported distribution as failed', async () => {
       const mockResult: QueryResult<RevenueReportRow> = {
         rows: [{ id: 'report-1' } as any],
@@ -225,6 +331,22 @@ describe('RevenueReportRepository', () => {
       expect(mockPool.query).toHaveBeenCalledWith(
         expect.stringContaining('SET distribution_status = '),
         ['report-1']
+      );
+    });
+
+    it('throws when failing to mark a reported distribution as failed', async () => {
+      const mockResult: QueryResult<RevenueReportRow> = {
+        rows: [],
+        rowCount: 0,
+        command: 'UPDATE',
+        oid: 0,
+        fields: [],
+      };
+
+      mockPool.query.mockResolvedValueOnce(mockResult);
+
+      await expect(repository.markReportDistributionFailed('report-nonexistent')).rejects.toThrow(
+        'Failed to mark revenue report report-nonexistent as failed'
       );
     });
   });
