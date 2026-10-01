@@ -1,4 +1,10 @@
-import { SessionStore, PostgresSessionStore, hashSessionToken } from "../sessionStore";
+import {
+  SessionStore,
+  PostgresSessionStore,
+  hashSessionToken,
+  constantTimeHexEqual,
+  generateSessionToken,
+} from "../sessionStore";
 import { globalMetrics } from "../metrics";
 import type { SessionRepository } from "../../db/repositories/sessionRepository";
 
@@ -73,7 +79,7 @@ class FakeSessionRepository {
     return count;
   }
 
-  async deleteAllSessionsByUserId(_userId: string): Promise<void> {
+  async deleteAllSessionsByUserId(): Promise<void> {
     this.rows.clear();
   }
 }
@@ -364,5 +370,578 @@ describe("PostgresSessionStore – per-role TTL", () => {
       expect(spy).toHaveBeenCalledWith("session.idle_extended", { role: "admin" });
       spy.mockRestore();
     });
+  });
+});
+
+// ─── Suite: get() failure/empty-result contract ──────────────────────────────
+//
+// Regression coverage for the explicit failure branches in sessionStore.ts:
+//   - L188  `if (!session) return null;`            → unknown in-memory token
+//   - L192  `return null;` after lazy eviction       → expired in-memory session
+//   - L412  `if (!row) return null;`                → no matching DB row
+//
+// The security invariant under test: an unknown / expired / revoked session is
+// indistinguishable from a session that never existed. Callers get `null`, not a
+// distinguishable error, so the lookup cannot be used as an oracle.
+
+/** Pin `Date.now` to a fixed instant so expiry boundaries are deterministic. */
+function mockNow(ts: number): void {
+  jest.spyOn(Date, "now").mockReturnValue(ts);
+}
+
+const BASE = 1_700_000_000_000;
+
+/**
+ * Build a memory store whose TTL is `ttlMs` for every role used below.
+ * Required because `SessionStore` merges `DEFAULT_ROLE_TTL` on top of `ttlMs`,
+ * so a bare `ttlMs` would be ignored for known roles like `admin`.
+ */
+function makeStore(ttlMs: number, extra: Partial<{ sweepIntervalMs: number }> = {}): SessionStore {
+  return new SessionStore({
+    ttlMs,
+    roleTtlMs: { admin: ttlMs, verifier: ttlMs, investor: ttlMs, anonymous: ttlMs },
+    sweepIntervalMs: extra.sweepIntervalMs ?? 0,
+  });
+}
+
+describe("SessionStore – get() failure paths", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+    globalMetrics.reset();
+  });
+
+  describe("unknown token (L188 `if (!session) return null`)", () => {
+    it("returns null for a token that was never issued", async () => {
+      const store = makeStore(60_000);
+
+      await expect(store.get("deadbeefdeadbeefdeadbeefdeadbeef")).resolves.toBeNull();
+    });
+
+    it("returns null for an empty token without throwing", async () => {
+      const store = makeStore(60_000);
+
+      await expect(store.get("")).resolves.toBeNull();
+    });
+
+    it("returns null for a near-miss token one hex digit off a live token", async () => {
+      const store = makeStore(60_000);
+      const session = await store.create("u1", "admin");
+
+      const flipped = `${session.token.slice(0, -1)}${session.token.endsWith("0") ? "1" : "0"}`;
+      expect(flipped).not.toBe(session.token);
+
+      await expect(store.get(flipped)).resolves.toBeNull();
+      // The real token is untouched by the failed lookup.
+      await expect(store.get(session.token)).resolves.toMatchObject({ userId: "u1" });
+    });
+
+    it("does not count an unknown lookup as an evicted session", async () => {
+      const store = makeStore(60_000);
+
+      await store.get("nonexistent");
+      await store.get("also-nonexistent");
+
+      const stats = store.stats();
+      expect(stats.expiredCleaned).toBe(0);
+      expect(stats.activeSessions).toBe(0);
+      expect(stats.totalCreated).toBe(0);
+    });
+
+    it("returns null after an explicit delete (token becomes unknown)", async () => {
+      const store = makeStore(60_000);
+      const session = await store.create("u1", "admin");
+
+      await store.delete(session.token);
+
+      await expect(store.get(session.token)).resolves.toBeNull();
+      expect(store.stats().expiredCleaned).toBe(0);
+    });
+  });
+
+  describe("expired session (L192 `return null` after lazy eviction)", () => {
+    it("returns null once the TTL has elapsed", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+
+      mockNow(BASE + 1_000);
+      await expect(store.get(session.token)).resolves.toBeNull();
+    });
+
+    it("evicts the expired session so it can never be resurrected", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+
+      mockNow(BASE + 1_000);
+      await store.get(session.token);
+
+      expect(store.stats().expiredCleaned).toBe(1);
+      expect(store.stats().activeSessions).toBe(0);
+
+      // Re-reading the same token now takes the unknown-token branch (L188):
+      // expiry is not re-counted, so metrics stay stable.
+      await expect(store.get(session.token)).resolves.toBeNull();
+      expect(store.stats().expiredCleaned).toBe(1);
+    });
+
+    it("counts the session as created but not as active once expired", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+
+      mockNow(BASE + 5_000);
+      await store.get(session.token);
+
+      expect(store.stats().totalCreated).toBe(1);
+      expect(store.stats().expiredCleaned).toBe(1);
+      expect(store.stats().activeSessions).toBe(0);
+    });
+
+    it("sweep() reports the same eviction count the read path would apply", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      await store.create("u1", "admin");
+      await store.create("u2", "admin");
+      mockNow(BASE + 1_000);
+      await store.create("u3", "admin"); // expires at BASE + 2_000
+
+      mockNow(BASE + 1_500);
+      expect(store.sweep()).toBe(2);
+      expect(store.stats().expiredCleaned).toBe(2);
+      expect(store.stats().activeSessions).toBe(1);
+    });
+
+    it("returns null for an expired session but not for a live sibling", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const live = await store.create("u1", "admin");
+      mockNow(BASE + 1_000);
+      const expiring = await store.create("u2", "admin");
+
+      // `expiring` was created at BASE+1000 so it lives until BASE+2000.
+      mockNow(BASE + 1_999);
+      await expect(store.get(live.token)).resolves.toBeNull();
+      await expect(store.get(expiring.token)).resolves.not.toBeNull();
+
+      mockNow(BASE + 2_000);
+      await expect(store.get(expiring.token)).resolves.toBeNull();
+    });
+  });
+
+  describe("expiry boundary (normal vs failure path)", () => {
+    it("returns the session 1ms before expiry and null exactly at expiry", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+      expect(session.expiresAt).toBe(BASE + 1_000);
+
+      mockNow(BASE + 999);
+      const alive = await store.get(session.token);
+      expect(alive).not.toBeNull();
+      expect(alive!.token).toBe(session.token);
+
+      mockNow(BASE + 1_000);
+      await expect(store.get(session.token)).resolves.toBeNull();
+    });
+
+    it("never extends a session that is already expired, even via touch()", async () => {
+      const store = makeStore(1_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+
+      mockNow(BASE + 1_000);
+      await expect(store.touch(session.token)).resolves.toBe(false);
+      await expect(store.get(session.token)).resolves.toBeNull();
+    });
+
+    it("touch() on an unknown token returns false without touching metrics", async () => {
+      const store = makeStore(60_000);
+      const spy = jest.spyOn(globalMetrics, "incrementCounter");
+
+      await expect(store.touch("nope")).resolves.toBe(false);
+      expect(spy).not.toHaveBeenCalled();
+      expect(store.stats().expiredCleaned).toBe(0);
+      spy.mockRestore();
+    });
+
+    it("treats a zero-length TTL session as already expired", async () => {
+      const store = makeStore(0);
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+
+      await expect(store.get(session.token)).resolves.toBeNull();
+      expect(store.stats().expiredCleaned).toBe(1);
+    });
+  });
+
+  describe("normal path (no failure)", () => {
+    it("returns the live session with the full public shape", async () => {
+      const store = makeStore(60_000);
+      mockNow(BASE);
+      const session = await store.create("u1", "verifier");
+
+      mockNow(BASE + 10_000);
+      const found = await store.get(session.token);
+
+      expect(found).toEqual({
+        token: session.token,
+        userId: "u1",
+        role: "verifier",
+        expiresAt: BASE + 60_000,
+        createdAt: BASE,
+        lastSeenAt: BASE,
+      });
+      expect(store.stats().expiredCleaned).toBe(0);
+      expect(store.stats().activeSessions).toBe(1);
+    });
+
+    it("keeps sessions independent and returns null for a deleted user's token", async () => {
+      const store = makeStore(60_000);
+      mockNow(BASE);
+      const alice = await store.create("alice", "admin");
+      const bob = await store.create("bob", "investor");
+
+      await expect(store.get(alice.token)).resolves.toMatchObject({ userId: "alice" });
+      await expect(store.get(bob.token)).resolves.toMatchObject({ userId: "bob", role: "investor" });
+
+      await store.deleteAllForUser("alice");
+      await expect(store.get(alice.token)).resolves.toBeNull();
+      await expect(store.get(bob.token)).resolves.not.toBeNull();
+    });
+
+    it("stop() clears sessions so subsequent lookups miss", async () => {
+      const store = makeStore(60_000, { sweepIntervalMs: 10 });
+      mockNow(BASE);
+      const session = await store.create("u1", "admin");
+      store.startSweep();
+      store.startSweep(); // idempotent
+
+      await expect(store.get(session.token)).resolves.not.toBeNull();
+      store.stop();
+      await expect(store.get(session.token)).resolves.toBeNull();
+      expect(store.stats().activeSessions).toBe(0);
+    });
+  });
+});
+
+// ─── Suite: PostgresSessionStore get() failure paths ─────────────────────────
+
+/**
+ * Mirrors the real `sessions` table shape, where `role` is nullable for
+ * non-web (API/JWT) sessions.
+ */
+interface StubRow extends Omit<Row, "role"> {
+  role: string | null;
+}
+
+/**
+ * Minimal repository stub that lets a test control the row returned by
+ * `findByTokenHash` and observe the side effects of the lazy-cleanup path.
+ */
+class StubSessionRepository {
+  row: StubRow | null = null;
+  /** Rows the store asked to delete (lazy expiry cleanup). */
+  readonly deleted: string[] = [];
+  /** When set, `deleteByTokenHash` rejects to exercise the best-effort guard. */
+  deleteError: Error | null = null;
+  touchCalls = 0;
+  deleteAllCalls: string[] = [];
+
+  async findByTokenHash(): Promise<StubRow | null> {
+    return this.row ? { ...this.row } : null;
+  }
+
+  async deleteByTokenHash(tokenHash: string): Promise<void> {
+    this.deleted.push(tokenHash);
+    if (this.deleteError) throw this.deleteError;
+  }
+
+  async touchExpiryByTokenHash(): Promise<void> {
+    this.touchCalls += 1;
+  }
+
+  async deleteAllSessionsByUserId(userId: string): Promise<void> {
+    this.deleteAllCalls.push(userId);
+  }
+
+  async countActive(): Promise<number> {
+    return this.row ? 1 : 0;
+  }
+
+  async deleteExpired(): Promise<number> {
+    return 0;
+  }
+}
+
+function makeRow(overrides: Partial<StubRow> = {}): StubRow {
+  return {
+    id: "session-1",
+    user_id: "u1",
+    role: "admin",
+    token_hash: hashSessionToken("placeholder-token"),
+    expires_at: new Date(BASE + 60_000),
+    created_at: new Date(BASE),
+    ...overrides,
+  };
+}
+
+describe("PostgresSessionStore – get() failure paths", () => {
+  let repo: StubSessionRepository;
+  let store: PostgresSessionStore;
+
+  beforeEach(() => {
+    repo = new StubSessionRepository();
+    store = new PostgresSessionStore(repo as unknown as SessionRepository, {
+      ttlMs: 60_000,
+      now: () => BASE,
+    });
+    globalMetrics.reset();
+  });
+
+  describe("missing row (L412 `if (!row) return null`)", () => {
+    it("returns null when the repository finds no row", async () => {
+      repo.row = null;
+
+      await expect(store.get("missing-token")).resolves.toBeNull();
+    });
+
+    it("returns null for an empty token and never queries a real session", async () => {
+      repo.row = null;
+
+      await expect(store.get("")).resolves.toBeNull();
+      expect(repo.deleted).toHaveLength(0);
+    });
+
+    it("performs no delete side effect for a missing row", async () => {
+      repo.row = null;
+
+      await store.get("missing-token");
+
+      expect(repo.deleted).toEqual([]);
+    });
+
+    it("keeps returning null across repeated lookups of the same missing token", async () => {
+      repo.row = null;
+
+      await expect(store.get("missing-token")).resolves.toBeNull();
+      await expect(store.get("missing-token")).resolves.toBeNull();
+      expect(repo.deleted).toHaveLength(0);
+    });
+  });
+
+  describe("rejected rows are indistinguishable from missing rows", () => {
+    it("returns null when the stored hash does not match the presented token", async () => {
+      repo.row = makeRow({ token_hash: hashSessionToken("some-other-token") });
+
+      await expect(store.get("presented-token")).resolves.toBeNull();
+    });
+
+    it("returns null for a revoked row without attempting cleanup", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        revoked_at: new Date(BASE - 1),
+      });
+
+      await expect(store.get(token)).resolves.toBeNull();
+      expect(repo.deleted).toEqual([]);
+    });
+
+    it("returns null for a row whose revocation is in the future relative to the clock", async () => {
+      // `revoked_at` is presence-checked, not compared — any non-null value wins.
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        revoked_at: new Date(BASE + 1),
+      });
+
+      await expect(store.get(token)).resolves.toBeNull();
+    });
+
+    it("returns null for an empty stored hash (unusable row)", async () => {
+      repo.row = makeRow({ token_hash: "" });
+
+      await expect(store.get("presented-token")).resolves.toBeNull();
+    });
+  });
+
+  describe("expired row triggers best-effort lazy cleanup", () => {
+    it("returns null and deletes the row when expiry has passed", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE - 1),
+      });
+
+      await expect(store.get(token)).resolves.toBeNull();
+      expect(repo.deleted).toEqual([hashSessionToken(token)]);
+    });
+
+    it("still returns null when the cleanup delete rejects", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE - 1),
+      });
+      repo.deleteError = new Error("db unavailable");
+
+      await expect(store.get(token)).resolves.toBeNull();
+      expect(repo.deleted).toEqual([hashSessionToken(token)]);
+    });
+
+    it("treats expires_at exactly equal to now as expired", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE),
+      });
+
+      await expect(store.get(token)).resolves.toBeNull();
+      expect(repo.deleted).toHaveLength(1);
+    });
+
+    it("returns the session when expiry is 1ms in the future", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE + 1),
+      });
+
+      const found = await store.get(token);
+      expect(found).not.toBeNull();
+      expect(found!.token).toBe(token);
+      expect(repo.deleted).toHaveLength(0);
+    });
+  });
+
+  describe("touch() mirrors the get() failure contract", () => {
+    it("returns false when no row exists", async () => {
+      repo.row = null;
+
+      await expect(store.touch("missing-token")).resolves.toBe(false);
+      expect(repo.touchCalls).toBe(0);
+    });
+
+    it("returns false for an expired row and does not extend it", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE - 1),
+      });
+
+      await expect(store.touch(token)).resolves.toBe(false);
+      expect(repo.touchCalls).toBe(0);
+    });
+
+    it("returns false for a revoked row", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        revoked_at: new Date(BASE),
+      });
+
+      await expect(store.touch(token)).resolves.toBe(false);
+    });
+
+    it("extends a live row and honours maxExtendedExpiry", async () => {
+      const token = "presented-token";
+      repo.row = makeRow({
+        token_hash: hashSessionToken(token),
+        created_at: new Date(BASE - 200_000),
+        expires_at: new Date(BASE + 60_000),
+      });
+
+      const capped = new PostgresSessionStore(repo as unknown as SessionRepository, {
+        ttlMs: 60_000,
+        now: () => BASE,
+        maxExtendedExpiry: 300_000,
+      });
+
+      await expect(capped.touch(token)).resolves.toBe(true);
+      expect(repo.touchCalls).toBe(1);
+    });
+  });
+
+  describe("normal path and mapping", () => {
+    it("returns the live session mapped from the row", async () => {
+      const token = generateSessionToken();
+      repo.row = makeRow({
+        user_id: "u42",
+        role: "investor",
+        token_hash: hashSessionToken(token),
+        expires_at: new Date(BASE + 90_000),
+        created_at: new Date(BASE - 5_000),
+      });
+
+      await expect(store.get(token)).resolves.toEqual({
+        token,
+        userId: "u42",
+        role: "investor",
+        expiresAt: BASE + 90_000,
+        createdAt: BASE - 5_000,
+        lastSeenAt: BASE,
+      });
+      expect(repo.deleted).toHaveLength(0);
+    });
+
+    it("maps a null role to an empty string rather than leaking null", async () => {
+      const token = generateSessionToken();
+      repo.row = makeRow({ token_hash: hashSessionToken(token), role: null });
+
+      const found = await store.get(token);
+      expect(found).not.toBeNull();
+      expect(found!.role).toBe("");
+    });
+
+    it("delete() and deleteAllForUser() delegate by hashed token / user id", async () => {
+      const token = generateSessionToken();
+
+      await store.delete(token);
+      await store.deleteAllForUser("u1");
+
+      expect(repo.deleted).toEqual([hashSessionToken(token)]);
+      expect(repo.deleteAllCalls).toEqual(["u1"]);
+    });
+
+    it("stats() delegates the active count to the repository", async () => {
+      repo.row = makeRow();
+
+      await expect(store.stats()).resolves.toEqual({ activeSessions: 1 });
+    });
+  });
+});
+
+// ─── Suite: token-hash helpers ───────────────────────────────────────────────
+
+describe("constantTimeHexEqual – boundary inputs", () => {
+  it("returns true for identical hashes", () => {
+    const hash = hashSessionToken("t");
+    expect(constantTimeHexEqual(hash, hash)).toBe(true);
+  });
+
+  it("returns false for different hashes of equal length", () => {
+    expect(constantTimeHexEqual(hashSessionToken("a"), hashSessionToken("b"))).toBe(false);
+  });
+
+  it("returns false for differing lengths without throwing", () => {
+    expect(constantTimeHexEqual("aabb", "aabbcc")).toBe(false);
+  });
+
+  it("returns false for empty inputs", () => {
+    expect(constantTimeHexEqual("", "")).toBe(false);
+  });
+
+  it("hashSessionToken is a stable lowercase hex SHA-256", () => {
+    const hash = hashSessionToken("stable-input");
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashSessionToken("stable-input")).toBe(hash);
+    expect(hashSessionToken("other-input")).not.toBe(hash);
+  });
+
+  it("generateSessionToken produces unique 128-bit hex tokens", () => {
+    const tokens = new Set(Array.from({ length: 500 }, () => generateSessionToken()));
+    expect(tokens.size).toBe(500);
+    for (const token of tokens) expect(token).toMatch(/^[0-9a-f]{32}$/);
   });
 });

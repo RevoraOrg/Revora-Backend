@@ -179,4 +179,101 @@ describe('createListRevenueReportsHandler', () => {
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith({ error: 'Invalid request' });
   });
+
+  it('returns 400 when page is an array', async () => {
+    const handler = createListRevenueReportsHandler({
+      revenueReportRepository: mockRevenueReportRepository,
+      offeringOwnershipRepository: mockOfferingOwnershipRepository,
+    });
+    const req = createRequest({
+      userId: 'issuer-1',
+      query: {
+        page: ['1', '2'] as any,
+      },
+    });
+    const res = createResponse();
+
+    await handler(req, res, createNext());
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Invalid request' });
+  });
+
+  it('returns 400 when pageSize is an array', async () => {
+    const handler = createListRevenueReportsHandler({
+      revenueReportRepository: mockRevenueReportRepository,
+      offeringOwnershipRepository: mockOfferingOwnershipRepository,
+    });
+    const req = createRequest({
+      userId: 'issuer-1',
+      query: {
+        pageSize: ['10', '20'] as any,
+      },
+    });
+    const res = createResponse();
+
+    await handler(req, res, createNext());
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Invalid request' });
+  });
+
+  it('ignores period parameters when they are arrays', async () => {
+    mockOfferingOwnershipRepository.isOwnedByUser.mockResolvedValueOnce(true);
+    mockRevenueReportRepository.listByOffering.mockResolvedValueOnce(reports);
+
+    const handler = createListRevenueReportsHandler({
+      revenueReportRepository: mockRevenueReportRepository,
+      offeringOwnershipRepository: mockOfferingOwnershipRepository,
+    });
+    const req = createRequest({
+      userId: 'issuer-1',
+      query: {
+        periodFrom: ['2024-02', '2024-03'] as any,
+        periodTo: ['2024-03', '2024-04'] as any,
+      },
+    });
+    const res = createResponse();
+
+    await handler(req, res, createNext());
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({
+      data: reports.slice(0, 20),
+      pagination: {
+        page: 1,
+        pageSize: 20,
+        total: 3,
+        totalPages: 1,
+      },
+    });
+  });
+
+  it('uses default pagination when page and pageSize are undefined', async () => {
+    mockOfferingOwnershipRepository.isOwnedByUser.mockResolvedValueOnce(true);
+    mockRevenueReportRepository.listByOffering.mockResolvedValueOnce(reports);
+
+    const handler = createListRevenueReportsHandler({
+      revenueReportRepository: mockRevenueReportRepository,
+      offeringOwnershipRepository: mockOfferingOwnershipRepository,
+    });
+    const req = createRequest({
+      userId: 'issuer-1',
+      query: {},
+    });
+    const res = createResponse();
+
+    await handler(req, res, createNext());
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({
+      data: reports,
+      pagination: {
+        page: 1,
+        pageSize: 20,
+        total: 3,
+        totalPages: 1,
+      },
+    });
+  });
 });
