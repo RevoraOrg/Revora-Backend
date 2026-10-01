@@ -72,4 +72,89 @@ describe('verifyReproducibleBuildAttestation', () => {
       verifyReproducibleBuildAttestation(attestation, 'deadbeef', ['builder-1']),
     ).toThrow('Attestation missing builder.id');
   });
+
+  it('throws error when attestation is not an object (null, undefined, primitives)', () => {
+    expect(() =>
+      verifyReproducibleBuildAttestation(null, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation must be an object');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation(undefined, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation must be an object');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation('not-an-object', 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation must be an object');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation(123, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation must be an object');
+  });
+
+  it('throws error when builder.id is missing, empty, or not a string (boundary inputs)', () => {
+    expect(() =>
+      verifyReproducibleBuildAttestation({}, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation missing builder.id');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation({ builder: {} }, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation missing builder.id');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation({ builder: { id: '' } }, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation missing builder.id');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation({ builder: { id: '   ' } }, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation missing builder.id');
+
+    expect(() =>
+      verifyReproducibleBuildAttestation({ builder: { id: 123 } }, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation missing builder.id');
+  });
+
+  it('throws error when builder identity is not authorized for tenant', () => {
+    expect(() =>
+      verifyReproducibleBuildAttestation({ builder: { id: 'builder-2' } }, 'deadbeef', ['builder-1']),
+    ).toThrow('Attestation builder identity is not authorized for tenant');
+  });
+
+  it('verifies normal path with subject matching by name (case/whitespace normalization)', () => {
+    const attestation = {
+      builder: { id: 'builder-1' },
+      subject: [
+        {
+          name: '  Revora-Contract  ',
+        },
+      ],
+    };
+
+    const result = verifyReproducibleBuildAttestation(
+      attestation,
+      'revora-contract',
+      ['builder-1'],
+    );
+
+    expect(result).toEqual({
+      builderId: 'builder-1',
+      subjectDigest: 'revora-contract',
+      subjectName: 'Revora-Contract',
+    });
+  });
+
+  it('verifies normal path with unsupported predicate type error', () => {
+    const attestation = {
+      builder: { id: 'builder-1' },
+      predicateType: 'https://slsa.dev/provenance/v0.1',
+      subject: [
+        {
+          digest: { sha256: 'deadbeef' },
+        },
+      ],
+    };
+
+    expect(() =>
+      verifyReproducibleBuildAttestation(attestation, 'deadbeef', ['builder-1']),
+    ).toThrow('Unsupported attestation predicate type');
+  });
 });

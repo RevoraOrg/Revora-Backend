@@ -316,6 +316,7 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
 
   let healthy = false;
   let activeUrl = "";
+  let lastAttemptedUrl = "";
   let lastStatus = 0;
   // Typed as `unknown`: every use either narrows via instanceof or forwards
   // the value to classifyStellarRPCFailure, which accepts unknown causes.
@@ -325,7 +326,7 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
   let lastUrl = "";
 
   for (const horizonUrl of endpoints) {
-    lastUrl = horizonUrl;
+    lastAttemptedUrl = horizonUrl;
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), HORIZON_TIMEOUT_MS);
@@ -371,8 +372,8 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
       details: {
         failureClass,
         upstreamStatus: lastStatus,
-        url: lastUrl,
-        breakerStates
+        breakerStates,
+        url: lastAttemptedUrl || undefined,
       },
       error: failureClass === StellarRPCFailureClass.TIMEOUT ? "timeout" : "connection_error",
     };

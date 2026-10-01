@@ -12,3 +12,4 @@ pnpm-debug.log*
 Thumbs.db
 reports/mutation/
 .stryker-tmp/
+.tools/

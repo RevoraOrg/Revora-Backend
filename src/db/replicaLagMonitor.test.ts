@@ -87,6 +87,11 @@ function buildMonitor(
   return { monitor, metrics, client };
 }
 
+/** Invoke the private poll() with a narrow, typed escape hatch. */
+function pollOnce(monitor: ReplicaLagMonitor): Promise<void> {
+  return (monitor as unknown as { poll: () => Promise<void> }).poll();
+}
+
 // ---------------------------------------------------------------------------
 // ReplicaLagMonitor unit tests
 // ---------------------------------------------------------------------------
@@ -480,6 +485,200 @@ describe('ReplicaLagMonitor', () => {
     await monitor.start();
     expect(monitor.isReplicaHealthy()).toBe(true);
     await monitor.stop();
+  });
+
+  // -------------------------------------------------------------------------
+  // Regression: restart-after-stop failure contract (issue #997)
+  // -------------------------------------------------------------------------
+
+  describe('restart-after-stop failure contract', () => {
+    it('rejects with an Error carrying the exact stopped-restart message', async () => {
+      const { monitor } = buildMonitor(100);
+      await monitor.start();
+      await monitor.stop();
+
+      const err = await monitor.start().catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toBe(
+        'ReplicaLagMonitor has been stopped and cannot be restarted',
+      );
+    });
+
+    it('rejected start() performs no poll and schedules no interval timer', async () => {
+      jest.useFakeTimers();
+      const { pool: mockPool, client } = buildMockPool(100);
+      const metrics = new MetricsCollector({ enabled: true });
+
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 1_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await monitor.start();
+      await monitor.stop();
+      const queriesAfterStop = client.query.mock.calls.length;
+      expect(jest.getTimerCount()).toBe(0);
+
+      await expect(monitor.start()).rejects.toThrow(Error);
+
+      // No extra poll was executed and no timer re-armed by the failed start
+      expect(client.query.mock.calls.length).toBe(queriesAfterStop);
+      expect(jest.getTimerCount()).toBe(0);
+
+      // Advancing time must leave status untouched
+      const statusBefore = monitor.getStatus();
+      await jest.advanceTimersByTimeAsync(5_000);
+      expect(monitor.getStatus()).toEqual(statusBefore);
+    });
+
+    it('remains permanently non-restartable: repeated start() keeps throwing', async () => {
+      const { monitor } = buildMonitor(100);
+      await monitor.start();
+      await monitor.stop();
+
+      await expect(monitor.start()).rejects.toThrow(
+        'ReplicaLagMonitor has been stopped and cannot be restarted',
+      );
+      await expect(monitor.start()).rejects.toThrow(
+        'ReplicaLagMonitor has been stopped and cannot be restarted',
+      );
+    });
+
+    it('stop() before any start() also permanently disables start()', async () => {
+      const { monitor } = buildMonitor(100);
+      await monitor.stop();
+
+      await expect(monitor.start()).rejects.toThrow(
+        'ReplicaLagMonitor has been stopped and cannot be restarted',
+      );
+      // Status was never mutated by the failed lifecycle
+      expect(monitor.getStatus().lastCheckedAt).toBeNull();
+      expect(monitor.getStatus().consecutiveErrors).toBe(0);
+    });
+
+    it('double stop() resolves without throwing and does not resurrect the monitor', async () => {
+      const { pool: mockPool } = buildMockPool(100);
+      const metrics = new MetricsCollector({ enabled: true });
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 60_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await monitor.start();
+      await monitor.stop();
+      await expect(monitor.stop()).resolves.toBeUndefined();
+      await expect(monitor.start()).rejects.toThrow(Error);
+    });
+
+    it('normal path: start() before any stop() succeeds and polls immediately', async () => {
+      const { monitor, client } = buildMonitor(250);
+      await monitor.start();
+
+      expect(client.query).toHaveBeenCalledTimes(1);
+      expect(monitor.isReplicaHealthy()).toBe(true);
+      await monitor.stop();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Regression: poll failure & empty-result branches (issue #997)
+  // -------------------------------------------------------------------------
+
+  describe('poll failure and empty-result branches', () => {
+    it('treats an empty result set (no rows) as unhealthy', async () => {
+      const { pool: mockPool, client } = buildMockPool(100);
+      const metrics = new MetricsCollector({ enabled: true });
+
+      // rows: [] → result.rows[0]?.lag_ms evaluates to undefined
+      client.query.mockResolvedValue(makeQueryResult([]));
+
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 60_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await pollOnce(monitor);
+      expect(monitor.isReplicaHealthy()).toBe(false);
+      const status = monitor.getStatus();
+      expect(status.lastLagMs).toBeNull();
+      expect(status.consecutiveErrors).toBe(1);
+      expect(status.lastErrorAt).not.toBeNull();
+    });
+
+    it('treats Infinity lag as unhealthy (non-finite guard)', async () => {
+      const { pool: mockPool, client } = buildMockPool(100);
+      const metrics = new MetricsCollector({ enabled: true });
+      client.query.mockResolvedValue(makeQueryResult([{ lag_ms: 'Infinity' }]));
+
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 60_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await pollOnce(monitor);
+      expect(monitor.isReplicaHealthy()).toBe(false);
+      expect(monitor.getStatus().lastLagMs).toBeNull();
+    });
+
+    it('handles a non-Error rejection via String(err) without throwing', async () => {
+      const { pool: mockPool, client } = buildMockPool(100);
+      const metrics = new MetricsCollector({ enabled: true });
+      client.query.mockRejectedValue('raw string failure');
+
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 60_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await expect(pollOnce(monitor)).resolves.toBeUndefined();
+      expect(monitor.isReplicaHealthy()).toBe(false);
+      expect(monitor.getStatus().consecutiveErrors).toBe(1);
+    });
+
+    it('releases the client back to the pool even when the query rejects', async () => {
+      const { pool: mockPool, client } = buildMockPool('error');
+      const metrics = new MetricsCollector({ enabled: true });
+
+      const monitor = new ReplicaLagMonitor({
+        replicaUrl: 'postgresql://replica:5432/revora',
+        lagThresholdMs: 5_000,
+        pollIntervalMs: 60_000,
+        poolFactory: () => mockPool,
+        metrics,
+      });
+
+      await pollOnce(monitor);
+      expect(client.release).toHaveBeenCalledTimes(1);
+    });
+
+    it('boundary: lag of exactly 0 is healthy while threshold 0 makes any lag unhealthy', async () => {
+      const zeroThreshold = buildMonitor(1, { lagThresholdMs: 0 });
+      await zeroThreshold.monitor.start();
+      // 1 >= 0 → unhealthy at a zero threshold
+      expect(zeroThreshold.monitor.isReplicaHealthy()).toBe(false);
+      await zeroThreshold.monitor.stop();
+
+      const atZero = buildMonitor(0, { lagThresholdMs: 0 });
+      await atZero.monitor.start();
+      // 0 >= 0 → still unhealthy: threshold 0 tolerates nothing
+      expect(atZero.monitor.isReplicaHealthy()).toBe(false);
+      await atZero.monitor.stop();
+    });
   });
 });
 
