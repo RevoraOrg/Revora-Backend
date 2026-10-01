@@ -23,22 +23,16 @@ function mockService(result: any): ChangePasswordService {
   if (result.ok) {
     execute.mockResolvedValue(result);
   } else {
-    let err: AppError;
-    switch (result.reason) {
-      case 'VALIDATION_ERROR':
-        err = new AppError(ErrorCode.VALIDATION_ERROR, 400, result.message);
-        break;
-      case 'WRONG_PASSWORD':
-        err = new AppError(ErrorCode.UNAUTHORIZED, 401, result.message);
-        break;
-      case 'USER_NOT_FOUND':
-        err = new AppError(ErrorCode.NOT_FOUND, 404, result.message);
-        break;
-      default:
-        err = new AppError(ErrorCode.INTERNAL_ERROR, 500, 'Unknown');
-    }
-    execute.mockRejectedValue(err);
+    // Mirror the production service: domain failures are RETURNED as
+    // { ok: false, reason }, not thrown. The handler must translate them.
+    execute.mockResolvedValue(result);
   }
+  return { execute } as unknown as ChangePasswordService;
+}
+
+/** Rejection-style mock kept for tests that assert unexpected exceptions. */
+function mockRejectingService(err: unknown): ChangePasswordService {
+  const execute = jest.fn().mockRejectedValue(err);
   return { execute } as unknown as ChangePasswordService;
 }
 
@@ -80,7 +74,7 @@ describe('createChangePasswordHandler', () => {
     expect((svc.execute as jest.Mock)).not.toHaveBeenCalled();
   });
 
-  it('calls next(AppError) on VALIDATION_ERROR from service', async () => {
+  it('maps VALIDATION_ERROR result to next(AppError) 400 VALIDATION_ERROR', async () => {
     const handler = createChangePasswordHandler(
       mockService({ ok: false, reason: 'VALIDATION_ERROR', message: 'too short' }),
     );
@@ -88,34 +82,40 @@ describe('createChangePasswordHandler', () => {
     const next = jest.fn();
     await handler(mockReq(), res, next);
     expect(next).toHaveBeenCalledWith(expect.any(AppError));
-    expect(next.mock.calls[0][0].statusCode).toBe(400);
+    const err = next.mock.calls[0][0] as AppError;
+    expect(err.statusCode).toBe(400);
+    expect(err.code).toBe(ErrorCode.VALIDATION_ERROR);
   });
 
-  it('calls next(AppError) on WRONG_PASSWORD from service', async () => {
+  it('maps WRONG_PASSWORD result to next(AppError) 401 UNAUTHORIZED', async () => {
     const handler = createChangePasswordHandler(
-      mockService({ ok: false, reason: 'WRONG_PASSWORD', message: 'wrong' }),
+      mockService({ ok: false, reason: 'WRONG_PASSWORD', message: 'Current password is incorrect.' }),
     );
     const res = mockRes();
     const next = jest.fn();
     await handler(mockReq(), res, next);
     expect(next).toHaveBeenCalledWith(expect.any(AppError));
-    expect(next.mock.calls[0][0].statusCode).toBe(401);
+    const err = next.mock.calls[0][0] as AppError;
+    expect(err.statusCode).toBe(401);
+    expect(err.code).toBe(ErrorCode.UNAUTHORIZED);
   });
 
-  it('calls next(AppError) on USER_NOT_FOUND from service', async () => {
+  it('maps USER_NOT_FOUND result to next(AppError) 404 NOT_FOUND', async () => {
     const handler = createChangePasswordHandler(
-      mockService({ ok: false, reason: 'USER_NOT_FOUND', message: 'not found' }),
+      mockService({ ok: false, reason: 'USER_NOT_FOUND', message: 'User not found.' }),
     );
     const res = mockRes();
     const next = jest.fn();
     await handler(mockReq(), res, next);
     expect(next).toHaveBeenCalledWith(expect.any(AppError));
-    expect(next.mock.calls[0][0].statusCode).toBe(404);
+    const err = next.mock.calls[0][0] as AppError;
+    expect(err.statusCode).toBe(404);
+    expect(err.code).toBe(ErrorCode.NOT_FOUND);
   });
 
   it('calls next(err) on unexpected exception from service', async () => {
     const boom = new Error('db exploded');
-    const svc = { execute: jest.fn().mockRejectedValue(boom) } as unknown as ChangePasswordService;
+    const svc = mockRejectingService(boom);
     const handler = createChangePasswordHandler(svc);
     const next = jest.fn();
     const res = mockRes();
