@@ -1,7 +1,7 @@
 import { Request } from 'express';
 
 /**
- * Request body for POST /api/users/me/change-password
+ * Request body for POST /me/change-password (alias: PATCH /me/password)
  */
 export interface ChangePasswordBody {
   currentPassword: string;
@@ -26,8 +26,11 @@ export type AuthenticatedRequest = Request & {
 };
 
 /**
- * Success response shape
+ * Success response shape (HTTP 200).
+ * Failure responses use the shared ErrorResponse envelope from src/lib/errors:
+ *   { code, message } with statusCode 400 / 401 / 404 / 500.
  */
 export interface ChangePasswordResponse {
+  ok: true;
   message: string;
 }

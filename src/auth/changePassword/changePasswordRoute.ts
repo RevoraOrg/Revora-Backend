@@ -36,11 +36,32 @@ export function createChangePasswordRouter(opts: {
   const handler = createChangePasswordHandler(service) as RequestHandler;
 
   /**
-   * POST /api/v1/users/me/change-password
-   * PATCH /api/v1/users/me/password         (alias)
+   * POST /me/change-password
+   * PATCH /me/password          (alias)
    *
-   * Body: { currentPassword: string, newPassword: string }
-   * Auth: Bearer JWT (or x-user-id stub in dev)
+   * Mounted at the application root in src/app.ts (no path prefix), so the
+   * effective public paths are exactly the two listed above.
+   *
+   * Auth: Bearer JWT via createRequireAuth (session-hardened)
+   *   - Token must carry `sub` (user id) and `sid` (session id).
+   *   - Session is looked up server-side; expired/mismatched sessions → 401.
+   *   - The handler reads `req.user.sub` (preferred) or `req.user.id`.
+   *
+   * Request body: { currentPassword: string, newPassword: string }
+   *
+   * Success contract:
+   *   200 { ok: true, message: 'Password updated successfully' }
+   *   - `password_hash` is replaced with a fresh scrypt hash.
+   *   - ALL sessions for the user are invalidated (logout-everywhere).
+   *
+   * Failure contract (AppError via global errorHandler):
+   *   400 VALIDATION_ERROR  – missing body fields, or newPassword fails
+   *                           the strength policy (≥12 chars, mixed case,
+   *                           digit, special, not common/sequential).
+   *   401 UNAUTHORIZED      – missing/invalid Bearer token, unknown/expired
+   *                           session, or currentPassword does not match.
+   *   404 NOT_FOUND         – authenticated user id not present in `users`.
+   *   500 INTERNAL_ERROR    – unexpected DB/transaction failure.
    */
   router.post('/me/change-password', opts.requireAuth, handler);
   router.patch('/me/password', opts.requireAuth, handler);
