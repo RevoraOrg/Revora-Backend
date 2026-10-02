@@ -368,8 +368,10 @@ async function checkStellarHorizon(rpcClient?: StellarRpcClient): Promise<Depend
       details: {
         failureClass,
         upstreamStatus: lastStatus,
-        breakerStates,
-        url: lastAttemptedUrl || undefined,
+        // Safe metadata: the Horizon endpoint URL is our own configured,
+        // non-secret base URL (same value exposed on the success path).
+        url: activeUrl || endpoints[0],
+        breakerStates
       },
       error: failureClass === StellarRPCFailureClass.TIMEOUT ? "timeout" : "connection_error",
     };
