@@ -13,6 +13,7 @@
  * - config validation (k, tolerance, reference)
  * - allowReducedQuorum flag semantics
  * - metric emissions (evaluated / passed / failed / in-consensus / divergence)
+ * - METRIC_QUORUM_EVALUATED failure-path regression (config validation + empty result)
  * - pager invoked with divergent rates; pager exceptions never crash caller
  * - FxQuorumAlerting: pages ops and writes audit event (incl. divergent rates)
  * - assess() is non-throwing; evaluate() throws FxQuorumFailedError
@@ -28,6 +29,7 @@ import {
   FxQuorumEvaluator,
   FxQuorumFailedError,
   FxQuorumAlerting,
+  METRIC_QUORUM_EVALUATED,
   METRIC_QUORUM_EVALUATED,
   METRIC_QUORUM_PASSED,
   METRIC_QUORUM_FAILED,
@@ -102,6 +104,99 @@ describe('FxQuorumEvaluator construction', () => {
   it('accepts a valid config and exposes it via getConfig()', () => {
     const e = new FxQuorumEvaluator({ k: 3, tolerance: 0.01, reference: 'mean', minValidProviders: 3, allowReducedQuorum: false });
     expect(e.getConfig()).toEqual({ k: 3, tolerance: 0.01, reference: 'mean', minValidProviders: 3, allowReducedQuorum: false });
+  });
+});
+
+// ─── METRIC_QUORUM_EVALUATED failure handling (regression) ────────────────────
+
+describe('FxQuorumEvaluator: METRIC_QUORUM_EVALUATED failure handling', () => {
+  it('does not emit METRIC_QUORUM_EVALUATED when construction fails on invalid k', () => {
+    const metrics = makeMetrics();
+    expect(() => new FxQuorumEvaluator({ k: 0, tolerance: 0.01 }, { metrics })).toThrow(/k must be an integer/);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBe(0);
+  });
+
+  it('does not emit METRIC_QUORUM_EVALUATED when construction fails on invalid tolerance', () => {
+    const metrics = makeMetrics();
+    expect(() => new FxQuorumEvaluator({ k: 2, tolerance: -1 }, { metrics })).toThrow(/tolerance/);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBe(0);
+  });
+
+  it('does not emit METRIC_QUORUM_EVALUATED when construction fails on invalid reference', () => {
+    const metrics = makeMetrics();
+    expect(() => new FxQuorumEvaluator({ k: 2, tolerance: 0.01, reference: 'bogus' as any }, { metrics })).toThrow(/reference/);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBe(0);
+  });
+
+  it('emits METRIC_QUORUM_EVALUATED on the empty-result (total outage) failure path', () => {
+    const metrics = makeMetrics();
+    const e = new FxQuorumEvaluator({ k: 2, tolerance: 0.005 }, { metrics });
+    expect(() => e.evaluate('USD/EUR', [
+      { providerId: 'a', rate: null },
+      { providerId: 'b', rate: null },
+    ])).toThrow(FxQuorumFailedError);
+    const prom = metrics.exportPrometheus();
+    // The evaluation was attempted, so the evaluated counter must be observable
+    // even though the run failed and no consensus rate was produced.
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBeGreaterThanOrEqual(1);
+    expect(countMetric(prom, METRIC_QUORUM_FAILED)).toBeGreaterThanOrEqual(1);
+    expect(countMetric(prom, METRIC_QUORUM_PASSED)).toBe(0);
+  });
+
+  it('emits METRIC_QUORUM_EVALUATED on the divergence failure path', () => {
+    const metrics = makeMetrics();
+    const e = new FxQuorumEvaluator({ k: 2, tolerance: 0.005 }, { metrics });
+    expect(() => e.evaluate('USD/EUR', [
+      { providerId: 'a', rate: makeRate('1.0000') },
+      { providerId: 'b', rate: makeRate('1.2000') },
+    ])).toThrow(FxQuorumFailedError);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBeGreaterThanOrEqual(1);
+    expect(countMetric(prom, METRIC_QUORUM_FAILED)).toBeGreaterThanOrEqual(1);
+  });
+
+  it('emits METRIC_QUORUM_EVALUATED exactly once per successful evaluate() call', () => {
+    const metrics = makeMetrics();
+    const e = new FxQuorumEvaluator({ k: 2, tolerance: 0.005 }, { metrics });
+    e.evaluate('USD/EUR', [
+      { providerId: 'a', rate: makeRate('1.0000') },
+      { providerId: 'b', rate: makeRate('1.0001') },
+    ]);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBe(1);
+    expect(countMetric(prom, METRIC_QUORUM_PASSED)).toBe(1);
+    expect(countMetric(prom, METRIC_QUORUM_FAILED)).toBe(0);
+  });
+
+  it('emits METRIC_QUORUM_EVALUATED exactly once per failed evaluate() call', () => {
+    const metrics = makeMetrics();
+    const e = new FxQuorumEvaluator({ k: 2, tolerance: 0.005 }, { metrics });
+    expect(() => e.evaluate('USD/EUR', [
+      { providerId: 'a', rate: makeRate('1.0000') },
+      { providerId: 'b', rate: makeRate('1.2000') },
+    ])).toThrow(FxQuorumFailedError);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_EVALUATED)).toBe(1);
+    expect(countMetric(prom, METRIC_QUORUM_FAILED)).toBe(1);
+    expect(countMetric(prom, METRIC_QUORUM_PASSED)).toBe(0);
+  });
+
+  it('assess() on the empty-result path reports agreed=false without emitting a passed counter', () => {
+    const metrics = makeMetrics();
+    const e = new FxQuorumEvaluator({ k: 2, tolerance: 0.005 }, { metrics });
+    const r = e.assess('USD/EUR', [
+      { providerId: 'a', rate: null },
+      { providerId: 'b', rate: null },
+    ]);
+    expect(r.agreed).toBe(false);
+    expect(r.valid).toBe(0);
+    expect(r.inConsensus).toBe(0);
+    expect(r.total).toBe(2);
+    const prom = metrics.exportPrometheus();
+    expect(countMetric(prom, METRIC_QUORUM_PASSED)).toBe(0);
   });
 });
 

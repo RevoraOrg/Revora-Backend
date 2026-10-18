@@ -1,4 +1,4 @@
-import { OfacSanctionsLoader, OfacLoaderConfig } from '../services/ofacSanctionsLoader';
+import { OfacSanctionsLoader } from '../services/ofacSanctionsLoader';
 import { SanctionsListRepository, SanctionsEntry } from '../db/repositories/sanctionsListRepository';
 import { globalMetrics } from '../lib/metrics';
 
@@ -39,8 +39,8 @@ export interface RefreshResult {
  * - We additionally recompute the canonical checksum of the entries and store
  *   it with the snapshot; `SanctionsListRepository.verifyChecksum` lets an
  *   auditor confirm the on-disk entries match what was loaded.
- * - If loading/verification fails the job records a `failed` metric and throws;
- *   it never promotes a partial or untrusted list.
+ * - If loading/verification fails the job records a `failed` metric and returns
+ *   a failure result; it never promotes a partial or untrusted list.
  */
 export class RefreshSanctionsListsJob {
   constructor(private readonly deps: RefreshJobDeps) {}
@@ -90,7 +90,7 @@ export class RefreshSanctionsListsJob {
         checksum: snapshot.normalized_checksum,
       };
     } catch (err) {
-      globalMetrics.incrementCounter(
+      metrics.incrementCounter(
         SANCTIONS_REFRESH_FAILED,
         { version, error: String((err as Error)?.message ?? err) },
         1,

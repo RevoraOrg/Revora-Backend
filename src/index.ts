@@ -265,7 +265,7 @@ function isNonEmptyString(value: unknown, maxLength = 128): value is string {
 /**
  * @dev Decimal parser with strict input bounds to resist coercion abuse and NaN payloads.
  */
-function parseMoneyString(value: unknown): number | null {
+export function parseMoneyString(value: unknown): number | null {
   if (typeof value !== "string") return null;
   if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) return null;
   const parsed = Number(value);

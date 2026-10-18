@@ -364,6 +364,51 @@ export function requireAdmin(
 // ── authMiddleware (mock — X-Issuer-Id header) ────────────────────────────────
 // NOTE: named export collision with authMiddleware() above is intentional —
 // this const shadows the factory fn for issuer-only routes.
+// ── ensureUserOwnsResource ────────────────────────────────────────────────────
+/**
+ * Middleware that asserts the authenticated user owns the resource identified by
+ * the `:userId` route parameter.  Must be applied after `authMiddleware()` so
+ * that `req.user` is already populated.
+ *
+ * Security assumptions:
+ * - `req.user.id` (or `req.user.sub`) comes from a verified JWT — never from
+ *   the request body or a header that the caller controls.
+ * - A missing / mismatched user results in a 403 Forbidden, not a 401, because
+ *   the caller IS authenticated; they just do not own this resource.
+ */
+export function ensureUserOwnsResource(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void {
+  const authReq = req as AuthenticatedRequest;
+  const principalId = authReq.user?.id ?? authReq.user?.sub;
+  const resourceUserId = (req.params as Record<string, string>)?.userId;
+
+  if (!principalId) {
+    globalLogger.warn('ensureUserOwnsResource: no authenticated user', {
+      path: req.path,
+    });
+    next(Errors.unauthorized('Unauthorized'));
+    return;
+  }
+
+  if (principalId !== resourceUserId) {
+    globalLogger.warn(
+      'ensureUserOwnsResource: principal does not own resource',
+      {
+        principalId,
+        resourceUserId,
+        path: req.path,
+      },
+    );
+    next(Errors.forbidden('Forbidden: you do not own this resource'));
+    return;
+  }
+
+  next();
+}
+
 export const requireIssuerAuth = (
   req: AuthenticatedRequest,
   _res: Response,
@@ -505,6 +550,14 @@ function getAdminPubKeys(): ReturnType<
     });
     return null;
   }
+}
+
+/**
+ * @notice Reset the cached admin Ed25519 public keys.
+ * @dev Primarily intended for testing key reloading and configuration error paths.
+ */
+export function resetAdminPubKeysCache(): void {
+  adminPubKeysCache = null;
 }
 
 // ── Action → expected HTTP route segment map (for cross-checking) ────────────

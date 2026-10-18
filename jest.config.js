@@ -20,6 +20,7 @@ module.exports = {
     ],
   },
   collectCoverageFrom: [
+    'src/routes/offerings.investments.ts',
     'src/lib/pressureGauge.ts',
     'src/services/outboxDispatcher.ts',
     'src/lib/metrics.ts',

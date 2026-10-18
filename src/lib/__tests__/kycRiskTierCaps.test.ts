@@ -82,9 +82,27 @@ describe('kycRiskTierCaps', () => {
       expect(effectiveCapAmount(resolution, 1_000_000)).toBeNull();
     });
 
-    it('rejects non-finite offering size', () => {
+    it('returns null before validating the offering size when unlimited', () => {
+      const resolution = resolveEffectiveCap(null, 'standard');
+
+      expect(effectiveCapAmount(resolution, Number.NaN)).toBeNull();
+      expect(effectiveCapAmount(resolution, -1)).toBeNull();
+    });
+
+    it('returns zero for a zero-sized offering', () => {
+      const resolution = resolveEffectiveCap(1_000, 'elevated');
+
+      expect(effectiveCapAmount(resolution, 0)).toBe(0);
+    });
+
+    it('rejects negative and non-finite offering sizes when capped', () => {
       const resolution = resolveEffectiveCap(1_000, 'standard');
+
       expect(() => effectiveCapAmount(resolution, Number.NaN)).toThrow(/non-negative finite/);
+      expect(() => effectiveCapAmount(resolution, Number.POSITIVE_INFINITY)).toThrow(
+        /non-negative finite/,
+      );
+      expect(() => effectiveCapAmount(resolution, -1)).toThrow(/non-negative finite/);
     });
   });
 

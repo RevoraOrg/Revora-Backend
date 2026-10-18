@@ -31,6 +31,11 @@ export interface PaginatedResponse<T> {
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
+function parseQueryInteger(value: string, fallback: number): number {
+  const parsed = parseInt(value, 10);
+  return Number.isNaN(parsed) ? fallback : parsed;
+}
+
 /**
  * Parses pagination parameters from an Express request query.
  * 
@@ -43,11 +48,11 @@ const MAX_LIMIT = 100;
  * @returns PaginationParams
  */
 export function parsePagination(req: Request): PaginationParams {
-  const queryLimit = parseInt(req.query.limit as string, 10);
-  const limit = isNaN(queryLimit) ? DEFAULT_LIMIT : Math.min(Math.max(1, queryLimit), MAX_LIMIT);
+  const queryLimit = parseQueryInteger(req.query.limit as string, DEFAULT_LIMIT);
+  const limit = Math.min(Math.max(1, queryLimit), MAX_LIMIT);
 
-  const queryOffset = parseInt(req.query.offset as string, 10);
-  const offset = isNaN(queryOffset) ? 0 : Math.max(0, queryOffset);
+  const queryOffset = parseQueryInteger(req.query.offset as string, 0);
+  const offset = Math.max(0, queryOffset);
 
   const cursor = req.query.cursor as string;
 

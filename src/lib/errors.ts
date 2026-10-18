@@ -166,7 +166,11 @@ export class UniqueConstraintError extends Error {
   public readonly field: string;
 
   constructor(field: string) {
-    super(`Duplicate value for field: ${field}`);
+    // Canonical message form per Requirements 3.1–3.3 (see
+    // src/lib/__tests__/errors.property.test.ts Property 5):
+    // `Unique constraint violation on <field>`. Consumers (register roundtrip
+    // Req 3.3, startup-auth 409 mapping) assert this exact string.
+    super(`Unique constraint violation on ${field}`);
     Object.setPrototypeOf(this, new.target.prototype);
     this.name = 'UniqueConstraintError';
     this.field = field;

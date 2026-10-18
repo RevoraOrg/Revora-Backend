@@ -93,6 +93,26 @@ describe('SessionRepository', () => {
           }),
         ).rejects.toThrow('Failed to create session');
       });
+
+      it('uses the provided explicit client instead of the pool (explicit id path)', async () => {
+        const mockClient = { query: jest.fn().mockResolvedValue(makeQueryResult([BASE_SESSION])) };
+        
+        await repository.createSession(
+          {
+            id: 'session-client-123',
+            user_id: 'user-456',
+            token_hash: 'h',
+            expires_at: new Date(),
+          },
+          mockClient as any
+        );
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+          expect.stringContaining('INSERT INTO sessions'),
+          expect.arrayContaining(['session-client-123'])
+        );
+        expect(mockPool.query).not.toHaveBeenCalled();
+      });
     });
 
     // Branch B: no id supplied (5-column INSERT with generated UUID)
@@ -151,6 +171,25 @@ describe('SessionRepository', () => {
         await expect(
           repository.createSession({ user_id: 'u', token_hash: 'h', expires_at: new Date() }),
         ).rejects.toThrow('Failed to create session');
+      });
+
+      it('uses the provided explicit client instead of the pool (generated id path)', async () => {
+        const mockClient = { query: jest.fn().mockResolvedValue(makeQueryResult([BASE_SESSION])) };
+        
+        await repository.createSession(
+          {
+            user_id: 'user-456',
+            token_hash: 'h',
+            expires_at: new Date(),
+          },
+          mockClient as any
+        );
+
+        expect(mockClient.query).toHaveBeenCalledWith(
+          expect.stringContaining('INSERT INTO sessions'),
+          expect.arrayContaining(['user-456', 'h'])
+        );
+        expect(mockPool.query).not.toHaveBeenCalled();
       });
     });
 
@@ -475,6 +514,39 @@ describe('SessionRepository', () => {
           expires_at: new Date('2099-01-01'),
         }),
       ).rejects.toThrow('Failed to create session');
+    });
+
+    it('throws when DB returns empty rows with explicit id', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([]));
+      await expect(
+        repository.createWebSession({
+          id: 'explicit-id-fail',
+          user_id: 'u1',
+          role: 'admin',
+          token_hash: 'hash-abc',
+          expires_at: new Date('2099-01-01'),
+        }),
+      ).rejects.toThrow('Failed to create session');
+    });
+
+    it('uses the provided explicit client instead of the pool for web sessions', async () => {
+      const mockClient = { query: jest.fn().mockResolvedValue(makeQueryResult([{ ...BASE_SESSION, role: 'user' }])) };
+      
+      await repository.createWebSession(
+        {
+          user_id: 'user-456',
+          role: 'user',
+          token_hash: 'h',
+          expires_at: new Date(),
+        },
+        mockClient as any
+      );
+
+      expect(mockClient.query).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO sessions (id, user_id, role, token_hash, expires_at, created_at)'),
+        expect.arrayContaining(['user-456', 'user', 'h'])
+      );
+      expect(mockPool.query).not.toHaveBeenCalled();
     });
   });
 

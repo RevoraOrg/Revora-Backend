@@ -110,9 +110,23 @@ describe('SCIM 2.0 — Users', () => {
   });
 
   describe('GET /Users', () => {
-    it('returns empty list when no filter matches', async () => {
+    it('returns empty list when no filter is provided', async () => {
       const app = buildApp(repo);
       const res = await auth(request(app).get('/scim/v2/Users'));
+      expect(res.status).toBe(200);
+      expect(res.body.totalResults).toBe(0);
+    });
+
+    it('returns empty list when filter is empty string', async () => {
+      const app = buildApp(repo);
+      const res = await auth(request(app).get('/scim/v2/Users?filter='));
+      expect(res.status).toBe(200);
+      expect(res.body.totalResults).toBe(0);
+    });
+
+    it('returns empty list when filter format is invalid (regex failure)', async () => {
+      const app = buildApp(repo);
+      const res = await auth(request(app).get('/scim/v2/Users?filter=invalid_filter_format'));
       expect(res.status).toBe(200);
       expect(res.body.totalResults).toBe(0);
     });
@@ -453,11 +467,28 @@ describe('SCIM 2.0 — Groups', () => {
       expect(res.status).toBe(404);
     });
 
-    it('handles errors in group list', async () => {
+    it('returns all groups when no filter is provided', async () => {
       const app = buildApp(repo);
-      // Force parseFilter to return null so it calls Array.from on all groups
+      await auth(request(app).post('/scim/v2/Groups').send({ displayName: 'TestGroup' }));
       const res = await auth(request(app).get('/scim/v2/Groups'));
       expect(res.status).toBe(200);
+      expect(res.body.totalResults).toBe(1);
+    });
+
+    it('returns all groups when filter is empty string', async () => {
+      const app = buildApp(repo);
+      await auth(request(app).post('/scim/v2/Groups').send({ displayName: 'TestGroup' }));
+      const res = await auth(request(app).get('/scim/v2/Groups?filter='));
+      expect(res.status).toBe(200);
+      expect(res.body.totalResults).toBe(1);
+    });
+
+    it('returns all groups when filter format is invalid (regex failure)', async () => {
+      const app = buildApp(repo);
+      await auth(request(app).post('/scim/v2/Groups').send({ displayName: 'TestGroup' }));
+      const res = await auth(request(app).get('/scim/v2/Groups?filter=invalid_filter_format'));
+      expect(res.status).toBe(200);
+      expect(res.body.totalResults).toBe(1);
     });
   });
 

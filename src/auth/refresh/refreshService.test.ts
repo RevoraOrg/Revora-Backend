@@ -12,9 +12,11 @@
  * - Logs must never include the raw refresh token value.
  */
 
+import { Pool, PoolClient } from 'pg';
 import { RefreshService } from './refreshService';
 import { RefreshTokenPayload, RefreshTokenRepository, TokenService } from './types';
 import { withTransaction } from '../../db/transaction';
+import { Logger } from '../../lib/logger';
 
 jest.mock('../../db/transaction');
 
@@ -161,18 +163,14 @@ const createMockTokenService = (): jest.Mocked<TokenService> => ({
 
 describe('RefreshService', () => {
     let mockWithTransaction: jest.MockedFunction<typeof withTransaction>;
-    let mockDb: any;
-    let mockClient: any;
-    let logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
+    let mockDb: Pool;
+    let mockClient: PoolClient;
+    let logger: Logger;
 
     beforeEach(() => {
-        mockDb = {};
-        mockClient = {};
-        logger = {
-            info: jest.fn(),
-            warn: jest.fn(),
-            error: jest.fn(),
-        };
+        mockDb = {} as Pool;
+        mockClient = {} as PoolClient;
+        logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() } as unknown as Logger;
         mockWithTransaction = withTransaction as jest.MockedFunction<typeof withTransaction>;
         mockWithTransaction.mockReset();
         mockWithTransaction.mockImplementation(async (_db, callback) => callback(mockClient));
@@ -181,7 +179,7 @@ describe('RefreshService', () => {
     it('rotates a valid token and marks the parent consumed before creating the child session', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.issueTokens.mockReturnValue({ accessToken: 'access-new', refreshToken: 'refresh-new' });
@@ -216,7 +214,7 @@ describe('RefreshService', () => {
     it('rotates N to N+1 to N+2, then replaying N revokes N+1 and N+2 descendants', async () => {
         const repo = new InMemoryRefreshRepository();
         repo.addSession({ id: 'session-0', token: 'refresh-session-0' });
-        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger as any);
+        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger);
 
         const first = await service.refresh('refresh-session-0');
         expect(first?.refreshToken).toMatch(/^refresh-/);
@@ -242,7 +240,7 @@ describe('RefreshService', () => {
     it('replay of a grandparent token revokes a lineage longer than 10 sessions', async () => {
         const repo = new InMemoryRefreshRepository();
         repo.addSession({ id: 'session-0', token: 'refresh-session-0' });
-        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger as any);
+        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger);
 
         const sessionIds = ['session-0'];
         let refreshToken = 'refresh-session-0';
@@ -269,7 +267,7 @@ describe('RefreshService', () => {
         });
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.issueTokens.mockReturnValue({ accessToken: 'access-new', refreshToken: 'refresh-new' });
@@ -303,7 +301,7 @@ describe('RefreshService', () => {
     it('revokes the family when a previously consumed parent token is replayed after rotation', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
@@ -326,7 +324,7 @@ describe('RefreshService', () => {
     it('rejects an expired parent session without creating a child or revoking unrelated descendants', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
@@ -350,7 +348,7 @@ describe('RefreshService', () => {
         const rawToken = 'raw-refresh-token-value-that-must-not-leak';
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockImplementation(() => {
             throw new Error('invalid token');
@@ -359,15 +357,16 @@ describe('RefreshService', () => {
         const result = await service.refresh(rawToken);
 
         expect(result).toBeNull();
-        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(rawToken);
-        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(rawToken.substring(0, 10));
+        const warnCalls = JSON.stringify((logger.warn as jest.Mock).mock.calls);
+        expect(warnCalls).not.toContain(rawToken);
+        expect(warnCalls).not.toContain(rawToken.substring(0, 10));
         expect(mockWithTransaction).not.toHaveBeenCalled();
     });
 
     it('revokes session family when stored token hash does not match incoming token', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.hashToken.mockReturnValue('hash:different-token');
@@ -390,7 +389,7 @@ describe('RefreshService', () => {
     it('returns null when session is not found during refresh transaction', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-ghost', role: ROLE });
         repo.findSessionByIdForUpdate.mockResolvedValue(null);
@@ -405,7 +404,7 @@ describe('RefreshService', () => {
     it('revokes session family when session is already revoked', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
@@ -428,7 +427,7 @@ describe('RefreshService', () => {
     it('revokes session family when child session already exists (reuse probe)', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
@@ -452,7 +451,7 @@ describe('RefreshService', () => {
     it('clears inFlightSessions set and rethrows when transaction fails', async () => {
         const repo = createMockRepo();
         const tokenService = createMockTokenService();
-        const service = new RefreshService(repo, tokenService, mockDb, logger as any);
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
 
         tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
         repo.findSessionByIdForUpdate.mockRejectedValue(new Error('Connection lost'));
@@ -463,5 +462,260 @@ describe('RefreshService', () => {
         repo.findSessionByIdForUpdate.mockResolvedValue(null);
         const retryResult = await service.refresh('refresh-session-0');
         expect(retryResult).toBeNull();
+    });
+
+    // ── Regression: missing branch coverage ─────────────────────────────────
+
+    /**
+     * Regression for the `.catch` error handler at line ~193.
+     * When `withTransaction` rejects with a non-Error value (e.g. a plain
+     * string or object), the handler must fall through to `String(error)` so
+     * it never throws a TypeError from `.message` access.
+     * The error must be re-thrown unchanged; the in-flight lock must be cleared.
+     */
+    it('rethrows non-Error rejection from transaction and clears in-flight lock', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        // Reject with a plain string — not an Error instance — to exercise the
+        // `String(error)` branch in the catch handler (line ~193).
+        repo.findSessionByIdForUpdate.mockRejectedValue('plain-string-error');
+
+        await expect(service.refresh('refresh-session-0')).rejects.toBe('plain-string-error');
+
+        // The error message logged must be the string-coerced value, not a crash.
+        expect(logger.error).toHaveBeenCalledWith(
+            'Refresh transaction failed',
+            expect.objectContaining({
+                error: 'plain-string-error',
+            }),
+        );
+
+        // In-flight lock must be released so the same session can be retried.
+        repo.findSessionByIdForUpdate.mockResolvedValue(null);
+        const retryResult = await service.refresh('refresh-session-0');
+        expect(retryResult).toBeNull();
+    });
+
+    /**
+     * Regression for the `String(error)` branch in the token-verification
+     * catch block (line ~65).
+     * When `verifyRefreshToken` throws a non-Error value (e.g. a plain string),
+     * the logger must receive the string-coerced representation and the method
+     * must return null without crashing.
+     */
+    it('returns null and logs string-coerced message when verifyRefreshToken throws a non-Error value', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        // Throw a plain string (not an Error instance) to exercise String(error).
+        tokenService.verifyRefreshToken.mockImplementation(() => {
+            throw 'non-error-string-rejection';
+        });
+
+        const result = await service.refresh('any-token');
+
+        expect(result).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith(
+            'Refresh token verification failed',
+            expect.objectContaining({
+                error: 'non-error-string-rejection',
+            }),
+        );
+        expect(mockWithTransaction).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Regression for the default-logger constructor branch (lines ~50-65).
+     * When `RefreshService` is instantiated without an explicit logger, it
+     * creates its own `new Logger()`. The service must still function correctly —
+     * this exercises the default-parameter branch that all other tests skip by
+     * always injecting a mock logger.
+     */
+    it('works correctly when instantiated without an explicit logger (default Logger branch)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        // No fourth argument → default Logger() is constructed internally.
+        const service = new RefreshService(repo, tokenService, mockDb);
+
+        tokenService.verifyRefreshToken.mockImplementation(() => {
+            throw new Error('invalid signature');
+        });
+
+        // Must return null and must not throw, even with the real Logger.
+        const result = await service.refresh('any-token');
+        expect(result).toBeNull();
+    });
+
+    // ── Regression #979: explicit null-return failure paths (lines 67 / 77 / 97) ──
+
+    /**
+     * Line 67 — `verifyRefreshToken` throws an `Error` instance.
+     * Contract: return null, log the sanitized `error.message`, and never open
+     * a transaction or touch the repository.
+     */
+    it('returns null and logs the rejection reason when verifyRefreshToken throws (line 67)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockImplementation(() => {
+            throw new Error('jwt malformed');
+        });
+
+        const result = await service.refresh('refresh-session-0');
+
+        expect(result).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith(
+            'Refresh token verification failed',
+            { error: 'jwt malformed' },
+        );
+        expect(mockWithTransaction).not.toHaveBeenCalled();
+        expect(repo.findSessionByIdForUpdate).not.toHaveBeenCalled();
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+        expect(repo.createSession).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Line 67 boundary — empty and whitespace-only tokens are invalid inputs
+     * and must hit the same null contract as any other verification failure.
+     */
+    it('returns null for empty and whitespace-only tokens without opening a transaction (line 67 boundary)', async () => {
+        for (const boundaryToken of ['', '   ']) {
+            const repo = createMockRepo();
+            const tokenService = createMockTokenService();
+            const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+            tokenService.verifyRefreshToken.mockImplementation((token: string) => {
+                if (token.trim().length === 0) {
+                    throw new Error('empty token');
+                }
+                return { userId: USER_ID, sessionId: 'session-0', role: ROLE };
+            });
+
+            const result = await service.refresh(boundaryToken);
+
+            expect(result).toBeNull();
+            expect(logger.warn).toHaveBeenCalledWith(
+                'Refresh token verification failed',
+                { error: 'empty token' },
+            );
+            expect(mockWithTransaction).not.toHaveBeenCalled();
+        }
+    });
+
+    /**
+     * Line 77 — same-process duplicate while a refresh is mid-flight.
+     * Contract: the duplicate returns null with the in-flight warning and must
+     * not revoke anything (the winning caller's child session stays intact).
+     * Neighbouring normal path: the winner still completes rotation, and the
+     * lock is released so a later attempt reaches the transaction again.
+     */
+    it('returns null for a duplicate refresh while one is in flight and releases the lock afterwards (line 77)', async () => {
+        let releaseFirstRead!: () => void;
+        const firstRead = new Promise<void>((resolve) => {
+            releaseFirstRead = resolve;
+        });
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.issueTokens.mockReturnValue({ accessToken: 'access-new', refreshToken: 'refresh-new' });
+        tokenService.hashToken.mockReturnValueOnce('hash:refresh-session-0').mockReturnValueOnce('hash:refresh-new');
+        repo.findSessionByIdForUpdate.mockImplementationOnce(async () => {
+            await firstRead;
+            return {
+                id: 'session-0',
+                user_id: USER_ID,
+                token_hash: 'hash:refresh-session-0',
+                expires_at: NOW_FUTURE,
+                revoked_at: null,
+                token_consumed_at: null,
+            };
+        });
+        repo.findSessionByParentId.mockResolvedValue(null);
+        repo.createSession.mockResolvedValue({ id: 'session-1' });
+
+        const first = service.refresh('refresh-session-0');
+        const duplicate = await service.refresh('refresh-session-0');
+
+        // Failure contract: null + in-flight warning, no revocation, no writes.
+        expect(duplicate).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith(
+            'Concurrent refresh already in flight',
+            { userId: USER_ID, sessionId: 'session-0' },
+        );
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+        expect(repo.createSession).not.toHaveBeenCalled();
+
+        // Neighbouring normal path: the winner still completes rotation.
+        releaseFirstRead();
+        const winner = await first;
+        expect(winner).toEqual({ accessToken: 'access-new', refreshToken: 'refresh-new' });
+
+        // Lock release: a later attempt reaches the transaction again instead
+        // of being short-circuited by the in-flight gate.
+        repo.findSessionByIdForUpdate.mockResolvedValue(null);
+        await service.refresh('refresh-session-0');
+        expect(mockWithTransaction).toHaveBeenCalledTimes(2);
+    });
+
+    /**
+     * Line 97 — session row not found inside the transaction.
+     * Contract: return null with the not-found warning. Distinct from the
+     * verification failure path: the transaction IS opened here. No revocation
+     * and no writes may occur, and the in-flight lock must be released.
+     */
+    it('returns null with a not-found warning when the locked session row is missing (line 97)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-ghost', role: ROLE });
+        repo.findSessionByIdForUpdate.mockResolvedValue(null);
+
+        const result = await service.refresh('refresh-session-ghost');
+
+        expect(result).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith(
+            'Session not found during refresh',
+            { userId: USER_ID, sessionId: 'session-ghost' },
+        );
+        expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+        expect(repo.createSession).not.toHaveBeenCalled();
+        expect(repo.setSessionConsumed).not.toHaveBeenCalled();
+
+        // In-flight lock must be released by the finally block.
+        const retry = await service.refresh('refresh-session-ghost');
+        expect(retry).toBeNull();
+        expect(mockWithTransaction).toHaveBeenCalledTimes(2);
+    });
+
+    /**
+     * Line 97 boundary — the guard is falsy-based, so `undefined` (a bare
+     * repository miss) must take the same null path as an explicit `null`.
+     */
+    it('treats an undefined session row the same as a missing one (line 97 falsy boundary)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-void', role: ROLE });
+        repo.findSessionByIdForUpdate.mockResolvedValue(undefined as unknown as null);
+
+        const result = await service.refresh('refresh-session-void');
+
+        expect(result).toBeNull();
+        expect(logger.warn).toHaveBeenCalledWith(
+            'Session not found during refresh',
+            { userId: USER_ID, sessionId: 'session-void' },
+        );
+        expect(repo.revokeSessionAndDescendants).not.toHaveBeenCalled();
+        expect(repo.createSession).not.toHaveBeenCalled();
     });
 });
