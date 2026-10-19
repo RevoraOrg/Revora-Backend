@@ -173,7 +173,8 @@ export function createAMLRoutes(
   router.post('/rules', async (req: Request, res: Response) => {
     try {
       const validated = createRuleSchema.parse(req.body);
-      const rule = await amlService.createRule(validated);
+      const actor = getActor(req);
+      const rule = await amlService.createRule(validated, actor.id);
       res.status(201).json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -193,7 +194,8 @@ export function createAMLRoutes(
     try {
       const { ruleId } = req.params;
       const validated = updateRuleSchema.parse(req.body);
-      const rule = await amlService.updateRule(ruleId, validated);
+      const actor = getActor(req);
+      const rule = await amlService.updateRule(ruleId, validated, actor.id);
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -213,7 +215,8 @@ export function createAMLRoutes(
     try {
       const { ruleId } = req.params;
       const validated = rollbackRuleSchema.parse(req.body);
-      const rule = await amlService.rollbackRule(ruleId, validated.version);
+      const actor = getActor(req);
+      const rule = await amlService.rollbackRule(ruleId, validated.version, actor.id);
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -312,7 +315,8 @@ export function createAMLRoutes(
   router.post('/cases', async (req: Request, res: Response) => {
     try {
       const validated = createCaseSchema.parse(req.body);
-      const amlCase = await amlService.createCase(validated);
+      const actor = getActor(req);
+      const amlCase = await amlService.createCase(validated, actor.id);
       res.status(201).json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -332,7 +336,8 @@ export function createAMLRoutes(
     try {
       const { caseId } = req.params;
       const validated = updateCaseSchema.parse(req.body);
-      const amlCase = await amlService.updateCase(caseId, validated);
+      const actor = getActor(req);
+      const amlCase = await amlService.updateCase(caseId, validated, actor.id);
       res.json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -380,7 +385,8 @@ export function createAMLRoutes(
   router.post('/alerts/:alertId/dismiss', async (req: Request, res: Response) => {
     try {
       const { alertId } = req.params;
-      const alert = await amlService.dismissAlert(alertId);
+      const actor = getActor(req);
+      const alert = await amlService.dismissAlert(alertId, actor.id);
       res.json({ success: true, data: alert });
     } catch (error) {
       console.error('Error dismissing alert:', error);

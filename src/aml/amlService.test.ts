@@ -396,7 +396,7 @@ describe('AMLService', () => {
         config: { window_minutes: 60, max_amount: 10000, max_count: 10 },
       };
 
-      const rule = await service.createRule(input);
+      const rule = await service.createRule(input, 'user_u1');
 
       expect(rule.name).toBe(input.name);
       expect(rule.type).toBe(input.type);
@@ -406,6 +406,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_created');
+      expect(events[0].userId).toBe('user_u1');
     });
 
     it('should update a rule with version bump and audit logging', async () => {
@@ -422,7 +423,7 @@ describe('AMLService', () => {
         change_reason: 'Disabling for testing',
       };
 
-      const updated = await service.updateRule(rule.id, input);
+      const updated = await service.updateRule(rule.id, input, 'user_u2');
 
       expect(updated.enabled).toBe(false);
       expect(updated.version.minor).toBe(1);
@@ -431,6 +432,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_updated');
+      expect(events[0].userId).toBe('user_u2');
     });
 
     it('should rollback rule to previous version with audit logging', async () => {
@@ -444,7 +446,7 @@ describe('AMLService', () => {
 
       const targetVersion: SemVer = { major: 1, minor: 0, patch: 0 };
 
-      const rolledBack = await service.rollbackRule(rule.id, targetVersion);
+      const rolledBack = await service.rollbackRule(rule.id, targetVersion, 'user_u3');
 
       expect(rolledBack.version.patch).toBe(1);
 
@@ -452,6 +454,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_rollback');
+      expect(events[0].userId).toBe('user_u3');
     });
 
     it('should get all rules', async () => {
@@ -494,7 +497,7 @@ describe('AMLService', () => {
         notes: 'Initial review',
       };
 
-      const amlCase = await service.createCase(input);
+      const amlCase = await service.createCase(input, 'user_u4');
 
       expect(amlCase.status).toBe('assigned');
       expect(amlCase.assigned_to).toBe('analyst1');
@@ -503,6 +506,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_created');
+      expect(events[0].userId).toBe('user_u4');
     });
 
     it('should update a case with audit logging', async () => {
@@ -527,7 +531,7 @@ describe('AMLService', () => {
         notes: 'Investigation complete',
       };
 
-      const updated = await service.updateCase(amlCase.id, input);
+      const updated = await service.updateCase(amlCase.id, input, 'user_u5');
 
       expect(updated.status).toBe('closed');
       expect(updated.disposition).toBe('false_positive');
@@ -537,6 +541,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_updated');
+      expect(events[0].userId).toBe('user_u5');
     });
 
     it('should get case by ID', async () => {
@@ -668,7 +673,7 @@ describe('AMLService', () => {
         status: 'pending',
       });
 
-      const dismissed = await service.dismissAlert(alert.id);
+      const dismissed = await service.dismissAlert(alert.id, 'user_u6');
 
       expect(dismissed.status).toBe('dismissed');
 
@@ -676,6 +681,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u6');
     });
   });
 
@@ -869,6 +875,49 @@ describe('AMLService', () => {
         second_approver_id: 'officer_2',
         rationale: 'Second review confirms.',
       });
+    });
+  });
+
+  describe('Regression Tests', () => {
+    it('should not record "system" as userId when explicit actorId is provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert with explicit actorId
+      await service.dismissAlert(alert.id, 'user_u1');
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u1');
+      expect(events[0].userId).not.toBe('system');
+    });
+
+    it('should fall back to currentUserId when actorId is not provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert without explicit actorId (falls back to currentUserId)
+      await service.dismissAlert(alert.id);
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('test_user'); // currentUserId from service constructor
     });
   });
 });

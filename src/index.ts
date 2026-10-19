@@ -69,7 +69,7 @@ import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
 import { createAMLService } from "./aml/amlService";
-import { InMemorySecurityAuditRepository } from "./security/audit";
+import { InMemorySecurityAuditRepository, AuditLogSecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
@@ -743,7 +743,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
+  const amlAuditRepo = new AuditLogSecurityAuditRepository(auditLogRepo);
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,

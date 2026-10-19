@@ -41,7 +41,7 @@ class MockAMLService {
     ];
   }
 
-  async createRule(input: any): Promise<AMLRule> {
+  async createRule(input: any, actorId?: string): Promise<AMLRule> {
     const rule: AMLRule = {
       id: `rule_${Date.now()}`,
       ...input,
@@ -54,7 +54,7 @@ class MockAMLService {
     return rule;
   }
 
-  async updateRule(ruleId: string, input: any): Promise<AMLRule> {
+  async updateRule(ruleId: string, input: any, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -71,7 +71,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       ...input,
@@ -81,7 +81,7 @@ class MockAMLService {
     return this.rules[index];
   }
 
-  async rollbackRule(ruleId: string, version: SemVer): Promise<AMLRule> {
+  async rollbackRule(ruleId: string, version: SemVer, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -98,7 +98,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       version: { major: version.major, minor: version.minor, patch: version.patch + 1 },
@@ -138,7 +138,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.case_id === caseId);
   }
 
-  async createCase(input: any): Promise<AMLCase> {
+  async createCase(input: any, actorId?: string): Promise<AMLCase> {
     const amlCase: AMLCase = {
       id: `case_${Date.now()}`,
       ...input,
@@ -150,7 +150,7 @@ class MockAMLService {
     return amlCase;
   }
 
-  async updateCase(caseId: string, input: any): Promise<AMLCase> {
+  async updateCase(caseId: string, input: any, actorId?: string): Promise<AMLCase> {
     const index = this.cases.findIndex(c => c.id === caseId);
     if (index === -1) {
       // Return a mock case for testing
@@ -167,7 +167,7 @@ class MockAMLService {
         closed_at: (input.status === 'closed' || input.status === 'dismissed') ? new Date() : undefined,
       };
     }
-    
+
     this.cases[index] = {
       ...this.cases[index],
       ...input,
@@ -185,7 +185,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.investor_id === investorId);
   }
 
-  async dismissAlert(alertId: string): Promise<AMLAlert> {
+  async dismissAlert(alertId: string, actorId?: string): Promise<AMLAlert> {
     const index = this.alerts.findIndex(a => a.id === alertId);
     if (index === -1) {
       // Return a mock alert for testing
@@ -203,7 +203,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.alerts[index] = {
       ...this.alerts[index],
       status: 'dismissed',
@@ -355,6 +355,26 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createRule');
+      const newRule = {
+        name: 'Test Rule',
+        description: 'Test description',
+        type: 'velocity',
+        severity: 'high',
+        config: { window_minutes: 60 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules')
+        .set('x-user-id', 'user_123')
+        .send(newRule);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newRule, 'user_123');
+      spy.mockRestore();
+    });
   });
 
   describe('PUT /aml/rules/:ruleId', () => {
@@ -385,6 +405,24 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateRule');
+      const update = {
+        name: 'Updated Rule',
+        enabled: false,
+        change_reason: 'Testing',
+      };
+
+      const response = await request(app)
+        .put('/aml/rules/rule_1')
+        .set('x-user-id', 'user_456')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', update, 'user_456');
+      spy.mockRestore();
+    });
   });
 
   describe('POST /aml/rules/:ruleId/rollback', () => {
@@ -412,6 +450,22 @@ describe('AML Routes', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'rollbackRule');
+      const rollback = {
+        version: { major: 1, minor: 0, patch: 0 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules/rule_1/rollback')
+        .set('x-user-id', 'user_789')
+        .send(rollback);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', rollback.version, 'user_789');
+      spy.mockRestore();
     });
   });
 
@@ -499,6 +553,25 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createCase');
+      const newCase = {
+        alert_ids: ['alert_1'],
+        investor_id: 'inv_1',
+        assigned_to: 'analyst_1',
+        notes: 'Test case',
+      };
+
+      const response = await request(app)
+        .post('/aml/cases')
+        .set('x-user-id', 'user_abc')
+        .send(newCase);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newCase, 'user_abc');
+      spy.mockRestore();
+    });
   });
 
   describe('PUT /aml/cases/:caseId', () => {
@@ -529,6 +602,24 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateCase');
+      const update = {
+        status: 'closed',
+        disposition: 'false_positive',
+        notes: 'Investigated',
+      };
+
+      const response = await request(app)
+        .put('/aml/cases/case_1')
+        .set('x-user-id', 'user_xyz')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('case_1', update, 'user_xyz');
+      spy.mockRestore();
+    });
   });
 
   describe('GET /aml/alerts/pending', () => {
@@ -558,6 +649,17 @@ describe('AML Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.data.status).toBe('dismissed');
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'dismissAlert');
+      const response = await request(app)
+        .post('/aml/alerts/alert_1/dismiss')
+        .set('x-user-id', 'user_123');
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('alert_1', 'user_123');
+      spy.mockRestore();
     });
   });
 
