@@ -134,6 +134,24 @@ describe('DistributionRepository', () => {
     });
   });
 
+  describe('countPayoutsByStatus', () => {
+    it('should query and return count of payouts by status', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: 3 }] });
+      const count = await repository.countPayoutsByStatus('run-1', 'failed');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+COUNT\(\*\)::int\s+AS\s+count\s+FROM\s+distribution_payouts\s+WHERE\s+distribution_id\s+=\s+\$1\s+AND\s+status\s+=\s+\$2/i),
+        ['run-1', 'failed']
+      );
+      expect(count).toBe(3);
+    });
+
+    it('should return 0 when no rows or count is 0', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+      const count = await repository.countPayoutsByStatus('run-1', 'failed');
+      expect(count).toBe(0);
+    });
+  });
+
   describe('createPayout', () => {
     it('should create a payout with frozen_fx_rate_id', async () => {
       const input: CreatePayoutInput = {

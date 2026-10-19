@@ -213,6 +213,26 @@ export class DistributionRepository {
   }
 
   /**
+   * Count payouts for a specific distribution run filtered by status
+   * @param distributionId Distribution run ID
+   * @param status Payout status ('pending' | 'processed' | 'failed')
+   * @returns Number of payouts with the specified status
+   */
+  async countPayoutsByStatus(
+    distributionId: string,
+    status: 'pending' | 'processed' | 'failed'
+  ): Promise<number> {
+    const query = `
+      SELECT COUNT(*)::int AS count
+      FROM distribution_payouts
+      WHERE distribution_id = $1 AND status = $2
+    `;
+
+    const result = await this.db.query(query, [distributionId, status]);
+    return parseInt(String(result.rows[0]?.count ?? 0), 10);
+  }
+
+  /**
    * Update distribution run status
    * @param id Run ID
    * @param status New status
