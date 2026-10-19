@@ -102,6 +102,45 @@ describe('RevenueService', () => {
       expect(mockRevenueReportRepo.create).toHaveBeenCalled();
     });
 
+    it('passes issuer_id and reported_by to the repository', async () => {
+      mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockRevenueReportRepo.create.mockResolvedValue(mockReport);
+
+      await service.submitReport(validInput);
+
+      expect(mockRevenueReportRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ issuer_id: 'issuer-abc', reported_by: 'issuer-abc' })
+      );
+    });
+
+    it('uses explicit reportedBy when provided', async () => {
+      mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockRevenueReportRepo.create.mockResolvedValue(mockReport);
+
+      await service.submitReport({ ...validInput, reportedBy: 'user-xyz' });
+
+      expect(mockRevenueReportRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ issuer_id: 'issuer-abc', reported_by: 'user-xyz' })
+      );
+    });
+
+    it('regression: repository enforcing NOT NULL columns accepts the insert', async () => {
+      mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockRevenueReportRepo.create.mockImplementation(async (data: any) => {
+        for (const col of ['issuer_id', 'reported_by']) {
+          if (data[col] == null) {
+            throw new Error(`null value in column "${col}" violates not-null constraint`);
+          }
+        }
+        return mockReport;
+      });
+
+      await expect(service.submitReport(validInput)).resolves.toBeDefined();
+    });
+
     // ── Offering not found ──────────────────────────────────────────────────
 
     it('throws NOT_FOUND when offering does not exist', async () => {

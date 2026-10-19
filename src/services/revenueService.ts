@@ -13,6 +13,8 @@ import { PoolClient } from 'pg';
 export interface SubmitRevenueReportInput {
     offeringId: string;
     issuerId: string;
+    /** Acting user; defaults to `issuerId` when omitted. */
+    reportedBy?: string;
     amount: string;
     periodStart: Date;
     periodEnd: Date;
@@ -159,6 +161,8 @@ export class RevenueService {
         // 6. Save the report
         const reportData: CreateRevenueReportInput = {
             offering_id: input.offeringId,
+            issuer_id: input.issuerId,
+            reported_by: input.reportedBy ?? input.issuerId,
             amount: input.amount,
             period_start: input.periodStart,
             period_end: input.periodEnd,

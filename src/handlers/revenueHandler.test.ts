@@ -122,6 +122,7 @@ describe('RevenueHandler', () => {
                 expect(mockRevenueService.submitReport).toHaveBeenCalledWith({
                     offeringId: 'offering-1',
                     issuerId: 'issuer-1',
+                    reportedBy: 'issuer-1',
                     amount: '500.50',
                     periodStart: new Date('2024-02-01'),
                     periodEnd: new Date('2024-02-28'),
