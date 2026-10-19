@@ -1222,6 +1222,100 @@ describe('DistributionEngine', () => {
       const nonZero = amounts.filter(a => a > 0);
       expect(nonZero.length).toBeGreaterThan(0);
     });
+
+    it('distributes 0.34/0.33/0.33 for three 0.0049 balances with revenue 1 instead of throwing', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-3', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-3', period, 1);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
+    });
+
+    it('does not perturb pro-rata shares for small holders [0.004, 0.006]', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.004 },
+        { investor_id: 'i2', balance: 0.006 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-pair', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-pair', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '40.00' },
+        { investor_id: 'i2', amount: '60.00' },
+      ]);
+    });
+
+    it('distributes correctly with 7-decimal Stellar string balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances: BalanceRow[] = [
+        { investor_id: 'i1', balance: '0.0000001' },
+        { investor_id: 'i2', balance: '0.0000002' },
+        { investor_id: 'i3', balance: '0.0000007' },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-stellar-str', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-stellar-str', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '10.00' },
+        { investor_id: 'i2', amount: '20.00' },
+        { investor_id: 'i3', amount: '70.00' },
+      ]);
+    });
+
+    it('previewRun uses the same full-precision calculation for small balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-prev-small', start: new Date(), end: new Date() };
+      const preview = await engine.previewRun('off-prev-small', period, 1);
+
+      expect(preview.projections).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
+    });
   });
 
 // ── Property-based tests (fast-check) ────────────────────────────────────────
@@ -1378,6 +1472,39 @@ describe('DistributionEngine – property-based rounding invariants', () => {
           0,
         );
         return sumCents === Math.round(revenue * 100);
+      }),
+      { numRuns: 200 },
+    );
+  });
+
+  it('sum(payouts) === revenueAmount for small holders and 7-decimal Stellar balances', async () => {
+    // Arbitrary: fractional / small / Stellar-precision balances (including < 0.005 and strings)
+    const smallBalancesArb = fc
+      .array(
+        fc.oneof(
+          // Small floating point numbers (e.g. 0.0001 to 0.01)
+          fc.integer({ min: 1, max: 100 }).map((n) => n / 10000),
+          // 7-decimal Stellar stroops as decimal string (e.g. "0.0000001" to "0.0050000")
+          fc.integer({ min: 1, max: 50000 }).map((stroops) => (stroops / 10000000).toFixed(7)),
+          // Standard integer balance
+          fc.integer({ min: 1, max: 1000 }),
+        ),
+        { minLength: 1, maxLength: 8 },
+      )
+      .map((bals) => bals.map((b, i) => ({ investor_id: `i${i}`, balance: b })));
+
+    await fc.assert(
+      fc.asyncProperty(smallBalancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-small-prop', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-small-prop', period, revenue);
+
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        const expectedCents = Math.round(revenue * 100);
+        return sumCents === expectedCents;
       }),
       { numRuns: 200 },
     );

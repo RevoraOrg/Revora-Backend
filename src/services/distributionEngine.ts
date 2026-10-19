@@ -33,7 +33,7 @@ import {
 
 export interface BalanceRow {
   investor_id: string;
-  balance: number;
+  balance: number | string;
 }
 
 export interface DistributionBatchResult {
@@ -158,10 +158,14 @@ function calculateDistributionPayouts(
 
   // 1. Sum balances and compute shares using Decimal for precision
   const balanceDecimals = balances.map((b) => {
-    const rawStr = b.balance.toFixed(18);
-    const rawDecimal = new Decimal(rawStr);
-    const scaled = rawDecimal.toSorobanI128(2, "round");
-    return Decimal.fromScaledBigInt(scaled, 2);
+    if (typeof b.balance === "string") {
+      return new Decimal(b.balance.trim());
+    }
+    const str = b.balance.toString();
+    if (str.includes("e") || str.includes("E")) {
+      return new Decimal(b.balance.toFixed(18));
+    }
+    return new Decimal(str);
   });
 
   const totalBalanceDecimal = balanceDecimals.reduce(
