@@ -67,7 +67,7 @@ export interface MilestoneRepository {
     milestoneId: string;
     verifierId: string;
     validatedAt: Date;
-  }): Promise<Milestone>;
+  }): Promise<Milestone | null>;
 }
 
 export interface VaultRepository {
@@ -103,6 +103,7 @@ export interface HardenedMilestoneValidationDeps {
   auditRepository: SecurityAuditRepository;
   validationLimiter?: ValidationLimiter;
   securityConfig?: SecurityConfig;
+  runInTransaction?: <T>(fn: () => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -228,23 +229,38 @@ export const executeMilestoneValidation = async (
   });
 
   try {
-    // Create validation event first (for audit trail)
-    const validationEvent = await deps.milestoneValidationEventRepository.create({
-      vaultId,
-      milestoneId,
-      verifierId,
-      createdAt: now,
+    const runInTx = deps.runInTransaction ?? (async <T>(fn: () => Promise<T>): Promise<T> => fn());
+
+    // Execute conditional update and event creation in one unit of work
+    const { updatedMilestone, validationEvent } = await runInTx(async () => {
+      // 1. Conditional markValidated first (WHERE status = 'pending')
+      const updated = await deps.milestoneRepository.markValidated({
+        vaultId,
+        milestoneId,
+        verifierId,
+        validatedAt: now,
+      });
+
+      if (!updated) {
+        logger.warn('Milestone already validated or not pending', {
+          vaultId,
+          milestoneId,
+        });
+        throw Errors.conflict('Milestone already validated');
+      }
+
+      // 2. Create validation event in the same unit of work
+      const event = await deps.milestoneValidationEventRepository.create({
+        vaultId,
+        milestoneId,
+        verifierId,
+        createdAt: now,
+      });
+
+      return { updatedMilestone: updated, validationEvent: event };
     });
 
-    // Update milestone status
-    const updatedMilestone = await deps.milestoneRepository.markValidated({
-      vaultId,
-      milestoneId,
-      verifierId,
-      validatedAt: now,
-    });
-
-    // Publish domain event
+    // 3. Publish domain event only after commit (outbox-style)
     await deps.domainEventPublisher.publish('vault.milestone.validated', {
       validationEventId: validationEvent.id,
       vaultId,
@@ -392,8 +408,8 @@ export const createHardenedMilestoneValidationHandler = (
         }
 
         // Handle structured errors
-        const isAppError = (err: any): err is any => 'statusCode' in err;
-        const isSecurityError = (err: any): err is any => 'code' in err && 'details' in err;
+        const isAppError = (err: any): boolean => Boolean(err && typeof err === 'object' && 'statusCode' in err);
+        const isSecurityError = (err: any): boolean => Boolean(err && typeof err === 'object' && 'code' in err && 'details' in err);
 
         if (isAppError(error) || isSecurityError(error)) {
           const status = (error as any).statusCode || (error instanceof ValidationError ? 400 : 403);
