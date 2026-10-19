@@ -5,20 +5,42 @@ import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
 import { InvestmentService, createInvestmentService } from '../services/investmentService';
 import { createInvestmentServiceWithScreening } from '../services/investmentServiceSetup';
 import { AppError } from '../lib/errors';
-import { createIdempotencyMiddleware } from '../middleware/idempotency';
+import {
+  createIdempotencyMiddleware,
+  IdempotencyStore,
+  PostgresIdempotencyStore,
+} from '../middleware/idempotency';
 import { requireMobileAttestation } from '../security/mobileAttestation';
 import crypto from 'crypto';
+
+export const DEFAULT_INVESTMENT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export interface InvestmentsRouterOptions {
+  idempotencyStore?: IdempotencyStore;
+  idempotencyTtlMs?: number;
+  investmentService?: InvestmentService;
+}
 
 /**
  * Fingerprint function for investment requests.
  * Creates a deterministic hash of the request body to detect payload changes.
+ * Includes beneficial_owners to ensure changes in screened owners invalidate replay.
  */
 function fingerprintInvestmentRequest(req: Request): string {
-  const body = req.body as Record<string, unknown>;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const beneficial_owners =
+    Array.isArray(body.beneficial_owners) && body.beneficial_owners.length > 0
+      ? body.beneficial_owners
+          .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+          .map((v) => v.trim())
+      : undefined;
+
   // Normalize by extracting only relevant fields in a consistent order
   const normalized = JSON.stringify({
     amount: body.amount,
     asset: body.asset,
+    beneficial_owners:
+      beneficial_owners && beneficial_owners.length > 0 ? beneficial_owners : undefined,
     offering_id: body.offering_id,
   });
   return crypto.createHash('sha256').update(normalized).digest('hex');
@@ -44,14 +66,29 @@ function requireIdempotencyKey(req: Request, res: Response, next: NextFunction):
  * Factory that creates an Express Router for investment endpoints.
  * Requires the caller to supply a pg Pool for database access.
  */
-export function createInvestmentsRouter(db: Pool): Router {
+export function createInvestmentsRouter(
+  db: Pool,
+  options: InvestmentsRouterOptions = {}
+): Router {
   const router = Router();
   const investmentRepo = new InvestmentRepository(db);
-  const investmentService: InvestmentService = createInvestmentServiceWithScreening(db);
+  const investmentService: InvestmentService =
+    options.investmentService || createInvestmentServiceWithScreening(db);
 
-  // Create idempotency middleware with request body fingerprinting
+  const ttlMs = options.idempotencyTtlMs ?? DEFAULT_INVESTMENT_IDEMPOTENCY_TTL_MS;
+  const store =
+    options.idempotencyStore ||
+    new PostgresIdempotencyStore({
+      pool: db,
+      ttlMs,
+    });
+
+  // Create idempotency middleware with request body fingerprinting and principal isolation
   const idempotencyMiddleware = createIdempotencyMiddleware({
+    store,
     fingerprint: fingerprintInvestmentRequest,
+    requirePrincipal: true,
+    routePath: '/api/investments',
   });
 
   /**
