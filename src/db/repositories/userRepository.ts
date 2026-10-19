@@ -10,12 +10,36 @@ import {
  * Full user row — password_hash included for internal auth use only.
  * Never expose this type in API responses.
  */
+export type UserStatus = 'active' | 'suspended' | 'disabled' | 'deactivated';
+
+export const USER_STATUSES: readonly UserStatus[] = [
+  'active',
+  'suspended',
+  'disabled',
+  'deactivated',
+];
+
+export function isUserStatus(value: unknown): value is UserStatus {
+  return typeof value === 'string' && (USER_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Normalise a raw DB status value. Unknown / missing values fall back to
+ * `'active'` so a schema that predates the status column does not lock out
+ * every account.
+ */
+export function parseUserStatus(value: unknown): UserStatus {
+  return isUserStatus(value) ? value : 'active';
+}
+
 export interface User {
   id: string;
   email: string;
   password_hash: string;
   name?: string;
   role: 'startup' | 'investor';
+  /** Account lifecycle status. Non-`active` users must not authenticate. */
+  status: UserStatus;
   /** KYC risk tier used to scale per-offering investment caps. */
   kyc_risk_tier: KycRiskTier;
   last_oidc_groups?: string[] | null;
@@ -40,6 +64,7 @@ export interface UpdateUserInput {
   name?: string;
   password_hash?: string;
   role?: 'startup' | 'investor';
+  status?: UserStatus;
   kyc_risk_tier?: KycRiskTier;
   last_oidc_groups?: string[] | null;
 }
@@ -66,7 +91,7 @@ export class UserRepository {
    */
   async findById(id: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, status, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
@@ -85,7 +110,7 @@ export class UserRepository {
    */
   async findByEmail(email: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, status, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE email = $1
       LIMIT 1
@@ -168,6 +193,10 @@ export class UserRepository {
       sets.push(`role = $${idx++}`);
       values.push(input.role);
     }
+    if (input.status !== undefined) {
+      sets.push(`status = $${idx++}`);
+      values.push(input.status);
+    }
     if (input.kyc_risk_tier !== undefined) {
       sets.push(`kyc_risk_tier = $${idx++}`);
       values.push(input.kyc_risk_tier);
@@ -229,6 +258,7 @@ export class UserRepository {
       password_hash: row.password_hash,
       name: row.name ?? undefined,
       role: row.role as 'startup' | 'investor',
+      status: parseUserStatus(row.status),
       kyc_risk_tier: parseKycRiskTier(row.kyc_risk_tier),
       last_oidc_groups: row.last_oidc_groups ?? null,
       created_at: row.created_at,

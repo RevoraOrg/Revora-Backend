@@ -5,7 +5,7 @@ import {
     SessionRepository,
     UserRepository,
 } from './types';
-import { hashSessionToken, SESSION_TTL_MS } from '../session';
+import { hashSessionToken, SESSION_TTL_MS, computeFamilyExpiresAt } from '../session';
 
 /**
  * Domain service that orchestrates the login flow:
@@ -68,6 +68,9 @@ export class LoginService {
             userId: user.id,
             tokenHash,
             expiresAt,
+            // Anchor the absolute family deadline at login so refresh rotation
+            // can never extend the family's total lifetime.
+            familyExpiresAt: computeFamilyExpiresAt(),
         });
 
         return {

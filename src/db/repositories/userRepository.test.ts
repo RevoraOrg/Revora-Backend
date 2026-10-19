@@ -30,6 +30,7 @@ const BASE_USER: User = {
   password_hash: 'salt:hash',
   name: 'Alice',
   role: 'investor',
+  status: 'active',
   kyc_risk_tier: 'standard',
   created_at: new Date('2024-01-01'),
   updated_at: new Date('2024-01-01'),
@@ -90,6 +91,21 @@ describe('UserRepository', () => {
 
       const result = await repository.findById('user-123');
       expect(result!.name).toBe('Alice');
+    });
+
+    it('maps a known status value from DB', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([{ ...BASE_USER, status: 'suspended' }]));
+
+      const result = await repository.findById('user-123');
+      expect(result!.status).toBe('suspended');
+    });
+
+    it('defaults status to active when the column is absent or unknown', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([{ ...BASE_USER, status: undefined }]));
+      expect((await repository.findById('user-123'))!.status).toBe('active');
+
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([{ ...BASE_USER, status: 'bogus' }]));
+      expect((await repository.findById('user-123'))!.status).toBe('active');
     });
   });
 
@@ -257,6 +273,18 @@ describe('UserRepository', () => {
       const result = await repository.updateUser({ id: 'user-123', role: 'startup' });
 
       expect(result.role).toBe('startup');
+    });
+
+    it('updates status only (e.g. SCIM suspension)', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([{ ...BASE_USER, status: 'suspended' }]));
+
+      const result = await repository.updateUser({ id: 'user-123', status: 'suspended' });
+
+      expect(result.status).toBe('suspended');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('status'),
+        expect.arrayContaining(['suspended', 'user-123']),
+      );
     });
 
     it('updates all three fields at once', async () => {

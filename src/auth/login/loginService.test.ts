@@ -21,6 +21,7 @@ class RecordingSessionRepository implements SessionRepository {
     userId: string;
     tokenHash: string;
     expiresAt: Date;
+    familyExpiresAt?: Date | null;
   }> = [];
 
   async createSession(input: {
@@ -28,6 +29,7 @@ class RecordingSessionRepository implements SessionRepository {
     userId: string;
     tokenHash: string;
     expiresAt: Date;
+    familyExpiresAt?: Date | null;
   }): Promise<void> {
     this.created.push(input);
   }
@@ -141,6 +143,19 @@ describe('LoginService failure handling', () => {
     const daysFromNow = (expiresAt.getTime() - Date.now()) / (24 * 60 * 60 * 1000);
     expect(daysFromNow).toBeGreaterThan(6.99);
     expect(daysFromNow).toBeLessThan(7.01);
+  });
+
+  it('anchors the absolute refresh-family deadline at login (30 days)', async () => {
+    const { service, sessionRepo } = buildService([validUser]);
+
+    await service.login('jane@example.com', VALID_PASSWORD);
+
+    const { familyExpiresAt } = sessionRepo.created[0];
+    expect(familyExpiresAt).toBeInstanceOf(Date);
+    const daysFromNow =
+      (familyExpiresAt!.getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+    expect(daysFromNow).toBeGreaterThan(29.99);
+    expect(daysFromNow).toBeLessThan(30.01);
   });
 });
 

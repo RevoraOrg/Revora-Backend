@@ -380,6 +380,7 @@ describe('SCIM 2.0 — Users', () => {
   describe('DELETE /Users/:id', () => {
     it('deactivates a user (soft delete)', async () => {
       repo.findById.mockResolvedValue({ ...SAMPLE_USER, password_hash: 'hash' } as any);
+      repo.updateUser.mockResolvedValue({ ...SAMPLE_USER, status: 'suspended', password_hash: 'hash' } as any);
       const app = buildApp(repo);
       const res = await auth(request(app).delete('/scim/v2/Users/user-1'));
       expect(res.status).toBe(204);
@@ -388,6 +389,18 @@ describe('SCIM 2.0 — Users', () => {
       repo.findById.mockResolvedValue({ ...SAMPLE_USER, password_hash: 'hash' } as any);
       const res2 = await auth(request(app).get('/scim/v2/Users/user-1'));
       expect(res2.body.active).toBe(false);
+    });
+
+    it('persists a suspended status to the DB so refresh rotation can observe it (#1292)', async () => {
+      repo.findById.mockResolvedValue({ ...SAMPLE_USER, password_hash: 'hash' } as any);
+      repo.updateUser.mockResolvedValue({ ...SAMPLE_USER, status: 'suspended', password_hash: 'hash' } as any);
+      const app = buildApp(repo);
+
+      await auth(request(app).delete('/scim/v2/Users/user-1'));
+
+      expect(repo.updateUser).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'user-1', status: 'suspended' }),
+      );
     });
 
     it('returns 404 for unknown user', async () => {

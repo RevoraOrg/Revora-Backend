@@ -30,6 +30,7 @@
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { JwtIssuer, SessionRepository } from '../login/types';
+import { computeFamilyExpiresAt } from '../session';
 import {
   SocialAuthError,
   SocialAuthProvider,
@@ -294,6 +295,7 @@ export class SocialAuthService {
       userId: user.id,
       tokenHash: createHash('sha256').update(tokens.refreshToken).digest('hex'),
       expiresAt,
+      familyExpiresAt: computeFamilyExpiresAt(),
     });
 
     return {

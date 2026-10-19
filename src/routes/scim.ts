@@ -149,6 +149,22 @@ export function createScimRouter(
   const router = Router();
   const authMiddleware = createScimAuth(scimToken);
 
+  /**
+   * Determine whether a user is de-provisioned.
+   *
+   * Two sources are consulted so the flag is correct both for the in-process
+   * fast path (`suspendedUsers`) and for users suspended before this process
+   * started or by another replica (persisted `status`).
+   */
+  function isSuspended(
+    userId: string,
+    existing?: { status?: unknown } | null,
+  ): boolean {
+    if (suspendedUsers.has(userId)) return true;
+    const status = existing?.status;
+    return typeof status === 'string' && status !== 'active' && status !== 'enabled';
+  }
+
   router.use(authMiddleware);
 
   function emitOp(operation: string, resource: string): void {
@@ -334,7 +350,7 @@ export function createScimRouter(
         users = [];
       }
 
-      const allResources = users.map(u => userToScim(u, !suspendedUsers.has(u.id), baseUrl));
+      const allResources = users.map(u => userToScim(u, !isSuspended(u.id, u), baseUrl));
       const paged = allResources.slice(startIndex - 1, startIndex - 1 + count);
 
       const listResp: ScimListResponse = {
@@ -362,7 +378,7 @@ export function createScimRouter(
       const existing = await userRepo.findByEmail(userName);
       if (existing) {
         const { password_hash: _, ...safe } = existing;
-        const scim = userToScim(safe, !suspendedUsers.has(existing.id), baseUrl);
+        const scim = userToScim(safe, !isSuspended(existing.id, existing), baseUrl);
         res.status(201).json(scim);
         return;
       }
@@ -400,7 +416,7 @@ export function createScimRouter(
         return;
       }
       const { password_hash: _, ...safe } = u;
-      res.json(userToScim(safe, !suspendedUsers.has(u.id), baseUrl));
+      res.json(userToScim(safe, !isSuspended(u.id, u), baseUrl));
     } catch (err: any) {
       res.status(500).json(scimError(500, 'internal', err.message));
     }
@@ -422,12 +438,18 @@ export function createScimRouter(
         ? [givenName, familyName].filter(Boolean).join(' ')
         : (displayName || existing.name || '');
 
-      const active = body?.active !== undefined ? body.active : !suspendedUsers.has(existing.id);
+      const active = body?.active !== undefined
+        ? body.active
+        : !isSuspended(existing.id, existing);
 
+      // Persist the de-provision so downstream authorisation (e.g. refresh
+      // rotation) observes the suspension without relying on this process's
+      // in-memory state.
       const updated = await userRepo.updateUser({
         id: existing.id,
         email: body?.userName || existing.email,
         name: nameStr || undefined,
+        status: active ? 'active' : 'suspended',
       });
       const { password_hash: _, ...safe } = updated;
       if (!active) suspendedUsers.add(existing.id);
@@ -455,7 +477,7 @@ export function createScimRouter(
 
       let newEmail = existing.email;
       let newName = existing.name;
-      let newActive = !suspendedUsers.has(existing.id);
+      let newActive = !isSuspended(existing.id, existing);
 
       for (const op of operations) {
         if (op.op === 'replace' && op.value) {
@@ -481,6 +503,7 @@ export function createScimRouter(
         id: existing.id,
         email: newEmail,
         name: newName,
+        status: newActive ? 'active' : 'suspended',
       });
       const { password_hash: _, ...safe } = updated;
       if (!newActive) suspendedUsers.add(existing.id);
@@ -503,6 +526,8 @@ export function createScimRouter(
         res.status(404).json(scimError(404, 'unknown', `User ${req.params.id} not found`));
         return;
       }
+      // Soft-delete: persist a suspended status so refresh rotation fails closed.
+      await userRepo.updateUser({ id: u.id, status: 'suspended' });
       suspendedUsers.add(u.id);
       res.status(204).send();
     } catch (err: any) {

@@ -38,6 +38,11 @@ export interface SessionRepository {
     userId: string;
     tokenHash: string;
     expiresAt: Date;
+    /**
+     * Absolute deadline for the refresh-token family this session roots.
+     * Set at login and inherited by every rotated child.
+     */
+    familyExpiresAt?: Date | null;
   }): Promise<void>;
 }
 
