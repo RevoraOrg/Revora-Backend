@@ -46,8 +46,8 @@ export class Decimal {
     if (!DECIMAL_REGEX.test(decimalString)) {
       throw new AppError(
         ErrorCode.VALIDATION_ERROR,
-        `Invalid decimal string format: "${decimalString}". Must be a numeric string with up to 18 decimal places.`,
         400,
+        `Invalid decimal string format: "${decimalString}". Must be a numeric string with up to 18 decimal places.`,
         { field: 'amount', value: decimalString }
       );
     }
@@ -65,7 +65,7 @@ export class Decimal {
    * (the scaled `_value` can be negative after a subtraction).
    */
   toString(): string {
-    const isNegative = this._value < 0n;
+    const isNegative = (this._value as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -this._value : this._value;
     const valueStr = absValue.toString();
 
@@ -99,8 +99,8 @@ export class Decimal {
     if (targetScale < 0 || targetScale > 18) { // Common max scale for Stellar is 7, but 18 is max for input.
       throw new AppError(
         ErrorCode.INTERNAL_ERROR,
-        `Invalid target scale for Soroban i128 conversion: ${targetScale}. Must be between 0 and 18.`,
-        500
+        500,
+        `Invalid target scale for Soroban i128 conversion: ${targetScale}. Must be between 0 and 18.`
       );
     }
 
@@ -167,7 +167,7 @@ export class Decimal {
     const divisor = 10n ** BigInt(scale);
 
     // Handle negative values explicitly to avoid producing strings like "123.-05".
-    const isNegative = scaledValue < 0n;
+    const isNegative = (scaledValue as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -scaledValue : scaledValue;
     const integerPart = absValue / divisor;
     const fractionalPart = absValue % divisor;
@@ -270,10 +270,10 @@ export class Decimal {
   }
 
   isPositive(): boolean {
-    return this._value > 0n;
+    return (this._value as BigInt) > (0 as BigInt);
   }
 
   isNegative(): boolean {
-    return this._value < 0n;
+    return (this._value as BigInt) < (0 as BigInt);
   }
 }

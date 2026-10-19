@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import { UniqueConstraintError } from '../../lib/errors';
 import {
   DEFAULT_KYC_RISK_TIER,
@@ -64,14 +64,15 @@ export class UserRepository {
   /**
    * Find a user by ID (includes password_hash for internal auth flows).
    */
-  async findById(id: string): Promise<User | null> {
+  async findById(id: string, client?: PoolClient): Promise<User | null> {
     const query = `
       SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
     `;
-    const result: QueryResult<User> = await this.db.query(query, [id]);
+    const executor = client ?? this.db;
+    const result: QueryResult<User> = await executor.query(query, [id]);
     return result.rows.length > 0 ? this.mapUser(result.rows[0]) : null;
   }
 
