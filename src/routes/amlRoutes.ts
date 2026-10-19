@@ -7,6 +7,7 @@
 import { NextFunction, Router, Request, RequestHandler, Response } from 'express';
 import { AMLService } from '../aml/amlService';
 import { CaseAssignmentService } from '../aml/caseAssignmentService';
+import { requireCompliance } from '../middleware/auth';
 import { z } from 'zod';
 
 /**
@@ -120,6 +121,7 @@ export function createAMLRoutes(
   assignmentService?: CaseAssignmentService,
 ): Router {
   const router = Router();
+  router.use(requireCompliance);
   const reviewQueueGuards = [requireReviewQueueRole];
   const reviewQueueMutationGuards = [...reviewQueueGuards, requireCsrfToken];
 
