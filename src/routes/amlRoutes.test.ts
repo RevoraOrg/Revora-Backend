@@ -7,6 +7,7 @@
 
 import request from 'supertest';
 import express, { Express } from 'express';
+import crypto from 'crypto';
 import { createAMLRoutes } from './amlRoutes';
 import { AMLService } from '../aml/amlService';
 import { AMLRule, AMLCase, AMLAlert, OFACReview, SemVer } from '../aml/types';
@@ -271,12 +272,23 @@ class MockAMLService {
 describe('AML Routes', () => {
   let app: Express;
   let mockService: MockAMLService;
+  const TEST_JWT_SECRET = 'test-secret-that-is-long-enough-32chars!';
+  const originalJwtSecret = process.env.JWT_SECRET;
 
   beforeEach(() => {
+    process.env.JWT_SECRET = TEST_JWT_SECRET;
     app = express();
     app.use(express.json());
     mockService = new MockAMLService();
     app.use('/aml', createAMLRoutes(mockService as any));
+  });
+
+  afterAll(() => {
+    if (originalJwtSecret !== undefined) {
+      process.env.JWT_SECRET = originalJwtSecret;
+    } else {
+      delete process.env.JWT_SECRET;
+    }
   });
 
   describe('GET /aml/rules', () => {
@@ -781,12 +793,24 @@ describe('AML Routes', () => {
    * Helpers for OFAC route tests.
    *
    * The review queue endpoints require:
-   *   - x-user-id   / x-user-role headers (or req.user) for RBAC
-   *   - x-csrf-token header matching csrfToken cookie for mutation endpoints
+   *   - Verified JWT Bearer token with compliance/admin role
+   *   - x-csrf-token header matching csrfToken cookie (crypto.timingSafeEqual)
    */
+  function makeToken(sub: string, role: string): string {
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(
+      JSON.stringify({ sub, role, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600 }),
+    ).toString('base64url');
+    const sig = crypto.createHmac('sha256', TEST_JWT_SECRET).update(`${header}.${payload}`).digest('base64url');
+    return `${header}.${payload}.${sig}`;
+  }
+
+  function authHeader(role: string, sub = 'user-1') {
+    return { Authorization: `Bearer ${makeToken(sub, role)}` };
+  }
+
   const COMPLIANCE_HEADERS = {
-    'x-user-id': 'officer_1',
-    'x-user-role': 'compliance_officer',
+    ...authHeader('compliance', 'officer_1'),
   };
 
   const CSRF_HEADERS = {
@@ -838,10 +862,19 @@ describe('AML Routes', () => {
       expect(response.body.success).toBe(false);
     });
 
+    it('should return 401 when only header-based spoofed auth is provided (header-only spoof)', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set({ 'x-user-id': 'officer_1', 'x-user-role': 'compliance' });
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
     it('should return 403 for a non-compliance role', async () => {
       const response = await request(app)
         .get('/aml/ofac-reviews')
-        .set({ 'x-user-id': 'user_1', 'x-user-role': 'investor' });
+        .set(authHeader('investor', 'user_1'));
 
       expect(response.status).toBe(403);
       expect(response.body.success).toBe(false);
@@ -850,7 +883,7 @@ describe('AML Routes', () => {
     it('should accept admin role', async () => {
       const response = await request(app)
         .get('/aml/ofac-reviews')
-        .set({ 'x-user-id': 'admin_1', 'x-user-role': 'admin' });
+        .set(authHeader('admin', 'admin_1'));
 
       expect(response.status).toBe(200);
     });
@@ -858,7 +891,7 @@ describe('AML Routes', () => {
     it('should accept compliance role', async () => {
       const response = await request(app)
         .get('/aml/ofac-reviews')
-        .set({ 'x-user-id': 'officer_2', 'x-user-role': 'compliance' });
+        .set(authHeader('compliance', 'officer_2'));
 
       expect(response.status).toBe(200);
     });
@@ -895,8 +928,7 @@ describe('AML Routes', () => {
       const response = await request(app)
         .post('/aml/ofac-reviews')
         .set({
-          'x-user-id': 'officer_99',
-          'x-user-role': 'compliance_officer',
+          ...authHeader('compliance', 'officer_99'),
           'x-csrf-token': 'tok',
           cookie: 'csrfToken=tok',
         })
@@ -904,6 +936,21 @@ describe('AML Routes', () => {
 
       expect(response.status).toBe(201);
       expect(response.body.data.created_by).toBe('officer_99');
+    });
+
+    it('should return 401 when only header-based auth is sent (header-only spoof)', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set({
+          'x-user-id': 'officer_1',
+          'x-user-role': 'compliance',
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
+        .send(validCreateBody);
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
     });
 
     it('should return 400 for missing required fields', async () => {
@@ -991,7 +1038,11 @@ describe('AML Routes', () => {
     it('should return 403 for non-compliance role', async () => {
       const response = await request(app)
         .post('/aml/ofac-reviews')
-        .set({ 'x-user-id': 'user_1', 'x-user-role': 'investor', 'x-csrf-token': 'tok', cookie: 'csrfToken=tok' })
+        .set({
+          ...authHeader('investor', 'user_1'),
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
         .send(validCreateBody);
 
       expect(response.status).toBe(403);
@@ -1001,6 +1052,19 @@ describe('AML Routes', () => {
       const response = await request(app)
         .post('/aml/ofac-reviews')
         .set(COMPLIANCE_HEADERS) // no x-csrf-token
+        .send(validCreateBody);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
+    });
+
+    it('should return 403 when CSRF cookie is missing', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set({
+          ...COMPLIANCE_HEADERS,
+          'x-csrf-token': 'test-csrf-token',
+        })
         .send(validCreateBody);
 
       expect(response.status).toBe(403);
@@ -1018,6 +1082,7 @@ describe('AML Routes', () => {
         .send(validCreateBody);
 
       expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
     });
 
     it('should handle service errors gracefully', async () => {
@@ -1051,8 +1116,7 @@ describe('AML Routes', () => {
       request(app)
         .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
         .set({
-          'x-user-id': userId,
-          'x-user-role': 'compliance_officer',
+          ...authHeader('compliance', userId),
           'x-csrf-token': 'tok',
           cookie: 'csrfToken=tok',
         })
@@ -1140,10 +1204,29 @@ describe('AML Routes', () => {
       expect(response.status).toBe(401);
     });
 
+    it('should return 401 when only header-based spoofed auth is provided (header-only spoof)', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          'x-user-id': 'officer_2',
+          'x-user-role': 'compliance',
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
     it('should return 403 for non-compliance role', async () => {
       const response = await request(app)
         .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
-        .set({ 'x-user-id': 'u1', 'x-user-role': 'investor', 'x-csrf-token': 'tok', cookie: 'csrfToken=tok' })
+        .set({
+          ...authHeader('investor', 'u1'),
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
         .send({ rationale: 'Valid rationale for this test case.' });
 
       expect(response.status).toBe(403);
@@ -1157,6 +1240,62 @@ describe('AML Routes', () => {
 
       expect(response.status).toBe(403);
       expect(response.body.error).toContain('CSRF');
+    });
+
+    it('should return 403 when CSRF cookie is missing', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          ...authHeader('compliance', 'officer_2'),
+          'x-csrf-token': 'tok',
+        })
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
+    });
+
+    it('should return 403 when CSRF token does not match cookie (mismatch)', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          ...authHeader('compliance', 'officer_2'),
+          'x-csrf-token': 'wrong-tok',
+          cookie: 'csrfToken=correct-tok',
+        })
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
+    });
+
+    it('regression: reject two-header dual approval spoofing that previously bypassed dual-control', async () => {
+      // Repro from issue: POST approve twice with x-user-role: compliance, x-csrf-token: x, and x-user-id: a then b.
+      // On master, this would succeed without a valid JWT or CSRF cookie, clearing the review.
+      // After the fix, both requests must be rejected with 401.
+      const firstApprovalRes = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          'x-user-id': 'officer_a',
+          'x-user-role': 'compliance',
+          'x-csrf-token': 'x',
+        })
+        .send({ rationale: 'Attacker first approval with headers only.' });
+
+      expect(firstApprovalRes.status).toBe(401);
+      expect(firstApprovalRes.body.success).toBe(false);
+
+      const secondApprovalRes = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          'x-user-id': 'officer_b',
+          'x-user-role': 'compliance',
+          'x-csrf-token': 'x',
+        })
+        .send({ rationale: 'Attacker second approval with headers only.' });
+
+      expect(secondApprovalRes.status).toBe(401);
+      expect(secondApprovalRes.body.success).toBe(false);
     });
 
     it('should handle unexpected service errors gracefully', async () => {

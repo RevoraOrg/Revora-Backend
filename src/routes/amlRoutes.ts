@@ -5,6 +5,8 @@
  */
 
 import { NextFunction, Router, Request, RequestHandler, Response } from 'express';
+import crypto from 'crypto';
+import { requireCompliance } from '../middleware/auth';
 import { AMLService } from '../aml/amlService';
 import { CaseAssignmentService } from '../aml/caseAssignmentService';
 import { z } from 'zod';
@@ -72,16 +74,32 @@ function zodDetails(error: z.ZodError): unknown {
   return error.issues;
 }
 
+/**
+ * @notice Resolve the authenticated actor from verified request state.
+ * @dev Header-based identity fallbacks (x-user-id / x-user-role) are strictly forbidden
+ *      to ensure dual-control approval cannot be spoofed by unauthenticated callers.
+ *      The actor identity must originate from verified JWT middleware (e.g. `requireCompliance`).
+ * @param req Express request object
+ * @returns Resolved actor id and role, or undefined if unauthenticated
+ */
 function getActor(req: Request): { id?: string; role?: string } {
   const user = (req as any).user;
   const securityUser = (req as any).securityContext?.user;
 
   return {
-    id: user?.id || securityUser?.id || req.header('x-user-id') || undefined,
-    role: user?.role || securityUser?.role || req.header('x-user-role') || undefined,
+    id: user?.id || securityUser?.id || undefined,
+    role: user?.role || securityUser?.role || undefined,
   };
 }
 
+/**
+ * @notice Enforce role-based access control on the review queue.
+ * @dev Must be chained after JWT verification (`requireCompliance`) to guarantee that
+ *      `req.user` has been securely established.
+ * @param req Express request object
+ * @param res Express response object
+ * @param next Express next middleware callback
+ */
 function requireReviewQueueRole(req: Request, res: Response, next: NextFunction): void {
   const actor = getActor(req);
   const allowedRoles = ['admin', 'compliance', 'compliance_officer'];
@@ -100,11 +118,34 @@ function requireReviewQueueRole(req: Request, res: Response, next: NextFunction)
   next();
 }
 
+/**
+ * @notice Guard against CSRF attacks on OFAC queue mutation endpoints.
+ * @dev Requires both the `x-csrf-token` header and the `csrfToken` cookie to be present
+ *      and identical, compared using `crypto.timingSafeEqual` to avoid timing side-channels.
+ * @param req Express request object
+ * @param res Express response object
+ * @param next Express next middleware callback
+ */
 function requireCsrfToken(req: Request, res: Response, next: NextFunction): void {
   const csrfHeader = req.header('x-csrf-token');
-  const csrfCookie = req.header('cookie')?.match(/(?:^|;\s*)csrfToken=([^;]+)/)?.[1];
+  const rawCookie = req.header('cookie')?.match(/(?:^|;\s*)csrfToken=([^;]+)/)?.[1];
 
-  if (!csrfHeader || (csrfCookie && csrfHeader !== decodeURIComponent(csrfCookie))) {
+  if (!csrfHeader || !rawCookie) {
+    res.status(403).json({ success: false, error: 'Valid CSRF token required' });
+    return;
+  }
+
+  let decodedCookie: string;
+  try {
+    decodedCookie = decodeURIComponent(rawCookie);
+  } catch {
+    decodedCookie = rawCookie;
+  }
+
+  const headerBuf = Buffer.from(csrfHeader);
+  const cookieBuf = Buffer.from(decodedCookie);
+
+  if (headerBuf.length !== cookieBuf.length || !crypto.timingSafeEqual(headerBuf, cookieBuf)) {
     res.status(403).json({ success: false, error: 'Valid CSRF token required' });
     return;
   }
@@ -118,9 +159,10 @@ function requireCsrfToken(req: Request, res: Response, next: NextFunction): void
 export function createAMLRoutes(
   amlService: AMLService,
   assignmentService?: CaseAssignmentService,
+  options?: AMLRouteOptions,
 ): Router {
   const router = Router();
-  const reviewQueueGuards = [requireReviewQueueRole];
+  const reviewQueueGuards = options?.reviewQueueGuards ?? [requireCompliance, requireReviewQueueRole];
   const reviewQueueMutationGuards = [...reviewQueueGuards, requireCsrfToken];
 
   /**
@@ -528,6 +570,19 @@ export function createAMLRoutes(
         res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
       }
     }
+  });
+
+  router.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    const error = err as any;
+    if (error?.statusCode === 401 || error?.status === 401) {
+      res.status(401).json({ success: false, error: 'Authentication required' });
+      return;
+    }
+    if (error?.statusCode === 403 || error?.status === 403) {
+      res.status(403).json({ success: false, error: 'Compliance role required' });
+      return;
+    }
+    next(err);
   });
 
   return router;
