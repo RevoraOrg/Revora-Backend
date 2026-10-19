@@ -488,6 +488,18 @@ export function createRequireAuth(
       return;
     }
 
+    // Revoked (logout, token reuse, SCIM deprovisioning) means rejected now,
+    // not when the access token expires.
+    if (session.revoked_at) {
+      globalLogger.warn("Auth failed: Session revoked", {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Unauthorized: session revoked"));
+      return;
+    }
+
     if (isSessionExpired(session.expires_at)) {
       globalLogger.warn("Auth failed: Session expired", {
         sessionId: payload.sid,

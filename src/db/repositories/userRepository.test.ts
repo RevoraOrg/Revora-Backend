@@ -343,4 +343,81 @@ describe('UserRepository', () => {
       await expect(repository.updatePasswordHash('ghost', 'h')).resolves.toBeUndefined();
     });
   });
+
+  // ── setActive (#1300) ────────────────────────────────────────────────────
+
+  describe('setActive', () => {
+    let client: { query: jest.Mock; release: jest.Mock };
+    let txRepository: UserRepository;
+
+    /** SQL text of every statement sent on the transaction client, in order. */
+    const statements = () => client.query.mock.calls.map(([sql]) => String(sql).replace(/\s+/g, ' ').trim());
+
+    beforeEach(() => {
+      client = { query: jest.fn(), release: jest.fn() };
+      const pool = { query: jest.fn(), connect: jest.fn().mockResolvedValue(client) };
+      txRepository = new UserRepository(pool as unknown as Pool);
+    });
+
+    it('deactivates the user and revokes live sessions in the same transaction', async () => {
+      const inactiveRow = { ...BASE_USER, is_active: false, deactivated_at: new Date('2026-10-19T00:00:00Z') };
+      client.query.mockImplementation(async (sql: string) =>
+        String(sql).includes('UPDATE users') ? makeQueryResult([inactiveRow]) : makeQueryResult([]),
+      );
+
+      const result = await txRepository.setActive('user-123', false);
+
+      expect(result).not.toBeNull();
+      expect(result!.is_active).toBe(false);
+      expect(result!.deactivated_at).toEqual(new Date('2026-10-19T00:00:00Z'));
+
+      const sql = statements();
+      expect(sql[0]).toBe('BEGIN');
+      expect(sql[1]).toMatch(/^UPDATE users SET is_active = \$2/);
+      expect(sql[2]).toBe('UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL');
+      expect(sql[sql.length - 1]).toBe('COMMIT');
+      expect(client.query.mock.calls[1][1]).toEqual(['user-123', false]);
+      expect(client.query.mock.calls[2][1]).toEqual(['user-123']);
+    });
+
+    it('reactivates without touching sessions (revoked sessions stay revoked)', async () => {
+      client.query.mockImplementation(async (sql: string) =>
+        String(sql).includes('UPDATE users') ? makeQueryResult([{ ...BASE_USER, is_active: true }]) : makeQueryResult([]),
+      );
+
+      const result = await txRepository.setActive('user-123', true);
+
+      expect(result!.is_active).toBe(true);
+      expect(result!.deactivated_at).toBeNull();
+      expect(statements().some((q) => q.startsWith('UPDATE sessions'))).toBe(false);
+    });
+
+    it('returns null and revokes nothing when the user does not exist', async () => {
+      client.query.mockResolvedValue(makeQueryResult([]));
+
+      await expect(txRepository.setActive('ghost', false)).resolves.toBeNull();
+      expect(statements().some((q) => q.startsWith('UPDATE sessions'))).toBe(false);
+    });
+
+    it('rolls back the deactivation when revoking sessions fails', async () => {
+      client.query.mockImplementation(async (sql: string) => {
+        if (String(sql).includes('UPDATE users')) return makeQueryResult([{ ...BASE_USER, is_active: false }]);
+        if (String(sql).includes('UPDATE sessions')) throw new Error('sessions table locked');
+        return makeQueryResult([]);
+      });
+
+      await expect(txRepository.setActive('user-123', false)).rejects.toThrow();
+      expect(statements()).toContain('ROLLBACK');
+      expect(statements()).not.toContain('COMMIT');
+    });
+
+    it('maps rows without the is_active column (pre-migration) as active', async () => {
+      mockPool.query.mockResolvedValueOnce(makeQueryResult([BASE_USER]));
+
+      const user = await repository.findById('user-123');
+
+      expect(user!.is_active).toBe(true);
+      expect(user!.deactivated_at).toBeNull();
+    });
+  });
 });

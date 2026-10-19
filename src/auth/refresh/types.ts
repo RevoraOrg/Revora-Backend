@@ -31,6 +31,11 @@ export interface RefreshTokenRepository {
     findSessionByIdForUpdate(sessionId: string, client: PoolClient): Promise<any>;
     /** Mark a session's refresh token as consumed (rotation has occurred). */
     setSessionConsumed(sessionId: string, client?: PoolClient): Promise<void>;
+    /**
+     * False for a deactivated or missing user (#1300). Must lock the user row
+     * FOR SHARE so a concurrent deactivation waits for this refresh.
+     */
+    isUserActive(userId: string, client: PoolClient): Promise<boolean>;
 }
 
 export interface TokenService {

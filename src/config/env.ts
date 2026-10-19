@@ -101,6 +101,8 @@ const envSchema = z.object({
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
   OUTBOX_DISPATCHER_ENABLED: z.coerce.boolean().default(false),
+  // /scim/v2 is only mounted when set
+  SCIM_TOKEN: z.string().min(16).optional(),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
