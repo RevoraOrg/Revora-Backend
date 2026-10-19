@@ -98,6 +98,37 @@ describe('DistributionRepository', () => {
     });
   });
 
+  describe('findRunByOfferingAndPeriod', () => {
+    it('should return a run by offering_id and period_id regardless of amount', async () => {
+      const mockRun = {
+        id: 'run-123',
+        offering_id: 'offering-123',
+        period_id: 'period-456',
+        total_amount: '1000.00',
+        status: 'completed',
+        run_at: new Date(),
+      };
+
+      mockPool.query.mockResolvedValueOnce({ rows: [mockRun] });
+
+      const result = await repository.findRunByOfferingAndPeriod('offering-123', 'period-456');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions\s+WHERE\s+offering_id\s+=\s+\$1\s+AND\s+period_id\s+=\s+\$2/i),
+        ['offering-123', 'period-456']
+      );
+      expect(result?.id).toBe('run-123');
+    });
+
+    it('should return null when no run matches offering_id and period_id', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+
+      const result = await repository.findRunByOfferingAndPeriod('offering-none', 'period-none');
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('findRunByParams', () => {
     it('should return a run if parameters match', async () => {
       const mockRun = {
@@ -116,6 +147,27 @@ describe('DistributionRepository', () => {
       expect(mockPool.query).toHaveBeenCalledWith(
         expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions/i),
         ['offering-123', 'period-456', '1000.00']
+      );
+      expect(result?.id).toBe('run-123');
+    });
+
+    it('should delegate to findRunByOfferingAndPeriod when totalAmount is omitted', async () => {
+      const mockRun = {
+        id: 'run-123',
+        offering_id: 'offering-123',
+        period_id: 'period-456',
+        total_amount: '1000.00',
+        status: 'completed',
+        run_at: new Date(),
+      };
+
+      mockPool.query.mockResolvedValueOnce({ rows: [mockRun] });
+
+      const result = await repository.findRunByParams('offering-123', 'period-456');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions\s+WHERE\s+offering_id\s+=\s+\$1\s+AND\s+period_id\s+=\s+\$2/i),
+        ['offering-123', 'period-456']
       );
       expect(result?.id).toBe('run-123');
     });

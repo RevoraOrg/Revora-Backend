@@ -168,13 +168,54 @@ export class DistributionRepository {
   }
 
   /**
-   * Find a distribution run by unique parameters for idempotency
+   * Find a distribution run by offering and period (ignoring amount).
+   * Used for idempotency check and conflict detection.
+   *
+   * @param offeringId Offering ID
+   * @param periodId Period ID
+   * @param client Optional queryable (Pool or PoolClient)
+   * @returns Latest matching distribution run or null
+   */
+  async findRunByOfferingAndPeriod(
+    offeringId: string,
+    periodId: string,
+    client?: Queryable
+  ): Promise<DistributionRun | null> {
+    const query = `
+      SELECT *
+      FROM distributions
+      WHERE offering_id = $1 AND period_id = $2
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+    const queryable = client || this.db;
+    const result: QueryResult<DistributionRun> = await queryable.query(query, [
+      offeringId,
+      periodId,
+    ]);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.mapDistributionRun(result.rows[0]);
+  }
+
+  /**
+   * Find a distribution run by unique parameters for idempotency.
+   * If totalAmount is omitted, looks up by offering_id and period_id.
    */
   async findRunByParams(
     offeringId: string,
     periodId: string,
-    totalAmount: string
+    totalAmount?: string,
+    client?: Queryable
   ): Promise<DistributionRun | null> {
+    if (totalAmount === undefined) {
+      return this.findRunByOfferingAndPeriod(offeringId, periodId, client);
+    }
+
     const query = `
       SELECT *
       FROM distributions
@@ -182,7 +223,8 @@ export class DistributionRepository {
       LIMIT 1
     `;
 
-    const result: QueryResult<DistributionRun> = await this.db.query(query, [
+    const queryable = client || this.db;
+    const result: QueryResult<DistributionRun> = await queryable.query(query, [
       offeringId,
       periodId,
       totalAmount,
