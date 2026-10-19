@@ -179,9 +179,9 @@ export function isPrivateIPv6(ip: string): boolean {
     return embeddedIpv4(parts[6] ^ 0xffff, parts[7] ^ 0xffff);
   }
 
-  // ISATAP embeds IPv4 in groups 4-5 of the interface identifier.
-  if ((parts[6] === 0 || parts[6] === 0x0200) && parts[7] === 0x5efe) {
-    return embeddedIpv4(parts[4], parts[5]);
+  // ISATAP embeds IPv4 in groups 6-7 of the interface identifier.
+  if ((parts[4] === 0 || parts[4] === 0x0200) && parts[5] === 0x5efe) {
+    return embeddedIpv4(parts[6], parts[7]);
   }
 
   const [first] = parts;

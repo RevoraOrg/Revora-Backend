@@ -337,6 +337,7 @@ describe('SSRF Protection - Helper Functions', () => {
       expect(isPrivateIP('::ffff:7f00:1')).toBe(true);
       expect(isPrivateIP('64:ff9b::7f00:1')).toBe(true);
       expect(isPrivateIP('2002:7f00:1::')).toBe(true);
+      expect(isPrivateIP('2001:db8::5efe:7f00:1')).toBe(true);
     });
 
     it('should detect public addresses', () => {
