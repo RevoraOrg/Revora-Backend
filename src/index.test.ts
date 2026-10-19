@@ -1,4 +1,5 @@
-import { parseMoneyString } from "./index";
+import request from "supertest";
+import { parseMoneyString, createApp } from "./index";
 
 describe("src/index.ts", () => {
   describe("parseMoneyString", () => {
@@ -48,5 +49,26 @@ describe("src/index.ts", () => {
       expect(parseMoneyString("12345.67")).toBe(12345.67);
       expect(parseMoneyString("999999999999.99")).toBe(999999999999.99); // max valid boundary
     });
+  });
+});
+describe("error handling (supertest)", () => {
+  it("returns 400 INVALID_JSON for malformed JSON", async () => {
+    const app = createApp();
+    const res = await request(app)
+      .post("/api/v1/startup/register")
+      .set("content-type", "application/json")
+      .send("{bad");
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("INVALID_JSON");
+  });
+
+  it("returns 413 PAYLOAD_TOO_LARGE for a 33kb body", async () => {
+    const app = createApp();
+    const res = await request(app)
+      .post("/api/v1/startup/register")
+      .set("content-type", "application/json")
+      .send(JSON.stringify({ data: "x".repeat(33 * 1024) }));
+    expect(res.status).toBe(413);
+    expect(res.body.code).toBe("PAYLOAD_TOO_LARGE");
   });
 });
