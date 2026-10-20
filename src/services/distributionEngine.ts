@@ -339,11 +339,22 @@ class DistributionEngine {
       }
     }
 
-    if (batchResult.failedPayouts.length > 0) {
+    if (
+      batchResult.failedPayouts.length > 0 ||
+      batchResult.distributionRun?.status === "failed"
+    ) {
       const firstFailure = batchResult.failedPayouts[0];
-      throw new Error(
-        `Distribution failed: ${firstFailure.errorClass ?? "UNKNOWN"}`,
-      );
+      const failureClass = firstFailure?.errorClass ?? "UNKNOWN";
+      const failedCount = batchResult.failedPayouts.length;
+      const message = `Distribution failed: ${failureClass} (${failedCount} investor(s) not paid)`;
+      if (
+        failureClass === StellarRPCFailureClass.RETRYABLE ||
+        failureClass === StellarRPCFailureClass.TIMEOUT ||
+        failureClass === StellarRPCFailureClass.RATE_LIMITED
+      ) {
+        throw Errors.serviceUnavailable(message);
+      }
+      throw Errors.internal(message);
     }
 
     return { ...batchResult, payouts: batchResult.successfulPayouts };
@@ -687,7 +698,25 @@ class DistributionEngine {
           rawError: err instanceof Error ? err.message : String(err),
         });
 
+        // Always record the rolled-back batch's investors as failures so
+        // callers can observe a partial run, regardless of transactional mode.
         if (!this.pool) {
+          for (const r of batch) {
+            if (!r) continue; // guard against poisoned/null batch items
+            if (
+              !existingInvestorIds.has(r.investor_id) &&
+              !successfulPayouts.some((p) => p.investor_id === r.investor_id)
+            ) {
+              const amtStr = r.amount.toString();
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
+        } else {
           for (const r of batch) {
             if (!r) continue; // guard against poisoned/null batch items
             if (

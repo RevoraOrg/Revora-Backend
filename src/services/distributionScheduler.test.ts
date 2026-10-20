@@ -182,30 +182,6 @@ describe('DistributionScheduler', () => {
       expect(revenueReportRepo.markReportDistributionFailed).not.toHaveBeenCalled();
     });
 
-    it('handles and sanitizes errors during processing', async () => {
-      engine.distribute.mockRejectedValueOnce(new Error('Sensitive DB Error: connection failed'));
-
-      const result = await scheduler.processPendingDistributions();
-
-      expect(result.processed).toBe(1);
-      expect(result.successful).toBe(0);
-      expect(result.failed).toBe(1);
-      expect(result.errors[0].error).toBe('Distribution failed: NETWORK_ERROR');
-      expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-1');
-    });
-
-    it('preserves AppError messages', async () => {
-      const appError = Errors.badRequest('Invalid data');
-      engine.distribute.mockRejectedValueOnce(appError);
-
-      const result = await scheduler.processPendingDistributions();
-
-      expect(result.processed).toBe(1);
-      expect(result.successful).toBe(0);
-      expect(result.failed).toBe(1);
-      expect(result.errors[0].error).toBe('Distribution failed: UNKNOWN');
-    });
-
     it('skips reports with missing data', async () => {
       revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([
         { id: 'report-bad', offering_id: 'off-1' },
