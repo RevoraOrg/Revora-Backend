@@ -100,7 +100,7 @@ describe('DistributionScheduler', () => {
         start: expect.any(Date),
         end: expect.any(Date),
       },
-      1000
+      '1000.00'
     );
     expect(revenueReportRepo.claimApprovedReportForDistribution).toHaveBeenCalledWith('report-1');
     expect(revenueReportRepo.markReportDistributionCompleted).toHaveBeenCalledWith('report-1');
@@ -222,6 +222,147 @@ describe('DistributionScheduler', () => {
       expect(result.failed).toBe(1);
       expect(result.errors[0].error).toBe('Distribution failed: UNKNOWN');
       expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-bad');
+    });
+
+    it('passes a large claim amount through to the engine without Number() coercion', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([
+        {
+          id: 'report-big',
+          offering_id: 'off-big',
+          offering_timezone: 'UTC',
+          period_start: new Date('2026-02-01'),
+          period_end: new Date('2026-02-28'),
+          amount: '9876543210987654.32',
+        },
+      ]);
+      revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce({
+        id: 'report-big',
+        offering_id: 'off-big',
+        offering_timezone: 'UTC',
+        period_start: new Date('2026-02-01'),
+        period_end: new Date('2026-02-28'),
+        amount: '9876543210987654.32',
+      });
+
+      const result = await scheduler.processPendingDistributions();
+
+      expect(result.successful).toBe(1);
+      expect(engine.distribute).toHaveBeenCalledWith(
+        'off-big',
+        expect.anything(),
+        '9876543210987654.32',
+      );
+    });
+
+    it('fails a claim with a malformed amount instead of coercing it', async () => {
+      revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([
+        {
+          id: 'report-bad',
+          offering_id: 'off-bad',
+          offering_timezone: 'UTC',
+          period_start: new Date('2026-02-01'),
+          period_end: new Date('2026-02-28'),
+          amount: '1e3',
+        },
+      ]);
+      revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce({
+        id: 'report-bad',
+        offering_id: 'off-bad',
+        offering_timezone: 'UTC',
+        period_start: new Date('2026-02-01'),
+        period_end: new Date('2026-02-28'),
+        amount: '1e3',
+      });
+      // The engine rejects malformed amounts instead of coercing them.
+      engine.distribute.mockRejectedValueOnce(
+        Errors.validationError('Invalid revenueAmount: must be a plain decimal string (no sign, exponent, hex or whitespace)', {
+          field: 'revenueAmount',
+        }),
+      );
+
+      const result = await scheduler.processPendingDistributions();
+
+      expect(result.failed).toBe(1);
+      expect(engine.distribute).toHaveBeenCalledWith(
+        'off-bad',
+        expect.anything(),
+        '1e3',
+      );
+      expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith(
+        'report-bad',
+      );
+    });
+  });
+
+  describe('processScheduledDistributions', () => {
+    function makeSchedulerWithRepo(scheduledDistributionRepo: any) {
+      return new DistributionScheduler(engine, revenueReportRepo, {
+        scheduledDistributionRepo,
+      } as any);
+    }
+
+    it('passes a scheduled total_amount string straight through to the engine', async () => {
+      const repo = {
+        findDueScheduledDistributions: jest.fn().mockResolvedValue([
+          {
+            id: 'sched-1',
+            offering_id: 'off-1',
+            period_id: 'period-1',
+            run_at: new Date('2026-08-01T00:00:00Z'),
+          },
+        ]),
+        claimScheduledDistribution: jest.fn().mockResolvedValue({
+          id: 'sched-1',
+          offering_id: 'off-1',
+          period_id: 'period-1',
+          total_amount: '9876543210987654.32',
+          period_start: new Date('2026-06-01'),
+          period_end: new Date('2026-07-01'),
+          run_at: new Date('2026-08-01T00:00:00Z'),
+        }),
+        markCompleted: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const sched = makeSchedulerWithRepo(repo);
+      const result = await sched.processScheduledDistributions();
+
+      expect(result.successful).toBe(1);
+      expect(engine.distribute).toHaveBeenCalledWith(
+        'off-1',
+        expect.anything(),
+        '9876543210987654.32',
+      );
+      expect(repo.markCompleted).toHaveBeenCalledWith('sched-1');
+    });
+
+    it('validates a scheduled total_amount before invoking the engine', async () => {
+      const repo = {
+        findDueScheduledDistributions: jest.fn().mockResolvedValue([
+          {
+            id: 'sched-bad',
+            offering_id: 'off-1',
+            period_id: 'period-1',
+            run_at: new Date('2026-08-01T00:00:00Z'),
+          },
+        ]),
+        claimScheduledDistribution: jest.fn().mockResolvedValue({
+          id: 'sched-bad',
+          offering_id: 'off-1',
+          period_id: 'period-1',
+          total_amount: '1e3',
+          period_start: new Date('2026-06-01'),
+          period_end: new Date('2026-07-01'),
+          run_at: new Date('2026-08-01T00:00:00Z'),
+        }),
+        markFailed: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const sched = makeSchedulerWithRepo(repo);
+      const result = await sched.processScheduledDistributions();
+
+      expect(engine.distribute).not.toHaveBeenCalled();
+      expect(repo.markFailed).toHaveBeenCalledWith('sched-bad', expect.any(String));
+      expect(result.successful).toBe(0);
     });
   });
 
@@ -574,7 +715,7 @@ describe('DistributionScheduler', () => {
         expect.objectContaining({
           end: new Date('2026-01-31'),
         }),
-        1000
+        '1000.00'
       );
     });
 
@@ -590,7 +731,7 @@ describe('DistributionScheduler', () => {
         expect.objectContaining({
           end: new Date('2026-01-31'),
         }),
-        1000
+        '1000.00'
       );
     });
 
@@ -620,7 +761,7 @@ describe('DistributionScheduler', () => {
         expect.objectContaining({
           end: new Date('2026-01-31'),
         }),
-        1000
+        '1000.00'
       );
     });
 
@@ -638,7 +779,7 @@ describe('DistributionScheduler', () => {
         expect.objectContaining({
           end: new Date('2026-01-30'),
         }),
-        1000
+        '1000.00'
       );
     });
 
@@ -736,7 +877,7 @@ describe('DistributionScheduler', () => {
         expect.objectContaining({
           end: new Date('2026-01-30'),
         }),
-        1000
+        '1000.00'
       );
     });
 
@@ -797,9 +938,9 @@ describe('DistributionScheduler', () => {
       const result = await overlapScheduler.processPendingDistributions();
       expect(result.successful).toBe(3);
 
-      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(1, 'off-US', expect.objectContaining({ end: new Date('2026-01-30') }), 1000);
-      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(2, 'off-GB', expect.objectContaining({ end: new Date('2026-01-30') }), 1000);
-      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(3, 'off-DE', expect.objectContaining({ end: new Date('2026-01-29') }), 1000);
+      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(1, 'off-US', expect.objectContaining({ end: new Date('2026-01-30') }), '1000.00');
+      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(2, 'off-GB', expect.objectContaining({ end: new Date('2026-01-30') }), '1000.00');
+      expect(overlapEngine.distribute).toHaveBeenNthCalledWith(3, 'off-DE', expect.objectContaining({ end: new Date('2026-01-29') }), '1000.00');
     });
   });
 });
@@ -1294,7 +1435,7 @@ describe('processScheduledDistributions', () => {
         start: new Date('2026-06-01T00:00:00Z'),
         end: new Date('2026-07-01T00:00:00Z'),
       },
-      1000,
+      '1000.00',
     );
     expect(scheduledDistributionRepo.markCompleted).toHaveBeenCalledWith('sched-1');
     expect(scheduledDistributionRepo.markFailed).not.toHaveBeenCalled();
@@ -1317,7 +1458,7 @@ describe('processScheduledDistributions', () => {
         start: new Date('2026-08-01T00:00:00Z'),
         end: new Date('2026-08-01T00:00:00Z'),
       },
-      1000,
+      '1000.00',
     );
   });
 
@@ -1403,5 +1544,425 @@ describe('processScheduledDistributions', () => {
       5000,
       50,
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Decimal-string passthrough for processPendingDistributions (issue #1281)
+//
+// The scheduler pulls `claim.amount` from a NUMERIC(30,10) DB column — it
+// arrives as a decimal string and must reach the engine verbatim without
+// ever passing through Number().
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionScheduler – decimal-string amounts in processPendingDistributions (issue #1281)', () => {
+  let engine: any;
+  let revenueReportRepo: any;
+  let scheduler: DistributionScheduler;
+
+  beforeEach(() => {
+    engine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        successfulPayouts: [],
+        failedPayouts: [],
+      }),
+    };
+
+    revenueReportRepo = {
+      findApprovedWithoutDistribution: jest.fn(),
+      claimApprovedReportForDistribution: jest.fn(),
+      markReportDistributionCompleted: jest.fn().mockResolvedValue(undefined),
+      markReportDistributionFailed: jest.fn().mockResolvedValue(undefined),
+    };
+
+    scheduler = new DistributionScheduler(engine, revenueReportRepo);
+  });
+
+  function mockReport(amount: string, id = 'report-1') {
+    const row = {
+      id,
+      offering_id: 'off-1',
+      offering_timezone: 'UTC',
+      period_start: new Date('2026-01-01'),
+      period_end: new Date('2026-01-31'),
+      amount,
+    };
+    revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([row]);
+    revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce(row);
+  }
+
+  it('passes a large-value claim.amount straight through to the engine without Number() coercion', async () => {
+    // This amount has 17 significant digits — Number() would corrupt it to
+    // "12345678901234568.00" (off by 0.11). The scheduler must pass the raw
+    // string from the DB column directly to distribute().
+    const largeAmount = '12345678901234567.89';
+
+    // Prove the old Number() path was broken:
+    expect(Number(largeAmount).toFixed(2)).not.toBe(largeAmount);
+
+    mockReport(largeAmount);
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.successful).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      largeAmount, // exact string — never Number()-coerced
+    );
+  });
+
+  it('passes a standard two-decimal amount straight through unchanged', async () => {
+    mockReport('1000.00');
+    await scheduler.processPendingDistributions();
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '1000.00');
+  });
+
+  it('passes a high-precision (10 dp) amount straight through unchanged', async () => {
+    mockReport('9999999999.1234567890');
+    await scheduler.processPendingDistributions();
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      '9999999999.1234567890',
+    );
+  });
+
+  it('REGRESSION: claim.amount "1e3" reaches the engine which rejects it with a validation error', async () => {
+    // On old master Number("1e3") silently coerced to 1000. The engine now
+    // rejects the malformed string — the scheduler should record a failure.
+    mockReport('1e3', 'report-bad');
+    engine.distribute.mockRejectedValueOnce(
+      new Error('Invalid revenueAmount: must be a plain decimal string'),
+    );
+
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.failed).toBe(1);
+    // The scheduler must still call distribute() with the raw string — never coerce it
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '1e3');
+    expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-bad');
+  });
+
+  it('REGRESSION: claim.amount "0x10" reaches the engine which rejects it', async () => {
+    mockReport('0x10', 'report-hex');
+    engine.distribute.mockRejectedValueOnce(
+      new Error('Invalid revenueAmount: must be a plain decimal string'),
+    );
+
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.failed).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '0x10');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Decimal-string passthrough for processScheduledDistributions (issue #1281)
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionScheduler – decimal-string amounts in processScheduledDistributions (issue #1281)', () => {
+  let engine: any;
+  let revenueReportRepo: any;
+
+  beforeEach(() => {
+    engine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        successfulPayouts: [],
+        failedPayouts: [],
+      }),
+    };
+    revenueReportRepo = {
+      findApprovedWithoutDistribution: jest.fn().mockResolvedValue([]),
+      claimApprovedReportForDistribution: jest.fn(),
+      markReportDistributionCompleted: jest.fn(),
+      markReportDistributionFailed: jest.fn(),
+    };
+  });
+
+  function makeRepo(totalAmount: string) {
+    const row = {
+      id: 'sched-1',
+      offering_id: 'off-1',
+      period_id: 'period-1',
+      total_amount: totalAmount,
+      period_start: new Date('2026-06-01T00:00:00Z'),
+      period_end: new Date('2026-07-01T00:00:00Z'),
+      run_at: new Date('2026-08-01T00:00:00Z'),
+      status: 'processing',
+      attempts: 1,
+    };
+    return {
+      findDueScheduledDistributions: jest.fn().mockResolvedValue([row]),
+      claimScheduledDistribution: jest.fn().mockResolvedValue(row),
+      markCompleted: jest.fn().mockResolvedValue(undefined),
+      markFailed: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  it('passes a large-value total_amount straight through to the engine without Number() coercion', async () => {
+    const largeAmount = '12345678901234567.89';
+    expect(Number(largeAmount).toFixed(2)).not.toBe(largeAmount); // prove old bug existed
+
+    const repo = makeRepo(largeAmount);
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(result.successful).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      largeAmount,
+    );
+  });
+
+  it('rejects total_amount "1e3" before invoking the engine — marks the row failed', async () => {
+    const repo = makeRepo('1e3');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+    expect(result.failed).toBe(1);
+  });
+
+  it('rejects total_amount "0x10" before invoking the engine', async () => {
+    const repo = makeRepo('0x10');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+  });
+
+  it('rejects total_amount "-5" before invoking the engine', async () => {
+    const repo = makeRepo('-5');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Decimal-string passthrough for processPendingDistributions (issue #1281)
+//
+// The scheduler pulls `claim.amount` from a NUMERIC(30,10) DB column — it
+// arrives as a decimal string and must reach the engine verbatim without
+// ever passing through Number().
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionScheduler – decimal-string amounts in processPendingDistributions (issue #1281)', () => {
+  let engine: any;
+  let revenueReportRepo: any;
+  let scheduler: DistributionScheduler;
+
+  beforeEach(() => {
+    engine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        successfulPayouts: [],
+        failedPayouts: [],
+      }),
+    };
+
+    revenueReportRepo = {
+      findApprovedWithoutDistribution: jest.fn(),
+      claimApprovedReportForDistribution: jest.fn(),
+      markReportDistributionCompleted: jest.fn().mockResolvedValue(undefined),
+      markReportDistributionFailed: jest.fn().mockResolvedValue(undefined),
+    };
+
+    scheduler = new DistributionScheduler(engine, revenueReportRepo);
+  });
+
+  function mockReport(amount: string, id = 'report-1') {
+    const row = {
+      id,
+      offering_id: 'off-1',
+      offering_timezone: 'UTC',
+      period_start: new Date('2026-01-01'),
+      period_end: new Date('2026-01-31'),
+      amount,
+    };
+    revenueReportRepo.findApprovedWithoutDistribution.mockResolvedValueOnce([row]);
+    revenueReportRepo.claimApprovedReportForDistribution.mockResolvedValueOnce(row);
+  }
+
+  it('passes a large-value claim.amount straight through to the engine without Number() coercion', async () => {
+    // 17 significant digits — Number() would silently corrupt this to
+    // "12345678901234568.00" (off by 0.11).  The scheduler must pass the
+    // raw DB string directly to distribute() with no float round-trip.
+    const largeAmount = '12345678901234567.89';
+
+    // Prove the old Number() path was broken:
+    expect(Number(largeAmount).toFixed(2)).not.toBe(largeAmount);
+
+    mockReport(largeAmount);
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.successful).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      largeAmount, // exact string, never coerced
+    );
+  });
+
+  it('passes a standard two-decimal amount straight through unchanged', async () => {
+    mockReport('1000.00');
+    await scheduler.processPendingDistributions();
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '1000.00');
+  });
+
+  it('passes a high-precision (10 dp) amount straight through unchanged', async () => {
+    mockReport('9999999999.1234567890');
+    await scheduler.processPendingDistributions();
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      '9999999999.1234567890',
+    );
+  });
+
+  it('REGRESSION: claim.amount "1e3" reaches the engine which rejects it — scheduler records failure', async () => {
+    // Old master: Number("1e3") silently coerced to 1000 and the bad form
+    // was stored in distributions.total_amount without any error.
+    // Now the engine rejects the malformed string; scheduler must record the failure.
+    mockReport('1e3', 'report-bad');
+    engine.distribute.mockRejectedValueOnce(
+      new Error('Invalid revenueAmount: must be a plain decimal string'),
+    );
+
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.failed).toBe(1);
+    // Scheduler must forward the raw string — not coerce it first
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '1e3');
+    expect(revenueReportRepo.markReportDistributionFailed).toHaveBeenCalledWith('report-bad');
+  });
+
+  it('REGRESSION: claim.amount "0x10" reaches the engine which rejects it', async () => {
+    mockReport('0x10', 'report-hex');
+    engine.distribute.mockRejectedValueOnce(
+      new Error('Invalid revenueAmount: must be a plain decimal string'),
+    );
+
+    const result = await scheduler.processPendingDistributions();
+
+    expect(result.failed).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith('off-1', expect.anything(), '0x10');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Decimal-string passthrough for processScheduledDistributions (issue #1281)
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionScheduler – decimal-string amounts in processScheduledDistributions (issue #1281)', () => {
+  let engine: any;
+  let revenueReportRepo: any;
+
+  beforeEach(() => {
+    engine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        successfulPayouts: [],
+        failedPayouts: [],
+      }),
+    };
+    revenueReportRepo = {
+      findApprovedWithoutDistribution: jest.fn().mockResolvedValue([]),
+      claimApprovedReportForDistribution: jest.fn(),
+      markReportDistributionCompleted: jest.fn(),
+      markReportDistributionFailed: jest.fn(),
+    };
+  });
+
+  function makeRepo(totalAmount: string) {
+    const claimed = {
+      id: 'sched-1',
+      offering_id: 'off-1',
+      period_id: 'period-1',
+      total_amount: totalAmount,
+      period_start: new Date('2026-06-01T00:00:00Z'),
+      period_end: new Date('2026-07-01T00:00:00Z'),
+      run_at: new Date('2026-08-01T00:00:00Z'),
+      status: 'processing',
+      attempts: 1,
+    };
+    return {
+      findDueScheduledDistributions: jest.fn().mockResolvedValue([claimed]),
+      claimScheduledDistribution: jest.fn().mockResolvedValue(claimed),
+      markCompleted: jest.fn().mockResolvedValue(undefined),
+      markFailed: jest.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  it('passes a large-value total_amount straight through to the engine without Number() coercion', async () => {
+    const largeAmount = '12345678901234567.89';
+    // Demonstrate that the old Number() round-trip was lossy:
+    expect(Number(largeAmount).toFixed(2)).not.toBe(largeAmount);
+
+    const repo = makeRepo(largeAmount);
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(result.successful).toBe(1);
+    expect(engine.distribute).toHaveBeenCalledWith(
+      'off-1',
+      expect.anything(),
+      largeAmount,
+    );
+  });
+
+  it('rejects total_amount "1e3" before invoking the engine and marks the row failed', async () => {
+    const repo = makeRepo('1e3');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+    expect(result.failed).toBe(1);
+  });
+
+  it('rejects total_amount "0x10" before invoking the engine', async () => {
+    const repo = makeRepo('0x10');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+  });
+
+  it('rejects total_amount "-5" before invoking the engine', async () => {
+    const repo = makeRepo('-5');
+    const sched = new DistributionScheduler(engine, revenueReportRepo, {
+      scheduledDistributionRepo: repo as any,
+    });
+
+    const result = await sched.processScheduledDistributions();
+
+    expect(engine.distribute).not.toHaveBeenCalled();
+    expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
   });
 });

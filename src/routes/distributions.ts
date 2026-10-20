@@ -8,6 +8,7 @@
 import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
+import { parsePositiveDecimal } from '../lib/decimal';
 import { globalLogger as logger } from '../lib/logger';
 import { globalMetrics } from '../lib/metrics';
 import { DistributionStateManager } from '../services/distributionScheduler';
@@ -44,6 +45,23 @@ export interface ScheduleConfig {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
+/**
+ * Parse an amount field from the request body as a plain positive decimal
+ * string. Rejects exponent ("1e3"), hex ("0x10"), signed ("-5"), whitespace
+ * (" 12 "), non-string and non-positive forms with HTTP 400 — `Number()`
+ * would have silently coerced all of them and dropped precision above ~15
+ * significant digits.
+ */
+function parseAmountField(raw: unknown, field: string): string {
+  try {
+    return parsePositiveDecimal(raw, field);
+  } catch (err) {
+    throw Errors.badRequest(
+      err instanceof Error && err.message ? err.message : `Invalid ${field}`,
+    );
+  }
+}
+
 export function createDistributionHandlers(
   distributionEngine: any,
   offeringRepo?: OfferingRepo,
@@ -74,10 +92,7 @@ export function createDistributionHandlers(
       });
 
       const revenueRaw = req.body?.revenue_amount ?? req.body?.revenueAmount;
-      const revenueAmount = revenueRaw !== undefined ? Number(revenueRaw) : NaN;
-      if (Number.isNaN(revenueAmount) || revenueAmount <= 0) {
-        throw Errors.badRequest('Invalid revenue amount');
-      }
+      const revenueAmount = parseAmountField(revenueRaw, 'revenue_amount');
 
       const startRaw = req.body?.period?.start ?? req.body?.start;
       const endRaw = req.body?.period?.end ?? req.body?.end;
@@ -171,10 +186,7 @@ export function createDistributionHandlers(
       });
 
       const revenueRaw = req.body?.revenue_amount ?? req.body?.revenueAmount;
-      const revenueAmount = revenueRaw !== undefined ? Number(revenueRaw) : NaN;
-      if (Number.isNaN(revenueAmount) || revenueAmount <= 0) {
-        throw Errors.badRequest('Invalid revenue amount');
-      }
+      const revenueAmount = parseAmountField(revenueRaw, 'revenue_amount');
 
       const startRaw = req.body?.period?.start ?? req.body?.start;
       const endRaw = req.body?.period?.end ?? req.body?.end;
@@ -555,10 +567,7 @@ export function createDistributionHandlers(
       }
 
       const totalRaw = req.body?.total_amount;
-      const totalAmount = totalRaw !== undefined ? Number(totalRaw) : NaN;
-      if (Number.isNaN(totalAmount) || totalAmount <= 0) {
-        throw Errors.badRequest('total_amount must be a positive number');
-      }
+      const totalAmount = parseAmountField(totalRaw, 'total_amount');
 
       let periodStart: Date | undefined;
       let periodEnd: Date | undefined;

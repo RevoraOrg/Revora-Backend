@@ -1,5 +1,5 @@
 import * as fc from 'fast-check';
-import { Decimal } from './decimal';
+import { Decimal, parsePositiveDecimal } from './decimal';
 import { AppError, ErrorCode } from './errors';
 
 // Soroban i128 envelope: signed 128-bit integer bounds.
@@ -614,5 +614,54 @@ describe('Decimal Utility', () => {
       const nearOne = new Decimal('1.000000000000000001');
       expect(nearOne.multiply(nearOne).toString()).toBe('1.000000000000000002');
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// parsePositiveDecimal() — strict decimal-string validation (issue #1281)
+// ─────────────────────────────────────────────────────────────────────────
+describe('parsePositiveDecimal()', () => {
+  it('accepts plain positive decimal strings unchanged', () => {
+    expect(parsePositiveDecimal('100')).toBe('100');
+    expect(parsePositiveDecimal('100.00')).toBe('100.00');
+    expect(parsePositiveDecimal('0.01')).toBe('0.01');
+    expect(parsePositiveDecimal('12345678901234567.89')).toBe('12345678901234567.89');
+    expect(parsePositiveDecimal('10.567')).toBe('10.567'); // never rounded
+  });
+
+  it('uses the field name in validation errors', () => {
+    expect(() => parsePositiveDecimal('0', 'revenueAmount')).toThrow('revenueAmount must be > 0');
+    expect(() => parsePositiveDecimal('1e3', 'revenue_amount')).toThrow('revenue_amount');
+  });
+
+  it.each([0, 1000, null, undefined, true, {}, [], Symbol('x')])(
+    'rejects non-string input %p',
+    (bad) => {
+      expect(() => parsePositiveDecimal(bad as unknown, 'amount')).toThrow(/expected a decimal string/);
+    },
+  );
+
+  it.each(['', '   ', 'abc', '1e3', '1E10', '0x10', '-5', '+5', ' 12 ', '12 ', '1,000', '1.', '.5', '.', '0', '-0', '00', '00.00'])(
+    'rejects malformed or non-positive amount %p',
+    (bad) => {
+      expect(() => parsePositiveDecimal(bad, 'amount')).toThrow();
+    },
+  );
+
+  it('enforces integer and fractional digit limits (NUMERIC(30,10))', () => {
+    expect(() => parsePositiveDecimal('1'.repeat(21), 'amount')).toThrow();
+    expect(() => parsePositiveDecimal('0.' + '1'.repeat(11), 'amount')).toThrow();
+    expect(parsePositiveDecimal('1'.repeat(20))).toBe('1'.repeat(20));
+    expect(parsePositiveDecimal('0.' + '1'.repeat(10))).toBe('0.' + '1'.repeat(10));
+  });
+
+  it('throws an HTTP 400 AppError with code VALIDATION_ERROR', () => {
+    try {
+      parsePositiveDecimal('1e3', 'amount');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { statusCode: number; code: string }).statusCode).toBe(400);
+      expect((err as { statusCode: number; code: string }).code).toBe('VALIDATION_ERROR');
+    }
   });
 });

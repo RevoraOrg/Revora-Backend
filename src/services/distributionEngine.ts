@@ -15,7 +15,7 @@
  */
 import { Logger, globalLogger } from "../lib/logger";
 import { Errors, AppError } from "../lib/errors";
-import { Decimal } from "../lib/decimal";
+import { Decimal, parsePositiveDecimal } from "../lib/decimal";
 import { FxConversionEngine } from "./fxConversionEngine";
 import { Pool, PoolClient } from "pg";
 import {
@@ -135,6 +135,21 @@ export async function tryAcquireDistributionLock(
 }
 
 /**
+ * Canonical storage form for a validated revenue amount string.
+ *
+ * Preserves the historic `toFixed(2)` layout (integer part + at least two
+ * fractional digits) that idempotency lookups and `distributions.total_amount`
+ * were written against, while never rounding away precision: amounts with more
+ * than two fractional digits round-trip exactly as submitted, and values above
+ * `Number.MAX_SAFE_INTEGER` are never funneled through a JS number.
+ */
+function canonicalizeAmount(amountStr: string): string {
+  const [integerPart, fractionalPart = ''] = amountStr.split('.');
+  if (fractionalPart.length >= 2) return amountStr;
+  return `${integerPart}.${fractionalPart.padEnd(2, '0')}`;
+}
+
+/**
  * Core distribution calculation logic: prorate revenue across investors.
  *
  * This is the SHARED pure calculation function used by both real distribution runs
@@ -145,12 +160,13 @@ export async function tryAcquireDistributionLock(
  * It is purely functional — same inputs always yield same outputs.
  *
  * @param balances Array of investor balances
- * @param revenueAmount Total revenue to distribute
+ * @param revenueAmount Total revenue to distribute, as a validated plain
+ *        decimal string (never a JS number — precision must survive intact)
  * @returns Calculation result with per-investor rounded amounts
  */
 function calculateDistributionPayouts(
   balances: BalanceRow[],
-  revenueAmount: number,
+  revenueAmount: string,
 ): DistributionCalculation {
   if (!balances || balances.length === 0) {
     throw Errors.badRequest("No investors or balances found for offering");
@@ -173,7 +189,7 @@ function calculateDistributionPayouts(
     throw Errors.badRequest("Total balance must be > 0 to distribute revenue");
   }
 
-  const revenueRawStr = revenueAmount.toFixed(18);
+  const revenueRawStr = parsePositiveDecimal(revenueAmount, "revenueAmount");
   const revenueRawDecimal = new Decimal(revenueRawStr);
   const revenueScaled = revenueRawDecimal.toSorobanI128(2, "round");
   const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
@@ -281,7 +297,7 @@ class DistributionEngine {
   async distribute(
     offeringId: string,
     period: { id: string; start: Date; end: Date },
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<
     DistributionBatchResult & {
       payouts: Array<{ investor_id: string; amount: string }>;
@@ -354,24 +370,27 @@ class DistributionEngine {
    *
    * @param offeringId  The offering to distribute revenue for
    * @param period      Distribution period (must include an `id` field)
-   * @param revenueAmount The total amount of revenue to be distributed
+   * @param revenueAmount The total amount of revenue to be distributed,
+   *   as a plain positive decimal string (validated with the shared
+   *   parsePositiveDecimal grammar, never a JS number)
    * @returns Batch result with successful and failed payouts
    */
   async distributeWithBatch(
     offeringId: string,
     period: { id?: string; start: Date; end: Date } & Record<string, any>,
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<DistributionBatchResult> {
     const startTime = Date.now();
 
-    // 1. Validation
+    // 1. Validation — revenue must be a plain, positive decimal string so the
+    //    exact value flows into the idempotency key and total_amount without
+    //    ever passing through a lossy JS number.
     if (!offeringId) throw Errors.badRequest("offeringId is required");
-    if (revenueAmount <= 0)
-      throw Errors.badRequest("revenueAmount must be > 0");
+    const amtStr = canonicalizeAmount(
+      parsePositiveDecimal(revenueAmount, "revenueAmount"),
+    );
     if (!period || !period.id || !period.end)
       throw Errors.badRequest("Valid distribution period with ID is required");
-
-    const amtStr = revenueAmount.toFixed(2);
 
     // 2. Idempotency Check: Look for an existing run
     let run = await this.distributionRepo.findRunByParams(
@@ -779,21 +798,24 @@ class DistributionEngine {
    *
    * @param offeringId  The offering to preview distribution for
    * @param period      Distribution period (must include an `id` field)
-   * @param revenueAmount The total amount of revenue to preview distributing
+   * @param revenueAmount The total amount of revenue to preview distributing,
+   *        as a plain positive decimal string (never a JS number)
    * @returns Preview result with per-investor projected amounts and preview metadata
    */
   async previewRun(
     offeringId: string,
     period: { id?: string; start: Date; end: Date } & Record<string, any>,
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<DistributionPreviewResult> {
     const startTime = Date.now();
     const previewId = this.generatePreviewId();
 
-    // 1. Validation
+    // 1. Validation — same strict decimal-string grammar as real runs so a
+    //    preview can never display an amount the real run would reject.
     if (!offeringId) throw Errors.badRequest("offeringId is required");
-    if (revenueAmount <= 0)
-      throw Errors.badRequest("revenueAmount must be > 0");
+    const amtStr = canonicalizeAmount(
+      parsePositiveDecimal(revenueAmount, "revenueAmount"),
+    );
     if (!period || !period.id)
       throw Errors.badRequest("Valid distribution period with ID is required");
 
@@ -853,7 +875,7 @@ class DistributionEngine {
       preview_id: previewId,
       offering_id: offeringId,
       period_id: period.id,
-      revenue_amount: revenueAmount.toFixed(2),
+      revenue_amount: amtStr,
       computed_at: new Date().toISOString(),
       investor_count: balances.length,
       projections,
