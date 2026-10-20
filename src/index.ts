@@ -84,7 +84,7 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
-
+import { StellarTransactionVerifierImpl } from './lib/stellarTransactionVerifier';
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
 
@@ -1237,10 +1237,19 @@ if (require.main === module && env.NODE_ENV !== "test") {
   }
 
   if (roleConfig.reconciliation) {
+    // Build a StellarTransactionVerifier from the configured Horizon URL so that
+    // chain consistency checks can validate distribution transactions on-chain.
+    // When STELLAR_HORIZON_URL is absent the verifier falls back to the testnet
+    // endpoint; chain validation is still skipped with a single warning discrepancy
+    // if the verifier cannot be constructed.
+    const txVerifier = new StellarTransactionVerifierImpl({
+      horizonUrl: env.STELLAR_HORIZON_URL,
+    });
     const reconciliationScheduler = createReconciliationSchedulerRuntime({
       db: pool,
       metrics: globalMetrics,
       logger: undefined,
+      txVerifier,
     });
     reconciliationScheduler.start();
     backgroundStopFns.push(() => reconciliationScheduler.stop());

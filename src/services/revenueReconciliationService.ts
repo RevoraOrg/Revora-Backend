@@ -729,6 +729,26 @@ export class RevenueReconciliationService {
       }
     );
 
+    // When no verifier is configured, chain validation is disabled.  Emit a
+    // single warning-severity discrepancy so operators are aware, but do NOT
+    // raise per-run STELLAR_TX_FAILED criticals that would fire permanent alarms.
+    if (!this.txVerifier) {
+      this.logger.warn(
+        'Chain validation disabled: no StellarTransactionVerifier configured',
+        { offeringId }
+      );
+      discrepancies.push({
+        type: 'CHAIN_EVENT_VALIDATION_FAILED',
+        severity: 'warning',
+        message: 'Chain validation disabled: StellarTransactionVerifier not configured',
+        details: { reason: 'verifier_not_configured', runsCount: runs.length },
+        offeringId,
+        periodStart,
+        periodEnd,
+      });
+      return discrepancies;
+    }
+
     for (const run of runs) {
       if (!run.stellar_transaction_hash) {
         discrepancies.push({
