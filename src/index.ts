@@ -67,7 +67,8 @@ import { createReconciliationMetricsHandler } from "./routes/reconciliationRoute
 import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
-import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
+import { LedgerExportService } from "./services/ledgerExportService";
+import { PgLedgerEntryRepository } from "./db/repositories/ledgerEntryRepository";
 import { createAMLService } from "./aml/amlService";
 import { InMemorySecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
@@ -83,7 +84,7 @@ import taxationRouter from './routes/taxation';
 import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository';
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
-import { createRequireAuth } from './middleware/auth';
+import { createRequireAuth, requireCompliance } from './middleware/auth';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -792,11 +793,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const sanctionsListDiffService = new SanctionsListDiffService(sanctionsVersionsRepo);
   apiRouter.use("/compliance", createComplianceRouter(sanctionsVersionsRepo, sanctionsListDiffService));
 
-  // Initialize ledger export with in-memory repository
-  // TODO: Replace with PgLedgerEntryRepository when ledger_entries table exists
-  const ledgerRepo = new InMemoryLedgerRepository();
+  // Ledger export: backed by Postgres, access restricted to compliance/admin roles.
+  // Migration 061_create_ledger_entries.sql must be applied before this runs.
+  const ledgerRepo = new PgLedgerEntryRepository(pool);
   const ledgerExportService = new LedgerExportService(ledgerRepo);
-  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
+  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService, requireCompliance));
 
   // Investor statements (Issue #874): the fetch endpoint re-verifies the
   // persisted sha256 before serving. Storage defaults to in-memory — replace
