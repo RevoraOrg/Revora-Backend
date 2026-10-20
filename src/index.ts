@@ -84,6 +84,29 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
+// \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+import { createLoginRouter } from './auth/login/loginRoute';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { createLogoutRouter } from './auth/logout/logoutRoute';
+import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
+import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
+// \u2500\u2500 Auth services / adapters \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+import { LoginService } from './auth/login/loginService';
+import { RefreshService } from './auth/refresh/refreshService';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { SocialAuthService } from './auth/social/socialAuthService';
+import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryAdapter';
+import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
+import { SocialIdentityRepository } from './db/repositories/socialIdentityRepository';
+import {
+  JwtIssuer,
+  UserRole,
+  UserRepository as IUserRepository,
+  SessionRepository as ISessionRepository,
+} from './auth/login/types';
+import { issueToken } from './lib/jwt';
+import { Logger as AppLogger } from './lib/logger';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -826,6 +849,78 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createReconciliationMetricsHandler(globalMetrics),
   );
 
+  // ── Auth routes (login, refresh, logout, social, change-password) ────────
+  //
+  // Security assumptions:
+  //  - JwtIssuerImpl signs tokens with the same issueToken helper used
+  //    everywhere else; key rotation is controlled via env (JWT_SECRET).
+  //  - authSessionRepo is a fresh SessionRepository instance. Both
+  //    createRequireAuth and the auth services share the same underlying
+  //    pool, so sessions created at login are immediately honoured.
+  //  - Adapters translate concrete DB repositories to the narrow port
+  //    interfaces expected by each auth service without duplicating logic.
+  //  - Social-login endpoints are rate-limited per provider+sub via the
+  //    anti-enumeration middleware inside createSocialAuthRouter.
+  // ────────────────────────────────────────────────────────────────────────
+
+  // Local adapter classes — scoped inside createApp so they share closure.
+  class IndexUserRepositoryAdapter implements IUserRepository {
+    constructor(private readonly repo: UserRepository) {}
+    async findByEmail(email: string) {
+      const user = await this.repo.findByEmail(email);
+      if (!user) return null;
+      return { id: user.id, email: user.email, role: user.role as UserRole, passwordHash: user.password_hash };
+    }
+  }
+
+  class IndexSessionRepositoryAdapter implements ISessionRepository {
+    constructor(private readonly repo: SessionRepository) {}
+    async createSession(input: { id: string; userId: string; tokenHash: string; expiresAt: Date }) {
+      await this.repo.createSession({ id: input.id, user_id: input.userId, token_hash: input.tokenHash, expires_at: input.expiresAt });
+    }
+  }
+
+  class IndexJwtIssuer implements JwtIssuer {
+    sign(payload: { userId: string; sessionId: string; role: UserRole }) {
+      const accessToken = issueToken({ subject: payload.userId, additionalPayload: { sid: payload.sessionId, role: payload.role }, expiresIn: '1h' });
+      const refreshToken = issueToken({ subject: payload.userId, additionalPayload: { sid: payload.sessionId, role: payload.role, type: 'refresh' }, expiresIn: '7d' });
+      return { accessToken, refreshToken };
+    }
+  }
+
+  const authUserRepo = new UserRepository(pool);
+  const authSessionRepo = new SessionRepository(pool);
+  const requireAuthForLogin = createRequireAuth(authSessionRepo);
+  const jwtIssuer = new IndexJwtIssuer();
+
+  const loginService = new LoginService(
+    new IndexUserRepositoryAdapter(authUserRepo),
+    new IndexSessionRepositoryAdapter(authSessionRepo),
+    jwtIssuer,
+  );
+
+  const socialAuthService = new SocialAuthService(
+    new SocialUserRepositoryAdapter(authUserRepo),
+    new SocialIdentityRepository(pool),
+    new IndexSessionRepositoryAdapter(authSessionRepo),
+    jwtIssuer,
+    createDefaultSocialTokenVerifierFromEnv(),
+  );
+
+  const refreshTokenRepo = new RefreshTokenRepositoryAdapter(authSessionRepo);
+  const tokenService = new JwtTokenServiceAdapter();
+  const authLogger = new AppLogger({ serviceName: 'auth-refresh' });
+  const refreshService = new RefreshService(refreshTokenRepo, tokenService, pool, authLogger);
+
+  // Mount auth routes at app level (not under apiRouter) so absolute paths
+  // such as /api/auth/login are served without the API_VERSION_PREFIX.
+  app.use(createLoginRouter({ loginService }));
+  app.use(createRefreshRouter({ refreshService }));
+  app.use(createLogoutRouter({ requireAuth: requireAuthForLogin, sessionRepository: authSessionRepo }));
+  app.use(createSocialAuthRouter({ socialAuthService, requireAuth: requireAuthForLogin }));
+  // Change-password routes are relative paths (/me/change-password, /me/password)
+  // so mount them under the versioned /users prefix.
+  app.use(API_VERSION_PREFIX + '/users', createChangePasswordRouter({ db: pool, requireAuth: requireAuthForLogin }));
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);
