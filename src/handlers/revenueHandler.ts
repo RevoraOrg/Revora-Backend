@@ -76,6 +76,7 @@ export class RevenueHandler {
             const report = await this.revenueService.submitReport({
                 offeringId,
                 issuerId,
+                reportedBy: issuerId,
                 amount,
                 periodStart: new Date(periodStart),
                 periodEnd: new Date(periodEnd),
@@ -139,6 +140,7 @@ export class RevenueHandler {
             const report = await this.revenueService.submitReport({
                 offeringId,
                 issuerId,
+                reportedBy: issuerId,
                 amount,
                 periodStart: new Date(periodStart),
                 periodEnd: new Date(periodEnd),
