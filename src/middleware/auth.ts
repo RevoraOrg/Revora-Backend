@@ -498,13 +498,25 @@ export function createRequireAuth(
       return;
     }
 
-    if (hashSessionToken(token) !== session.token_hash) {
-      globalLogger.warn("Auth failed: Token hash mismatch", {
+    if (session.revoked_at) {
+      globalLogger.warn("Auth failed: Session revoked", {
         sessionId: payload.sid,
         userId: payload.sub,
+        revokedAt: session.revoked_at,
         path: req.path,
       });
-      next(Errors.unauthorized("Unauthorized: token mismatch"));
+      next(Errors.unauthorized("Unauthorized: session revoked"));
+      return;
+    }
+
+    if (session.token_consumed_at) {
+      globalLogger.warn("Auth failed: Refresh token already consumed", {
+        sessionId: payload.sid,
+        userId: payload.sub,
+        consumedAt: session.token_consumed_at,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Unauthorized: refresh token consumed"));
       return;
     }
 
