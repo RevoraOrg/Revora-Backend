@@ -1,0 +1,24 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "master",
+    "origin",
+    "solver/issue-1256-68-a0",
+    "solver/issue-1257-66-a0",
+    "test/issue-1084-1085-regression-coverage"
+  ],
+  "parent": {
+    "master": null,
+    "origin": "master",
+    "solver/issue-1256-68-a0": "master",
+    "solver/issue-1257-66-a0": "master",
+    "test/issue-1084-1085-regression-coverage": "master"
+  },
+  "order": [
+    "master",
+    "origin",
+    "solver/issue-1256-68-a0",
+    "solver/issue-1257-66-a0",
+    "test/issue-1084-1085-regression-coverage"
+  ]
+}
