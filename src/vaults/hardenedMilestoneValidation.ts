@@ -31,6 +31,7 @@ import {
   createRateLimitStore,
   createValidationRateLimit,
 } from '../security/rateLimit';
+import { z } from 'zod';
 import { logger } from '../lib/logger';
 import { Errors } from '../lib/errors';
 
@@ -432,6 +433,78 @@ export const createHardenedMilestoneValidationRouter = (
 };
 
 /**
+ * Zod schemas for security monitoring query parameters.
+ *
+ * limit: integer in [1, 500], default 100.
+ * since: ISO datetime string no more than 90 days in the past, default now-24h.
+ *
+ * Both schemas are coerced from the raw string values provided by Express
+ * query params. Validation failures are returned as 400 with structured field
+ * errors so they never reach the catch-block 500 path.
+ */
+const MAX_SINCE_DAYS = 90;
+
+const auditQuerySchema = z.object({
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v === '' ? '100' : v))
+    .pipe(
+      z
+        .string()
+        .regex(/^-?\d+$/, 'limit must be an integer')
+        .transform(Number)
+        .pipe(
+          z
+            .number()
+            .int('limit must be an integer')
+            .min(1, 'limit must be ≥ 1')
+            .max(500, 'limit must be ≤ 500')
+        )
+    ),
+});
+
+const violationsQuerySchema = z.object({
+  limit: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v === '' ? '100' : v))
+    .pipe(
+      z
+        .string()
+        .regex(/^-?\d+$/, 'limit must be an integer')
+        .transform(Number)
+        .pipe(
+          z
+            .number()
+            .int('limit must be an integer')
+            .min(1, 'limit must be ≥ 1')
+            .max(500, 'limit must be ≤ 500')
+        )
+    ),
+  since: z
+    .string()
+    .optional()
+    .transform((v) =>
+      v === undefined || v === '' ? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() : v
+    )
+    .pipe(
+      z
+        .string()
+        .refine((v) => {
+          const d = new Date(v);
+          return !isNaN(d.getTime());
+        }, 'since must be a valid ISO datetime')
+        .refine((v) => {
+          const d = new Date(v);
+          const cutoff = new Date(Date.now() - MAX_SINCE_DAYS * 24 * 60 * 60 * 1000);
+          return d >= cutoff;
+        }, `since must be within the last ${MAX_SINCE_DAYS} days`)
+        .transform((v) => new Date(v))
+    ),
+});
+
+/**
  * Security monitoring endpoint for audit trail
  */
 export const createSecurityMonitoringRouter = (
@@ -455,7 +528,16 @@ export const createSecurityMonitoringRouter = (
   // Get user's audit trail
   router.get('/security/audit/my-events', async (req: Request, res: Response) => {
     const securityContext = (req as any).securityContext as SecurityContext;
-    const limit = parseInt(req.query.limit as string) || 100;
+
+    const parsed = auditQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid query parameters',
+        fieldErrors: parsed.error.flatten().fieldErrors,
+        requestId: securityContext.requestId,
+      });
+    }
+    const { limit } = parsed.data;
 
     try {
       logger.info('Retrieving user audit events', {
@@ -505,10 +587,15 @@ export const createSecurityMonitoringRouter = (
       });
     }
 
-    const since = req.query.since 
-      ? new Date(req.query.since as string)
-      : new Date(Date.now() - 24 * 60 * 60 * 1000); // Last 24 hours
-    const limit = parseInt(req.query.limit as string) || 100;
+    const parsed = violationsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: 'Invalid query parameters',
+        fieldErrors: parsed.error.flatten().fieldErrors,
+        requestId: securityContext.requestId,
+      });
+    }
+    const { limit, since } = parsed.data;
 
     try {
       logger.info('Retrieving security violations', {

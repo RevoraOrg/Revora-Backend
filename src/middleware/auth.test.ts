@@ -10,7 +10,6 @@ import {
   resetAdminPubKeysCache,
   AdminSignatureContext,
 } from './auth';
-import { hashSessionToken } from '../auth/session';
 import { signJwt } from '../utils/jwt';
 import {
   issueToken,
@@ -20,6 +19,8 @@ import {
 } from '../lib/jwt';
 import { AuthenticatedRequest as LogoutAuthenticatedRequest } from '../auth/logout/types';
 import { AppError } from '../lib/errors';
+import { LoginService } from '../auth/login/loginService';
+import { JwtIssuer, SessionRepository, UserRecord, UserRepository } from '../auth/login/types';
 
 // ── Shared secret setup ───────────────────────────────────────────────────────
 beforeAll(() => {
@@ -78,12 +79,11 @@ describe('requireAuth middleware', () => {
   });
 
   it('calls next() and sets req.auth for a valid token', async () => {
-    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
-    const tokenHash = hashSessionToken(token);
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
     sessionRepo.findById.mockResolvedValueOnce({
       id: 'session-abc',
       user_id: 'user-123',
-      token_hash: tokenHash,
+      token_hash: 'arbitrary-hash',
       expires_at: new Date(Date.now() + 10 * 60 * 1000),
       created_at: new Date(),
     });
@@ -134,6 +134,98 @@ describe('requireAuth middleware', () => {
     await requireAuth(req as Request, res, mockNext);
 
     expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+  });
+
+  it('accepts valid access token without token hash check', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: 'arbitrary-hash-not-checked',
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith();
+    expect(req.auth?.userId).toBe('user-123');
+    expect(req.auth?.sessionId).toBe('session-abc');
+  });
+
+  it('rejects revoked session with 401', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: 'some-hash',
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+      revoked_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: session revoked');
+  });
+
+  it('rejects session with consumed refresh token with 401', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: 'some-hash',
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+      token_consumed_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: refresh token consumed');
+  });
+
+  it('rejects session when user_id does not match token sub', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'different-user-456',
+      token_hash: 'some-hash',
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: session not found or user mismatch');
+  });
+
+  it('rejects when session does not exist', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc', role: 'investor' });
+    sessionRepo.findById.mockResolvedValueOnce(null);
+
+    const req = makeReq(`Bearer ${token}`);
+    const res = mockRes();
+
+    await requireAuth(req as Request, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: session not found or user mismatch');
   });
 });
 
@@ -1011,4 +1103,183 @@ describe('requireAdminWithEd25519Signature and AdminSignatureContext', () => {
       expect(req.adminSignature).toBeUndefined();
     });
   });
-});
+});
+
+// ── Regression test: LoginService + createRequireAuth end-to-end ────────────
+describe('regression: LoginService with createRequireAuth middleware', () => {
+  const mockNext: NextFunction = jest.fn();
+
+  class InMemoryUserRepository implements UserRepository {
+    constructor(private readonly users: UserRecord[]) {}
+
+    async findByEmail(email: string): Promise<UserRecord | null> {
+      return this.users.find((user) => user.email === email) ?? null;
+    }
+  }
+
+  class InMemorySessionRepository implements SessionRepository {
+    private sessions: Map<string, { id: string; userId: string; tokenHash: string; expiresAt: Date; revokedAt?: Date; tokenConsumedAt?: Date }> = new Map();
+
+    async createSession(input: {
+      id: string;
+      userId: string;
+      tokenHash: string;
+      expiresAt: Date;
+    }): Promise<void> {
+      this.sessions.set(input.id, {
+        id: input.id,
+        userId: input.userId,
+        tokenHash: input.tokenHash,
+        expiresAt: input.expiresAt,
+      });
+    }
+
+    async findById(id: string): Promise<{ id: string; user_id: string; token_hash: string; expires_at: Date; revoked_at?: Date; token_consumed_at?: Date } | null> {
+      const session = this.sessions.get(id);
+      if (!session) return null;
+      return {
+        id: session.id,
+        user_id: session.userId,
+        token_hash: session.tokenHash,
+        expires_at: session.expiresAt,
+        revoked_at: session.revokedAt,
+        token_consumed_at: session.tokenConsumedAt,
+      };
+    }
+
+    revokeSession(sessionId: string): void {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.revokedAt = new Date();
+      }
+    }
+
+    consumeToken(sessionId: string): void {
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        session.tokenConsumedAt = new Date();
+      }
+    }
+  }
+
+  class RealJwtIssuer implements JwtIssuer {
+    sign(payload: { userId: string; sessionId: string; role: string }): {
+      accessToken: string;
+      refreshToken: string;
+    } {
+      const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+      const accessPayload = Buffer.from(JSON.stringify({
+        sub: payload.userId,
+        sid: payload.sessionId,
+        role: payload.role,
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 900,
+      })).toString('base64url');
+      const refreshPayload = Buffer.from(JSON.stringify({
+        sub: payload.userId,
+        sid: payload.sessionId,
+        role: payload.role,
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 604800,
+      })).toString('base64url');
+
+      const accessSig = crypto.createHmac('sha256', SECRET).update(`${header}.${accessPayload}`).digest('base64url');
+      const refreshSig = crypto.createHmac('sha256', SECRET).update(`${header}.${refreshPayload}`).digest('base64url');
+
+      return {
+        accessToken: `${header}.${accessPayload}.${accessSig}`,
+        refreshToken: `${header}.${refreshPayload}.${refreshSig}`,
+      };
+    }
+  }
+
+  const VALID_PASSWORD = 'correct-password';
+  const validUser: UserRecord = {
+    id: 'user-1',
+    email: 'test@example.com',
+    role: 'investor',
+    passwordHash: crypto.createHash('sha256').update(VALID_PASSWORD).digest('hex'),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.JWT_SECRET = SECRET;
+  });
+
+  it('accepts a fresh access token from login', async () => {
+    const userRepo = new InMemoryUserRepository([validUser]);
+    const sessionRepo = new InMemorySessionRepository();
+    const jwtIssuer = new RealJwtIssuer();
+    const loginService = new LoginService(userRepo, sessionRepo as any, jwtIssuer);
+    const requireAuth = createRequireAuth(sessionRepo as any);
+
+    const loginResult = await loginService.login('test@example.com', VALID_PASSWORD);
+    expect(loginResult).not.toBeNull();
+    expect(loginResult?.accessToken).toBeDefined();
+
+    const req = {
+      headers: { authorization: `Bearer ${loginResult!.accessToken}` },
+    } as Request;
+    const res = mockRes();
+
+    await requireAuth(req, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith();
+    expect((req as any).auth?.userId).toBe('user-1');
+    expect((req as any).auth?.sessionId).toBeDefined();
+  });
+
+  it('rejects request after session is revoked', async () => {
+    const userRepo = new InMemoryUserRepository([validUser]);
+    const sessionRepo = new InMemorySessionRepository();
+    const jwtIssuer = new RealJwtIssuer();
+    const loginService = new LoginService(userRepo, sessionRepo as any, jwtIssuer);
+    const requireAuth = createRequireAuth(sessionRepo as any);
+
+    const loginResult = await loginService.login('test@example.com', VALID_PASSWORD);
+    const sessionId = (req => {
+      const parts = loginResult!.accessToken.split('.');
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      return payload.sid;
+    })();
+
+    sessionRepo.revokeSession(sessionId);
+
+    const req = {
+      headers: { authorization: `Bearer ${loginResult!.accessToken}` },
+    } as Request;
+    const res = mockRes();
+
+    await requireAuth(req, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: session revoked');
+  });
+
+  it('rejects request after refresh token is consumed', async () => {
+    const userRepo = new InMemoryUserRepository([validUser]);
+    const sessionRepo = new InMemorySessionRepository();
+    const jwtIssuer = new RealJwtIssuer();
+    const loginService = new LoginService(userRepo, sessionRepo as any, jwtIssuer);
+    const requireAuth = createRequireAuth(sessionRepo as any);
+
+    const loginResult = await loginService.login('test@example.com', VALID_PASSWORD);
+    const sessionId = (req => {
+      const parts = loginResult!.accessToken.split('.');
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      return payload.sid;
+    })();
+
+    sessionRepo.consumeToken(sessionId);
+
+    const req = {
+      headers: { authorization: `Bearer ${loginResult!.accessToken}` },
+    } as Request;
+    const res = mockRes();
+
+    await requireAuth(req, res, mockNext);
+
+    expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    expect((mockNext.mock.calls[0][0] as AppError).message).toBe('Unauthorized: refresh token consumed');
+  });
+});

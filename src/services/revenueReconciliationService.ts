@@ -21,6 +21,7 @@ import { DistributionRepository, DistributionRun, Payout } from '../db/repositor
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger, Logger, LogLevel } from '../lib/logger';
+import { Decimal } from '../lib/decimal';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailureClass,
@@ -56,6 +57,7 @@ export type DiscrepancyType =
   | 'INVESTOR_ALLOCATION_ERROR'
   | 'ROUNDING_LOSS_UNACCOUNTED'
   | 'MISSING_PAYOUT'
+  | 'UNEXPECTED_PAYOUT'
   | 'DUPLICATE_PAYOUT'
   | 'OVERPAYMENT'
   | 'UNDERPAMENT'
@@ -84,6 +86,7 @@ export interface ReconciliationSummary {
   investorCount: number;
   payoutsProcessed: number;
   payoutsFailed: number;
+  failedPayouts?: number;
   chainDrift?: {
     onChainAmount: string;
     localAmount: string;
@@ -377,6 +380,7 @@ export class RevenueReconciliationService {
           investorCount: investorIds.size,
           payoutsProcessed: this.countProcessedPayouts(relevantRuns),
           payoutsFailed: totalFailedPayouts,
+          failedPayouts: totalFailedPayouts,
           chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
         },
         checkedAt: new Date(),
@@ -663,6 +667,65 @@ export class RevenueReconciliationService {
       return discrepancies;
     }
 
+    const payouts = (await this.distributionRepo.getPayoutsForRun(run.id)) || [];
+    const payoutInvestorIds = new Set(payouts.map((p) => p.investor_id));
+
+    // Check for missing payouts: expected investors with no payout
+    for (const investorId of expectedInvestorIds) {
+      if (!payoutInvestorIds.has(investorId)) {
+        discrepancies.push({
+          type: 'MISSING_PAYOUT',
+          severity: 'error',
+          message: `Missing payout for investor ${investorId} in run ${run.id}`,
+          details: {
+            runId: run.id,
+            investorId,
+          },
+          offeringId: run.offering_id,
+        });
+      }
+    }
+
+    // Check for unexpected payouts: payouts for investors not in expected set
+    for (const payout of payouts) {
+      if (!expectedInvestorIds.has(payout.investor_id)) {
+        discrepancies.push({
+          type: 'UNEXPECTED_PAYOUT',
+          severity: 'error',
+          message: `Unexpected payout for investor ${payout.investor_id} in run ${run.id}`,
+          details: {
+            runId: run.id,
+            payoutId: payout.id,
+            investorId: payout.investor_id,
+            amount: payout.amount,
+          },
+          offeringId: run.offering_id,
+        });
+      }
+    }
+
+    // Check sum(payout.amount) == run.total_amount using Decimal
+    let payoutSum = new Decimal('0');
+    for (const payout of payouts) {
+      payoutSum = payoutSum.add(new Decimal(payout.amount));
+    }
+
+    const runTotal = new Decimal(run.total_amount);
+    if (payoutSum.compareTo(runTotal) !== 0) {
+      discrepancies.push({
+        type: 'PAYOUT_SUM_MISMATCH',
+        severity: 'error',
+        message: `Payout sum mismatch in run ${run.id}: sum of payouts (${payoutSum.toString()}) does not match run total (${run.total_amount})`,
+        details: {
+          runId: run.id,
+          expectedAmount: run.total_amount,
+          actualAmount: payoutSum.toString(),
+          difference: payoutSum.subtract(runTotal).toString(),
+        },
+        offeringId: run.offering_id,
+      });
+    }
+
     return discrepancies;
   }
 
@@ -859,7 +922,14 @@ export class RevenueReconciliationService {
   }
 
   private async countFailedPayouts(runId: string): Promise<number> {
-    return 0;
+    if (typeof this.distributionRepo.countPayoutsByStatus === 'function') {
+      const count = await this.distributionRepo.countPayoutsByStatus(runId, 'failed');
+      if (typeof count === 'number') {
+        return count;
+      }
+    }
+    const payouts = (await this.distributionRepo.getPayoutsForRun(runId)) || [];
+    return payouts.filter((p) => p.status === 'failed').length;
   }
 
   private countProcessedPayouts(runs: DistributionRun[]): number {

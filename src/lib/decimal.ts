@@ -65,7 +65,7 @@ export class Decimal {
    * (the scaled `_value` can be negative after a subtraction).
    */
   toString(): string {
-    const isNegative = this._value < 0n;
+    const isNegative = (this._value as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -this._value : this._value;
     const valueStr = absValue.toString();
 
@@ -167,7 +167,7 @@ export class Decimal {
     const divisor = 10n ** BigInt(scale);
 
     // Handle negative values explicitly to avoid producing strings like "123.-05".
-    const isNegative = scaledValue < 0n;
+    const isNegative = (scaledValue as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -scaledValue : scaledValue;
     const integerPart = absValue / divisor;
     const fractionalPart = absValue % divisor;
@@ -270,10 +270,10 @@ export class Decimal {
   }
 
   isPositive(): boolean {
-    return this._value > 0n;
+    return (this._value as BigInt) > (0 as BigInt);
   }
 
   isNegative(): boolean {
-    return this._value < 0n;
+    return (this._value as BigInt) < (0 as BigInt);
   }
 }

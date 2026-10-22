@@ -69,7 +69,7 @@ import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
 import { createAMLService } from "./aml/amlService";
-import { InMemorySecurityAuditRepository } from "./security/audit";
+import { InMemorySecurityAuditRepository, AuditLogSecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
@@ -743,7 +743,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
+  const amlAuditRepo = new AuditLogSecurityAuditRepository(auditLogRepo);
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,
@@ -825,6 +825,16 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createMetricsAuthMiddleware(),
     createReconciliationMetricsHandler(globalMetrics),
   );
+
+  // SCIM 2.0 provisioning (#1300), only when a token is configured.
+  // IdPs send application/scim+json, which the global parser skips.
+  if (env.SCIM_TOKEN) {
+    app.use(
+      "/scim/v2",
+      express.json({ type: ["application/json", "application/scim+json"], limit: "32kb" }),
+      createScimRouter(new UserRepository(pool), env.SCIM_TOKEN),
+    );
+  }
 
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));

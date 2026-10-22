@@ -143,9 +143,5 @@ export class PasswordResetService {
   private hashToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
   }
-
-  private hashPassword(plaintext: string): string {
-    return createHash('sha256').update(plaintext).digest('hex');
-  }
 }
 

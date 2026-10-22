@@ -757,6 +757,302 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
       
       expect(res.status).toHaveBeenCalledWith(500);
     });
+
+    // --- Input validation: /security/audit/my-events ---
+
+    describe('/security/audit/my-events — limit validation', () => {
+      const getAuditHandler = () => {
+        const router = createSecurityMonitoringRouter(auditRepository);
+        return (router as any).stack.find(
+          (s: any) => s.route?.path === '/security/audit/my-events'
+        )?.route.stack[0].handle;
+      };
+
+      it('returns 400 when limit exceeds 500', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '100000000' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.error).toBe('Invalid query parameters');
+        expect(body.fieldErrors.limit).toBeDefined();
+      });
+
+      it('returns 400 when limit is negative', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '-5' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.error).toBe('Invalid query parameters');
+        expect(body.fieldErrors.limit).toBeDefined();
+      });
+
+      it('returns 400 when limit is zero', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '0' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+      });
+
+      it('returns 400 when limit is not an integer string', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: 'abc' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+      });
+
+      it('accepts limit=1 (minimum boundary)', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '1' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        // repo returns [] by default; should be 200 (json called, not status 400/500)
+        expect(res.status).not.toHaveBeenCalledWith(400);
+        expect(res.status).not.toHaveBeenCalledWith(500);
+        expect(res.json).toHaveBeenCalled();
+      });
+
+      it('accepts limit=500 (maximum boundary)', async () => {
+        const handler = getAuditHandler();
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '500' },
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).not.toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalled();
+      });
+
+      it('applies default limit of 100 when no limit is supplied', async () => {
+        const handler = getAuditHandler();
+        const mockRepo = {
+          findByUserId: jest.fn().mockResolvedValue([]),
+        } as any;
+        const routerWithSpy = createSecurityMonitoringRouter(mockRepo);
+        const h = (routerWithSpy as any).stack.find(
+          (s: any) => s.route?.path === '/security/audit/my-events'
+        )?.route.stack[0].handle;
+
+        const req = createMockRequest({ securityContext: createMockSecurityContext() });
+        const res = createMockResponse();
+
+        await h(req, res);
+
+        expect(mockRepo.findByUserId).toHaveBeenCalledWith('verifier-1', 100);
+      });
+
+      it('returns 500 only for repository failures, not for input errors', async () => {
+        // A bad limit should return 400, NOT bubble up to 500.
+        const failingRepo = {
+          findByUserId: jest.fn().mockRejectedValue(new Error('DB down')),
+        } as any;
+        const router = createSecurityMonitoringRouter(failingRepo);
+        const handler = (router as any).stack.find(
+          (s: any) => s.route?.path === '/security/audit/my-events'
+        )?.route.stack[0].handle;
+
+        const req = createMockRequest({
+          securityContext: createMockSecurityContext(),
+          query: { limit: '999999' }, // bad input
+        });
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        // Must be 400, not 500 — even though the repo would have thrown.
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(failingRepo.findByUserId).not.toHaveBeenCalled();
+      });
+    });
+
+    // --- Input validation: /security/violations ---
+
+    describe('/security/violations — query validation', () => {
+      const adminContext = () =>
+        createMockRequest({
+          securityContext: {
+            ...createMockSecurityContext(),
+            user: { id: 'admin-1', role: 'admin', permissions: ['audit:read'] },
+          },
+        });
+
+      const getViolationsHandler = (repo = auditRepository) => {
+        const router = createSecurityMonitoringRouter(repo);
+        return (router as any).stack.find(
+          (s: any) => s.route?.path === '/security/violations'
+        )?.route.stack[0].handle;
+      };
+
+      /**
+       * Regression test: ?since=abc previously threw RangeError inside
+       * since.toISOString() and was caught as a 500. It must now return 400.
+       */
+      it('REGRESSION: returns 400 (not 500) when since is an invalid date string', async () => {
+        const handler = getViolationsHandler();
+        const req = { ...adminContext(), query: { since: 'abc' } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.status).not.toHaveBeenCalledWith(500);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.error).toBe('Invalid query parameters');
+        expect(body.fieldErrors.since).toBeDefined();
+      });
+
+      it('returns 400 when since is a non-ISO garbage string', async () => {
+        const handler = getViolationsHandler();
+        const req = { ...adminContext(), query: { since: 'yesterday' } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        // 'yesterday' is not a valid date, so new Date('yesterday') is Invalid Date.
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.fieldErrors.since).toBeDefined();
+      });
+
+      it('returns 400 when limit=100000 (exceeds cap)', async () => {
+        const handler = getViolationsHandler();
+        const validSince = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const req = { ...adminContext(), query: { limit: '100000', since: validSince } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.fieldErrors.limit).toBeDefined();
+      });
+
+      it('returns 400 when limit=-5', async () => {
+        const handler = getViolationsHandler();
+        const validSince = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const req = { ...adminContext(), query: { limit: '-5', since: validSince } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.fieldErrors.limit).toBeDefined();
+      });
+
+      it('returns 400 when since is older than 90 days', async () => {
+        const handler = getViolationsHandler();
+        const tooOld = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString();
+        const req = { ...adminContext(), query: { since: tooOld } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.fieldErrors.since).toBeDefined();
+      });
+
+      it('accepts a valid ISO since within 90 days', async () => {
+        const handler = getViolationsHandler();
+        const validSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const req = { ...adminContext(), query: { since: validSince, limit: '50' } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).not.toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalled();
+      });
+
+      it('applies default since of now-24h and default limit of 100 when omitted', async () => {
+        const mockRepo = {
+          findSecurityViolations: jest.fn().mockResolvedValue([]),
+        } as any;
+        const handler = getViolationsHandler(mockRepo);
+        const req = {
+          ...adminContext(),
+          query: {},
+        } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(mockRepo.findSecurityViolations).toHaveBeenCalledWith(
+          expect.any(Date),
+          100
+        );
+        const calledWith: Date = mockRepo.findSecurityViolations.mock.calls[0][0];
+        const diffMs = Date.now() - calledWith.getTime();
+        // Should be approximately 24h (within a 10-second tolerance)
+        expect(diffMs).toBeGreaterThan(23 * 60 * 60 * 1000);
+        expect(diffMs).toBeLessThan(25 * 60 * 60 * 1000);
+      });
+
+      it('returns 500 only on repository failure, not on input error', async () => {
+        const failingRepo = {
+          findSecurityViolations: jest.fn().mockRejectedValue(new Error('DB timeout')),
+        } as any;
+        const handler = getViolationsHandler(failingRepo);
+        // Send a bad since — validation should short-circuit before hitting the repo.
+        const req = { ...adminContext(), query: { since: 'not-a-date' } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(failingRepo.findSecurityViolations).not.toHaveBeenCalled();
+      });
+
+      it('returns 500 when the repository itself throws for a valid request', async () => {
+        const failingRepo = {
+          findSecurityViolations: jest.fn().mockRejectedValue(new Error('DB timeout')),
+        } as any;
+        const handler = getViolationsHandler(failingRepo);
+        const validSince = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const req = { ...adminContext(), query: { since: validSince, limit: '10' } } as any;
+        const res = createMockResponse();
+
+        await handler(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(500);
+        const body = (res.json as jest.Mock).mock.calls[0][0];
+        expect(body.error).toBe('Failed to retrieve security violations');
+      });
+    });
   });
 
   describe('Milestone Validation Router', () => {

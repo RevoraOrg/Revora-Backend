@@ -11,9 +11,22 @@ import crypto from 'crypto';
 import { createAMLRoutes } from './amlRoutes';
 import { AMLService } from '../aml/amlService';
 import { AMLRule, AMLCase, AMLAlert, OFACReview, SemVer } from '../aml/types';
+import { errorHandler } from '../middleware/errorHandler';
+
+const TEST_JWT_SECRET = 'test-jwt-secret-aml-test-suite-32-chars-long!';
+process.env.JWT_SECRET = TEST_JWT_SECRET;
+
+function makeToken(sub: string, role: string): string {
+  return jwt.sign({ sub, role }, TEST_JWT_SECRET, { expiresIn: '1h' });
+}
+
+function authReq(req: request.Test, role = 'compliance', sub = 'officer_1'): request.Test {
+  return req.set('Authorization', `Bearer ${makeToken(sub, role)}`);
+}
 
 // Mock AMLService
 class MockAMLService {
+  lastActorId?: string;
   private rules: AMLRule[] = [];
   private cases: AMLCase[] = [];
   private alerts: AMLAlert[] = [];
@@ -42,7 +55,7 @@ class MockAMLService {
     ];
   }
 
-  async createRule(input: any): Promise<AMLRule> {
+  async createRule(input: any, actorId?: string): Promise<AMLRule> {
     const rule: AMLRule = {
       id: `rule_${Date.now()}`,
       ...input,
@@ -55,7 +68,7 @@ class MockAMLService {
     return rule;
   }
 
-  async updateRule(ruleId: string, input: any): Promise<AMLRule> {
+  async updateRule(ruleId: string, input: any, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -72,7 +85,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       ...input,
@@ -82,7 +95,7 @@ class MockAMLService {
     return this.rules[index];
   }
 
-  async rollbackRule(ruleId: string, version: SemVer): Promise<AMLRule> {
+  async rollbackRule(ruleId: string, version: SemVer, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -99,7 +112,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       version: { major: version.major, minor: version.minor, patch: version.patch + 1 },
@@ -139,7 +152,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.case_id === caseId);
   }
 
-  async createCase(input: any): Promise<AMLCase> {
+  async createCase(input: any, actorId?: string): Promise<AMLCase> {
     const amlCase: AMLCase = {
       id: `case_${Date.now()}`,
       ...input,
@@ -151,7 +164,7 @@ class MockAMLService {
     return amlCase;
   }
 
-  async updateCase(caseId: string, input: any): Promise<AMLCase> {
+  async updateCase(caseId: string, input: any, actorId?: string): Promise<AMLCase> {
     const index = this.cases.findIndex(c => c.id === caseId);
     if (index === -1) {
       // Return a mock case for testing
@@ -168,7 +181,7 @@ class MockAMLService {
         closed_at: (input.status === 'closed' || input.status === 'dismissed') ? new Date() : undefined,
       };
     }
-    
+
     this.cases[index] = {
       ...this.cases[index],
       ...input,
@@ -186,7 +199,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.investor_id === investorId);
   }
 
-  async dismissAlert(alertId: string): Promise<AMLAlert> {
+  async dismissAlert(alertId: string, actorId?: string): Promise<AMLAlert> {
     const index = this.alerts.findIndex(a => a.id === alertId);
     if (index === -1) {
       // Return a mock alert for testing
@@ -204,7 +217,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.alerts[index] = {
       ...this.alerts[index],
       status: 'dismissed',
@@ -281,6 +294,7 @@ describe('AML Routes', () => {
     app.use(express.json());
     mockService = new MockAMLService();
     app.use('/aml', createAMLRoutes(mockService as any));
+    app.use(errorHandler);
   });
 
   afterAll(() => {
@@ -293,7 +307,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/rules', () => {
     it('should return all rules', async () => {
-      const response = await request(app).get('/aml/rules');
+      const response = await authReq(request(app).get('/aml/rules'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -304,7 +318,7 @@ describe('AML Routes', () => {
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
       jest.spyOn(mockService, 'getRules').mockRejectedValueOnce(new Error('DB error'));
 
-      const response = await request(app).get('/aml/rules');
+      const response = await authReq(request(app).get('/aml/rules'));
 
       expect(response.status).toBe(500);
       expect(response.body.success).toBe(false);
@@ -314,7 +328,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/rules/enabled', () => {
     it('should return enabled rules', async () => {
-      const response = await request(app).get('/aml/rules/enabled');
+      const response = await authReq(request(app).get('/aml/rules/enabled'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -324,7 +338,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/rules/:ruleId/history', () => {
     it('should return rule version history', async () => {
-      const response = await request(app).get('/aml/rules/rule_1/history');
+      const response = await authReq(request(app).get('/aml/rules/rule_1/history'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -342,8 +356,8 @@ describe('AML Routes', () => {
         config: { window_minutes: 60 },
       };
 
-      const response = await request(app)
-        .post('/aml/rules')
+      const response = await authReq(request(app)
+        .post('/aml/rules'))
         .send(newRule);
 
       expect(response.status).toBe(201);
@@ -360,12 +374,32 @@ describe('AML Routes', () => {
         config: {},
       };
 
-      const response = await request(app)
-        .post('/aml/rules')
+      const response = await authReq(request(app)
+        .post('/aml/rules'))
         .send(invalidRule);
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createRule');
+      const newRule = {
+        name: 'Test Rule',
+        description: 'Test description',
+        type: 'velocity',
+        severity: 'high',
+        config: { window_minutes: 60 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules')
+        .set('x-user-id', 'user_123')
+        .send(newRule);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newRule, 'user_123');
+      spy.mockRestore();
     });
   });
 
@@ -377,8 +411,8 @@ describe('AML Routes', () => {
         change_reason: 'Testing',
       };
 
-      const response = await request(app)
-        .put('/aml/rules/rule_1')
+      const response = await authReq(request(app)
+        .put('/aml/rules/rule_1'))
         .send(update);
 
       expect(response.status).toBe(200);
@@ -390,12 +424,30 @@ describe('AML Routes', () => {
         change_reason: '', // Required field
       };
 
-      const response = await request(app)
-        .put('/aml/rules/rule_1')
+      const response = await authReq(request(app)
+        .put('/aml/rules/rule_1'))
         .send(invalidUpdate);
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateRule');
+      const update = {
+        name: 'Updated Rule',
+        enabled: false,
+        change_reason: 'Testing',
+      };
+
+      const response = await request(app)
+        .put('/aml/rules/rule_1')
+        .set('x-user-id', 'user_456')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', update, 'user_456');
+      spy.mockRestore();
     });
   });
 
@@ -405,8 +457,8 @@ describe('AML Routes', () => {
         version: { major: 1, minor: 0, patch: 0 },
       };
 
-      const response = await request(app)
-        .post('/aml/rules/rule_1/rollback')
+      const response = await authReq(request(app)
+        .post('/aml/rules/rule_1/rollback'))
         .send(rollback);
 
       expect(response.status).toBe(200);
@@ -418,18 +470,34 @@ describe('AML Routes', () => {
         version: { major: -1, minor: 0, patch: 0 },
       };
 
-      const response = await request(app)
-        .post('/aml/rules/rule_1/rollback')
+      const response = await authReq(request(app)
+        .post('/aml/rules/rule_1/rollback'))
         .send(invalidRollback);
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'rollbackRule');
+      const rollback = {
+        version: { major: 1, minor: 0, patch: 0 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules/rule_1/rollback')
+        .set('x-user-id', 'user_789')
+        .send(rollback);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', rollback.version, 'user_789');
+      spy.mockRestore();
+    });
   });
 
   describe('GET /aml/cases', () => {
     it('should get cases by status', async () => {
-      const response = await request(app).get('/aml/cases?status=open');
+      const response = await authReq(request(app).get('/aml/cases?status=open'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -437,7 +505,7 @@ describe('AML Routes', () => {
     });
 
     it('should get cases by analyst', async () => {
-      const response = await request(app).get('/aml/cases?analyst_id=analyst_1');
+      const response = await authReq(request(app).get('/aml/cases?analyst_id=analyst_1'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -445,7 +513,7 @@ describe('AML Routes', () => {
     });
 
     it('should require query parameter', async () => {
-      const response = await request(app).get('/aml/cases');
+      const response = await authReq(request(app).get('/aml/cases'));
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
@@ -454,7 +522,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/cases/:caseId', () => {
     it('should get a specific case', async () => {
-      const response = await request(app).get('/aml/cases/case_1');
+      const response = await authReq(request(app).get('/aml/cases/case_1'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -463,7 +531,7 @@ describe('AML Routes', () => {
     it('should return 404 for nonexistent case', async () => {
       jest.spyOn(mockService, 'getCase').mockResolvedValueOnce(null);
 
-      const response = await request(app).get('/aml/cases/nonexistent');
+      const response = await authReq(request(app).get('/aml/cases/nonexistent'));
 
       expect(response.status).toBe(404);
       expect(response.body.success).toBe(false);
@@ -472,7 +540,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/cases/:caseId/alerts', () => {
     it('should get alerts for a case', async () => {
-      const response = await request(app).get('/aml/cases/case_1/alerts');
+      const response = await authReq(request(app).get('/aml/cases/case_1/alerts'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -489,8 +557,8 @@ describe('AML Routes', () => {
         notes: 'Test case',
       };
 
-      const response = await request(app)
-        .post('/aml/cases')
+      const response = await authReq(request(app)
+        .post('/aml/cases'))
         .send(newCase);
 
       expect(response.status).toBe(201);
@@ -504,12 +572,31 @@ describe('AML Routes', () => {
         investor_id: 'inv_1',
       };
 
-      const response = await request(app)
-        .post('/aml/cases')
+      const response = await authReq(request(app)
+        .post('/aml/cases'))
         .send(invalidCase);
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createCase');
+      const newCase = {
+        alert_ids: ['alert_1'],
+        investor_id: 'inv_1',
+        assigned_to: 'analyst_1',
+        notes: 'Test case',
+      };
+
+      const response = await request(app)
+        .post('/aml/cases')
+        .set('x-user-id', 'user_abc')
+        .send(newCase);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newCase, 'user_abc');
+      spy.mockRestore();
     });
   });
 
@@ -521,8 +608,8 @@ describe('AML Routes', () => {
         notes: 'Investigated',
       };
 
-      const response = await request(app)
-        .put('/aml/cases/case_1')
+      const response = await authReq(request(app)
+        .put('/aml/cases/case_1'))
         .send(update);
 
       expect(response.status).toBe(200);
@@ -534,18 +621,36 @@ describe('AML Routes', () => {
         status: 'invalid_status',
       };
 
-      const response = await request(app)
-        .put('/aml/cases/case_1')
+      const response = await authReq(request(app)
+        .put('/aml/cases/case_1'))
         .send(invalidUpdate);
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateCase');
+      const update = {
+        status: 'closed',
+        disposition: 'false_positive',
+        notes: 'Investigated',
+      };
+
+      const response = await request(app)
+        .put('/aml/cases/case_1')
+        .set('x-user-id', 'user_xyz')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('case_1', update, 'user_xyz');
+      spy.mockRestore();
+    });
   });
 
   describe('GET /aml/alerts/pending', () => {
     it('should get pending alerts', async () => {
-      const response = await request(app).get('/aml/alerts/pending');
+      const response = await authReq(request(app).get('/aml/alerts/pending'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -555,7 +660,7 @@ describe('AML Routes', () => {
 
   describe('GET /aml/alerts/investor/:investorId', () => {
     it('should get alerts for investor', async () => {
-      const response = await request(app).get('/aml/alerts/investor/inv_1');
+      const response = await authReq(request(app).get('/aml/alerts/investor/inv_1'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -565,11 +670,22 @@ describe('AML Routes', () => {
 
   describe('POST /aml/alerts/:alertId/dismiss', () => {
     it('should dismiss an alert', async () => {
-      const response = await request(app).post('/aml/alerts/alert_1/dismiss');
+      const response = await authReq(request(app).post('/aml/alerts/alert_1/dismiss'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.data.status).toBe('dismissed');
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'dismissAlert');
+      const response = await request(app)
+        .post('/aml/alerts/alert_1/dismiss')
+        .set('x-user-id', 'user_123');
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('alert_1', 'user_123');
+      spy.mockRestore();
     });
   });
 
@@ -592,6 +708,7 @@ describe('AML Routes', () => {
         '/aml',
         createAMLRoutes(mockService as any, mockAssignmentService as any),
       );
+      assignmentApp.use(errorHandler);
     });
 
     it('should auto-assign a case successfully', async () => {
@@ -602,8 +719,8 @@ describe('AML Routes', () => {
         reviewer_capacities: [],
       });
 
-      const response = await request(assignmentApp)
-        .post('/aml/cases/assign-auto')
+      const response = await authReq(request(assignmentApp)
+        .post('/aml/cases/assign-auto'))
         .send({ case_id: 'c1' });
 
       expect(response.status).toBe(200);
@@ -612,8 +729,8 @@ describe('AML Routes', () => {
     });
 
     it('should return 400 when case_id is missing', async () => {
-      const response = await request(assignmentApp)
-        .post('/aml/cases/assign-auto')
+      const response = await authReq(request(assignmentApp)
+        .post('/aml/cases/assign-auto'))
         .send({});
 
       expect(response.status).toBe(400);
@@ -626,8 +743,8 @@ describe('AML Routes', () => {
         message: 'No eligible reviewer available',
       });
 
-      const response = await request(assignmentApp)
-        .post('/aml/cases/assign-auto')
+      const response = await authReq(request(assignmentApp)
+        .post('/aml/cases/assign-auto'))
         .send({ case_id: 'c1' });
 
       expect(response.status).toBe(409);
@@ -638,9 +755,10 @@ describe('AML Routes', () => {
       const noServiceApp = express();
       noServiceApp.use(express.json());
       noServiceApp.use('/aml', createAMLRoutes(mockService as any));
+      noServiceApp.use(errorHandler);
 
-      const response = await request(noServiceApp)
-        .post('/aml/cases/assign-auto')
+      const response = await authReq(request(noServiceApp)
+        .post('/aml/cases/assign-auto'))
         .send({ case_id: 'c1' });
 
       expect(response.status).toBe(503);
@@ -651,8 +769,8 @@ describe('AML Routes', () => {
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
       mockAssignmentService.assignCase.mockRejectedValue(new Error('DB connection lost'));
 
-      const response = await request(assignmentApp)
-        .post('/aml/cases/assign-auto')
+      const response = await authReq(request(assignmentApp)
+        .post('/aml/cases/assign-auto'))
         .send({ case_id: 'c1' });
 
       expect(response.status).toBe(500);
@@ -678,6 +796,7 @@ describe('AML Routes', () => {
         '/aml',
         createAMLRoutes(mockService as any, mockAssignmentService as any),
       );
+      assignmentApp.use(errorHandler);
     });
 
     it('should batch-assign all open cases', async () => {
@@ -686,7 +805,7 @@ describe('AML Routes', () => {
         { case_id: 'c2', assigned_to: 'r2', age_days: 2, reviewer_capacities: [] },
       ]);
 
-      const response = await request(assignmentApp).post('/aml/cases/assign-all');
+      const response = await authReq(request(assignmentApp).post('/aml/cases/assign-all'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -697,7 +816,7 @@ describe('AML Routes', () => {
     it('should return empty array when no cases to assign', async () => {
       mockAssignmentService.assignAllOpenCases.mockResolvedValue([]);
 
-      const response = await request(assignmentApp).post('/aml/cases/assign-all');
+      const response = await authReq(request(assignmentApp).post('/aml/cases/assign-all'));
 
       expect(response.status).toBe(200);
       expect(response.body.data).toHaveLength(0);
@@ -707,8 +826,9 @@ describe('AML Routes', () => {
       const noServiceApp = express();
       noServiceApp.use(express.json());
       noServiceApp.use('/aml', createAMLRoutes(mockService as any));
+      noServiceApp.use(errorHandler);
 
-      const response = await request(noServiceApp).post('/aml/cases/assign-all');
+      const response = await authReq(request(noServiceApp).post('/aml/cases/assign-all'));
 
       expect(response.status).toBe(503);
     });
@@ -717,7 +837,7 @@ describe('AML Routes', () => {
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
       mockAssignmentService.assignAllOpenCases.mockRejectedValue(new Error('Pool exhausted'));
 
-      const response = await request(assignmentApp).post('/aml/cases/assign-all');
+      const response = await authReq(request(assignmentApp).post('/aml/cases/assign-all'));
 
       expect(response.status).toBe(500);
       expect(response.body.success).toBe(false);
@@ -742,6 +862,7 @@ describe('AML Routes', () => {
         '/aml',
         createAMLRoutes(mockService as any, mockAssignmentService as any),
       );
+      assignmentApp.use(errorHandler);
     });
 
     it('should return reviewer capacities', async () => {
@@ -757,7 +878,7 @@ describe('AML Routes', () => {
         },
       ]);
 
-      const response = await request(assignmentApp).get('/aml/cases/reviewer-capacities');
+      const response = await authReq(request(assignmentApp).get('/aml/cases/reviewer-capacities'));
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
@@ -769,8 +890,9 @@ describe('AML Routes', () => {
       const noServiceApp = express();
       noServiceApp.use(express.json());
       noServiceApp.use('/aml', createAMLRoutes(mockService as any));
+      noServiceApp.use(errorHandler);
 
-      const response = await request(noServiceApp).get('/aml/cases/reviewer-capacities');
+      const response = await authReq(request(noServiceApp).get('/aml/cases/reviewer-capacities'));
 
       expect(response.status).toBe(503);
     });
@@ -779,7 +901,7 @@ describe('AML Routes', () => {
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
       mockAssignmentService.getReviewerCapacities.mockRejectedValue(new Error('Timeout'));
 
-      const response = await request(assignmentApp).get('/aml/cases/reviewer-capacities');
+      const response = await authReq(request(assignmentApp).get('/aml/cases/reviewer-capacities'));
 
       expect(response.status).toBe(500);
       expect(response.body.success).toBe(false);
@@ -859,7 +981,7 @@ describe('AML Routes', () => {
       const response = await request(app).get('/aml/ofac-reviews');
 
       expect(response.status).toBe(401);
-      expect(response.body.success).toBe(false);
+      expect(response.body.code).toBe('UNAUTHORIZED');
     });
 
     it('should return 401 when only header-based spoofed auth is provided (header-only spoof)', async () => {
@@ -877,7 +999,7 @@ describe('AML Routes', () => {
         .set(authHeader('investor', 'user_1'));
 
       expect(response.status).toBe(403);
-      expect(response.body.success).toBe(false);
+      expect(response.body.code).toBe('FORBIDDEN');
     });
 
     it('should accept admin role', async () => {
@@ -1326,4 +1448,343 @@ describe('AML Routes', () => {
       expect(inQueue).toBe(true);
     });
   });
+
+  // ── Authentication & Authorization matrix across all endpoints ─────────────
+  describe('Authentication & Authorization across all AML endpoints', () => {
+    let matrixApp: Express;
+    let matrixAmlService: MockAMLService;
+    let matrixAssignmentService: any;
+
+    beforeEach(() => {
+      matrixAmlService = new MockAMLService();
+      matrixAssignmentService = {
+        assignCase: jest.fn().mockResolvedValue({ case_id: 'case_1', assigned_to: 'r1', age_days: 1, reviewer_capacities: [] }),
+        assignAllOpenCases: jest.fn().mockResolvedValue([]),
+        getReviewerCapacities: jest.fn().mockResolvedValue([]),
+      };
+
+      matrixApp = express();
+      matrixApp.use(express.json());
+      matrixApp.use(
+        '/aml',
+        createAMLRoutes(matrixAmlService as any, matrixAssignmentService as any),
+      );
+      matrixApp.use(errorHandler);
+    });
+
+    const endpoints: Array<{
+      method: 'get' | 'post' | 'put';
+      path: string;
+      body?: Record<string, unknown>;
+    }> = [
+      { method: 'get', path: '/aml/rules' },
+      { method: 'get', path: '/aml/rules/enabled' },
+      { method: 'get', path: '/aml/rules/rule_1/history' },
+      { method: 'get', path: '/aml/rules/rule_1' },
+      {
+        method: 'post',
+        path: '/aml/rules',
+        body: {
+          name: 'High Velocity Rule',
+          description: 'Flags excessive transfers within 10 minutes',
+          type: 'velocity',
+          severity: 'high',
+          config: { threshold: 10000, window_minutes: 10 },
+        },
+      },
+      {
+        method: 'put',
+        path: '/aml/rules/rule_1',
+        body: { change_reason: 'Updating threshold', enabled: false },
+      },
+      {
+        method: 'post',
+        path: '/aml/rules/rule_1/rollback',
+        body: { version: { major: 1, minor: 0, patch: 0 } },
+      },
+      { method: 'get', path: '/aml/cases?status=open' },
+      { method: 'get', path: '/aml/cases/case_1' },
+      { method: 'get', path: '/aml/cases/case_1/alerts' },
+      {
+        method: 'post',
+        path: '/aml/cases',
+        body: { alert_ids: ['alert_1'], investor_id: 'inv_1' },
+      },
+      {
+        method: 'put',
+        path: '/aml/cases/case_1',
+        body: { status: 'investigating' },
+      },
+      { method: 'get', path: '/aml/alerts/pending' },
+      { method: 'get', path: '/aml/alerts/investor/inv_1' },
+      {
+        method: 'post',
+        path: '/aml/alerts/alert_1/dismiss',
+      },
+      {
+        method: 'post',
+        path: '/aml/cases/assign-auto',
+        body: { case_id: 'case_1' },
+      },
+      {
+        method: 'post',
+        path: '/aml/cases/assign-all',
+      },
+      { method: 'get', path: '/aml/cases/reviewer-capacities' },
+      { method: 'get', path: '/aml/ofac-reviews' },
+      {
+        method: 'post',
+        path: '/aml/ofac-reviews',
+        body: {
+          alert_id: 'alert_ofac_matrix',
+          investor_id: 'investor_matrix',
+          matched_name: 'Matrix Matched Name',
+          rationale: 'Valid rationale for ofac review matrix test',
+        },
+      },
+      {
+        method: 'post',
+        path: '/aml/ofac-reviews/rev_matrix/approve',
+        body: { rationale: 'Valid rationale for ofac approval test' },
+      },
+    ];
+
+    endpoints.forEach(({ method, path, body }) => {
+      it(`should return 401 Unauthorized for anonymous ${method.toUpperCase()} ${path}`, async () => {
+        const req = request(matrixApp)[method](path);
+        if (body) {
+          req.send(body);
+        }
+        const res = await req;
+        expect(res.status).toBe(401);
+      });
+
+      it(`should return 403 Forbidden for non-compliance user ${method.toUpperCase()} ${path}`, async () => {
+        const investorToken = makeToken('user_investor', 'investor');
+        const req = request(matrixApp)[method](path)
+          .set('Authorization', `Bearer ${investorToken}`)
+          .set('x-csrf-token', 'tok')
+          .set('cookie', 'csrfToken=tok');
+        if (body) {
+          req.send(body);
+        }
+        const res = await req;
+        expect(res.status).toBe(403);
+      });
+
+      it(`should allow compliance officer for ${method.toUpperCase()} ${path}`, async () => {
+        const complianceToken = makeToken('officer_compliance', 'compliance');
+        const req = request(matrixApp)[method](path)
+          .set('Authorization', `Bearer ${complianceToken}`)
+          .set('x-user-id', 'officer_compliance')
+          .set('x-user-role', 'compliance')
+          .set('x-csrf-token', 'tok')
+          .set('cookie', 'csrfToken=tok');
+        if (body) {
+          req.send(body);
+        }
+        const res = await req;
+        expect(res.status).not.toBe(401);
+        expect(res.status).not.toBe(403);
+      });
+    });
+  });
+
+  // ── Regression: Anonymous Caller Protection (Security Fix) ─────────────────
+  describe('Regression: Anonymous Caller Protection (Security Fix)', () => {
+    it('rejects anonymous alert dismissal with 401 Unauthorized', async () => {
+      const res = await request(app)
+        .post('/aml/alerts/alert_123/dismiss');
+
+      expect(res.status).toBe(401);
+    });
+
+    it('rejects anonymous rule disabling / update with 401 Unauthorized', async () => {
+      const res = await request(app)
+        .put('/aml/rules/rule_123')
+        .send({ enabled: false, change_reason: 'Disabling rule maliciously' });
+
+      expect(res.status).toBe(401);
+    });
+
+    it('rejects anonymous reading of investor alert history with 401 Unauthorized', async () => {
+      const res = await request(app)
+        .get('/aml/alerts/investor/investor_sensitive_1');
+
+      expect(res.status).toBe(401);
+    });
+
+    it('allows compliance officer to dismiss alert', async () => {
+      const complianceToken = makeToken('officer_security', 'compliance');
+      const res = await request(app)
+        .post('/aml/alerts/alert_123/dismiss')
+        .set('Authorization', `Bearer ${complianceToken}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('allows compliance officer to disable rule', async () => {
+      const complianceToken = makeToken('officer_security', 'compliance');
+      const res = await request(app)
+        .put('/aml/rules/rule_1')
+        .set('Authorization', `Bearer ${complianceToken}`)
+        .send({ enabled: false, change_reason: 'Legitimate deactivation' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+  });
+
+  // ── Service Error Handling across AML endpoints ────────────────────────────
+  describe('Service Error Handling across AML endpoints', () => {
+    it('handles errors gracefully in GET /rules/enabled', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getEnabledRules').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/rules/enabled'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /rules/:ruleId/history', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getRuleHistory').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/rules/rule_1/history'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /rules/:ruleId', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getRuleHistory').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/rules/rule_1/history'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in PUT /rules/:ruleId', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'updateRule').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).put('/aml/rules/rule_1').send({ change_reason: 'test' }));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in POST /rules/:ruleId/rollback', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'rollbackRule').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).post('/aml/rules/rule_1/rollback').send({ version: { major: 1, minor: 0, patch: 0 } }));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /cases/:caseId', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getCase').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/cases/case_1'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /cases/:caseId/alerts', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getCaseAlerts').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/cases/case_1/alerts'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in POST /cases', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'createCase').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).post('/aml/cases').send({ alert_ids: ['a1'], investor_id: 'i1' }));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in PUT /cases/:caseId', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'updateCase').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).put('/aml/cases/case_1').send({ status: 'closed' }));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /alerts/pending', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getPendingAlerts').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/alerts/pending'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /alerts/investor/:investorId', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getInvestorAlerts').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/alerts/investor/inv_1'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in POST /alerts/:alertId/dismiss', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'dismissAlert').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).post('/aml/alerts/a1/dismiss'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in POST /rules', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'createRule').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(
+        request(app).post('/aml/rules').send({
+          name: 'Test Rule',
+          description: 'Test rule description',
+          type: 'velocity',
+          severity: 'high',
+          config: { threshold: 10 },
+        })
+      );
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles errors gracefully in GET /cases with status query', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getCasesByStatus').mockRejectedValueOnce(new Error('DB failure'));
+      const res = await authReq(request(app).get('/aml/cases?status=open'));
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('handles non-Error exceptions in POST /ofac-reviews/:id/approve', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'approveOFACReview').mockRejectedValueOnce('raw string error');
+      const res = await request(app)
+        .post('/aml/ofac-reviews/rev_1/approve')
+        .set(COMPLIANCE_HEADERS)
+        .set(CSRF_HEADERS)
+        .send({ rationale: 'This is a valid rationale for approving the review.' });
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+  });
 });
+
+
