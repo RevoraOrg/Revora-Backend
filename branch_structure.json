@@ -1,0 +1,18 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "master",
+    "origin",
+    "security/issue-1262-security-aml-investor-screening-falls-back-to"
+  ],
+  "parent": {
+    "master": null,
+    "origin": "master",
+    "security/issue-1262-security-aml-investor-screening-falls-back-to": "master"
+  },
+  "order": [
+    "master",
+    "origin",
+    "security/issue-1262-security-aml-investor-screening-falls-back-to"
+  ]
+}

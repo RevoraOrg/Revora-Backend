@@ -296,10 +296,25 @@ export class RuleEvaluator {
   private evaluateSanctionsRule(context: TransactionContext, rule: AMLRule): { triggered: boolean; details: Record<string, unknown> } {
     const config = rule.config as unknown as SanctionsRuleConfig;
     const sanctionsList = config.sanctions_list || [];
-    const nameToScreen = context.investor_name || context.investor_id;
 
-    if (!nameToScreen || sanctionsList.length === 0) {
-      return { triggered: false, details: { reason: 'Missing investor name or sanctions list' } };
+    // Fail closed: a missing legal name means screening cannot complete.
+    // Never fall back to investor_id — an identifier can never match a
+    // sanctions list and would silently clear the check (false negative).
+    const nameToScreen = context.investor_name;
+    if (!nameToScreen || nameToScreen.trim() === '') {
+      return {
+        triggered: true,
+        details: {
+          reason: 'missing_investor_name',
+          action: 'pending_review',
+          review_status: 'pending_review',
+          matched: false,
+        },
+      };
+    }
+
+    if (sanctionsList.length === 0) {
+      return { triggered: false, details: { reason: 'Missing sanctions list' } };
     }
 
     // Per-tenant threshold > rule config threshold > default 0.85

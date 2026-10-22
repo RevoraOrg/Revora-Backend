@@ -6,10 +6,10 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "jest --coverage",
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev": "node api.js && ts-node-dev --respawn --transpile-only src/index.ts",
     "migrate": "node src/db/migrate.js",
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "build": "node api.js && tsc",
+    "start": "node api.js && node dist/index.js",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "test:coverage": "jest --coverage --runInBand",
     "test:coverage:backend-011": "jest --runInBand --coverage src/middleware/rateLimit.test.ts src/middleware/startupAuthRateTierPolicy.test.ts src/routes/health.test.ts --collectCoverageFrom='src/middleware/rateLimit.ts' --collectCoverageFrom='src/middleware/startupAuthRateTierPolicy.ts' --coverageThreshold='{\"global\":{\"statements\":95,\"lines\":95,\"functions\":95}}'",
