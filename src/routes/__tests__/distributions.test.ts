@@ -95,6 +95,7 @@ describe('POST /api/v1/offerings/:id/distribute', () => {
       .send({
         revenue_amount: 1000,
         period: {
+          id: '550e8400-e29b-41d4-a716-446655440000',
           start: '2026-06-01T00:00:00Z',
           end: '2026-07-01T00:00:00Z',
         },

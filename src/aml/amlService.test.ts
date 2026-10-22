@@ -18,6 +18,7 @@ import {
   CreateCaseInput,
   UpdateCaseInput,
   SemVer,
+  TransactionContext,
 } from './types';
 import {
   RECORDED_PROVIDERS,
@@ -396,7 +397,7 @@ describe('AMLService', () => {
         config: { window_minutes: 60, max_amount: 10000, max_count: 10 },
       };
 
-      const rule = await service.createRule(input);
+      const rule = await service.createRule(input, 'user_u1');
 
       expect(rule.name).toBe(input.name);
       expect(rule.type).toBe(input.type);
@@ -406,6 +407,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_created');
+      expect(events[0].userId).toBe('user_u1');
     });
 
     it('should update a rule with version bump and audit logging', async () => {
@@ -422,7 +424,7 @@ describe('AMLService', () => {
         change_reason: 'Disabling for testing',
       };
 
-      const updated = await service.updateRule(rule.id, input);
+      const updated = await service.updateRule(rule.id, input, 'user_u2');
 
       expect(updated.enabled).toBe(false);
       expect(updated.version.minor).toBe(1);
@@ -431,6 +433,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_updated');
+      expect(events[0].userId).toBe('user_u2');
     });
 
     it('should rollback rule to previous version with audit logging', async () => {
@@ -444,7 +447,7 @@ describe('AMLService', () => {
 
       const targetVersion: SemVer = { major: 1, minor: 0, patch: 0 };
 
-      const rolledBack = await service.rollbackRule(rule.id, targetVersion);
+      const rolledBack = await service.rollbackRule(rule.id, targetVersion, 'user_u3');
 
       expect(rolledBack.version.patch).toBe(1);
 
@@ -452,6 +455,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_rollback');
+      expect(events[0].userId).toBe('user_u3');
     });
 
     it('should get all rules', async () => {
@@ -494,7 +498,7 @@ describe('AMLService', () => {
         notes: 'Initial review',
       };
 
-      const amlCase = await service.createCase(input);
+      const amlCase = await service.createCase(input, 'user_u4');
 
       expect(amlCase.status).toBe('assigned');
       expect(amlCase.assigned_to).toBe('analyst1');
@@ -503,6 +507,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_created');
+      expect(events[0].userId).toBe('user_u4');
     });
 
     it('should update a case with audit logging', async () => {
@@ -527,7 +532,7 @@ describe('AMLService', () => {
         notes: 'Investigation complete',
       };
 
-      const updated = await service.updateCase(amlCase.id, input);
+      const updated = await service.updateCase(amlCase.id, input, 'user_u5');
 
       expect(updated.status).toBe('closed');
       expect(updated.disposition).toBe('false_positive');
@@ -537,6 +542,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_updated');
+      expect(events[0].userId).toBe('user_u5');
     });
 
     it('should get case by ID', async () => {
@@ -668,7 +674,7 @@ describe('AMLService', () => {
         status: 'pending',
       });
 
-      const dismissed = await service.dismissAlert(alert.id);
+      const dismissed = await service.dismissAlert(alert.id, 'user_u6');
 
       expect(dismissed.status).toBe('dismissed');
 
@@ -676,6 +682,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u6');
     });
   });
 
@@ -871,6 +878,49 @@ describe('AMLService', () => {
       });
     });
   });
+
+  describe('Regression Tests', () => {
+    it('should not record "system" as userId when explicit actorId is provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert with explicit actorId
+      await service.dismissAlert(alert.id, 'user_u1');
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u1');
+      expect(events[0].userId).not.toBe('system');
+    });
+
+    it('should fall back to currentUserId when actorId is not provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert without explicit actorId (falls back to currentUserId)
+      await service.dismissAlert(alert.id);
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('test_user'); // currentUserId from service constructor
+    });
+  });
 });
 
   /**
@@ -1049,3 +1099,262 @@ describe('AMLService', () => {
       expect(findPiiLeaks(clean)).toEqual([]);
     });
   });
+
+// ─── Tenant Sanctions Threshold Wiring Tests (#1289) ─────────────────────────
+
+/**
+ * Minimal stub for TenantSettingsService.  Only getSanctionsThreshold is used
+ * by AMLService, so that is the only method we need.
+ */
+class MockTenantSettingsService {
+  constructor(private readonly thresholdByTenant: Record<string, number> = {}) {}
+
+  async getSanctionsThreshold(tenantId: string): Promise<number> {
+    return this.thresholdByTenant[tenantId] ?? 0.85;
+  }
+}
+
+/**
+ * A RuleEvaluator stub that captures the context it receives so tests can
+ * inspect whether tenant_settings was attached before evaluation.
+ */
+class CapturingEvaluator {
+  capturedContext: TransactionContext | null = null;
+
+  async evaluate(context: TransactionContext, _rules: any[]): Promise<any[]> {
+    this.capturedContext = context;
+    return [];
+  }
+}
+
+describe('AMLService – tenant threshold context enrichment (#1289)', () => {
+  let ruleRepo: MockRuleRepository;
+  let alertRepo: MockAlertRepository;
+  let auditRepo: MockAuditRepository;
+  let capturingEvaluator: CapturingEvaluator;
+
+  function makeService(tenantThresholds: Record<string, number> = {}) {
+    capturingEvaluator = new CapturingEvaluator();
+    const tenantSettingsService = new MockTenantSettingsService(tenantThresholds);
+    return new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      capturingEvaluator as any,
+      auditRepo,
+      'test_user',
+      undefined, // ofacReviewRepo not needed
+      tenantSettingsService as any,
+    );
+  }
+
+  beforeEach(() => {
+    ruleRepo = new MockRuleRepository();
+    alertRepo = new MockAlertRepository();
+    auditRepo = new MockAuditRepository();
+  });
+
+  it('regression: without TenantSettingsService, tenant_settings is never attached', async () => {
+    // Verify the pre-fix behaviour: service wired WITHOUT tenantSettingsService.
+    capturingEvaluator = new CapturingEvaluator();
+    const serviceWithoutTenant = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      capturingEvaluator as any,
+      auditRepo,
+      'test_user',
+    );
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      // tenant_settings deliberately absent — simulates the bug
+    };
+
+    await serviceWithoutTenant.evaluateTransaction(context);
+
+    // Without the fix the evaluator receives the context as-is, with no
+    // tenant_settings populated.
+    expect(capturingEvaluator.capturedContext?.tenant_settings).toBeUndefined();
+  });
+
+  it('with TenantSettingsService, tenant threshold is attached when tenant_id is set', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      // tenant_settings absent — service must populate it
+    };
+
+    await service.evaluateTransaction(context);
+
+    expect(capturingEvaluator.capturedContext?.tenant_settings?.sanctions_threshold).toBe(0.95);
+  });
+
+  it('does not overwrite an already-populated tenant_settings.sanctions_threshold', async () => {
+    // Callers that pre-populate context (e.g. tests, admin overrides) must not
+    // have their value silently replaced.
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.99 }, // caller already set it
+    };
+
+    await service.evaluateTransaction(context);
+
+    // Pre-existing value must be preserved
+    expect(capturingEvaluator.capturedContext?.tenant_settings?.sanctions_threshold).toBe(0.99);
+  });
+
+  it('does not load threshold when tenant_id is absent', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      // no tenant_id
+    };
+
+    await service.evaluateTransaction(context);
+
+    expect(capturingEvaluator.capturedContext?.tenant_settings).toBeUndefined();
+  });
+
+  it('original caller context is not mutated (shallow copy is used)', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+    };
+
+    await service.evaluateTransaction(context);
+
+    // The original context object must remain unchanged
+    expect(context.tenant_settings).toBeUndefined();
+  });
+
+  it('alert details include threshold_source tenant when tenant threshold is active', async () => {
+    // Use a real RuleEvaluator so the full path is exercised end-to-end.
+    const investmentRepo = { listByInvestor: async () => [] };
+    const realEvaluator = new RuleEvaluator(investmentRepo as any);
+
+    const tenantSettingsService = new MockTenantSettingsService({ tenant_abc: 0.95 });
+    const service = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      realEvaluator,
+      auditRepo,
+      'test_user',
+      undefined,
+      tenantSettingsService as any,
+    );
+
+    // Create a sanctions rule that would trigger at 0.85 but NOT at 0.95.
+    await ruleRepo.create(
+      {
+        name: 'Sanctions Rule',
+        description: 'Test sanctions rule',
+        type: 'sanctions_screening',
+        severity: 'critical',
+        config: {
+          sanctions_list: ['Specially Designated National'],
+          fuzzy_enabled: true,
+        },
+      },
+      'test_user',
+    );
+
+    // Investor name that scores above 0.85 but below 0.95 vs the list entry
+    const context: TransactionContext = {
+      investment_id: 'inv_sanctions_1',
+      investor_id: 'investor_sanctions_1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      investor_name: 'Specially Designated Nationol',
+      tenant_id: 'tenant_abc',
+      previous_transactions: [],
+      // No tenant_settings — service must attach it
+    };
+
+    const alerts = await service.evaluateTransaction(context);
+
+    // With tenant threshold 0.95 the near-miss name must NOT trigger
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('with default 0.85 threshold the same near-miss name DOES trigger (proving threshold is used)', async () => {
+    // Same setup but without TenantSettingsService — falls back to 0.85.
+    const investmentRepo = { listByInvestor: async () => [] };
+    const realEvaluator = new RuleEvaluator(investmentRepo as any);
+
+    const serviceDefault = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      realEvaluator,
+      auditRepo,
+      'test_user',
+      // No tenantSettingsService
+    );
+
+    await ruleRepo.create(
+      {
+        name: 'Sanctions Rule',
+        description: 'Test sanctions rule',
+        type: 'sanctions_screening',
+        severity: 'critical',
+        config: {
+          sanctions_list: ['Specially Designated National'],
+          fuzzy_enabled: true,
+        },
+      },
+      'test_user',
+    );
+
+    const context: TransactionContext = {
+      investment_id: 'inv_sanctions_2',
+      investor_id: 'investor_sanctions_2',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      investor_name: 'Specially Designated Nationol',
+      previous_transactions: [],
+    };
+
+    const alerts = await service.evaluateTransaction(context);
+
+    // At 0.85 this near-miss SHOULD trigger, confirming the threshold matters
+    expect(alerts.length).toBeGreaterThan(0);
+    expect(alerts[0].details.threshold_source).toBe('default');
+    expect(alerts[0].details.threshold).toBe(0.85);
+  });
+});
