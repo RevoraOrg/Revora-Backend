@@ -31,6 +31,7 @@ import {
  *  - Session not found                  -> null
  *  - Session already revoked            -> null + revokeSessionAndDescendants
  *  - Token already used after rotation  -> null + revokeSessionAndDescendants
+ *  - Account deactivated (SCIM, #1300)  -> null + revokeSessionAndDescendants
  *  - Concurrent duplicate in-process    -> null (no revocation)
  */
 export class RefreshService {
@@ -137,6 +138,16 @@ export class RefreshService {
                     userId,
                     sessionId,
                     revokedAt: session.revoked_at,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            // 2c.5 Reject deactivated users (#1300)
+            if (!(await this.repository.isUserActive(session.user_id, client))) {
+                this.logger.warn('Attempted refresh for inactive user', {
+                    userId,
+                    sessionId,
                 });
                 await this.repository.revokeSessionAndDescendants(sessionId, client);
                 return null;

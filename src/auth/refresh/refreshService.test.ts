@@ -38,6 +38,7 @@ type StoredSession = {
 class InMemoryRefreshRepository implements RefreshTokenRepository {
     readonly sessions = new Map<string, StoredSession>();
     readonly revocations: string[] = [];
+    userActive = true;
 
     addSession(input: {
         id: string;
@@ -119,6 +120,10 @@ class InMemoryRefreshRepository implements RefreshTokenRepository {
             session.token_consumed_at = new Date('2026-01-01T00:00:00.000Z');
         }
     }
+
+    async isUserActive(): Promise<boolean> {
+        return this.userActive;
+    }
 }
 
 class DeterministicTokenService implements TokenService {
@@ -153,6 +158,7 @@ const createMockRepo = (): jest.Mocked<RefreshTokenRepository> => ({
     revokeSessionAndDescendants: jest.fn().mockResolvedValue(undefined),
     setSessionConsumed: jest.fn().mockResolvedValue(undefined),
     findSessionByParentId: jest.fn(),
+    isUserActive: jest.fn().mockResolvedValue(true),
 });
 
 const createMockTokenService = (): jest.Mocked<TokenService> => ({
@@ -422,6 +428,54 @@ describe('RefreshService', () => {
         expect(result).toBeNull();
         expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
         expect(repo.createSession).not.toHaveBeenCalled();
+    });
+
+    it('rejects and revokes the session family when the account was deactivated (#1300)', async () => {
+        const repo = createMockRepo();
+        const tokenService = createMockTokenService();
+        const service = new RefreshService(repo, tokenService, mockDb, logger);
+
+        tokenService.verifyRefreshToken.mockReturnValue({ userId: USER_ID, sessionId: 'session-0', role: ROLE });
+        tokenService.hashToken.mockReturnValue('hash:refresh-session-0');
+        repo.findSessionByIdForUpdate.mockResolvedValue({
+            id: 'session-0',
+            user_id: USER_ID,
+            token_hash: 'hash:refresh-session-0',
+            expires_at: NOW_FUTURE,
+            revoked_at: null,
+            token_consumed_at: null,
+        });
+        repo.isUserActive.mockResolvedValue(false);
+
+        const result = await service.refresh('refresh-session-0');
+
+        expect(result).toBeNull();
+        expect(repo.isUserActive).toHaveBeenCalledWith(USER_ID, mockClient);
+        expect(repo.revokeSessionAndDescendants).toHaveBeenCalledWith('session-0', mockClient);
+        expect(repo.setSessionConsumed).not.toHaveBeenCalled();
+        expect(repo.createSession).not.toHaveBeenCalled();
+        expect(tokenService.issueTokens).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith('Attempted refresh for inactive user', {
+            userId: USER_ID,
+            sessionId: 'session-0',
+        });
+    });
+
+    it('stops a deactivated user mid-lineage: the current child token no longer rotates (#1300)', async () => {
+        const repo = new InMemoryRefreshRepository();
+        const service = new RefreshService(repo, new DeterministicTokenService(), mockDb, logger);
+        repo.addSession({ id: 'session-0', token: 'refresh-session-0' });
+
+        const first = await service.refresh('refresh-session-0');
+        expect(first).not.toBeNull();
+        const childId = [...repo.sessions.keys()].find((id) => id !== 'session-0')!;
+
+        repo.userActive = false;
+        const second = await service.refresh(`refresh-${childId}`);
+
+        expect(second).toBeNull();
+        expect(repo.sessions.get(childId)!.revoked_at).not.toBeNull();
+        expect(repo.sessions.size).toBe(2);
     });
 
     it('revokes session family when child session already exists (reuse probe)', async () => {

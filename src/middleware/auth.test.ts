@@ -135,6 +135,25 @@ describe('requireAuth middleware', () => {
 
     expect(mockNext).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
   });
+
+  it('rejects a still-valid token whose session was revoked (e.g. SCIM deprovisioning, #1300)', async () => {
+    const token = signJwt({ sub: 'user-123', sid: 'session-abc' });
+    sessionRepo.findById.mockResolvedValueOnce({
+      id: 'session-abc',
+      user_id: 'user-123',
+      token_hash: hashSessionToken(token),
+      expires_at: new Date(Date.now() + 10 * 60 * 1000),
+      created_at: new Date(),
+      revoked_at: new Date(),
+    });
+
+    const req = makeReq(`Bearer ${token}`);
+    await requireAuth(req as Request, mockRes(), mockNext);
+
+    const err = expectAppError(mockNext as jest.Mock, 401);
+    expect(err.message).toBe('Unauthorized: session revoked');
+    expect(req.auth).toBeUndefined();
+  });
 });
 
 // ── authMiddleware (master — JWT factory fn) ──────────────────────────────────
