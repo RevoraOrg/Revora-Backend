@@ -11,7 +11,8 @@ import { hashSessionToken, SESSION_TTL_MS } from '../session';
  * Domain service that orchestrates the login flow:
  *
  *  1. Look up the user by email.
- *  2. Compare the provided password against the stored hash.
+ *  2. Compare the provided password against the stored hash and reject
+ *     deactivated accounts.
  *  3. Generate a new session ID.
  *  4. Issue tokens embedding the session ID.
  *  5. Persist the session with the refresh token hash.
@@ -42,6 +43,12 @@ export class LoginService {
 
         // 2. Verify password
         if (!this.verifyPassword(password, user.passwordHash)) {
+            return null;
+        }
+
+        // Deactivated (#1300). Same result as a wrong password, and checked
+        // after it so the timing doesn't give the account state away.
+        if (user.isActive === false) {
             return null;
         }
 

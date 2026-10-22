@@ -12,13 +12,13 @@
  */
 
 import {
-  OutboxHmacRotationService,
   LocalKmsClient,
   KmsClient,
   RotationAuditEvent,
   AuditSink,
   OutboxHmacRotationOptions,
 } from '../outboxHmacRotationService';
+import { OutboxHmacRotationService } from '../outboxDispatcher';
 import {
   signPayload,
   verifyWebhookPayloadDualKey,
@@ -661,6 +661,8 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     event_type: WebhookEventType.PAYOUT_COMPLETED,
     payload: { investor_id: 'inv-1' },
     status: 'pending',
+    locked_until: null,
+    lease_token: null,
     attempts: 0,
     available_at: new Date(),
     created_at: new Date('2025-01-01T00:00:00Z'),

@@ -826,6 +826,16 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createReconciliationMetricsHandler(globalMetrics),
   );
 
+  // SCIM 2.0 provisioning (#1300), only when a token is configured.
+  // IdPs send application/scim+json, which the global parser skips.
+  if (env.SCIM_TOKEN) {
+    app.use(
+      "/scim/v2",
+      express.json({ type: ["application/json", "application/scim+json"], limit: "32kb" }),
+      createScimRouter(new UserRepository(pool), env.SCIM_TOKEN),
+    );
+  }
+
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);

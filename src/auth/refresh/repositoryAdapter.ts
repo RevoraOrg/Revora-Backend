@@ -34,4 +34,13 @@ export class RefreshTokenRepositoryAdapter implements RefreshTokenRepository {
     async setSessionConsumed(sessionId: string, client?: PoolClient): Promise<void> {
         return this.sessionRepository.setSessionConsumed(sessionId, client);
     }
+
+    /** Missing user counts as inactive. */
+    async isUserActive(userId: string, client: PoolClient): Promise<boolean> {
+        const result = await client.query<{ is_active: boolean }>(
+            'SELECT is_active FROM users WHERE id = $1 FOR SHARE',
+            [userId],
+        );
+        return result.rows.length > 0 && result.rows[0].is_active !== false;
+    }
 }

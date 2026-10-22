@@ -14,11 +14,13 @@ import {
 } from '../lib/webhookSignature';
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 import type { PoolClient } from 'pg';
+import * as ssrfProtection from '../lib/ssrfProtection';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const mockFetch = jest.fn() as jest.MockedFunction<typeof fetch>;
 global.fetch = mockFetch;
+const mockSafeFetch = jest.spyOn(ssrfProtection, 'safeFetch');
 
 function makeEndpoint(overrides: Partial<WebhookEndpointRecord> = {}): WebhookEndpointRecord {
   return { id: 'ep-1', url: 'https://example.com/hook', secret: 'shhh', ...overrides };
@@ -46,6 +48,7 @@ function flushPromises(): Promise<void> {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockSafeFetch.mockImplementation((url, init) => mockFetch(url, init as RequestInit));
 });
 
 // ─── signPayload ─────────────────────────────────────────────────────────────
@@ -116,8 +119,30 @@ describe('WebhookService.deliver', () => {
       expect.objectContaining({
         method: 'POST',
         body,
+        redirect: 'manual',
       }),
     );
+  });
+
+  it('refuses a privately resolving endpoint without issuing a request', async () => {
+    const privateResolution = new ssrfProtection.SsrfValidationError(
+      'Hostname resolved to a private address',
+      'RESOLVED_TO_PRIVATE',
+    );
+    mockSafeFetch.mockRejectedValue(privateResolution);
+
+    const result = await svc.deliver(
+      makeEndpoint({ url: 'https://private.example/hook' }),
+      makePayload({}),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.attempts).toBe(3);
+    expect(mockSafeFetch).toHaveBeenCalledWith(
+      'https://private.example/hook',
+      expect.objectContaining({ redirect: 'manual' }),
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('retries on 500 and succeeds on second attempt', async () => {
@@ -288,6 +313,8 @@ describe('WebhookService.emit with transactional client', () => {
       event_type: WebhookEventType.DISTRIBUTION_COMPLETED,
       payload: {},
       status: 'pending',
+      locked_until: null,
+      lease_token: null,
       attempts: 0,
       available_at: new Date(),
       created_at: new Date(),
@@ -363,6 +390,8 @@ describe('WebhookService.emitToOutbox', () => {
       event_type: WebhookEventType.PAYOUT_COMPLETED,
       payload: {},
       status: 'pending',
+      locked_until: null,
+      lease_token: null,
       attempts: 0,
       available_at: new Date(),
       created_at: new Date(),
