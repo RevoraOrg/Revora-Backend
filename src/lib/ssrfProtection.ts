@@ -1,7 +1,5 @@
-import { lookup } from 'dns';
-import { promisify } from 'util';
-
-const dnsLookup = promisify(lookup);
+import { lookup as dnsLookup } from 'dns/promises';
+import * as https from 'https';
 
 /**
  * @title SSRF Protection for Webhook Delivery
@@ -16,13 +14,13 @@ const dnsLookup = promisify(lookup);
  * - Decimal and hex-encoded IP addresses are normalized and validated
  *
  * Abuse/failure paths handled:
- * - IPv4 private ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+ * - IPv4 private/shared/benchmark ranges (10/8, 172.16/12, 192.168/16, 100.64/10, 198.18/15)
  * - IPv4 loopback (127.0.0.0/8)
  * - IPv4 link-local (169.254.0.0/16)
  * - IPv4 unspecified (0.0.0.0/8)
  * - IPv6 loopback (::1)
  * - IPv6 unique local addresses (fc00::/7)
- * - IPv6 link-local (fe80::/10)
+ * - IPv6 link-local (fe80::/10) and IPv4-embedded IPv6 forms
  * - IPv6 unspecified (::)
  * - DNS rebinding attacks (hostname resolves to private IP)
  * - Non-HTTPS schemes
@@ -62,9 +60,22 @@ export interface SsrfValidationResult {
   hostname?: string;
 }
 
+export interface SafeFetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string | Uint8Array;
+  signal?: AbortSignal;
+  redirect?: 'manual';
+}
+
+export interface SafeFetchResponse {
+  ok: boolean;
+  status: number;
+}
+
 /**
  * @notice Checks if an IPv4 address is in a private/reserved range.
- * @dev Covers 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, 0.0.0.0/8
+ * @dev Covers private, shared, benchmarking, loopback, link-local, and unspecified IPv4 ranges.
  */
 export function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split('.').map(Number);
@@ -92,6 +103,12 @@ export function isPrivateIPv4(ip: string): boolean {
   // 0.0.0.0/8 (unspecified)
   if (first === 0) return true;
 
+  // 100.64.0.0/10 (shared address space)
+  if (first === 100 && second >= 64 && second <= 127) return true;
+
+  // 198.18.0.0/15 (benchmarking)
+  if (first === 198 && (second === 18 || second === 19)) return true;
+
   return false;
 }
 
@@ -113,8 +130,20 @@ export function isPrivateIPv6(ip: string): boolean {
     return true;
   }
 
-  // Expand compressed IPv6 for easier checking
+  // Convert an IPv4 tail to its two IPv6 groups before checking embedded forms.
   let expanded = normalized;
+  if (expanded.includes('.')) {
+    const lastColon = expanded.lastIndexOf(':');
+    const ipv4 = expanded.slice(lastColon + 1).split('.').map(Number);
+    if (ipv4.length !== 4 || ipv4.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+      return false;
+    }
+    const high = ((ipv4[0] << 8) | ipv4[1]).toString(16);
+    const low = ((ipv4[2] << 8) | ipv4[3]).toString(16);
+    expanded = `${expanded.slice(0, lastColon)}:${high}:${low}`;
+  }
+
+  // Expand compressed IPv6 for easier checking
   if (expanded.includes('::')) {
     const parts = expanded.split('::');
     const leftParts = parts[0].split(':').filter(p => p);
@@ -126,6 +155,33 @@ export function isPrivateIPv6(ip: string): boolean {
   const parts = expanded.split(':').map(p => parseInt(p, 16) || 0);
   if (parts.length !== 8) {
     return false; // Invalid IPv6, will be caught elsewhere
+  }
+
+  const embeddedIpv4 = (high: number, low: number): boolean =>
+    isPrivateIPv4(`${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`);
+
+  // IPv4-mapped, IPv4-compatible, and well-known NAT64 prefixes.
+  if (parts.slice(0, 5).every((part) => part === 0) && parts[5] === 0xffff) {
+    return embeddedIpv4(parts[6], parts[7]);
+  }
+  if (parts.slice(0, 6).every((part) => part === 0)) {
+    return embeddedIpv4(parts[6], parts[7]);
+  }
+  if (parts[0] === 0x0064 && parts[1] === 0xff9b && parts.slice(2, 6).every((part) => part === 0)) {
+    return embeddedIpv4(parts[6], parts[7]);
+  }
+
+  // 6to4 embeds IPv4 in groups 1-2; Teredo stores its bitwise inverse.
+  if (parts[0] === 0x2002) {
+    return embeddedIpv4(parts[1], parts[2]);
+  }
+  if (parts[0] === 0x2001 && parts[1] === 0) {
+    return embeddedIpv4(parts[6] ^ 0xffff, parts[7] ^ 0xffff);
+  }
+
+  // ISATAP embeds IPv4 in groups 6-7 of the interface identifier.
+  if ((parts[4] === 0 || parts[4] === 0x0200) && parts[5] === 0x5efe) {
+    return embeddedIpv4(parts[6], parts[7]);
   }
 
   const [first] = parts;
@@ -294,22 +350,27 @@ export async function validateWebhookUrl(
   // Hostname - perform DNS resolution if enabled
   if (resolveDns) {
     try {
-      const { address } = await dnsLookup(hostname);
-      
-      // Check if resolved IP is private
-      if (isPrivateIP(address)) {
+      const addresses = await dnsLookup(hostname, { all: true, verbatim: true });
+      const privateAddress = addresses.find(({ address }) => isPrivateIP(address));
+
+      // Reject mixed public/private answers instead of selecting a public record selectively.
+      if (privateAddress) {
         return {
           valid: false,
           error: new SsrfValidationError(
-            `Hostname resolved to private or reserved IP address: ${hostname} -> ${address}`,
+            `Hostname resolved to private or reserved IP address: ${hostname} -> ${privateAddress.address}`,
             'RESOLVED_TO_PRIVATE'
           ),
         };
       }
 
+      if (addresses.length === 0) {
+        throw new Error('DNS returned no addresses');
+      }
+
       return {
         valid: true,
-        resolvedIp: address,
+        resolvedIp: addresses[0].address,
         hostname,
       };
     } catch (error) {
@@ -328,6 +389,61 @@ export async function validateWebhookUrl(
     valid: true,
     hostname,
   };
+}
+
+/**
+ * Sends an HTTPS request only to the address validated during this call.
+ * Redirects are returned to the caller and are never followed automatically.
+ */
+export async function safeFetch(
+  url: string | URL,
+  init: SafeFetchInit = {}
+): Promise<SafeFetchResponse> {
+  if (init.redirect && init.redirect !== 'manual') {
+    throw new Error('Webhook redirects must be handled manually');
+  }
+
+  const target = new URL(url);
+  const validation = await validateWebhookUrl(target.toString());
+  if (!validation.valid || !validation.resolvedIp) {
+    throw validation.error ?? new SsrfValidationError('Webhook URL could not be validated', 'INVALID_URL');
+  }
+
+  const pinnedIp = validation.resolvedIp;
+  const family = pinnedIp.includes(':') ? 6 : 4;
+  const agent = new https.Agent({
+    keepAlive: false,
+    lookup: (_hostname, options, callback) => {
+      if (typeof options === 'object' && options.all) {
+        callback(null, [{ address: pinnedIp, family }]);
+      } else {
+        callback(null, pinnedIp, family);
+      }
+    },
+  });
+
+  try {
+    return await new Promise<SafeFetchResponse>((resolve, reject) => {
+      const request = https.request(target, {
+        method: init.method ?? 'GET',
+        headers: init.headers,
+        signal: init.signal,
+        agent,
+      }, (response) => {
+        const status = response.statusCode ?? 0;
+        response.resume();
+        resolve({ status, ok: status >= 200 && status < 300 });
+      });
+
+      request.once('error', reject);
+      if (init.body !== undefined) {
+        request.write(init.body);
+      }
+      request.end();
+    });
+  } finally {
+    agent.destroy();
+  }
 }
 
 /**

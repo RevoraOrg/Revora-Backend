@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import {
   createIdempotencyMiddleware,
   InMemoryIdempotencyStore,
+  PostgresIdempotencyStore,
   IdempotencyRecord,
   IdempotencyStore,
 } from './idempotency';
@@ -1011,5 +1012,360 @@ describe('createIdempotencyMiddleware – fingerprint conflict', () => {
 
     expect(res2.statusCode).toBe(200);
     expect(res2.headers['idempotency-status']).toBe('cached');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Principal Namespacing & Cross-Tenant Isolation Tests
+// ---------------------------------------------------------------------------
+
+describe('createIdempotencyMiddleware – principal namespacing & tenant isolation', () => {
+  it('namespaces store key as ${principalId}:${method}:${routePath}:${headerKey}', async () => {
+    const store: IdempotencyStore = {
+      checkAndReserve: jest.fn().mockResolvedValue({ state: 'new' }),
+      save: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+    };
+
+    const middleware = createIdempotencyMiddleware({
+      store,
+      routePath: '/api/investments',
+    });
+
+    const req = createRequest('POST', 'client-uuid-123') as any;
+    req.user = { id: 'investor-user-456' };
+    const res = new MockResponse();
+    const next: NextFunction = jest.fn(() => {
+      res.status(201).json({ success: true });
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    expect(store.checkAndReserve).toHaveBeenCalledWith(
+      'investor-user-456:POST:/api/investments:client-uuid-123'
+    );
+    expect(store.save).toHaveBeenCalledWith(
+      'investor-user-456:POST:/api/investments:client-uuid-123',
+      expect.objectContaining({ status: 201 })
+    );
+  });
+
+  it('supports user.sub when user.id is absent', async () => {
+    const store: IdempotencyStore = {
+      checkAndReserve: jest.fn().mockResolvedValue({ state: 'new' }),
+      save: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+    };
+
+    const middleware = createIdempotencyMiddleware({
+      store,
+      routePath: '/api/transfers',
+    });
+
+    const req = createRequest('POST', 'sub-key') as any;
+    req.user = { sub: 'sub-principal-789' };
+    const res = new MockResponse();
+    const next: NextFunction = jest.fn(() => {
+      res.status(200).send('ok');
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    expect(store.checkAndReserve).toHaveBeenCalledWith(
+      'sub-principal-789:POST:/api/transfers:sub-key'
+    );
+  });
+
+  it('falls back to raw header key when no principal is present and requirePrincipal is false', async () => {
+    const store: IdempotencyStore = {
+      checkAndReserve: jest.fn().mockResolvedValue({ state: 'new' }),
+      save: jest.fn().mockResolvedValue(undefined),
+      release: jest.fn().mockResolvedValue(undefined),
+    };
+
+    const middleware = createIdempotencyMiddleware({
+      store,
+      routePath: '/api/public-action',
+    });
+
+    const req = createRequest('POST', 'anon-key') as any; // no user
+    const res = new MockResponse();
+    const next: NextFunction = jest.fn(() => {
+      res.status(200).send('ok');
+    });
+
+    await middleware(req, res as unknown as Response, next);
+    await Promise.resolve();
+
+    expect(store.checkAndReserve).toHaveBeenCalledWith('anon-key');
+  });
+
+  it('rejects with 401 when requirePrincipal is true and req.user is missing', async () => {
+    const store: IdempotencyStore = {
+      checkAndReserve: jest.fn(),
+      save: jest.fn(),
+      release: jest.fn(),
+    };
+
+    const middleware = createIdempotencyMiddleware({
+      store,
+      requirePrincipal: true,
+    });
+
+    const req = createRequest('POST', 'secure-key') as any; // no user
+    const res = new MockResponse();
+    const next: NextFunction = jest.fn();
+
+    await middleware(req, res as unknown as Response, next);
+
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({
+      error: 'Unauthorized: Authentication required for idempotency',
+    });
+    expect(next).not.toHaveBeenCalled();
+    expect(store.checkAndReserve).not.toHaveBeenCalled();
+  });
+
+  it('guarantees cross-tenant isolation: two investors using the same key both get their own execution', async () => {
+    const store = new InMemoryIdempotencyStore();
+    const middleware = createIdempotencyMiddleware({
+      store,
+      routePath: '/api/investments',
+    });
+
+    // Investor 1 sends key "shared-fixed-uuid"
+    const req1 = createRequest('POST', 'shared-fixed-uuid') as any;
+    req1.user = { id: 'investor-1' };
+    const res1 = new MockResponse();
+    const next1 = jest.fn(() => {
+      res1.status(201).json({ id: 'inv-1', investor: 'investor-1', amount: '500' });
+    });
+
+    await middleware(req1, res1 as unknown as Response, next1);
+    await Promise.resolve();
+
+    expect(next1).toHaveBeenCalledTimes(1);
+    expect(res1.statusCode).toBe(201);
+    expect((res1.body as any).id).toBe('inv-1');
+
+    // Investor 2 sends the EXACT SAME key "shared-fixed-uuid"
+    const req2 = createRequest('POST', 'shared-fixed-uuid') as any;
+    req2.user = { id: 'investor-2' };
+    const res2 = new MockResponse();
+    const next2 = jest.fn(() => {
+      res2.status(201).json({ id: 'inv-2', investor: 'investor-2', amount: '1000' });
+    });
+
+    await middleware(req2, res2 as unknown as Response, next2);
+    await Promise.resolve();
+
+    // MUST NOT return investor 1's cached response; investor 2 gets their own investment!
+    expect(next2).toHaveBeenCalledTimes(1);
+    expect(res2.statusCode).toBe(201);
+    expect((res2.body as any).id).toBe('inv-2');
+    expect((res2.body as any).investor).toBe('investor-2');
+    expect(res2.headers['idempotency-status']).toBeUndefined(); // Fresh execution, not cached!
+
+    // Replay for Investor 1 with same key returns Investor 1's cached body
+    const req1Replay = createRequest('POST', 'shared-fixed-uuid') as any;
+    req1Replay.user = { id: 'investor-1' };
+    const res1Replay = new MockResponse();
+    const next1Replay = jest.fn();
+
+    await middleware(req1Replay, res1Replay as unknown as Response, next1Replay);
+    await Promise.resolve();
+
+    expect(next1Replay).not.toHaveBeenCalled();
+    expect(res1Replay.statusCode).toBe(201);
+    expect((res1Replay.body as any).id).toBe('inv-1');
+    expect(res1Replay.headers['idempotency-status']).toBe('cached');
+
+    // Replay for Investor 2 with same key returns Investor 2's cached body
+    const req2Replay = createRequest('POST', 'shared-fixed-uuid') as any;
+    req2Replay.user = { id: 'investor-2' };
+    const res2Replay = new MockResponse();
+    const next2Replay = jest.fn();
+
+    await middleware(req2Replay, res2Replay as unknown as Response, next2Replay);
+    await Promise.resolve();
+
+    expect(next2Replay).not.toHaveBeenCalled();
+    expect(res2Replay.statusCode).toBe(201);
+    expect((res2Replay.body as any).id).toBe('inv-2');
+    expect(res2Replay.headers['idempotency-status']).toBe('cached');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PostgresIdempotencyStore Unit Tests
+// ---------------------------------------------------------------------------
+
+describe('PostgresIdempotencyStore', () => {
+  let mockClient: {
+    query: jest.Mock;
+    release: jest.Mock;
+  };
+  let mockPool: {
+    connect: jest.Mock;
+    query: jest.Mock;
+  };
+
+  beforeEach(() => {
+    mockClient = {
+      query: jest.fn(),
+      release: jest.fn(),
+    };
+    mockPool = {
+      connect: jest.fn().mockResolvedValue(mockClient),
+      query: jest.fn(),
+    };
+  });
+
+  it('reserves a new key with row lock and inflight insert', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+      ttlMs: 60000,
+    });
+
+    // BEGIN, SELECT FOR UPDATE returns no rows, INSERT inflight, COMMIT
+    mockClient.query
+      .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({ rows: [] }) // SELECT FOR UPDATE
+      .mockResolvedValueOnce({ rows: [] }) // INSERT
+      .mockResolvedValueOnce({ rows: [] }); // COMMIT
+
+    const result = await store.checkAndReserve('pg-key-1');
+
+    expect(result.state).toBe('new');
+    expect(mockClient.query).toHaveBeenCalledWith('BEGIN');
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining('SELECT'),
+      ['pg-key-1']
+    );
+    expect(mockClient.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO idempotency_keys'),
+      expect.arrayContaining(['pg-key-1'])
+    );
+    expect(mockClient.query).toHaveBeenCalledWith('COMMIT');
+    expect(mockClient.release).toHaveBeenCalled();
+  });
+
+  it('returns inflight if key is currently in progress', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+    });
+
+    mockClient.query
+      .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({
+        rows: [{ state: 'inflight' }],
+      }) // SELECT FOR UPDATE
+      .mockResolvedValueOnce({ rows: [] }); // ROLLBACK
+
+    const result = await store.checkAndReserve('pg-inflight-key');
+
+    expect(result.state).toBe('inflight');
+    expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+    expect(mockClient.release).toHaveBeenCalled();
+  });
+
+  it('returns cached record if key completed and not expired', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+    });
+
+    const now = new Date();
+    mockClient.query
+      .mockResolvedValueOnce({ rows: [] }) // BEGIN
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            state: 'completed',
+            response_status: 201,
+            response_body: '{"id":"inv-1"}',
+            response_content_type: 'application/json',
+            fingerprint: 'fp-123',
+            created_at: now.toISOString(),
+          },
+        ],
+      }) // SELECT FOR UPDATE
+      .mockResolvedValueOnce({ rows: [] }); // ROLLBACK
+
+    const result = await store.checkAndReserve('pg-cached-key');
+
+    expect(result.state).toBe('cached');
+    if (result.state === 'cached') {
+      expect(result.record.status).toBe(201);
+      expect(result.record.body).toBe('{"id":"inv-1"}');
+      expect(result.record.contentType).toBe('application/json');
+      expect(result.record.fingerprint).toBe('fp-123');
+    }
+    expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+    expect(mockClient.release).toHaveBeenCalled();
+  });
+
+  it('fails open (returns state: "new") on pool connection error without throwing', async () => {
+    mockPool.connect.mockRejectedValueOnce(new Error('Connection timeout'));
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+    });
+
+    const result = await store.checkAndReserve('err-conn-key');
+
+    expect(result.state).toBe('new');
+    expect(mockClient.release).not.toHaveBeenCalled(); // client was never connected
+  });
+
+  it('saves completed response record with TTL', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+      ttlMs: 3600000, // 1 hour
+    });
+    mockPool.query.mockResolvedValueOnce({ rows: [] });
+
+    const record: IdempotencyRecord = {
+      status: 201,
+      body: '{"status":"ok"}',
+      contentType: 'application/json',
+      fingerprint: 'fp-abc',
+      createdAt: new Date(),
+    };
+
+    await store.save('save-key', record);
+
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('UPDATE idempotency_keys'),
+      expect.arrayContaining([201, '{"status":"ok"}', 'save-key'])
+    );
+  });
+
+  it('releases key on failure so it can be retried', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+    });
+    mockPool.query.mockResolvedValueOnce({ rows: [] });
+
+    await store.release('release-key');
+
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining("SET state = 'released'"),
+      ['release-key']
+    );
+  });
+
+  it('cleans up expired records', async () => {
+    const store = new PostgresIdempotencyStore({
+      pool: mockPool as unknown as Pool,
+    });
+    mockPool.query.mockResolvedValueOnce({ rowCount: 42 });
+
+    const deleted = await store.cleanupExpired();
+
+    expect(deleted).toBe(42);
+    expect(mockPool.query).toHaveBeenCalledWith(
+      expect.stringContaining('WHERE expires_at IS NOT NULL AND expires_at < NOW()')
+    );
   });
 });

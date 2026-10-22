@@ -17,6 +17,44 @@ import { AccountingLedgerService, DistributionRunLedger } from '../services/acco
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
 
 /**
+ * Convenience factory for HTTP 422 Unprocessable Entity.
+ * Used when the request is well-formed but semantically invalid (e.g. no
+ * matching revenue report exists for the provided period).
+ */
+const unprocessableEntity = (message: string) =>
+  createError(ErrorCode.VALIDATION_ERROR, message, 422);
+
+/**
+ * UUID v4 regex (RFC 4122).
+ * Used to validate period.id before passing it to the distribution engine,
+ * since distributions.period_id is a UUID NOT NULL column.
+ */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Returns true iff the string is a well-formed RFC 4122 UUID. */
+export function isUUID(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/**
+ * Minimal repository surface the distributions router depends on for
+ * period/revenue-report resolution. Defined locally so the router stays
+ * decoupled from the full repository class and test fakes remain simple.
+ */
+export interface RevenueReportRepo {
+  /**
+   * Find any revenue report that covers [periodStart, periodEnd) for the
+   * given offering. Used to resolve a missing period.id from the caller.
+   */
+  findOverlappingReport(
+    offeringId: string,
+    periodStart: Date,
+    periodEnd: Date,
+  ): Promise<{ id: string } | null>;
+}
+
+/**
  * Minimal repository surface the distributions router depends on for the
  * double-entry accounting export. Defined locally to keep the router
  * decoupled from the full repository class and preserve test compatibility.
@@ -70,6 +108,7 @@ export function createDistributionHandlers(
   distributionAccountRepo?: DistributionAccountRepo,
   accountingLedger?: AccountingLedgerService,
   scheduledDistributionRepo?: ScheduledDistributionRepository,
+  revenueReportRepo?: RevenueReportRepo,
 ) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
     const requestId = (req as any).id;
@@ -111,17 +150,41 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      // period.id is required: it is the secondary dimension of the advisory
-      // lock key (offering_id, period_id) that prevents two processes from
-      // running the same distribution batch concurrently and double-paying.
-      // Accept either a caller-provided id (e.g. revenue report id) or derive
-      // a deterministic one from the start/end timestamps so manual triggers
-      // still receive a valid lock.
+      // period.id must be a valid UUID to satisfy the distributions.period_id UUID NOT NULL column.
+      //
+      // - If the caller provides a period.id, validate it is a UUID; reject with 400 if not.
+      // - If the caller omits period.id, resolve it from the revenue report that covers the
+      //   given [start, end) window.  Reject with 422 if no matching report is found.
+      //   A synthetic timestamp-derived key is NOT accepted because it would fail the DB
+      //   UUID constraint (see #1259).
       const periodIdRaw = req.body?.period?.id ?? req.body?.periodId;
-      const periodId =
-        periodIdRaw && typeof periodIdRaw === 'string' && periodIdRaw.trim().length > 0
-          ? periodIdRaw
-          : `${startDate.getTime()}:${endDate.getTime()}`;
+      let periodId: string;
+
+      if (periodIdRaw !== undefined && periodIdRaw !== null && String(periodIdRaw).trim().length > 0) {
+        const candidate = String(periodIdRaw).trim();
+        if (!isUUID(candidate)) {
+          throw Errors.badRequest('period.id must be a valid UUID');
+        }
+        periodId = candidate;
+      } else {
+        // No period.id provided — look up the matching revenue report.
+        if (!revenueReportRepo) {
+          throw unprocessableEntity(
+            'period.id is required (no revenue report repository configured)',
+          );
+        }
+        const report = await revenueReportRepo.findOverlappingReport(
+          offeringId,
+          startDate,
+          endDate,
+        );
+        if (!report) {
+          throw unprocessableEntity(
+            'No revenue report found for the given offering and period; provide an explicit period.id',
+          );
+        }
+        periodId = report.id;
+      }
 
       const period = { id: periodId, start: startDate, end: endDate };
 
@@ -205,8 +268,41 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      // Include period.id if provided in request, generate a synthetic one for preview if not
-      const periodId = req.body?.period?.id ?? `${startRaw}:${endRaw}`;
+      // period.id must be a valid UUID (same constraint as trigger):
+      // the engine passes it through to previewRun which surfaces it in the
+      // response — and if the same period is later actually distributed the
+      // UUID must match the DB row.
+      //
+      // - Caller-provided id: validate as UUID, reject 400 if not.
+      // - Omitted id: resolve via revenue report repo, reject 422 if not found.
+      const periodIdRawPreview = req.body?.period?.id ?? req.body?.periodId;
+      let periodId: string;
+
+      if (periodIdRawPreview !== undefined && periodIdRawPreview !== null && String(periodIdRawPreview).trim().length > 0) {
+        const candidate = String(periodIdRawPreview).trim();
+        if (!isUUID(candidate)) {
+          throw Errors.badRequest('period.id must be a valid UUID');
+        }
+        periodId = candidate;
+      } else {
+        // No period.id provided — resolve from revenue report.
+        if (!revenueReportRepo) {
+          throw unprocessableEntity(
+            'period.id is required (no revenue report repository configured)',
+          );
+        }
+        const report = await revenueReportRepo.findOverlappingReport(
+          offeringId,
+          startDate,
+          endDate,
+        );
+        if (!report) {
+          throw unprocessableEntity(
+            'No revenue report found for the given offering and period; provide an explicit period.id',
+          );
+        }
+        periodId = report.id;
+      }
       const period = { id: periodId, start: startDate, end: endDate };
 
       // Authorization: same level as real distribution (admin or startup issuer of offering)
@@ -746,6 +842,7 @@ export default function createDistributionsRouter(opts: {
   distributionAccountRepo?: DistributionAccountRepo;
   accountingLedger?: AccountingLedgerService;
   scheduledDistributionRepo?: ScheduledDistributionRepository;
+  revenueReportRepo?: RevenueReportRepo;
 }) {
   const router = express.Router();
   const handlers = createDistributionHandlers(
@@ -756,6 +853,7 @@ export default function createDistributionsRouter(opts: {
     opts.distributionAccountRepo,
     opts.accountingLedger,
     opts.scheduledDistributionRepo,
+    opts.revenueReportRepo,
   );
 
   router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);

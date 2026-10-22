@@ -105,8 +105,9 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
   }
 
   async checkAndReserve(key: string): Promise<IdempotencyCheckResult> {
-    const client = await this.pool.connect();
+    let client;
     try {
+      client = await this.pool.connect();
       await client.query('BEGIN');
 
       // First, delete expired records for this key
@@ -183,12 +184,14 @@ export class PostgresIdempotencyStore implements IdempotencyStore {
       await client.query('COMMIT');
       return { state: 'new' };
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
+      if (client) {
+        await client.query('ROLLBACK').catch(() => {});
+      }
       // On database error, fail open to avoid blocking requests
       console.error('[PostgresIdempotencyStore] checkAndReserve error:', error);
       return { state: 'new' };
     } finally {
-      client.release();
+      client?.release();
     }
   }
 
@@ -273,6 +276,9 @@ export interface IdempotencyMiddlewareOptions {
   methods?: string[];
   shouldStoreResponse?: (statusCode: number) => boolean;
   fingerprint?: (req: Request) => string;
+  requirePrincipal?: boolean;
+  routePath?: string | ((req: Request) => string);
+  getPrincipalId?: (req: Request) => string | undefined;
 }
 
 const DEFAULT_METHODS = ['POST', 'PATCH'];
@@ -322,6 +328,63 @@ function replayResponse(res: Response, record: IdempotencyRecord): void {
   res.status(record.status).send(record.body);
 }
 
+export function resolvePrincipalId(
+  req: Request,
+  options: IdempotencyMiddlewareOptions
+): string | undefined {
+  if (options.getPrincipalId) {
+    return options.getPrincipalId(req);
+  }
+  const authReq = req as { user?: { id?: unknown; sub?: unknown } | unknown };
+  const user = authReq.user;
+  if (!user) {
+    return undefined;
+  }
+  if (typeof user === 'string' && user.trim() !== '') {
+    return user.trim();
+  }
+  if (typeof user === 'object' && user !== null) {
+    const u = user as { id?: unknown; sub?: unknown };
+    const id = u.id ?? u.sub;
+    if (id !== undefined && id !== null && String(id).trim() !== '') {
+      return String(id).trim();
+    }
+  }
+  return undefined;
+}
+
+export function resolveRoutePath(
+  req: Request,
+  configuredPath?: string | ((req: Request) => string)
+): string {
+  if (typeof configuredPath === 'function') {
+    return configuredPath(req);
+  }
+  if (configuredPath) {
+    return configuredPath;
+  }
+  const base = req.baseUrl || '';
+  const sub =
+    req.route?.path ??
+    req.path ??
+    (req.originalUrl ? req.originalUrl.split('?')[0] : '') ??
+    (req.url ? req.url.split('?')[0] : '') ??
+    '';
+  let full = `${base}${sub}`;
+  if (!full) {
+    full = req.originalUrl
+      ? req.originalUrl.split('?')[0]
+      : req.url
+      ? req.url.split('?')[0]
+      : '/';
+  }
+  full = full.replace(/\/+/g, '/');
+  if (full.length > 1 && full.endsWith('/')) {
+    full = full.slice(0, -1);
+  }
+  return full || '/';
+}
+
 export function createIdempotencyMiddleware(
   options: IdempotencyMiddlewareOptions = {}
 ): RequestHandler {
@@ -340,16 +403,30 @@ export function createIdempotencyMiddleware(
       return;
     }
 
-    const key = req.header(headerName)?.trim();
-    if (!key) {
+    const headerKey = req.header(headerName)?.trim();
+    if (!headerKey) {
       next();
       return;
     }
 
+    const principalId = resolvePrincipalId(req, options);
+    if (options.requirePrincipal && !principalId) {
+      res.status(401).json({
+        error: 'Unauthorized: Authentication required for idempotency',
+      });
+      return;
+    }
+
+    const method = req.method.toUpperCase();
+    const routePath = resolveRoutePath(req, options.routePath);
+    const storeKey = principalId
+      ? `${principalId}:${method}:${routePath}:${headerKey}`
+      : headerKey;
+
     const requestFingerprint = fingerprint?.(req);
     let checkResult;
     try {
-      checkResult = await store.checkAndReserve(key);
+      checkResult = await store.checkAndReserve(storeKey);
     } catch (error) {
       // On internal error, we allow the request to proceed without idempotency
       // to avoid blocking clients due to infra issues.
@@ -401,7 +478,7 @@ export function createIdempotencyMiddleware(
     res.once('finish', () => {
       completed = true;
       if (!shouldStoreResponse(res.statusCode)) {
-        void store.release(key);
+        void store.release(storeKey);
         return;
       }
 
@@ -413,12 +490,12 @@ export function createIdempotencyMiddleware(
         fingerprint: requestFingerprint,
         createdAt: new Date(),
       };
-      void store.save(key, record);
+      void store.save(storeKey, record);
     });
 
     res.once('close', () => {
       if (!completed) {
-        void store.release(key);
+        void store.release(storeKey);
       }
     });
 

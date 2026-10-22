@@ -10,13 +10,25 @@ class MockDistributionRepo {
   public failNextRunCount = 0;
   public failNextPayoutCount = 0;
   public failSpecificPayouts: number[] = []; // indices of payouts that should fail
+  public failNextRunUniqueViolation = false;
 
-  async findRunByParams(offeringId: string, periodId: string, amount: string): Promise<any> {
-    return this.runs.find(r => 
-      r.offering_id === offeringId && 
-      r.period_id === periodId && 
-      r.total_amount === amount
+  async findRunByOfferingAndPeriod(offeringId: string, periodId: string): Promise<any> {
+    const matching = this.runs.filter(
+      r => r.offering_id === offeringId && r.period_id === periodId
     );
+    if (matching.length === 0) return null;
+    return matching[matching.length - 1];
+  }
+
+  async findRunByParams(offeringId: string, periodId: string, amount?: string): Promise<any> {
+    if (amount !== undefined) {
+      return this.runs.find(r => 
+        r.offering_id === offeringId && 
+        r.period_id === periodId && 
+        r.total_amount === amount
+      ) || null;
+    }
+    return this.findRunByOfferingAndPeriod(offeringId, periodId);
   }
 
   async getPayoutsForRun(runId: string): Promise<any[]> {
@@ -37,9 +49,23 @@ class MockDistributionRepo {
   }
 
   async createDistributionRun(input: any): Promise<any> {
+    if (this.failNextRunUniqueViolation) {
+      this.failNextRunUniqueViolation = false;
+      const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+      err.code = '23505';
+      throw err;
+    }
     if (this.failNextRunCount > 0) {
       this.failNextRunCount--;
       throw new Error('Database error (run)');
+    }
+    const existingActive = this.runs.find(
+      r => r.offering_id === input.offering_id && r.period_id === input.period_id && r.status !== 'failed'
+    );
+    if (existingActive) {
+      const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+      err.code = '23505';
+      throw err;
     }
     const run = { 
       id: `run-${this.runs.length + 1}`, 
@@ -128,6 +154,210 @@ describe('DistributionEngine', () => {
     expect(res1.payouts).toEqual(res2.payouts);
     expect(repo.runs).toHaveLength(1);
     expect(repo.payouts).toHaveLength(1);
+  });
+
+  describe('Offering-period idempotency and conflict handling', () => {
+    it('returns cached completed result when called with the same amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 60 },
+        { investor_id: 'i2', balance: 40 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-same', start: new Date(), end: new Date() };
+
+      const res1 = await engine.distribute('off-same', period, 100);
+      expect(res1.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Second call with identical amount
+      const res2 = await engine.distribute('off-same', period, 100);
+      expect(res2.distributionRun.id).toBe(res1.distributionRun.id);
+      expect(res2.payouts).toEqual(res1.payouts);
+      // No duplicate runs or payouts
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+    });
+
+    it('throws 409 conflict and creates no payouts when called with a different amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 60 },
+        { investor_id: 'i2', balance: 40 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-diff', start: new Date(), end: new Date() };
+
+      // Initial run for 1000
+      await engine.distribute('off-diff', period, 1000);
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Second call with different amount: 1000.01
+      let conflictErr: any;
+      try {
+        await engine.distribute('off-diff', period, 1000.01);
+      } catch (err: any) {
+        conflictErr = err;
+      }
+
+      expect(conflictErr).toBeDefined();
+      expect(conflictErr.statusCode).toBe(409);
+      expect(conflictErr.code).toBe('CONFLICT');
+      expect(conflictErr.message).toMatch(/already exists with a different amount/);
+      // Ensure no second run and no second batch of payouts was created
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+    });
+
+    it('handles concurrent insert race hitting 23505 and returns cached result on same amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [{ investor_id: 'i1', balance: 100 }];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-race-1', start: new Date(), end: new Date() };
+
+      // Simulate concurrent worker creating the run in DB between findRun and createRun
+      let firstFind = true;
+      const originalFind = repo.findRunByOfferingAndPeriod.bind(repo);
+      repo.findRunByOfferingAndPeriod = async (offId: string, perId: string) => {
+        if (firstFind) {
+          firstFind = false;
+          return null; // Initial check finds nothing
+        }
+        return originalFind(offId, perId); // Re-read finds it
+      };
+
+      // Mock createDistributionRun to simulate another transaction having inserted it first
+      const originalCreate = repo.createDistributionRun.bind(repo);
+      repo.createDistributionRun = async (input: any) => {
+        // Concurrent worker creates completed run
+        await originalCreate({
+          ...input,
+          status: 'completed',
+        });
+        await repo.createPayout({
+          distribution_id: repo.runs[0].id,
+          investor_id: 'i1',
+          amount: '50.00',
+        });
+
+        // Current worker gets 23505
+        const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+        err.code = '23505';
+        throw err;
+      };
+
+      const result = await engine.distribute('off-race-1', period, 50);
+
+      expect(result.distributionRun.id).toBe(repo.runs[0].id);
+      expect(result.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(1);
+    });
+
+    it('handles concurrent insert race hitting 23505 and throws 409 conflict on different amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [{ investor_id: 'i1', balance: 100 }];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-race-2', start: new Date(), end: new Date() };
+
+      let firstFind = true;
+      const originalFind = repo.findRunByOfferingAndPeriod.bind(repo);
+      repo.findRunByOfferingAndPeriod = async (offId: string, perId: string) => {
+        if (firstFind) {
+          firstFind = false;
+          return null;
+        }
+        return originalFind(offId, perId);
+      };
+
+      const originalCreate = repo.createDistributionRun.bind(repo);
+      repo.createDistributionRun = async (input: any) => {
+        // Concurrent worker inserted with total_amount = 50.00
+        await originalCreate({
+          ...input,
+          total_amount: '50.00',
+          status: 'completed',
+        });
+
+        const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+        err.code = '23505';
+        throw err;
+      };
+
+      // Current worker attempts to distribute 75
+      await expect(engine.distribute('off-race-2', period, 75)).rejects.toMatchObject({
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(0);
+    });
+
+    it('regression: calling distribute with 1000 and then 1000.01 rejects with 409 without creating duplicate runs or payouts', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'inv-1', balance: 600 },
+        { investor_id: 'inv-2', balance: 400 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const offeringId = 'off-repro';
+      const period = { id: 'p-repro', start: new Date('2026-01-01'), end: new Date('2026-01-31') };
+
+      // Initial trigger for revenueAmount = 1000
+      const firstRun = await engine.distribute(offeringId, period, 1000);
+      expect(firstRun.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Repro: second trigger for the same (offering, period) with slightly different revenue_amount (1000.01)
+      let rejectedError: any;
+      try {
+        await engine.distribute(offeringId, period, 1000.01);
+      } catch (err: any) {
+        rejectedError = err;
+      }
+
+      // Assertions
+      expect(rejectedError).toBeDefined();
+      expect(rejectedError.statusCode).toBe(409);
+      expect(rejectedError.code).toBe('CONFLICT');
+      // Verify no second distribution run was created
+      expect(repo.runs).toHaveLength(1);
+      // Verify no second set of payouts was created (money correctness: investors not paid twice)
+      expect(repo.payouts).toHaveLength(2);
+    });
   });
 
   it('resumes from a partial failure', async () => {
@@ -1222,6 +1452,100 @@ describe('DistributionEngine', () => {
       const nonZero = amounts.filter(a => a > 0);
       expect(nonZero.length).toBeGreaterThan(0);
     });
+
+    it('distributes 0.34/0.33/0.33 for three 0.0049 balances with revenue 1 instead of throwing', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-3', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-3', period, 1);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
+    });
+
+    it('does not perturb pro-rata shares for small holders [0.004, 0.006]', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.004 },
+        { investor_id: 'i2', balance: 0.006 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-pair', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-pair', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '40.00' },
+        { investor_id: 'i2', amount: '60.00' },
+      ]);
+    });
+
+    it('distributes correctly with 7-decimal Stellar string balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances: BalanceRow[] = [
+        { investor_id: 'i1', balance: '0.0000001' },
+        { investor_id: 'i2', balance: '0.0000002' },
+        { investor_id: 'i3', balance: '0.0000007' },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-stellar-str', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-stellar-str', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '10.00' },
+        { investor_id: 'i2', amount: '20.00' },
+        { investor_id: 'i3', amount: '70.00' },
+      ]);
+    });
+
+    it('previewRun uses the same full-precision calculation for small balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-prev-small', start: new Date(), end: new Date() };
+      const preview = await engine.previewRun('off-prev-small', period, 1);
+
+      expect(preview.projections).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
+    });
   });
 
 // ── Property-based tests (fast-check) ────────────────────────────────────────
@@ -1378,6 +1702,39 @@ describe('DistributionEngine – property-based rounding invariants', () => {
           0,
         );
         return sumCents === Math.round(revenue * 100);
+      }),
+      { numRuns: 200 },
+    );
+  });
+
+  it('sum(payouts) === revenueAmount for small holders and 7-decimal Stellar balances', async () => {
+    // Arbitrary: fractional / small / Stellar-precision balances (including < 0.005 and strings)
+    const smallBalancesArb = fc
+      .array(
+        fc.oneof(
+          // Small floating point numbers (e.g. 0.0001 to 0.01)
+          fc.integer({ min: 1, max: 100 }).map((n) => n / 10000),
+          // 7-decimal Stellar stroops as decimal string (e.g. "0.0000001" to "0.0050000")
+          fc.integer({ min: 1, max: 50000 }).map((stroops) => (stroops / 10000000).toFixed(7)),
+          // Standard integer balance
+          fc.integer({ min: 1, max: 1000 }),
+        ),
+        { minLength: 1, maxLength: 8 },
+      )
+      .map((bals) => bals.map((b, i) => ({ investor_id: `i${i}`, balance: b })));
+
+    await fc.assert(
+      fc.asyncProperty(smallBalancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-small-prop', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-small-prop', period, revenue);
+
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        const expectedCents = Math.round(revenue * 100);
+        return sumCents === expectedCents;
       }),
       { numRuns: 200 },
     );

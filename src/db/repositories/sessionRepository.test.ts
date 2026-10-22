@@ -36,6 +36,7 @@ const BASE_SESSION: Session = {
   created_at: new Date('2024-01-01'),
   parent_id: undefined,
   revoked_at: undefined,
+  family_expires_at: null,
 };
 
 function makeQueryResult<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
@@ -221,6 +222,42 @@ describe('SessionRepository', () => {
       });
 
       expect(result.revoked_at).toEqual(revokedAt);
+    });
+
+    it('forwards an explicit family_expires_at into the INSERT', async () => {
+      const familyExpiresAt = new Date('2030-01-31T00:00:00.000Z');
+      mockPool.query.mockResolvedValueOnce(
+        makeQueryResult([{ ...BASE_SESSION, family_expires_at: familyExpiresAt }]),
+      );
+
+      const result = await repository.createSession({
+        id: 'session-123',
+        user_id: 'user-456',
+        token_hash: 'h',
+        expires_at: new Date(),
+        family_expires_at: familyExpiresAt,
+      });
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringContaining('family_expires_at'),
+        expect.arrayContaining([familyExpiresAt]),
+      );
+      expect(result.family_expires_at).toEqual(familyExpiresAt);
+    });
+
+    it('coerces a null/absent family_expires_at to null (family lifetime unset)', async () => {
+      mockPool.query.mockResolvedValueOnce(
+        makeQueryResult([{ ...BASE_SESSION, family_expires_at: null }]),
+      );
+
+      const result = await repository.createSession({
+        id: 'session-123',
+        user_id: 'user-456',
+        token_hash: 'h',
+        expires_at: new Date(),
+      });
+
+      expect(result.family_expires_at).toBeNull();
     });
   });
 

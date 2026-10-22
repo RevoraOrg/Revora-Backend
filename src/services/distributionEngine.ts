@@ -33,7 +33,7 @@ import {
 
 export interface BalanceRow {
   investor_id: string;
-  balance: number;
+  balance: number | string;
 }
 
 export interface DistributionBatchResult {
@@ -174,10 +174,14 @@ function calculateDistributionPayouts(
 
   // 1. Sum balances and compute shares using Decimal for precision
   const balanceDecimals = balances.map((b) => {
-    const rawStr = b.balance.toFixed(18);
-    const rawDecimal = new Decimal(rawStr);
-    const scaled = rawDecimal.toSorobanI128(2, "round");
-    return Decimal.fromScaledBigInt(scaled, 2);
+    if (typeof b.balance === "string") {
+      return new Decimal(b.balance.trim());
+    }
+    const str = b.balance.toString();
+    if (str.includes("e") || str.includes("E")) {
+      return new Decimal(b.balance.toFixed(18));
+    }
+    return new Decimal(str);
   });
 
   const totalBalanceDecimal = balanceDecimals.reduce(
@@ -400,6 +404,12 @@ class DistributionEngine {
     );
 
     if (run) {
+      if (Number(run.total_amount) !== Number(amtStr)) {
+        throw Errors.conflict(
+          `Distribution for offering ${offeringId} / period ${period.id} already exists with a different amount (${run.total_amount})`,
+        );
+      }
+
       if (run.status === "completed") {
         this.logger.info(
           "Distribution already completed, returning cached results",
@@ -533,21 +543,83 @@ class DistributionEngine {
           periodId: period.id,
           runId: run.id,
         });
-      } catch (err) {
-        const failure = classifyStellarRPCFailure(err, {
-          operation: "createDistributionRun",
-          offeringId,
-          periodId: period.id,
-        });
-        this.logger.error("Failed to create distribution run", {
-          offeringId,
-          periodId: period.id,
-          error: err instanceof Error ? err.message : String(err),
-          failureClass: failure.class,
-        });
-        throw Errors.internal(
-          `Failed to initialize distribution run: ${failure.class}`,
-        );
+      } catch (err: any) {
+        const isUniqueViolation =
+          err?.code === "23505" ||
+          err?.cause?.code === "23505" ||
+          (typeof err?.message === "string" &&
+            err.message.includes("23505"));
+
+        if (isUniqueViolation) {
+          this.logger.info(
+            "Distribution run creation hit unique constraint (23505), re-reading existing run",
+            {
+              offeringId,
+              periodId: period.id,
+            },
+          );
+
+          const existingRun = this.distributionRepo.findRunByOfferingAndPeriod
+            ? await this.distributionRepo.findRunByOfferingAndPeriod(
+                offeringId,
+                period.id,
+              )
+            : await this.distributionRepo.findRunByParams(
+                offeringId,
+                period.id,
+              );
+
+          if (!existingRun) {
+            throw Errors.conflict(
+              `Distribution for offering ${offeringId} / period ${period.id} is already in progress`,
+            );
+          }
+
+          run = existingRun;
+
+          if (Number(run.total_amount) !== Number(amtStr)) {
+            throw Errors.conflict(
+              `Distribution for offering ${offeringId} / period ${period.id} already exists with a different amount (${run.total_amount})`,
+            );
+          }
+
+          if (run.status === "completed") {
+            this.logger.info(
+              "Distribution already completed, returning cached results",
+              {
+                offeringId,
+                periodId: period.id,
+                runId: run.id,
+              },
+            );
+            const existingPayouts =
+              await this.distributionRepo.getPayoutsForRun(run.id);
+            return {
+              distributionRun: run,
+              successfulPayouts: existingPayouts.map((p: any) => ({
+                investor_id: p.investor_id,
+                amount: p.amount,
+              })),
+              failedPayouts: [],
+              totalPayouts: existingPayouts.length,
+            };
+          }
+        } else {
+          const failure = classifyStellarRPCFailure(err, {
+            operation: "createDistributionRun",
+            offeringId,
+            periodId: period.id,
+          });
+          this.logger.error("Failed to create distribution run", {
+            offeringId,
+            periodId: period.id,
+            error: err instanceof Error ? err.message : String(err),
+            failureClass: failure.class,
+          });
+          throw Errors.internal(
+            `Failed to initialize distribution run: ${failure.class}`,
+          );
+        }
       }
     } else if (run.status !== "processing") {
       try {
@@ -934,8 +1006,15 @@ class DistributionEngine {
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         return await fn();
-      } catch (err) {
+      } catch (err: any) {
         lastError = err;
+        if (
+          err?.code === "23505" ||
+          err?.cause?.code === "23505" ||
+          (typeof err?.message === "string" && err.message.includes("23505"))
+        ) {
+          throw err;
+        }
         if (attempt < this.maxRetries) {
           const delay =
             this.initialDelayMs * Math.pow(this.backoffFactor, attempt - 1);

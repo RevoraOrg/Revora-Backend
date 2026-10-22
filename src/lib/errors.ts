@@ -9,6 +9,8 @@ export const ErrorCode = {
   SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
   INTERNAL_ERROR: "INTERNAL_ERROR",
   TOO_MANY_REQUESTS: "TOO_MANY_REQUESTS",
+  INVALID_JSON: "INVALID_JSON",
+  PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];

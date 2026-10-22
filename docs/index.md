@@ -24,6 +24,7 @@ Entry point: [../README.md](../README.md). Files are per-feature design notes; v
 - [postgres-session-store.md](postgres-session-store.md)
 - [rbac-hierarchy-property-tests.md](rbac-hierarchy-property-tests.md)
 - [rbac-policy-diff-approval.md](rbac-policy-diff-approval.md)
+- [refresh-token-absolute-lifetime-and-reauth.md](refresh-token-absolute-lifetime-and-reauth.md)
 - [refresh-token-replay-detection.md](refresh-token-replay-detection.md)
 - [refresh-token-rotation.md](refresh-token-rotation.md)
 - [scim-provisioning.md](scim-provisioning.md)

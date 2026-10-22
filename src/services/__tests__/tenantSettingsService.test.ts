@@ -9,6 +9,14 @@ class MockTenantSettingsRepository {
     return this.store.get(tenantId) ?? null;
   }
 
+  async withTransaction<T>(callback: (client: any) => Promise<T>): Promise<T> {
+    return callback({});
+  }
+
+  async findByTenantIdForUpdate(tenantId: string): Promise<TenantSettingsRow | null> {
+    return this.findByTenantId(tenantId);
+  }
+
   async upsertSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
     const row: TenantSettingsRow = {
       tenant_id: tenantId,
@@ -75,20 +83,26 @@ describe('TenantSettingsService - Dual-Control Sanctions Threshold Tuning', () =
     await expect(
       service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_1', '')
     ).rejects.toThrow('reason is required');
+    await expect(
+      service.proposeSanctionsThreshold('tenant_abc', Number.NaN, 'user_1', 'reason')
+    ).rejects.toThrow('between 0.0 and 1.0');
+    await expect(
+      service.proposeSanctionsThreshold('tenant_abc', Number.POSITIVE_INFINITY, 'user_1', 'reason')
+    ).rejects.toThrow('between 0.0 and 1.0');
   });
 
   it('blocks self-approval by the proposer (dual-control collusion guard)', async () => {
-    await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
+    const proposal = await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
 
     await expect(
-      service.approveSanctionsThreshold('tenant_abc', 'user_proposer')
+      service.approveSanctionsThreshold('tenant_abc', 'user_proposer', proposal.id)
     ).rejects.toThrow(/Dual-control security violation/i);
   });
 
   it('applies new threshold when approved by a distinct second user', async () => {
-    await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
+    const proposal = await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
 
-    const updatedRow = await service.approveSanctionsThreshold('tenant_abc', 'user_approver');
+    const updatedRow = await service.approveSanctionsThreshold('tenant_abc', 'user_approver', proposal.id);
 
     expect(updatedRow.settings.sanctions_threshold).toBe(0.80);
     expect(updatedRow.settings.pending_threshold_change).toBeNull();
@@ -111,9 +125,9 @@ describe('TenantSettingsService - Dual-Control Sanctions Threshold Tuning', () =
   });
 
   it('allows rejecting a pending threshold proposal', async () => {
-    await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
+    const proposal = await service.proposeSanctionsThreshold('tenant_abc', 0.80, 'user_proposer', 'Tuning');
 
-    const updatedRow = await service.rejectSanctionsThreshold('tenant_abc', 'user_rejecter', 'Threshold too low');
+    const updatedRow = await service.rejectSanctionsThreshold('tenant_abc', 'user_rejecter', 'Threshold too low', proposal.id);
 
     expect(updatedRow.settings.pending_threshold_change).toBeNull();
     const currentThreshold = await service.getSanctionsThreshold('tenant_abc');
@@ -130,5 +144,23 @@ describe('TenantSettingsService - Dual-Control Sanctions Threshold Tuning', () =
         }),
       })
     );
+  });
+
+  it('rejects a second pending proposal and does not overwrite the reviewed request', async () => {
+    const proposal = await service.proposeSanctionsThreshold(
+      'tenant_abc',
+      0.85,
+      'user_proposer',
+      'review this threshold',
+    );
+    await expect(
+      service.proposeSanctionsThreshold('tenant_abc', 0.30, 'user_proposer', 'replacement'),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      service.approveSanctionsThreshold('tenant_abc', 'user_approver', 'stale-request-id'),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(await service.getSanctionsThreshold('tenant_abc')).toBe(0.85);
+    await service.approveSanctionsThreshold('tenant_abc', 'user_approver', proposal.id);
+    expect(await service.getSanctionsThreshold('tenant_abc')).toBe(0.85);
   });
 });
