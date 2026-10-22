@@ -428,7 +428,7 @@ export const requireIssuerAuth = (
 
 // ── createRequireAuth (session-hardened)
 export function createRequireAuth(
-  sessionRepository: DbSessionRepository,
+  sessionRepository: Pick<DbSessionRepository, "findById">,
 ): RequestHandler {
   return async (
     req: Request,

@@ -286,11 +286,16 @@ export function createPayoutsHandlers(payoutRepo: PayoutRepo) {
 export default function createPayoutsRouter(opts: {
   payoutRepo: PayoutRepo;
   verifyJWT: express.RequestHandler;
+  routePath?: string;
 }) {
   const router = express.Router();
   const handlers = createPayoutsHandlers(opts.payoutRepo);
 
-  router.get('/api/investments/payouts', opts.verifyJWT, handlers.listPayouts);
+  router.get(
+    opts.routePath ?? '/api/investments/payouts',
+    opts.verifyJWT,
+    handlers.listPayouts,
+  );
 
   return router;
 }

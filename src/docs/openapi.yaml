@@ -1468,6 +1468,497 @@ paths:
                 $ref: "#/components/schemas/Error"
 
   # ─────────────────────────────────────────────────────────────────────
+  # Distribution and investor payouts
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/offerings/{id}/distribute:
+    post:
+      summary: Trigger an offering distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                revenue_amount:
+                  type: number
+                  exclusiveMinimum: 0
+                revenueAmount:
+                  type: number
+                  exclusiveMinimum: 0
+                period:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    start:
+                      type: string
+                      format: date-time
+                    end:
+                      type: string
+                      format: date-time
+                  required: [start, end]
+                start:
+                  type: string
+                  format: date-time
+                end:
+                  type: string
+                  format: date-time
+              required: [revenue_amount]
+      responses:
+        "200":
+          description: Distribution run and payout results
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid distribution input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not authorized for this offering
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/offerings/{id}/distribute/preview:
+    post:
+      summary: Preview an offering distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                revenue_amount:
+                  type: number
+                  exclusiveMinimum: 0
+                revenueAmount:
+                  type: number
+                  exclusiveMinimum: 0
+                period:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    start:
+                      type: string
+                      format: date-time
+                    end:
+                      type: string
+                      format: date-time
+                  required: [start, end]
+                start:
+                  type: string
+                  format: date-time
+                end:
+                  type: string
+                  format: date-time
+              required: [revenue_amount]
+      responses:
+        "200":
+          description: Projected investor payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Invalid preview input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not authorized for this offering
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/offerings/{id}/ledger/export:
+    get:
+      summary: Export an offering distribution ledger
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: period_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Distribution ledger export
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/distributions/{id}/pause:
+    post:
+      summary: Pause a distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Distribution paused
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Administrator role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/distributions/{id}/resume:
+    post:
+      summary: Resume a paused distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Distribution resumed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Administrator role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/distributions/schedule:
+    post:
+      summary: Schedule a distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "201":
+          description: Distribution scheduled
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not authorized to schedule distributions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: List scheduled distributions
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Scheduled distributions
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/distributions/schedule/{id}:
+    delete:
+      summary: Cancel a scheduled distribution
+      tags: [Distributions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Scheduled distribution cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Caller is not authorized to cancel distributions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/investments/payouts:
+    get:
+      summary: List payouts for the authenticated investor
+      tags: [Payouts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, processed, failed]
+        - in: query
+          name: minAmount
+          schema:
+            type: number
+            minimum: 0
+        - in: query
+          name: maxAmount
+          schema:
+            type: number
+            minimum: 0
+        - in: query
+          name: from
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: sortBy
+          schema:
+            type: string
+            enum: [created_at, amount, status]
+        - in: query
+          name: sortOrder
+          schema:
+            type: string
+            enum: [asc, desc]
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Payout page for the authenticated investor
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Investor role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # Existing served routes documented here to keep the app-wide parity suite
+  # bidirectional when distribution routes are mounted.
+  /api/v1/admin/ledger/export:
+    get:
+      summary: Export the admin accounting ledger
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Ledger export
+        default:
+          description: Export or authorization error
+  /api/v1/admin/webhooks/{endpointId}/dead-letters:
+    get:
+      summary: List dead-letter webhook deliveries
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: endpointId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dead-letter deliveries
+        default:
+          description: Authorization or retrieval error
+  /api/v1/admin/webhooks/dead-letters/{id}/replay:
+    post:
+      summary: Replay a dead-letter webhook delivery
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Replay accepted
+        default:
+          description: Authorization or replay error
+  /api/v1/statements/{periodId}/{investorId}:
+    get:
+      summary: Fetch an investor statement
+      tags: [Statements]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: investorId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Investor statement document
+        default:
+          description: Authorization or retrieval error
+  /metrics/reconciliation:
+    get:
+      summary: Read reconciliation metrics
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Reconciliation metrics
+        default:
+          description: Metrics endpoint unavailable or unauthorized
+
+  # ─────────────────────────────────────────────────────────────────────
   # Ledger
   # ─────────────────────────────────────────────────────────────────────
   /api/v1/ledger/export:

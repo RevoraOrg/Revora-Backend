@@ -50,6 +50,17 @@ import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
 import { createAdminWebhookRouter } from "./routes/adminWebhooks";
 import { AccountingLedgerService } from "./services/accountingLedgerService";
 import { DistributionRepository } from "./db/repositories/distributionRepository";
+import { BalanceSnapshotRepository } from "./db/repositories/balanceSnapshotRepository";
+import { OfferingRepository } from "./db/repositories/offeringRepository";
+import { ScheduledDistributionRepository } from "./db/repositories/scheduledDistributionRepository";
+import { BalanceRow } from "./services/distributionEngine";
+import DistributionEngine from "./services/distributionEngine";
+import { DistributionStateManager } from "./services/distributionScheduler";
+import createDistributionsRouter, {
+  DistributionAccountRepo,
+  OfferingRepo,
+} from "./routes/distributions";
+import createPayoutsRouter, { PayoutRepo } from "./routes/payouts";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { TenantSettingsRepository } from "./db/repositories/tenantSettingsRepository";
@@ -131,6 +142,22 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
+  sessionRepository?: Pick<SessionRepository, "findById">;
+  distributionEngine?: Pick<DistributionEngine, "distribute" | "previewRun">;
+  distributionOfferingRepo?: OfferingRepo;
+  distributionRepo?: DistributionAccountRepo &
+    Pick<DistributionRepository, "listPayoutsByInvestor">;
+  payoutRepo?: PayoutRepo;
+  balanceSnapshotRepo?: Pick<
+    BalanceSnapshotRepository,
+    "findByOfferingAndPeriod"
+  >;
+  scheduledDistributionRepo?: Pick<
+    ScheduledDistributionRepository,
+    "create" | "findByOffering" | "findAll" | "markCancelled"
+  >;
+  distributionStateManager?: Pick<DistributionStateManager, "pause" | "resume">;
+  accountingLedger?: AccountingLedgerService;
 }
 
 /**
@@ -749,6 +776,8 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
+  const accountingLedger =
+    dependencies.accountingLedger ?? new AccountingLedgerService();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
@@ -771,7 +800,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     "/admin/ledger",
     createAdminLedgerExportRouter({
       distributionAccountRepo: new DistributionRepository(pool),
-      accountingLedger: new AccountingLedgerService(),
+      accountingLedger,
       auditLogRepo,
     }),
   );
@@ -805,7 +834,82 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // 404 (no artifacts exist), which is fail-safe.
   const statementStorage = new InMemoryStatementPdfStorage();
   const pdfRenderJobRepo = new PdfRenderJobRepository(pool);
-  const sessionRepo = new SessionRepository(pool);
+  const sessionRepo = dependencies.sessionRepository ?? new SessionRepository(pool);
+
+  const offeringRepo =
+    dependencies.distributionOfferingRepo ?? new OfferingRepository(pool);
+  const distributionRepo =
+    dependencies.distributionRepo ?? new DistributionRepository(pool);
+  const payoutRepo: PayoutRepo =
+    dependencies.payoutRepo ?? {
+      async listPayoutsByInvestor(investorId) {
+        const payouts = await distributionRepo.listPayoutsByInvestor(investorId);
+        return payouts.map((payout) => ({
+          id: payout.id,
+          distribution_run_id: payout.distribution_id,
+          investor_id: payout.investor_id,
+          amount: payout.amount,
+          status: payout.status,
+          transaction_hash: payout.tx_hash ?? undefined,
+          created_at: payout.created_at,
+          updated_at: payout.updated_at,
+        }));
+      },
+    };
+  const balanceSnapshotRepo =
+    dependencies.balanceSnapshotRepo ?? new BalanceSnapshotRepository(pool);
+  /**
+   * @dev Distribution calculations read persisted snapshots keyed by period;
+   * this app composition deliberately does not start the separate scheduler.
+   */
+  const balanceProvider = {
+    async getBalances(
+      offeringId: string,
+      period: { id: string },
+    ): Promise<BalanceRow[]> {
+      const snapshots = await balanceSnapshotRepo.findByOfferingAndPeriod(
+        offeringId,
+        period.id,
+      );
+      return snapshots.map((snapshot) => ({
+        investor_id: snapshot.holder_address_or_id,
+        balance: Number(snapshot.balance),
+      }));
+    },
+  };
+  const distributionEngine =
+    dependencies.distributionEngine ??
+    new DistributionEngine(
+      offeringRepo,
+      distributionRepo,
+      balanceProvider,
+      {},
+      pool,
+    );
+  const scheduledDistributionRepo =
+    dependencies.scheduledDistributionRepo ??
+    new ScheduledDistributionRepository(pool);
+  const distributionStateManager =
+    dependencies.distributionStateManager ?? new DistributionStateManager();
+
+  apiRouter.use(
+    createDistributionsRouter({
+      distributionEngine,
+      offeringRepo,
+      verifyJWT: createRequireAuth(sessionRepo),
+      distributionStateManager,
+      distributionAccountRepo: distributionRepo,
+      accountingLedger,
+      scheduledDistributionRepo,
+    }),
+  );
+  apiRouter.use(
+    createPayoutsRouter({
+      payoutRepo,
+      verifyJWT: createRequireAuth(sessionRepo),
+      routePath: "/investments/payouts",
+    }),
+  );
   apiRouter.use(
     "/statements",
     createStatementsRouter({
