@@ -50,6 +50,8 @@ function makeDbUser(overrides: Partial<User> = {}): User {
         role: 'startup',
         kyc_risk_tier: 'standard',
         last_oidc_groups: ['engineering'],
+        is_active: true,
+        deactivated_at: null,
         created_at: new Date('2024-01-01T00:00:00.000Z'),
         updated_at: new Date('2024-06-01T00:00:00.000Z'),
         ...overrides,
@@ -100,7 +102,26 @@ describe('UserRepositoryAdapter', () => {
                 email: 'investor@funds.co',
                 role: 'investor',
                 passwordHash: 'b'.repeat(64),
+                isActive: true,
             });
+        });
+
+        it('maps is_active = false onto isActive so login can reject it (#1300)', async () => {
+            mockUserRepo.findByEmail.mockResolvedValue(makeDbUser({ is_active: false }));
+
+            const result = await adapter.findByEmail('any@example.com');
+
+            expect(result).toHaveProperty('isActive', false);
+        });
+
+        it('treats a row without is_active as active', async () => {
+            const legacyRow = makeDbUser();
+            delete legacyRow.is_active;
+            mockUserRepo.findByEmail.mockResolvedValue(legacyRow);
+
+            const result = await adapter.findByEmail('any@example.com');
+
+            expect(result).toHaveProperty('isActive', true);
         });
 
         it('renames password_hash to passwordHash and drops every other column', async () => {
@@ -118,13 +139,16 @@ describe('UserRepositoryAdapter', () => {
             expect(result).not.toHaveProperty('name');
             expect(result).not.toHaveProperty('kyc_risk_tier');
             expect(result).not.toHaveProperty('last_oidc_groups');
+            expect(result).not.toHaveProperty('is_active');
+            expect(result).not.toHaveProperty('deactivated_at');
             expect(result).not.toHaveProperty('created_at');
             expect(result).not.toHaveProperty('updated_at');
 
-            // Exactly the four declared fields, nothing more.
+            // Exactly the declared fields, nothing more.
             expect(Object.keys(result as UserRecord).sort()).toEqual([
                 'email',
                 'id',
+                'isActive',
                 'passwordHash',
                 'role',
             ]);

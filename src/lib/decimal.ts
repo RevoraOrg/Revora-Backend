@@ -65,7 +65,7 @@ export class Decimal {
    * (the scaled `_value` can be negative after a subtraction).
    */
   toString(): string {
-    const isNegative = this._value < 0n;
+    const isNegative = (this._value as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -this._value : this._value;
     const valueStr = absValue.toString();
 
@@ -167,7 +167,7 @@ export class Decimal {
     const divisor = 10n ** BigInt(scale);
 
     // Handle negative values explicitly to avoid producing strings like "123.-05".
-    const isNegative = scaledValue < 0n;
+    const isNegative = (scaledValue as BigInt) < (0 as BigInt);
     const absValue = isNegative ? -scaledValue : scaledValue;
     const integerPart = absValue / divisor;
     const fractionalPart = absValue % divisor;
@@ -270,10 +270,101 @@ export class Decimal {
   }
 
   isPositive(): boolean {
-    return this._value > 0n;
+    return (this._value as BigInt) > (0 as BigInt);
   }
 
   isNegative(): boolean {
-    return this._value < 0n;
+    return (this._value as BigInt) < (0 as BigInt);
   }
+}
+
+// ─── Shared positive-decimal parsing (revenue / distribution amounts) ─────────
+
+/**
+ * @notice Validation limits for monetary decimal strings, mirroring
+ *         `RevenueService.submitReport` (DB columns are NUMERIC(30,10)):
+ *         up to 20 integer digits and 10 fractional digits.
+ *
+ * @dev The digit-length bounds are equivalent to the `MAX_AMOUNT` magnitude
+ *      check used by RevenueService: any value with at most 20 integer digits
+ *      and at most 10 fractional digits is <= 99999999999999999999.9999999999,
+ *      so the length checks subsume the comparison without any float math.
+ */
+export const POSITIVE_DECIMAL_LIMITS = {
+  /** Maximum number of integer digits before the decimal point. */
+  MAX_INTEGER_DIGITS: 20,
+  /** Maximum number of fractional digits after the decimal point. */
+  MAX_DECIMAL_PLACES: 10,
+} as const;
+
+// Plain decimal strings only: no sign ("-5"), no exponent ("1e3", "1e-7"),
+// no hex ("0x10"), no surrounding or embedded whitespace (" 12 "), and no
+// thousands separators. Anchored with only bounded/simple quantifiers, so it
+// runs in linear time (no catastrophic backtracking / ReDoS).
+const PLAIN_POSITIVE_DECIMAL_REGEX = /^\d+(\.\d+)?$/;
+
+/**
+ * @notice Parses an untrusted value into a strictly positive, plain decimal
+ *         string — the canonical representation carried end to end through the
+ *         revenue and distribution paths.
+ *
+ * @dev Replaces `Number(value)`-style coercion, which silently accepts
+ *      exponent/hex/whitespace forms and destroys precision above ~15
+ *      significant digits (e.g. `Number("12345678901234567.89")` becomes
+ *      `12345678901234568`). Only strings are accepted: JSON numbers are
+ *      rejected so callers must submit decimal strings and no float can enter
+ *      the amount pipeline.
+ *
+ * Security assumptions:
+ * - The input is treated as attacker-controlled: the strict anchored grammar
+ *   rejects every non-canonical numeric form before any parsing occurs.
+ * - Zero and negative values are rejected; magnitude is bounded by digit
+ *   counts (NUMERIC(30,10)) with no floating-point comparison.
+ *
+ * @param raw The untrusted value (must be a string).
+ * @param field Field name used in error messages (e.g. `revenue_amount`).
+ * @returns The validated decimal string, unchanged.
+ * @throws {AppError} HTTP 400 (`VALIDATION_ERROR`) if the value is not a
+ *         string, is not a plain decimal, exceeds the NUMERIC(30,10) limits,
+ *         or is not greater than zero.
+ */
+export function parsePositiveDecimal(raw: unknown, field = 'amount'): string {
+  if (typeof raw !== 'string') {
+    throw Errors.validationError(
+      `Invalid ${field}: expected a decimal string (e.g. "1234.56"), received ${
+        raw === null ? 'null' : typeof raw
+      }`,
+      { field, receivedType: raw === null ? 'null' : typeof raw },
+    );
+  }
+
+  if (!PLAIN_POSITIVE_DECIMAL_REGEX.test(raw)) {
+    throw Errors.validationError(
+      `Invalid ${field}: must be a plain decimal string (no sign, exponent, hex or whitespace)`,
+      { field },
+    );
+  }
+
+  const [integerPart, fractionalPart = ''] = raw.split('.');
+
+  if (integerPart.length > POSITIVE_DECIMAL_LIMITS.MAX_INTEGER_DIGITS) {
+    throw Errors.validationError(
+      `Invalid ${field}: exceeds maximum integer digits of ${POSITIVE_DECIMAL_LIMITS.MAX_INTEGER_DIGITS}`,
+      { field },
+    );
+  }
+
+  if (fractionalPart.length > POSITIVE_DECIMAL_LIMITS.MAX_DECIMAL_PLACES) {
+    throw Errors.validationError(
+      `Invalid ${field}: decimal places exceed maximum ${POSITIVE_DECIMAL_LIMITS.MAX_DECIMAL_PLACES} places`,
+      { field },
+    );
+  }
+
+  // At least one non-zero digit anywhere ⇒ value > 0 (exact, no float math).
+  if (!/[1-9]/.test(raw)) {
+    throw Errors.validationError(`${field} must be > 0`, { field });
+  }
+
+  return raw;
 }

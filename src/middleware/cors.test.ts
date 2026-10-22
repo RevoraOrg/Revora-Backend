@@ -13,12 +13,14 @@ jest.mock('../lib/logger', () => ({
   },
 }));
 
-// Mock the env module
+// Mock the env module (readEnvBoolean is re-exported from the real module so
+// the shared boolean-flag parser is exercised against live process.env)
 jest.mock('../config/env', () => ({
   env: {
     ALLOWED_ORIGINS: [],
     ALLOWED_ORIGINS_ARRAY: [],
   },
+  readEnvBoolean: jest.requireActual('../config/env').readEnvBoolean,
 }));
 
 describe('CORS Middleware', () => {

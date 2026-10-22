@@ -1,0 +1,24 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "master",
+    "origin",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are",
+    "security/issue-1293-security-password-reset-resetpassword-skips"
+  ],
+  "parent": {
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run": "master",
+    "master": null,
+    "origin": "master",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are": "master",
+    "security/issue-1293-security-password-reset-resetpassword-skips": "master"
+  },
+  "order": [
+    "master",
+    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "origin",
+    "security/issue-1268-security-jwt-access-and-refresh-tokens-are",
+    "security/issue-1293-security-password-reset-resetpassword-skips"
+  ]
+}

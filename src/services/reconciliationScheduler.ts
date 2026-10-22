@@ -39,7 +39,9 @@ import { OfferingRepository } from '../db/repositories/offeringRepository';
 import {
   RevenueReconciliationService,
   ReconciliationResult,
+  StellarRevenueClient,
 } from './revenueReconciliationService';
+import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -522,6 +524,12 @@ export interface CreateReconciliationSchedulerRuntimeOptions {
   offeringRepo?: ActiveOfferingRepository;
   /** Underlying scheduler. Defaults to a ReconciliationScheduler built from db + metrics. */
   scheduler?: ReconciliationScheduler;
+  /** Optional Stellar transaction verifier injected from the application bootstrap.
+   *  When absent, chain validation is skipped and a single warning discrepancy is
+   *  emitted per reconcile call instead of per-run STELLAR_TX_FAILED criticals. */
+  txVerifier?: StellarTransactionVerifier;
+  /** Optional Stellar revenue client for on-chain state queries. */
+  stellarClient?: StellarRevenueClient;
 }
 
 /**
@@ -544,7 +552,11 @@ export function createReconciliationSchedulerRuntime(
   const scheduler =
     options.scheduler ??
     new ReconciliationScheduler(
-      new RevenueReconciliationService(options.db),
+      new RevenueReconciliationService(
+        options.db,
+        options.stellarClient,
+        options.txVerifier,
+      ),
       options.offeringRepo ?? (new OfferingRepository(options.db) as unknown as ActiveOfferingRepository),
       runStore,
       options.metrics,
