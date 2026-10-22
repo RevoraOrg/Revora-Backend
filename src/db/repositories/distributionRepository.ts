@@ -198,18 +198,28 @@ export class DistributionRepository {
   /**
    * Get all payouts for a specific distribution run
    */
-  async getPayoutsForRun(distributionId: string): Promise<Payout[]> {
+  async getPayoutsForRun(distributionId: string, client?: Queryable): Promise<Payout[]> {
     const query = `
       SELECT *
       FROM distribution_payouts
       WHERE distribution_id = $1
     `;
 
-    const result: QueryResult<Payout> = await this.db.query(query, [
+    const result: QueryResult<Payout> = await (client || this.db).query(query, [
       distributionId,
     ]);
 
     return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  async getDistributionTotal(distributionId: string, client?: Queryable): Promise<string | null> {
+    const query = `
+      SELECT total_amount
+      FROM distributions
+      WHERE id = $1
+    `;
+    const result = await (client || this.db).query(query, [distributionId]);
+    return result.rows.length === 0 ? null : String(result.rows[0].total_amount);
   }
 
   /**

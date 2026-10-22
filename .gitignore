@@ -13,3 +13,4 @@ Thumbs.db
 reports/mutation/
 .stryker-tmp/
 .tools/
+.opencode

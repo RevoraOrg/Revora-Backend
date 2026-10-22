@@ -24,6 +24,12 @@ function createMockReq(overrides: Partial<Request> = {}): Request {
   } as Request;
 }
 
+function createAuthorizedReq(overrides: Partial<Request> = {}, role = 'admin'): Request {
+  const req = createMockReq(overrides) as Request & { user?: { role: string } };
+  req.user = { role };
+  return req;
+}
+
 function createMockRes(): Response {
   const res: Partial<Response> = {
     status: jest.fn().mockReturnThis(),
@@ -550,9 +556,9 @@ describe('createDisputeSLAHandlers', () => {
 
   describe('processRefund', () => {
     it('should process refund and return 201', async () => {
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
-        body: { amount: '100.00', originalDisbursement: 'disb-1', reason: 'Customer dispute' },
+        body: { amount: '100.00', distributionId: 'distribution-1', reason: 'Customer dispute' },
       });
       const res = createMockRes();
 
@@ -574,17 +580,42 @@ describe('createDisputeSLAHandlers', () => {
       expect(refundService.processPartialRefund).toHaveBeenCalledWith({
         disputeId: 'dispute-1',
         amount: '100.00',
-        originalDisbursement: 'disb-1',
         reason: 'Customer dispute',
         ledgerEventId: undefined,
-        distributionId: undefined,
+        distributionId: 'distribution-1',
       });
     });
 
+    it('should reject investor tokens with 403', async () => {
+      const req = createAuthorizedReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '10.00', distributionId: 'distribution-1' },
+      }, 'investor');
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(refundService.processPartialRefund).not.toHaveBeenCalled();
+    });
+
+    it('should reject a caller-supplied original disbursement cap', async () => {
+      const req = createAuthorizedReq({
+        params: { disputeId: 'dispute-1' },
+        body: { amount: '10.00', distributionId: 'distribution-1', originalDisbursement: '999999.00' },
+      });
+      const res = createMockRes();
+
+      await handlers.processRefund(req, res, mockNext);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(refundService.processPartialRefund).not.toHaveBeenCalled();
+    });
+
     it('should return 400 when disputeId is missing', async () => {
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: {},
-        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+        body: { amount: '100.00', distributionId: 'distribution-1' },
       });
       const res = createMockRes();
 
@@ -597,9 +628,9 @@ describe('createDisputeSLAHandlers', () => {
     });
 
     it('should return 400 when amount is missing', async () => {
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
-        body: { originalDisbursement: 'disb-1' },
+        body: { distributionId: 'distribution-1' },
       });
       const res = createMockRes();
 
@@ -611,8 +642,8 @@ describe('createDisputeSLAHandlers', () => {
       );
     });
 
-    it('should return 400 when originalDisbursement is missing', async () => {
-      const req = createMockReq({
+    it('should return 400 when distributionId is missing', async () => {
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
         body: { amount: '100.00' },
       });
@@ -621,16 +652,14 @@ describe('createDisputeSLAHandlers', () => {
       await handlers.processRefund(req, res, mockNext);
 
       expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith(
-        expect.objectContaining({ error: expect.stringContaining('originalDisbursement') }),
-      );
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('distributionId') }));
     });
 
     it('should return 500 when refundService is not initialized', async () => {
       const handlersNoRefund = createDisputeSLAHandlers(service, undefined);
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
-        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+        body: { amount: '100.00', distributionId: 'distribution-1' },
       });
       const res = createMockRes();
 
@@ -643,9 +672,9 @@ describe('createDisputeSLAHandlers', () => {
     });
 
     it('should call next on service error', async () => {
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
-        body: { amount: '100.00', originalDisbursement: 'disb-1' },
+        body: { amount: '100.00', distributionId: 'distribution-1' },
       });
       const res = createMockRes();
       refundService.processPartialRefund.mockRejectedValue(new Error('Refund failed'));
@@ -656,7 +685,7 @@ describe('createDisputeSLAHandlers', () => {
     });
 
     it('should handle undefined req.body in processRefund', async () => {
-      const req = createMockReq({
+      const req = createAuthorizedReq({
         params: { disputeId: 'dispute-1' },
         body: undefined as any,
       });
