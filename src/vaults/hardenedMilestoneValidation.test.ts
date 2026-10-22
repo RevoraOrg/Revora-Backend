@@ -13,6 +13,7 @@ import {
   validateMilestoneBusinessRules,
   executeMilestoneValidation,
 } from './hardenedMilestoneValidation';
+import { InMemoryMilestoneRepository } from './hardenedMilestoneValidation.integration';
 import {
   InMemorySecurityAuditRepository,
   createSecurityAuditRepository,
@@ -415,6 +416,15 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
 
     it('records failure when validation fails', async () => {
       const error = new Error('Database error');
+      const updatedMilestone = {
+        id: 'milestone-1',
+        vault_id: 'vault-1',
+        status: 'validated' as const,
+        created_at: new Date(),
+        validated_at: new Date(),
+        validated_by: 'verifier-1',
+      };
+      milestoneRepo.markValidated.mockResolvedValue(updatedMilestone);
       validationEventRepo.create.mockRejectedValue(error);
 
       await expect(
@@ -434,6 +444,106 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
       expect(auditEvents[0].action).toBe('milestone_validation_failed');
       expect(auditEvents[0].outcome).toBe('FAILURE');
       expect(auditEvents[0].details.error).toBe('Database error');
+    });
+
+    it('leaves no validation event when markValidated fails', async () => {
+      const error = new Error('Database error in markValidated');
+      milestoneRepo.markValidated.mockRejectedValue(error);
+
+      await expect(
+        executeMilestoneValidation(
+          'vault-1',
+          'milestone-1',
+          'verifier-1',
+          securityContext,
+          makeDeps()
+        )
+      ).rejects.toThrow('Database error in markValidated');
+
+      expect(validationEventRepo.create).not.toHaveBeenCalled();
+      expect(domainEventPublisher.publish).not.toHaveBeenCalled();
+
+      const auditEvents = auditRepository.getAllEvents();
+      expect(auditEvents).toHaveLength(1);
+      expect(auditEvents[0].outcome).toBe('FAILURE');
+    });
+
+    it('maps null from conditional markValidated to 409 Conflict and creates no event', async () => {
+      milestoneRepo.markValidated.mockResolvedValue(null);
+
+      await expect(
+        executeMilestoneValidation(
+          'vault-1',
+          'milestone-1',
+          'verifier-1',
+          securityContext,
+          makeDeps()
+        )
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        message: 'Milestone already validated',
+      });
+
+      expect(validationEventRepo.create).not.toHaveBeenCalled();
+      expect(domainEventPublisher.publish).not.toHaveBeenCalled();
+    });
+
+    it('executes conditional markValidated and event creation in runInTransaction', async () => {
+      const updatedMilestone = {
+        id: 'milestone-1',
+        vault_id: 'vault-1',
+        status: 'validated' as const,
+        created_at: new Date(),
+        validated_at: new Date(),
+        validated_by: 'verifier-1',
+      };
+      const validationEvent = {
+        id: 'event-1',
+        vault_id: 'vault-1',
+        milestone_id: 'milestone-1',
+        verifier_id: 'verifier-1',
+        created_at: new Date(),
+      };
+      const runInTransaction = jest.fn().mockImplementation(async (fn) => fn());
+      milestoneRepo.markValidated.mockResolvedValue(updatedMilestone);
+      validationEventRepo.create.mockResolvedValue(validationEvent);
+      domainEventPublisher.publish.mockResolvedValue(undefined);
+
+      const result = await executeMilestoneValidation(
+        'vault-1',
+        'milestone-1',
+        'verifier-1',
+        securityContext,
+        {
+          ...makeDeps(),
+          runInTransaction,
+        }
+      );
+
+      expect(runInTransaction).toHaveBeenCalledTimes(1);
+      expect(result.milestone).toEqual(updatedMilestone);
+      expect(result.validationEvent).toEqual(validationEvent);
+      expect(domainEventPublisher.publish).toHaveBeenCalledWith(
+        'vault.milestone.validated',
+        expect.anything()
+      );
+    });
+
+    it('handles non-Error thrown during execution', async () => {
+      milestoneRepo.markValidated.mockRejectedValue('string error');
+
+      await expect(
+        executeMilestoneValidation(
+          'vault-1',
+          'milestone-1',
+          'verifier-1',
+          securityContext,
+          makeDeps()
+        )
+      ).rejects.toBe('string error');
+
+      const auditEvents = auditRepository.getAllEvents();
+      expect(auditEvents[0].details.error).toBe('Unknown error');
     });
   });
 
@@ -571,6 +681,89 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
         'vault-1',
         'verifier-1'
       );
+    });
+
+    it('regression: two concurrent validations of same milestone yield exactly one 200 and one 409 with single event and single publish', async () => {
+      const inMemoryMilestoneRepo = new InMemoryMilestoneRepository([
+        {
+          id: 'milestone-1',
+          vault_id: 'vault-1',
+          status: 'pending',
+          created_at: new Date('2026-01-01'),
+        },
+      ]);
+
+      const eventsCreated: any[] = [];
+      const customValidationEventRepo = {
+        create: jest.fn().mockImplementation(async (input) => {
+          const evt = {
+            id: `evt-${eventsCreated.length + 1}`,
+            vault_id: input.vaultId,
+            milestone_id: input.milestoneId,
+            verifier_id: input.verifierId,
+            created_at: input.createdAt,
+          };
+          eventsCreated.push(evt);
+          return evt;
+        }),
+      };
+
+      const publishedEvents: any[] = [];
+      const customPublisher = {
+        publish: jest.fn().mockImplementation(async (name, payload) => {
+          publishedEvents.push({ name, payload });
+        }),
+      };
+
+      vaultRepo.getById.mockResolvedValue({ id: 'vault-1', status: 'active' });
+      verifierAssignmentRepo.isVerifierAssignedToVault.mockResolvedValue(true);
+      validationLimiter.checkConcurrentValidations.mockResolvedValue(true);
+      validationLimiter.releaseValidation.mockResolvedValue(undefined);
+
+      const deps = {
+        milestoneRepository: inMemoryMilestoneRepo,
+        vaultRepository: vaultRepo,
+        verifierAssignmentRepository: verifierAssignmentRepo,
+        milestoneValidationEventRepository: customValidationEventRepo,
+        domainEventPublisher: customPublisher,
+        auditRepository,
+        validationLimiter,
+        securityConfig: DEFAULT_SECURITY_CONFIG,
+      };
+
+      const handlers = createHardenedMilestoneValidationHandler(deps);
+      const mainHandler = handlers[handlers.length - 1];
+
+      const req1 = createMockRequest({
+        securityContext: createMockSecurityContext({ id: 'verifier-1' }),
+        validated: { params: { id: 'vault-1', mid: 'milestone-1' } },
+      });
+      const res1 = createMockResponse();
+      const next1 = createMockNext();
+
+      const req2 = createMockRequest({
+        securityContext: createMockSecurityContext({ id: 'verifier-2' }),
+        validated: { params: { id: 'vault-1', mid: 'milestone-1' } },
+      });
+      const res2 = createMockResponse();
+      const next2 = createMockNext();
+
+      // Execute both concurrent validation requests
+      await Promise.all([
+        mainHandler(req1, res1, next1),
+        mainHandler(req2, res2, next2),
+      ]);
+
+      const statuses = [
+        (res1.status as jest.Mock).mock.calls[0]?.[0],
+        (res2.status as jest.Mock).mock.calls[0]?.[0],
+      ];
+
+      expect(statuses.sort()).toEqual([200, 409]);
+      expect(customValidationEventRepo.create).toHaveBeenCalledTimes(1);
+      expect(customPublisher.publish).toHaveBeenCalledTimes(1);
+      expect(eventsCreated).toHaveLength(1);
+      expect(publishedEvents).toHaveLength(1);
     });
   });
 
@@ -757,6 +950,30 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
       
       expect(res.status).toHaveBeenCalledWith(500);
     });
+
+    it('returns security violations with explicit since query parameter', async () => {
+      const auditRepo = {
+        findSecurityViolations: jest.fn().mockResolvedValue([]),
+      } as any;
+      const router = createSecurityMonitoringRouter(auditRepo);
+      const req = createMockRequest({
+        securityContext: {
+          ...createMockSecurityContext(),
+          user: { id: 'admin-1', role: 'admin', permissions: ['audit:read'] },
+        },
+      });
+      (req as any).query = { since: '2026-10-01T00:00:00.000Z', limit: '25' };
+      const res = createMockResponse();
+
+      const handler = (router as any).stack.find((s: any) => s.route?.path === '/security/violations')?.route.stack[0].handle;
+      await handler(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          meta: expect.objectContaining({ count: 0, since: '2026-10-01T00:00:00.000Z' }),
+        })
+      );
+    });
   });
 
   describe('Milestone Validation Router', () => {
@@ -786,6 +1003,44 @@ describe('Hardened Milestone Validation Auth Matrix', () => {
       await mainHandler(req, res, next);
       
       expect(next).toHaveBeenCalledWith(expect.any(Error));
+    });
+
+    it('handles ValidationError without statusCode in main handler', async () => {
+      const deps = makeDeps();
+      const handlers = createHardenedMilestoneValidationHandler(deps);
+      const mainHandler = handlers[handlers.length - 1];
+
+      milestoneRepo.getByVaultAndId.mockRejectedValue(
+        new ValidationError('Invalid parameter format', 'INVALID_PARAM', { field: 'mid' })
+      );
+
+      const req = createMockRequest({
+        securityContext: createMockSecurityContext(),
+        validated: { params: { id: 'vault-1', mid: 'milestone-1' } },
+      });
+      const res = createMockResponse();
+      const next = jest.fn();
+
+      await mainHandler(req, res, next);
+      expect(res.status).toHaveBeenCalledWith(400);
+    });
+
+    it('handles non-Error thrown in unhandled branch of main handler', async () => {
+      const deps = makeDeps();
+      const handlers = createHardenedMilestoneValidationHandler(deps);
+      const mainHandler = handlers[handlers.length - 1];
+
+      milestoneRepo.getByVaultAndId.mockRejectedValue('raw string failure');
+
+      const req = createMockRequest({
+        securityContext: createMockSecurityContext(),
+        validated: { params: { id: 'vault-1', mid: 'milestone-1' } },
+      });
+      const res = createMockResponse();
+      const next = jest.fn();
+
+      await mainHandler(req, res, next);
+      expect(next).toHaveBeenCalledWith('raw string failure');
     });
   });
 });

@@ -11,12 +11,13 @@
 
 import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
 import { Pool } from 'pg';
-import { RevenueReconciliationService } from '../services/revenueReconciliationService';
+import { RevenueReconciliationService, StellarRevenueClient } from '../services/revenueReconciliationService';
 import { AppError, Errors } from '../lib/errors';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Logger } from '../lib/logger';
 import { MetricsCollector } from '../lib/metrics';
 import { classifyStellarRPCFailure, StellarRPCFailureClass } from '../lib/stellarRpcFailure';
+import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
 
 export interface ReconciliationRequest extends Request {
   user?: {
@@ -646,13 +647,23 @@ export interface CreateReconciliationRouterOptions {
   auditLogRepo?: AuditLogRepository;
   logger?: Logger;
   requireAuth: RequestHandler;
+  /** Optional Stellar transaction verifier injected from the application bootstrap.
+   *  When absent, chain validation is skipped and a single warning discrepancy is
+   *  emitted per reconcile call instead of per-run STELLAR_TX_FAILED criticals. */
+  txVerifier?: StellarTransactionVerifier;
+  /** Optional Stellar revenue client for on-chain state queries. */
+  stellarClient?: StellarRevenueClient;
 }
 
 export function createReconciliationRouter(
   options: CreateReconciliationRouterOptions
 ): Router {
   const router = Router();
-  const reconciliationService = new RevenueReconciliationService(options.db);
+  const reconciliationService = new RevenueReconciliationService(
+    options.db,
+    options.stellarClient,
+    options.txVerifier,
+  );
   const handlers = createReconciliationHandlers(
     reconciliationService,
     options.offeringRepo,

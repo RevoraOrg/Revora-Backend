@@ -11,8 +11,14 @@ import { Logger, globalLogger } from '../lib/logger';
 import DistributionEngine from './distributionEngine';
 import { RevenueReportRepository } from '../db/repositories/revenueReportRepository';
 import { ScheduledDistributionRepository } from '../db/repositories/scheduledDistributionRepository';
+import { AdvisoryLockNotAvailableError } from '../db/transaction';
 import { AppError, Errors } from '../lib/errors';
-import { classifyStellarRPCFailure } from '../lib/stellarRpcFailure';
+import { parsePositiveDecimal } from '../lib/decimal';
+import {
+  classifyStellarRPCFailure,
+  StellarRPCFailure,
+  StellarRPCFailureClass,
+} from '../lib/stellarRpcFailure';
 import { HolidayCalendarService, BlackoutShiftDecision } from './holidayCalendarService';
 import { MetricsCollector } from '../lib/metrics';
 
@@ -168,6 +174,29 @@ export const STELLAR_MAINTENANCE_WINDOWS = [
     durationMinutes: 120,
   },
 ] as const;
+
+/**
+ * Classifies a distribution failure into a safe failure class without ever
+ * throwing: if classification itself fails (for example when the error carries
+ * non-string diagnostic fields), fall back to `UNKNOWN` so failure handling
+ * can still complete instead of crashing the scheduler loop.
+ */
+function safeClassifyStellarRPCFailure(
+  err: unknown,
+  context: Parameters<typeof classifyStellarRPCFailure>[1],
+): StellarRPCFailure {
+  try {
+    return classifyStellarRPCFailure(err, context);
+  } catch {
+    return {
+      class: StellarRPCFailureClass.UNKNOWN,
+      context,
+      originalError: err,
+      timestamp: new Date().toISOString(),
+      shouldRetry: false,
+    };
+  }
+}
 
 // ─── Private timezone helpers ─────────────────────────────────────────────────
 
@@ -699,6 +728,9 @@ export class DistributionScheduler {
       }
     }
 
+    // In-process de-duplication of reports already distributed this tick.
+    this.processedReportIds = new Set<string>();
+
     this.catchupBacklogAlertThreshold =
       options.catchupBacklogAlertThreshold ?? this.catchupMax * 2;
   }
@@ -826,7 +858,9 @@ export class DistributionScheduler {
             start: claim.period_start,
             end: periodEnd,
           },
-          Number(claim.amount),
+          // NUMERIC column → decimal string; passed straight through so the
+          // exact stored value (never a lossy Number()) reaches the engine.
+          claim.amount,
         );
 
         await this.revenueReportRepo.markReportDistributionCompleted(claim.id);
@@ -903,7 +937,7 @@ export class DistributionScheduler {
 
         summary.failed++;
 
-        const failure = classifyStellarRPCFailure(err, {
+        const failure = safeClassifyStellarRPCFailure(err, {
           operation: "automatedDistribution",
           offeringId: claim.offering_id,
           periodId: claim.id,
@@ -1073,12 +1107,10 @@ export class DistributionScheduler {
           );
         }
 
-        const amount = Number(claim.total_amount);
-        if (!Number.isFinite(amount) || amount <= 0) {
-          throw Errors.badRequest(
-            `Scheduled distribution ${claim.id} has an invalid amount`,
-          );
-        }
+        // Strict decimal-string validation (rejects exponent/hex/whitespace
+        // forms and non-positive values) — the string itself, not a Number()
+        // round-trip, is what the engine persists as total_amount.
+        const amount = parsePositiveDecimal(claim.total_amount, 'total_amount');
 
         this.logger.info('Processing deferred scheduled distribution', {
           scheduledId: claim.id,
@@ -1112,7 +1144,7 @@ export class DistributionScheduler {
           continue;
         }
 
-        const failure = classifyStellarRPCFailure(err, {
+        const failure = safeClassifyStellarRPCFailure(err, {
           operation: 'scheduledDistribution',
           offeringId: claim.offering_id,
           periodId: claim.period_id,

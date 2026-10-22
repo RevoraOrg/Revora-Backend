@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { UserRepository, SafeUser } from '../db/repositories/userRepository';
+import { UserRepository, SafeUser, User } from '../db/repositories/userRepository';
 import { globalMetrics } from '../lib/metrics';
 import { createScimAuth } from '../middleware/scimAuth';
 
@@ -131,6 +131,24 @@ function groupToScim(g: GroupRecord, baseUrl: string): ScimGroup {
   };
 }
 
+function isActive(u: Pick<SafeUser, 'is_active'>): boolean {
+  return u.is_active !== false;
+}
+
+// Okta sends a boolean, Azure AD sends "True" / "False".
+// Anything else returns undefined so the caller can reject it.
+function parseScimBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+  }
+  return undefined;
+}
+
+class InvalidActiveValueError extends Error {}
+
 function parseFilter(filter?: string): { field: string; op: string; value: string } | null {
   if (!filter) return null;
   const m = filter.match(/^(\w+)\s+(eq|co|sw|pr|gt|ge|lt|le)\s+"([^"]*)"$/);
@@ -145,9 +163,24 @@ export function createScimRouter(
 ): Router {
   const groups = new Map<string, GroupRecord>();
   const groupByName = new Map<string, string>();
-  const suspendedUsers = new Set<string>();
   const router = Router();
   const authMiddleware = createScimAuth(scimToken);
+
+  /**
+   * Determine whether a user is de-provisioned.
+   *
+   * Two sources are consulted so the flag is correct both for the in-process
+   * fast path (`suspendedUsers`) and for users suspended before this process
+   * started or by another replica (persisted `status`).
+   */
+  function isSuspended(
+    userId: string,
+    existing?: { status?: unknown } | null,
+  ): boolean {
+    if (suspendedUsers.has(userId)) return true;
+    const status = existing?.status;
+    return typeof status === 'string' && status !== 'active' && status !== 'enabled';
+  }
 
   router.use(authMiddleware);
 
@@ -158,6 +191,17 @@ export function createScimRouter(
       1,
       'SCIM operation counter',
     );
+  }
+
+  // Deactivation is always written, even for an already inactive user, so a
+  // repeated IdP call also revokes sessions created in the meantime.
+  async function applyActive(user: User, active: boolean): Promise<User> {
+    if (active && isActive(user)) return user;
+    const updated = await userRepo.setActive(user.id, active);
+    if (!updated) {
+      throw new Error(`User ${user.id} disappeared while updating active state`);
+    }
+    return updated;
   }
 
   // --- ServiceProviderConfig ---
@@ -334,7 +378,7 @@ export function createScimRouter(
         users = [];
       }
 
-      const allResources = users.map(u => userToScim(u, !suspendedUsers.has(u.id), baseUrl));
+      const allResources = users.map(u => userToScim(u, !isSuspended(u.id, u), baseUrl));
       const paged = allResources.slice(startIndex - 1, startIndex - 1 + count);
 
       const listResp: ScimListResponse = {
@@ -362,7 +406,7 @@ export function createScimRouter(
       const existing = await userRepo.findByEmail(userName);
       if (existing) {
         const { password_hash: _, ...safe } = existing;
-        const scim = userToScim(safe, !suspendedUsers.has(existing.id), baseUrl);
+        const scim = userToScim(safe, !isSuspended(existing.id, existing), baseUrl);
         res.status(201).json(scim);
         return;
       }
@@ -380,7 +424,7 @@ export function createScimRouter(
         role: 'startup',
       });
       const { password_hash: _, ...safe } = created;
-      const scim = userToScim(safe, true, baseUrl);
+      const scim = userToScim(safe, isActive(created), baseUrl);
       res.status(201).json(scim);
     } catch (err: any) {
       if (err.constructor?.name === 'UniqueConstraintError') {
@@ -400,7 +444,7 @@ export function createScimRouter(
         return;
       }
       const { password_hash: _, ...safe } = u;
-      res.json(userToScim(safe, !suspendedUsers.has(u.id), baseUrl));
+      res.json(userToScim(safe, !isSuspended(u.id, u), baseUrl));
     } catch (err: any) {
       res.status(500).json(scimError(500, 'internal', err.message));
     }
@@ -422,18 +466,27 @@ export function createScimRouter(
         ? [givenName, familyName].filter(Boolean).join(' ')
         : (displayName || existing.name || '');
 
-      const active = body?.active !== undefined ? body.active : !suspendedUsers.has(existing.id);
+      const active = body?.active !== undefined
+        ? body.active
+        : !isSuspended(existing.id, existing);
 
+      // Persist the de-provision so downstream authorisation (e.g. refresh
+      // rotation) observes the suspension without relying on this process's
+      // in-memory state.
       const updated = await userRepo.updateUser({
         id: existing.id,
         email: body?.userName || existing.email,
         name: nameStr || undefined,
+        status: active ? 'active' : 'suspended',
       });
+      updated = await applyActive(updated, active);
       const { password_hash: _, ...safe } = updated;
-      if (!active) suspendedUsers.add(existing.id);
-      else suspendedUsers.delete(existing.id);
-      res.json(userToScim(safe, active, baseUrl));
+      res.json(userToScim(safe, isActive(updated), baseUrl));
     } catch (err: any) {
+      if (err instanceof InvalidActiveValueError) {
+        res.status(400).json(scimError(400, 'invalidValue', 'active must be a boolean'));
+        return;
+      }
       if (err.constructor?.name === 'UniqueConstraintError') {
         res.status(409).json(scimError(409, 'uniqueness', 'Email already exists'));
         return;
@@ -455,10 +508,12 @@ export function createScimRouter(
 
       let newEmail = existing.email;
       let newName = existing.name;
-      let newActive = !suspendedUsers.has(existing.id);
+      let newActive = !isSuspended(existing.id, existing);
 
       for (const op of operations) {
-        if (op.op === 'replace' && op.value) {
+        // op is case-insensitive (RFC 7644 3.5.2); Azure AD sends "Replace"
+        const opName = typeof op?.op === 'string' ? op.op.toLowerCase() : '';
+        if (opName === 'replace' && op.value && typeof op.value === 'object') {
           if (op.value.userName) newEmail = op.value.userName;
           if (op.value.displayName) newName = op.value.displayName;
           if (op.value.name?.givenName || op.value.name?.familyName) {
@@ -467,26 +522,36 @@ export function createScimRouter(
             const combined = [gn, fn].filter(Boolean).join(' ');
             if (combined) newName = combined;
           }
-          if (op.value.active !== undefined) newActive = op.value.active;
-        } else if (op.op === 'replace' && op.path === 'userName') {
+          if (op.value.active !== undefined) {
+            const parsed = parseScimBoolean(op.value.active);
+            if (parsed === undefined) throw new InvalidActiveValueError();
+            newActive = parsed;
+          }
+        } else if (opName === 'replace' && op.path === 'userName') {
           newEmail = op.value;
-        } else if (op.op === 'replace' && op.path === 'active') {
-          newActive = op.value === true || op.value === 'true';
-        } else if (op.op === 'replace' && op.path === 'displayName') {
+        } else if (opName === 'replace' && op.path === 'active') {
+          const parsed = parseScimBoolean(op.value);
+          if (parsed === undefined) throw new InvalidActiveValueError();
+          newActive = parsed;
+        } else if (opName === 'replace' && op.path === 'displayName') {
           newName = op.value;
         }
       }
 
-      const updated = await userRepo.updateUser({
+      let updated = await userRepo.updateUser({
         id: existing.id,
         email: newEmail,
         name: newName,
+        status: newActive ? 'active' : 'suspended',
       });
+      updated = await applyActive(updated, newActive);
       const { password_hash: _, ...safe } = updated;
-      if (!newActive) suspendedUsers.add(existing.id);
-      else suspendedUsers.delete(existing.id);
-      res.json(userToScim(safe, newActive, baseUrl));
+      res.json(userToScim(safe, isActive(updated), baseUrl));
     } catch (err: any) {
+      if (err instanceof InvalidActiveValueError) {
+        res.status(400).json(scimError(400, 'invalidValue', 'active must be a boolean'));
+        return;
+      }
       if (err.constructor?.name === 'UniqueConstraintError') {
         res.status(409).json(scimError(409, 'uniqueness', 'Email already exists'));
         return;
@@ -503,6 +568,8 @@ export function createScimRouter(
         res.status(404).json(scimError(404, 'unknown', `User ${req.params.id} not found`));
         return;
       }
+      // Soft-delete: persist a suspended status so refresh rotation fails closed.
+      await userRepo.updateUser({ id: u.id, status: 'suspended' });
       suspendedUsers.add(u.id);
       res.status(204).send();
     } catch (err: any) {

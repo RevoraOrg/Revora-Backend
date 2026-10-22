@@ -24,7 +24,7 @@ import { Logger } from './lib/logger';
 import { RefreshService } from './auth/refresh/refreshService';
 import { createRefreshRouter } from './auth/refresh/refreshRoute';
 import { RefreshTokenRepository, TokenService } from './auth/refresh/types';
-import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { RefreshTokenRepositoryAdapter, RefreshUserLookupAdapter } from './auth/refresh/repositoryAdapter';
 import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
 import { errorHandler } from './middleware/errorHandler';
 import { SocialIdentityRepository } from './db/repositories/socialIdentityRepository';
@@ -219,9 +219,16 @@ export function createApp() {
 
   // Refresh service
   const refreshTokenRepository = new RefreshTokenRepositoryAdapter(sessionRepository);
+  const refreshUserLookup = new RefreshUserLookupAdapter(userRepository);
   const tokenService = new JwtTokenServiceAdapter();
   const logger = new Logger({ serviceName: 'auth-refresh' });
-  const refreshService = new RefreshService(refreshTokenRepository, tokenService, pool, logger);
+  const refreshService = new RefreshService(
+    refreshTokenRepository,
+    tokenService,
+    pool,
+    logger,
+    refreshUserLookup,
+  );
 
   // Auth and health routes
   app.use(createLoginRouter({ loginService }));

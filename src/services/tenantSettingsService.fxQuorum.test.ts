@@ -24,6 +24,14 @@ class FakeRepo {
     return this.rows.get(tenantId) ?? null;
   }
 
+  async withTransaction<T>(callback: (client: any) => Promise<T>): Promise<T> {
+    return callback({});
+  }
+
+  async findByTenantIdForUpdate(tenantId: string): Promise<TenantSettingsRow | null> {
+    return this.findByTenantId(tenantId);
+  }
+
   async upsertSettings(tenantId: string, settings: Record<string, unknown>): Promise<TenantSettingsRow> {
     const existing = this.rows.get(tenantId);
     const row: TenantSettingsRow = {
@@ -100,13 +108,13 @@ describe('TenantSettingsService FX quorum config', () => {
 
   it('approveFxQuorumConfig applies the change, clears pending, and audits (with collusion guard)', async () => {
     const { svc, audit } = makeService();
-    await svc.proposeFxQuorumConfig('tenant-1', 4, 0.02, 'alice', 'widen guard');
+    const proposal = await svc.proposeFxQuorumConfig('tenant-1', 4, 0.02, 'alice', 'widen guard');
 
     // Same person cannot approve their own proposal.
-    await expect(svc.approveFxQuorumConfig('tenant-1', 'alice')).rejects.toThrow(/cannot approve their own/);
+    await expect(svc.approveFxQuorumConfig('tenant-1', 'alice', proposal.id)).rejects.toThrow(/cannot approve their own/);
 
     // A different approver can.
-    const row = await svc.approveFxQuorumConfig('tenant-1', 'bob');
+    const row = await svc.approveFxQuorumConfig('tenant-1', 'bob', proposal.id);
     expect(row.settings.fx_quorum).toEqual({ k: 4, tolerance: 0.02, reference: undefined });
     expect(row.settings.pending_fx_quorum_change).toBeNull();
 
@@ -118,18 +126,38 @@ describe('TenantSettingsService FX quorum config', () => {
 
   it('approveFxQuorumConfig throws when there is no pending change', async () => {
     const { svc } = makeService();
-    await expect(svc.approveFxQuorumConfig('tenant-1', 'bob')).rejects.toThrow(/No pending/);
+    await expect(svc.approveFxQuorumConfig('tenant-1', 'bob', 'missing-id')).rejects.toThrow(/No pending/);
   });
 
   it('rejectFxQuorumConfig clears the pending change and audits the rejection', async () => {
     const { svc, audit } = makeService();
-    await svc.proposeFxQuorumConfig('tenant-1', 4, 0.02, 'alice', 'widen guard');
-    const row = await svc.rejectFxQuorumConfig('tenant-1', 'bob', 'not needed');
+    const proposal = await svc.proposeFxQuorumConfig('tenant-1', 4, 0.02, 'alice', 'widen guard');
+    const row = await svc.rejectFxQuorumConfig('tenant-1', 'bob', 'not needed', proposal.id);
     expect(row.settings.pending_fx_quorum_change).toBeNull();
 
     const rejected = audit.records.find((r) => r.action === 'fx_quorum_config_change_rejected');
     expect(rejected).toBeDefined();
     expect(rejected.details.rejection_reason).toBe('not needed');
+  });
+
+  it('rejects a replacement proposal and stale approval without changing the pending config', async () => {
+    const { svc, repo } = makeService({ fx_quorum: { k: 2, tolerance: 0.005 } });
+    const proposal = await svc.proposeFxQuorumConfig('tenant-1', 4, 0.02, 'alice', 'review this');
+    await expect(
+      svc.proposeFxQuorumConfig('tenant-1', 1, 0.5, 'mallory', 'swap it'),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    await expect(
+      svc.approveFxQuorumConfig('tenant-1', 'bob', 'stale-request-id'),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(repo['rows'].get('tenant-1')?.settings.fx_quorum).toEqual({
+      k: 2,
+      tolerance: 0.005,
+    });
+    expect(
+      (repo['rows'].get('tenant-1')?.settings.pending_fx_quorum_change as { id: string }).id,
+    ).toBe(proposal.id);
+    await svc.approveFxQuorumConfig('tenant-1', 'bob', proposal.id);
+    expect((await svc.getRawFxQuorumConfig('tenant-1'))?.k).toBe(4);
   });
 
   it('resolveFxQuorumConfig merges tenant override over platform defaults', async () => {
