@@ -133,6 +133,39 @@ export class InvestmentLotRepository {
   }
 
   /**
+   * Find lots for an investor+offering acquired within a date range.
+   * Used for wash-sale detection to find repurchases within the ±window.
+   */
+  async findByInvestorOfferingAndDateRange(
+    client: PoolClient,
+    investorId: string,
+    offeringId: string,
+    startDate: Date,
+    endDate: Date,
+  ): Promise<InvestmentLot[]> {
+    const query = `
+      SELECT *
+      FROM investment_lots
+      WHERE investor_id = $1
+        AND offering_id = $2
+        AND acquired_at >= $3
+        AND acquired_at <= $4
+        AND status IN ('open', 'partially_used')
+        AND remaining_quantity > 0
+      ORDER BY acquired_at ASC
+    `;
+
+    const result: QueryResult<InvestmentLotRow> = await client.query(query, [
+      investorId,
+      offeringId,
+      startDate,
+      endDate,
+    ]);
+
+    return result.rows.map((row) => this.mapLot(row));
+  }
+
+  /**
    * Find available lots within a transaction (for atomic disposal).
    * Uses FOR UPDATE to lock lots against concurrent disposals.
    */

@@ -70,7 +70,7 @@ export function buildSessionCookie(
   const name         = opts.name ?? SESSION_COOKIE_NAME;
   const path         = opts.path ?? "/";
 
-  const sameSite     = opts.sameSite ?? "Lax";
+  const sameSite     = opts.sameSite ?? "Strict";
 
   if (isProduction && !secure) {
     throw new Error(
@@ -110,7 +110,7 @@ export function issueSessionCookie(
 export function clearSessionCookie(opts: SessionCookieOptions = {}): string {
   const name = opts.name ?? SESSION_COOKIE_NAME;
   const path = opts.path ?? "/";
-  const sameSite = opts.sameSite ?? "Lax";
+  const sameSite = opts.sameSite ?? "Strict";
   return `${name}=; Path=${path}; HttpOnly; SameSite=${sameSite}; Max-Age=0`;
 }
 
@@ -201,7 +201,7 @@ export function createSessionRouter(store: ISessionStore, getPolicy?: (tenantId:
     const session = await store.create(userId, role);
 
     const tenantId = req.header("x-tenant-id");
-    let sameSite: 'Lax' | 'Strict' = 'Lax';
+    let sameSite: 'Lax' | 'Strict' = 'Strict';
     if (tenantId && getPolicy) {
       sameSite = await getPolicy(tenantId);
     }

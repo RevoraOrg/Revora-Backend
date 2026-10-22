@@ -160,3 +160,124 @@ describe('offerings catalog routes', () => {
     assert(err2.message === 'DB connection closed');
   });
 });
+
+/**
+ * The public catalog must still be served when a repository only implements the
+ * raw `list` source (no `listPublic`). These cases pin the success contract
+ * (public-safe projection, stable ordering, pagination, totals) and the failure
+ * contract (missing source -> 500, invalid input -> 400, driver errors surface).
+ */
+describe('offerings catalog fallback source (list)', () => {
+  const day1 = new Date('2026-01-01T00:00:00.000Z');
+  const day2 = new Date('2026-01-02T00:00:00.000Z');
+  const rows = [
+    { id:'11111111-1111-4111-8111-111111111111', issuer_id:'s1', title:'A', status:'active', amount:'100.00', created_at:day1, private_note:'issuer-only' },
+    { id:'33333333-3333-4333-8333-333333333333', issuer_id:'s3', title:'C', status:'active', amount:'300.00', created_at:day1, private_note:'issuer-only' },
+    { id:'22222222-2222-4222-8222-222222222222', issuer_id:'s2', title:'B', status:'active', amount:'200.00', created_at:day2, private_note:'issuer-only' },
+    { id:'44444444-4444-4444-8444-444444444444', issuer_id:'s4', title:'D', status:'archived', amount:'400.00', created_at:day2 },
+  ];
+
+  function makeFallbackRepo(overrides: any = {}) {
+    const calls: any[] = [];
+    return {
+      calls,
+      list: async (opts: any) => { calls.push(opts); return overrides.rows ?? rows; },
+      ...overrides,
+    };
+  }
+
+  it('projects raw rows to the public shape with stable ordering and totals', async () => {
+    const repo = makeFallbackRepo();
+    const handlers = createPublicHandlers(repo as any);
+    const res = makeRes();
+
+    await handlers.listCatalog(makeReq({ status: 'active' }), res, (e:any)=>{ throw e });
+    const out = res._get();
+
+    assert(out.statusCode === 200);
+    assert(out.jsonData.total === 3, 'total counts pre-pagination filtered rows');
+    assert.deepStrictEqual(out.jsonData.offerings.map((o:any)=>o.id), [
+      '22222222-2222-4222-8222-222222222222', // newest first
+      '11111111-1111-4111-8111-111111111111', // ties broken by id ascending
+      '33333333-3333-4333-8333-333333333333',
+    ]);
+    assert(!('issuer_id' in out.jsonData.offerings[0]));
+    assert(!('private_note' in out.jsonData.offerings[0]));
+    // The route owns the window, so only `status` is forwarded to the repository.
+    assert.deepStrictEqual(repo.calls, [{ status: 'active' }]);
+  });
+
+  it('applies pagination over the filtered, ordered rows', async () => {
+    const repo = makeFallbackRepo();
+    const handlers = createPublicHandlers(repo as any);
+    const res = makeRes();
+
+    await handlers.listCatalog(makeReq({ status: 'active', limit: '2', offset: '1' }), res, (e:any)=>{ throw e });
+    const out = res._get();
+
+    assert(out.jsonData.total === 3);
+    assert.deepStrictEqual(out.jsonData.offerings.map((o:any)=>o.id), [
+      '11111111-1111-4111-8111-111111111111',
+      '33333333-3333-4333-8333-333333333333',
+    ]);
+  });
+
+  it('honours a repository countPublic total when present', async () => {
+    const repo = makeFallbackRepo({ countPublic: async () => 4242 });
+    const handlers = createPublicHandlers(repo as any);
+    const res = makeRes();
+
+    await handlers.listCatalog(makeReq({ limit: '1' }), res, (e:any)=>{ throw e });
+    const out = res._get();
+
+    assert(out.jsonData.total === 4242);
+    assert(out.jsonData.offerings.length === 1);
+  });
+
+  it('bounds the response with the default page size when limit is omitted', async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: `${String(i).padStart(8, '0')}-0000-4000-8000-000000000000`,
+      issuer_id: 's1',
+      title: `T${i}`,
+      status: 'active',
+      amount: '1.00',
+      created_at: day1,
+    }));
+    const handlers = createPublicHandlers(makeFallbackRepo({ rows: many }) as any);
+    const res = makeRes();
+
+    await handlers.listCatalog(makeReq({}), res, (e:any)=>{ throw e });
+    const out = res._get();
+
+    assert(out.jsonData.offerings.length === 100);
+    assert(out.jsonData.total === 150);
+  });
+
+  it('rejects out-of-range limit on the fallback path', async () => {
+    const repo = makeFallbackRepo();
+    const handlers = createPublicHandlers(repo as any);
+    let err: any;
+
+    await handlers.listCatalog(makeReq({ limit: '1001' }), makeRes(), (e:any)=>{ err = e });
+    assert(err.code === 'BAD_REQUEST');
+    assert(err.statusCode === 400);
+    assert.deepStrictEqual(repo.calls, [], 'invalid input must never reach the repository');
+  });
+
+  it('returns a deterministic 500 when no catalog source is wired at all', async () => {
+    const handlers = createPublicHandlers({ listPublic: 'not-a-function', list: 42 } as any);
+    let err: any;
+
+    await handlers.listCatalog(makeReq({}), makeRes(), (e:any)=>{ err = e });
+    assert(err.code === 'INTERNAL_ERROR');
+    assert(err.statusCode === 500);
+  });
+
+  it('surfaces repository failures from the fallback source', async () => {
+    const handlers = createPublicHandlers(makeFallbackRepo({ list: async () => { throw new Error('DB Error fallback'); } }) as any);
+    let err: any;
+
+    await handlers.listCatalog(makeReq({}), makeRes(), (e:any)=>{ err = e });
+    assert(err.message === 'DB Error fallback');
+  });
+});

@@ -10,7 +10,7 @@ import { UniqueConstraintError } from '../errors';
  * must produce an object where:
  *   - `name === "UniqueConstraintError"`
  *   - `field === f`
- *   - `message === "Duplicate value for field: " + f`
+ *   - `message === "Unique constraint violation on " + f`
  *   - `instanceof UniqueConstraintError === true` (prototype chain intact)
  *
  * Validates: Requirements 3.1, 3.2, 3.3
@@ -28,7 +28,7 @@ describe('UniqueConstraintError – constructor invariants (Property 5)', () => 
         expect(error.field).toBe(field);
 
         // message must be the canonical form
-        expect(error.message).toBe(`Duplicate value for field: ${field}`);
+        expect(error.message).toBe(`Unique constraint violation on ${field}`);
 
         // instanceof must work after TypeScript transpilation (prototype chain)
         expect(error instanceof UniqueConstraintError).toBe(true);

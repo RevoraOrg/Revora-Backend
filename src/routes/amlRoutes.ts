@@ -173,7 +173,8 @@ export function createAMLRoutes(
   router.post('/rules', async (req: Request, res: Response) => {
     try {
       const validated = createRuleSchema.parse(req.body);
-      const rule = await amlService.createRule(validated);
+      const actor = getActor(req);
+      const rule = await amlService.createRule(validated, actor.id);
       res.status(201).json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -193,7 +194,8 @@ export function createAMLRoutes(
     try {
       const { ruleId } = req.params;
       const validated = updateRuleSchema.parse(req.body);
-      const rule = await amlService.updateRule(ruleId, validated);
+      const actor = getActor(req);
+      const rule = await amlService.updateRule(ruleId, validated, actor.id);
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -213,7 +215,8 @@ export function createAMLRoutes(
     try {
       const { ruleId } = req.params;
       const validated = rollbackRuleSchema.parse(req.body);
-      const rule = await amlService.rollbackRule(ruleId, validated.version);
+      const actor = getActor(req);
+      const rule = await amlService.rollbackRule(ruleId, validated.version, actor.id);
       res.json({ success: true, data: rule });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -312,7 +315,8 @@ export function createAMLRoutes(
   router.post('/cases', async (req: Request, res: Response) => {
     try {
       const validated = createCaseSchema.parse(req.body);
-      const amlCase = await amlService.createCase(validated);
+      const actor = getActor(req);
+      const amlCase = await amlService.createCase(validated, actor.id);
       res.status(201).json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -332,7 +336,8 @@ export function createAMLRoutes(
     try {
       const { caseId } = req.params;
       const validated = updateCaseSchema.parse(req.body);
-      const amlCase = await amlService.updateCase(caseId, validated);
+      const actor = getActor(req);
+      const amlCase = await amlService.updateCase(caseId, validated, actor.id);
       res.json({ success: true, data: amlCase });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -380,7 +385,8 @@ export function createAMLRoutes(
   router.post('/alerts/:alertId/dismiss', async (req: Request, res: Response) => {
     try {
       const { alertId } = req.params;
-      const alert = await amlService.dismissAlert(alertId);
+      const actor = getActor(req);
+      const alert = await amlService.dismissAlert(alertId, actor.id);
       res.json({ success: true, data: alert });
     } catch (error) {
       console.error('Error dismissing alert:', error);
@@ -433,6 +439,100 @@ export function createAMLRoutes(
     } catch (error: any) {
       console.error('Error batch auto-assigning AML cases:', error);
       res.status(500).json({ success: false, error: 'Failed to batch auto-assign cases' });
+    }
+  });
+
+  // ── OFAC dual-control review queue ──────────────────────────────────────────
+
+  /**
+   * GET /aml/ofac-reviews
+   * Return the active review queue (pending_first_approval and
+   * pending_second_approval rows, oldest-first). Expired pending-second rows
+   * are reset to pending_first before the list is returned.
+   *
+   * Requires: compliance role.
+   */
+  router.get('/ofac-reviews', ...reviewQueueGuards, async (req: Request, res: Response) => {
+    try {
+      const queue = await amlService.getOFACReviewQueue();
+      res.json({ success: true, data: queue });
+    } catch (error) {
+      console.error('Error fetching OFAC review queue:', error);
+      res.status(500).json({ success: false, error: 'Failed to fetch OFAC review queue' });
+    }
+  });
+
+  /**
+   * POST /aml/ofac-reviews
+   * Open a new false-positive review for an OFAC-flagged investor.
+   *
+   * Requires: compliance role + valid CSRF token.
+   */
+  router.post('/ofac-reviews', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
+    try {
+      const actor = (req as any).amlActor as { id: string; role: string };
+      const validated = createOFACReviewSchema.parse(req.body);
+      const input = {
+        ...validated,
+        expires_at: validated.expires_at ? new Date(validated.expires_at) : undefined,
+      };
+      const review = await amlService.createOFACReview(input, actor.id);
+      res.status(201).json({ success: true, data: review });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+      } else {
+        console.error('Error creating OFAC review:', error);
+        res.status(500).json({ success: false, error: 'Failed to create OFAC review' });
+      }
+    }
+  });
+
+  /**
+   * POST /aml/ofac-reviews/:reviewId/approve
+   * Record a clearance approval on an existing review.
+   *
+   * Business rules enforced by `OFACReviewRepository.approve()`:
+   * - The case creator may not approve.
+   * - The first approver may not be the second approver (dual-control).
+   * - A `pending_second_approval` review whose `expires_at` has elapsed is
+   *   automatically reset to `pending_first_approval` before the new approval
+   *   is recorded, forcing the workflow to restart.
+   * - An already-cleared review is rejected with 409.
+   *
+   * Requires: compliance role + valid CSRF token.
+   */
+  router.post('/ofac-reviews/:reviewId/approve', ...reviewQueueMutationGuards, async (req: Request, res: Response) => {
+    try {
+      const { reviewId } = req.params;
+      const actor = (req as any).amlActor as { id: string; role: string };
+      const validated = approveOFACReviewSchema.parse(req.body);
+      const review = await amlService.approveOFACReview(reviewId, actor.id, validated.rationale);
+      res.json({ success: true, data: review });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ success: false, error: 'Invalid input', details: zodDetails(error) });
+      } else if (error instanceof Error) {
+        const msg = error.message;
+        if (
+          msg.includes('not found')
+        ) {
+          res.status(404).json({ success: false, error: msg });
+        } else if (
+          msg.includes('creator cannot approve') ||
+          msg.includes('cannot approve an OFAC review twice') ||
+          msg.includes('already cleared') ||
+          msg.includes('rationale is required')
+        ) {
+          res.status(409).json({ success: false, error: msg });
+        } else {
+          console.error('Error approving OFAC review:', error);
+          res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
+        }
+      } else {
+        console.error('Error approving OFAC review:', error);
+        res.status(500).json({ success: false, error: 'Failed to approve OFAC review' });
+      }
     }
   });
 

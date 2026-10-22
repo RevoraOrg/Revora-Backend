@@ -3,9 +3,12 @@ import { EventEmitter } from 'events';
 import {
   renderStatementPdfBytes,
   renderStatementPdfDetails,
+  renderStatementPdfWithContent,
   makeStatementRenderFn,
+  makeContentStatementRenderFn,
   verifyTreasurySignature,
   parseEd25519PublicKey,
+  deriveSignerKeyId,
   statementPdfEventEmitter,
   InMemoryStatementPdfStorage,
   WATERMARK_DRAFT_TEXT,
@@ -13,6 +16,8 @@ import {
   StatementFinalFlag,
   FinalSignaturePayload,
 } from './statementPdfService';
+import { StatementContent, StatementDataProvider } from './statementDataProvider';
+import { globalLogger } from '../lib/logger';
 import {
   PdfRenderJobRow,
   buildStatementStorageKey,
@@ -142,6 +147,8 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
         expect(eventData.investorId).toBe('inv-777');
         expect(eventData.ledgerRevisionHash).toBe(ledgerRevisionHash);
         expect(eventData.batchId).toBe(job.batch_id);
+        expect(eventData.signerKeyId).toBeDefined();
+        expect(eventData.requestingPrincipal).toBeNull();
         done();
       });
 
@@ -205,6 +212,80 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
       });
 
       expect(result.watermarkSuppressed).toBe(true);
+    });
+
+    it('includes signerKeyId in audit event when provided in options', (done) => {
+      const job = makeJob();
+      const payloadObj: FinalSignaturePayload = {
+        periodId: job.period_id,
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-kid',
+        timestamp: Date.now(),
+      };
+      const finalFlag = signPayload(payloadObj, treasuryKeyPair.privateKey);
+      const customEmitter = new EventEmitter();
+
+      customEmitter.on(EVENT_PDF_WATERMARK_SUPPRESSED, (eventData) => {
+        expect(eventData.signerKeyId).toBe('custom-key-id-001');
+        expect(eventData.requestingPrincipal).toBeNull();
+        done();
+      });
+
+      renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+        signerKeyId: 'custom-key-id-001',
+        eventEmitter: customEmitter,
+      });
+    });
+
+    it('includes requestingPrincipal in audit event when provided in options', (done) => {
+      const job = makeJob();
+      const payloadObj: FinalSignaturePayload = {
+        periodId: job.period_id,
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-princ',
+        timestamp: Date.now(),
+      };
+      const finalFlag = signPayload(payloadObj, treasuryKeyPair.privateKey);
+      const customEmitter = new EventEmitter();
+
+      customEmitter.on(EVENT_PDF_WATERMARK_SUPPRESSED, (eventData) => {
+        expect(eventData.requestingPrincipal).toBe('user-abc-123');
+        expect(eventData.signerKeyId).toBeDefined();
+        done();
+      });
+
+      renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+        requestingPrincipal: 'user-abc-123',
+        eventEmitter: customEmitter,
+      });
+    });
+
+    it('uses kid from finalFlag payload as signerKeyId when options.signerKeyId is not set', (done) => {
+      const job = makeJob();
+      const payloadObj: FinalSignaturePayload = {
+        periodId: job.period_id,
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-kid-payload',
+        timestamp: Date.now(),
+        kid: 'payload-kid-456',
+      };
+      const finalFlag = signPayload(payloadObj, treasuryKeyPair.privateKey);
+      const customEmitter = new EventEmitter();
+
+      customEmitter.on(EVENT_PDF_WATERMARK_SUPPRESSED, (eventData) => {
+        expect(eventData.signerKeyId).toBe('payload-kid-456');
+        done();
+      });
+
+      renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+        eventEmitter: customEmitter,
+      });
     });
   });
 
@@ -295,6 +376,96 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
 
       expect(result.watermarkSuppressed).toBe(false);
       expect(result.bytes.toString('utf8')).toContain(WATERMARK_DRAFT_TEXT);
+    });
+
+    it('logs security-relevant event when signature verification fails with forged signature', () => {
+      const warnSpy = jest.spyOn(globalLogger, 'warn').mockImplementation(() => {});
+      const job = makeJob();
+      const otherKey = createTreasuryKeyPair();
+      const payloadObj: FinalSignaturePayload = {
+        periodId: job.period_id,
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-sec-log',
+        timestamp: Date.now(),
+      };
+      const finalFlag = signPayload(payloadObj, otherKey.privateKey);
+
+      const result = renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+      });
+
+      expect(result.watermarkSuppressed).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'pdf.watermark.security-relevant: signature verification failed',
+        expect.objectContaining({
+          periodId: job.period_id,
+          investorId: job.investor_id,
+          reason: 'Ed25519 signature verification failed',
+        })
+      );
+      warnSpy.mockRestore();
+    });
+
+    it('logs security-relevant event when signature is expired', () => {
+      const warnSpy = jest.spyOn(globalLogger, 'warn').mockImplementation(() => {});
+      const job = makeJob();
+      const payloadObj: FinalSignaturePayload = {
+        periodId: job.period_id,
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-exp-sec',
+        timestamp: Date.now() - 100_000,
+        expiresAt: Date.now() - 1000,
+      };
+      const finalFlag = signPayload(payloadObj, treasuryKeyPair.privateKey);
+
+      const result = renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+      });
+
+      expect(result.watermarkSuppressed).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'pdf.watermark.security-relevant: signature verification failed',
+        expect.objectContaining({ reason: 'Signature expired' })
+      );
+      warnSpy.mockRestore();
+    });
+
+    it('logs security-relevant event when periodId does not match', () => {
+      const warnSpy = jest.spyOn(globalLogger, 'warn').mockImplementation(() => {});
+      const job = makeJob({ period_id: '2026-07' });
+      const payloadObj: FinalSignaturePayload = {
+        periodId: '2026-08',
+        investorId: job.investor_id,
+        ledgerRevisionHash: 'rev-per-sec',
+        timestamp: Date.now(),
+      };
+      const finalFlag = signPayload(payloadObj, treasuryKeyPair.privateKey);
+
+      const result = renderStatementPdfDetails(job, {
+        finalFlag,
+        treasuryPublicKey: treasuryKeyPair.publicKey,
+      });
+
+      expect(result.watermarkSuppressed).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'pdf.watermark.security-relevant: signature verification failed',
+        expect.objectContaining({ reason: expect.stringContaining('Period mismatch') })
+      );
+      warnSpy.mockRestore();
+    });
+
+    it('does not log security-relevant event when no finalFlag is provided (normal draft)', () => {
+      const warnSpy = jest.spyOn(globalLogger, 'warn').mockImplementation(() => {});
+      const job = makeJob();
+      const result = renderStatementPdfDetails(job);
+      expect(result.watermarkSuppressed).toBe(false);
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        'pdf.watermark.security-relevant: signature verification failed',
+        expect.anything()
+      );
+      warnSpy.mockRestore();
     });
 
     it('keeps watermark ON when periodId does not match job', () => {
@@ -412,6 +583,23 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
 
     it('throws error for malformed key inputs', () => {
       expect(() => parseEd25519PublicKey('not-a-key')).toThrow();
+    });
+
+    it('deriveSignerKeyId returns deterministic thumbprint for valid public key', () => {
+      const pem = treasuryKeyPair.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+      const first = deriveSignerKeyId(pem);
+      const second = deriveSignerKeyId(pem);
+      expect(first).toBeDefined();
+      expect(first).toBe(second);
+      expect(first!.length).toBe(16);
+    });
+
+    it('deriveSignerKeyId returns undefined for invalid input', () => {
+      expect(deriveSignerKeyId('not-a-valid-key')).toBeUndefined();
+    });
+
+    it('deriveSignerKeyId returns undefined when input is undefined', () => {
+      expect(deriveSignerKeyId(undefined)).toBeUndefined();
     });
   });
 
@@ -576,6 +764,187 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
       });
 
       expect(res.watermarkSuppressed).toBe(true);
+    });
+  });
+
+  describe('Deterministic content renderer (Issue #874)', () => {
+    function makeFixedJob(overrides: Partial<PdfRenderJobRow> = {}): PdfRenderJobRow {
+      return {
+        id: 'job-det',
+        batch_id: 'batch-det',
+        investor_id: 'inv-det',
+        period_id: '2026-07',
+        status: 'processing',
+        attempts: 1,
+        available_at: new Date('2026-07-01T00:00:00.000Z'),
+        claimed_at: new Date('2026-07-01T00:00:00.000Z'),
+        storage_key: buildStatementStorageKey('2026-07', 'inv-det'),
+        checksum: null,
+        error: null,
+        created_at: new Date('2026-07-01T00:00:00.000Z'),
+        updated_at: new Date('2026-07-01T00:00:00.000Z'),
+        ...overrides,
+      };
+    }
+
+    function makeContent(overrides: Partial<StatementContent> = {}): StatementContent {
+      return {
+        investorId: 'inv-det',
+        investorName: 'Det Investor',
+        periodId: '2026-07',
+        periodLabel: 'Q3 2026',
+        generatedAt: new Date('2026-08-01T00:00:00.000Z'),
+        holdings: [
+          { offeringName: 'Alpha Fund', offeringSymbol: 'ALPHA', balance: '1000.00' },
+        ],
+        transactions: [
+          {
+            date: new Date('2026-07-05T00:00:00.000Z'),
+            type: 'investment',
+            description: 'Investment in Alpha Fund',
+            amount: '1000.00',
+            status: 'completed',
+          },
+        ],
+        distributionSummary: {
+          totalDistributed: '120.00',
+          fees: '30.00',
+          distributions: [
+            {
+              date: new Date('2026-07-15T00:00:00.000Z'),
+              amount: '120.00',
+              status: 'processed',
+            },
+          ],
+        },
+        revenueSummary: {
+          totalAmount: '500.00',
+          periodStart: new Date('2026-07-01T00:00:00.000Z'),
+          periodEnd: new Date('2026-07-31T00:00:00.000Z'),
+        },
+        taxClassifications: [
+          {
+            offeringId: 'off-1',
+            offeringName: 'Alpha Fund',
+            jurisdiction: 'US',
+            quantity: '100',
+            costBasisPerUnit: '10',
+            acquiredAt: new Date('2026-06-01T00:00:00.000Z'),
+          },
+        ],
+        ...overrides,
+      };
+    }
+
+    it('renders the same bytes for identical job + content (deterministic hash)', () => {
+      const job = makeFixedJob();
+      const first = renderStatementPdfWithContent(job, makeContent());
+      const second = renderStatementPdfWithContent(job, makeContent());
+      expect(second.bytes.equals(first.bytes)).toBe(true);
+      expect(checksumPayload(first.bytes)).toBe(checksumPayload(second.bytes));
+      const text = first.bytes.toString('utf8');
+      expect(text).toContain('%%CONTENT_BEGIN');
+      expect(text).toContain('%%CONTENT_END');
+      expect(text).toContain('Period: 2026-07 (Q3 2026)');
+    });
+
+    it('never embeds generatedAt or wall-clock values in the bytes', () => {
+      const job = makeFixedJob();
+      const a = renderStatementPdfWithContent(
+        job,
+        makeContent({ generatedAt: new Date('2026-08-01T00:00:00.000Z') })
+      );
+      const b = renderStatementPdfWithContent(
+        job,
+        makeContent({ generatedAt: new Date('2030-01-01T00:00:00.000Z') })
+      );
+      expect(b.bytes.equals(a.bytes)).toBe(true);
+      expect(a.bytes.toString('utf8')).not.toContain('2030');
+    });
+
+    it('changes bytes when content changes (a mutation would change the hash)', () => {
+      const job = makeFixedJob();
+      const a = renderStatementPdfWithContent(job, makeContent());
+      const b = renderStatementPdfWithContent(
+        job,
+        makeContent({
+          holdings: [{ offeringName: 'Beta', offeringSymbol: 'BETA', balance: '9.00' }],
+        })
+      );
+      expect(a.bytes.equals(b.bytes)).toBe(false);
+      expect(checksumPayload(a.bytes)).not.toBe(checksumPayload(b.bytes));
+    });
+
+    it('embeds positions, distributions, fees, revenue and tax classifications', () => {
+      const text = renderStatementPdfWithContent(makeFixedJob(), makeContent()).bytes.toString('utf8');
+      expect(text).toContain('POSITIONS');
+      expect(text).toContain('Alpha Fund | ALPHA | 1000.00');
+      expect(text).toContain('DISTRIBUTIONS');
+      expect(text).toContain('Total distributed: 120.00');
+      expect(text).toContain('Fees (retained revenue): 30.00');
+      expect(text).toContain('TRANSACTIONS');
+      expect(text).toContain('TAX CLASSIFICATIONS');
+      expect(text).toContain('US | 100 | 10 | 2026-06-01T00:00:00.000Z');
+      expect(text).toContain('REVENUE');
+      expect(text).toContain('Total revenue: 500.00');
+    });
+
+    it('renders sorted output even when the provider returns unsorted rows', () => {
+      const content = makeContent({
+        holdings: [
+          { offeringName: 'Zeta', offeringSymbol: 'Z', balance: '1.00' },
+          { offeringName: 'Alpha', offeringSymbol: 'A', balance: '2.00' },
+        ],
+        transactions: [
+          {
+            date: new Date('2026-07-20T00:00:00.000Z'),
+            type: 'distribution',
+            description: 'b',
+            amount: '5.00',
+            status: 'processed',
+          },
+          {
+            date: new Date('2026-07-01T00:00:00.000Z'),
+            type: 'investment',
+            description: 'a',
+            amount: '1.00',
+            status: 'completed',
+          },
+        ],
+      });
+      const text = renderStatementPdfWithContent(makeFixedJob(), content).bytes.toString('utf8');
+      expect(text.indexOf('Alpha | A | 2.00')).toBeGreaterThan(-1);
+      expect(text.indexOf('Zeta | Z | 1.00')).toBeGreaterThan(text.indexOf('Alpha | A | 2.00'));
+      expect(text.indexOf('| investment |')).toBeLessThan(text.indexOf('| distribution |'));
+    });
+
+    it('escapes PDF-unsafe text in rendered lines', () => {
+      const content = makeContent({
+        investorName: 'Weird (Inc)',
+        holdings: [{ offeringName: 'A (B) C\nD', offeringSymbol: 'AB', balance: '1.00' }],
+      });
+      const text = renderStatementPdfWithContent(makeFixedJob(), content).bytes.toString('utf8');
+      expect(text).toContain('Weird \\(Inc\\)');
+      expect(text).not.toContain('Weird (Inc)');
+      expect(text).not.toContain('A (B) C\nD');
+    });
+
+    it('makeContentStatementRenderFn fetches content, renders and stores with checksum', async () => {
+      const storage = new InMemoryStatementPdfStorage();
+      const content = makeContent();
+      const dataProvider: StatementDataProvider = {
+        getStatementContent: jest.fn().mockResolvedValue(content),
+      };
+      const renderFn = makeContentStatementRenderFn(storage, dataProvider);
+      const job = makeFixedJob();
+      const res = await renderFn(job);
+
+      expect(dataProvider.getStatementContent).toHaveBeenCalledWith('inv-det', '2026-07');
+      expect(res.checksum).toBe(checksumPayload(res.bytes));
+      expect(res.storageKey).toBe(buildStatementStorageKey('2026-07', 'inv-det'));
+      const stored = await storage.getObject(res.storageKey);
+      expect(stored?.equals(res.bytes)).toBe(true);
+      expect(res.watermarkSuppressed).toBe(false);
     });
   });
 });

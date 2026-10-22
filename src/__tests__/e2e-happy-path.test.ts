@@ -1551,4 +1551,50 @@ describe("Backend End-to-End Happy Path Tests", () => {
       expect(user2Notifications[0].user_id).toBe(user2.id);
     });
   });
+
+  /**
+   * P99 Latency Budgets for Hot Routes
+   *
+   * Synthetic latency test that runs a fixed load against the in-process app
+   * and asserts the p99 from the histogram is below the budget.
+   */
+  describe("P99 Latency Budgets for Hot Routes", () => {
+    it("should assert the hot routes stay under a documented p99 budget", async () => {
+      const express = require("express");
+      const request = require("supertest");
+      const { MetricsCollector } = require("../lib/metrics");
+      const { metricsMiddleware } = require("../middleware/metricsMiddleware");
+      const { HOT_ROUTE_BUDGETS, getLatencyBudget } = require("../lib/latency-budgets");
+
+      const metrics = new MetricsCollector({ enabled: true });
+      const app = express();
+      app.use(metricsMiddleware({ metrics, detailedRoutes: true }));
+      app.get("/api/v1/health", (req: any, res: any) => res.status(200).json({ status: "ok" }));
+      app.post("/api/v1/offerings/validation-matrix", (req: any, res: any) => res.status(200).json({ valid: true }));
+      app.post("/api/investments", (req: any, res: any) => res.status(201).json({ id: "inv-123" }));
+
+      // Run synthetic load (50 requests per route)
+      for (let i = 0; i < 50; i++) {
+        await request(app).get("/api/v1/health");
+        await request(app).post("/api/v1/offerings/validation-matrix").send({});
+        await request(app).post("/api/investments").send({});
+      }
+
+      // Assert p99 from histogram below the budget
+      const healthBudget = getLatencyBudget("GET", "/api/v1/health");
+      const healthP99 = metrics.computeP99Latency("GET", "/api/v1/health");
+      expect(healthP99).toBeGreaterThanOrEqual(0);
+      expect(healthP99).toBeLessThanOrEqual(healthBudget.p99BudgetMs);
+
+      const validationBudget = getLatencyBudget("POST", "/api/v1/offerings/validation-matrix");
+      const validationP99 = metrics.computeP99Latency("POST", "/api/v1/offerings/validation-matrix");
+      expect(validationP99).toBeGreaterThanOrEqual(0);
+      expect(validationP99).toBeLessThanOrEqual(validationBudget.p99BudgetMs);
+
+      const investmentsBudget = getLatencyBudget("POST", "/api/investments");
+      const investmentsP99 = metrics.computeP99Latency("POST", "/api/investments");
+      expect(investmentsP99).toBeGreaterThanOrEqual(0);
+      expect(investmentsP99).toBeLessThanOrEqual(investmentsBudget.p99BudgetMs);
+    });
+  });
 });

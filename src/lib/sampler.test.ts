@@ -7,6 +7,15 @@ import { globalMetrics } from './metrics';
 
 jest.mock('perf_hooks');
 jest.mock('inspector');
+// `fs/promises` namespace properties are non-configurable getters under
+// ts-jest/Node, so jest.spyOn cannot replace them directly; use a manual mock.
+jest.mock('fs/promises', () => ({
+  mkdir: jest.fn(),
+  writeFile: jest.fn(),
+  readdir: jest.fn(),
+  stat: jest.fn(),
+  unlink: jest.fn(),
+}));
 jest.mock('./metrics', () => ({
   globalMetrics: {
     incrementCounter: jest.fn(),
@@ -45,6 +54,7 @@ describe('EventLoopSampler', () => {
     const mockEnable = jest.fn();
     (perf_hooks.monitorEventLoopDelay as jest.Mock).mockReturnValue({
       enable: mockEnable,
+      disable: jest.fn(),
       reset: jest.fn(),
       mean: 0,
     });
@@ -58,6 +68,7 @@ describe('EventLoopSampler', () => {
     const mockReset = jest.fn();
     (perf_hooks.monitorEventLoopDelay as jest.Mock).mockReturnValue({
       enable: jest.fn(),
+      disable: jest.fn(),
       reset: mockReset,
       mean: 60 * 1e6, // 60ms in nanoseconds
     });
@@ -84,8 +95,10 @@ describe('EventLoopSampler', () => {
 
     // Fast-forward 5 seconds to finish profile capture
     jest.advanceTimersByTime(5000);
-    await Promise.resolve();
-    await Promise.resolve(); // Extra ticks for promises
+    // Flush the full async capture chain (saveProfile → writeFile → cleanup)
+    for (let i = 0; i < 20; i++) {
+      await Promise.resolve();
+    }
 
     expect(inspector.Session).toHaveBeenCalled();
     expect(mockConnect).toHaveBeenCalled();
@@ -102,6 +115,7 @@ describe('EventLoopSampler', () => {
   it('should not trigger capture if lag is below threshold', async () => {
     (perf_hooks.monitorEventLoopDelay as jest.Mock).mockReturnValue({
       enable: jest.fn(),
+      disable: jest.fn(),
       reset: jest.fn(),
       mean: 40 * 1e6, // 40ms in nanoseconds
     });
@@ -118,6 +132,7 @@ describe('EventLoopSampler', () => {
   it('should prevent multiple captures during cooldown', async () => {
     (perf_hooks.monitorEventLoopDelay as jest.Mock).mockReturnValue({
       enable: jest.fn(),
+      disable: jest.fn(),
       reset: jest.fn(),
       mean: 60 * 1e6, // 60ms
     });

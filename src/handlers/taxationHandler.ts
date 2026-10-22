@@ -21,6 +21,7 @@ import { AppError, Errors } from '../lib/errors';
 import { Logger } from '../lib/logger';
 import { LogLevel } from '../lib/logger';
 import { DisposalStrategy } from '../services/taxation/types';
+import { WashSaleDetectorInput } from '../services/taxation/washSaleDetector';
 
 const VALID_STRATEGIES: DisposalStrategy[] = ['FIFO', 'LIFO', 'HIFO'];
 
@@ -255,6 +256,103 @@ export class TaxationHandler {
         next(error);
       } else {
         this.logger.error('Unexpected error listing lots', { error });
+        next(Errors.internal('Internal server error'));
+      }
+    }
+  };
+
+  /**
+   * Handle POST /taxation/wash-sale-detection
+   *
+   * Detects wash-sale conditions for a disposal and creates cost-basis adjustments
+   * if applicable. The adjustment is idempotent per (investor, offering, disposed_at).
+   *
+   * @returns 200 with WashSaleDetectionResult
+   */
+  detectWashSales = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const requestId = req.requestId;
+      const userId = req.user?.id || req.user?.sub;
+
+      if (!userId) {
+        return next(Errors.unauthorized('User not authenticated'));
+      }
+
+      const {
+        offering_id,
+        disposed_at,
+        disposal_realized_gain_loss,
+        disposal_quantity,
+        disposal_cost_basis_per_unit,
+        window_days,
+      } = req.body;
+
+      if (!offering_id) {
+        return next(Errors.validationError('Missing required field: offering_id'));
+      }
+      if (!disposed_at) {
+        return next(Errors.validationError('Missing required field: disposed_at'));
+      }
+      if (disposal_realized_gain_loss === undefined || disposal_realized_gain_loss === null) {
+        return next(Errors.validationError('Missing required field: disposal_realized_gain_loss'));
+      }
+      if (disposal_quantity === undefined || disposal_quantity === null) {
+        return next(Errors.validationError('Missing required field: disposal_quantity'));
+      }
+      if (disposal_cost_basis_per_unit === undefined || disposal_cost_basis_per_unit === null) {
+        return next(Errors.validationError('Missing required field: disposal_cost_basis_per_unit'));
+      }
+
+      if (typeof disposal_realized_gain_loss !== 'number') {
+        return next(Errors.validationError('disposal_realized_gain_loss must be a number'));
+      }
+      if (typeof disposal_quantity !== 'number' || disposal_quantity <= 0) {
+        return next(Errors.validationError('disposal_quantity must be a positive number'));
+      }
+      if (typeof disposal_cost_basis_per_unit !== 'number' || disposal_cost_basis_per_unit < 0) {
+        return next(Errors.validationError('disposal_cost_basis_per_unit must be non-negative'));
+      }
+      if (window_days !== undefined && (typeof window_days !== 'number' || window_days < 1 || window_days > 365)) {
+        return next(Errors.validationError('window_days must be between 1 and 365'));
+      }
+
+      this.logger.info('Running wash-sale detection', {
+        requestId,
+        userId,
+        offering_id,
+        disposal_realized_gain_loss,
+        window_days,
+      });
+
+      const result = await this.taxationService.detectWashSales({
+        investor_id: userId,
+        offering_id,
+        disposed_at: new Date(disposed_at),
+        disposal_realized_gain_loss,
+        disposal_quantity,
+        disposal_cost_basis_per_unit,
+        window_days,
+      });
+
+      this.logger.info('Wash-sale detection complete', {
+        requestId,
+        userId,
+        isWashSale: result.isWashSale,
+        adjustmentCount: result.adjustments.length,
+        adjustmentAmount: result.adjustmentAmount,
+      });
+
+      res.status(200).json({
+        message: result.isWashSale
+          ? 'Wash-sale condition detected and adjustments recorded'
+          : 'No wash-sale condition detected',
+        data: result,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        next(error);
+      } else {
+        this.logger.error('Unexpected error during wash-sale detection', { error });
         next(Errors.internal('Internal server error'));
       }
     }

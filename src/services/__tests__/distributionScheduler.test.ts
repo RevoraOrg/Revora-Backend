@@ -273,19 +273,12 @@ describe('DistributionScheduler.evaluateCron', () => {
 
 // ─── Tests: DistributionScheduler — window deduplication ──────────────────────
 
-describe('DistributionScheduler window deduplication', () => {
-  it('marks and checks windows', () => {
+describe('DistributionScheduler report deduplication', () => {
+  it('marks and checks processed reports', () => {
     const s = makeScheduler();
-    const w: TimezoneWindow = {
-      wallClockStart: new Date('2026-01-15'),
-      wallClockEnd: new Date('2026-02-15'),
-      utcStart: new Date('2026-01-15T10:00:00Z'),
-      utcEnd: new Date('2026-02-15T10:00:00Z'),
-      timezone: 'UTC',
-    };
-    expect(s.isWindowAlreadyCompleted(w)).toBe(false);
-    s.markWindowCompleted(w);
-    expect(s.isWindowAlreadyCompleted(w)).toBe(true);
+    expect(s.isReportAlreadyProcessed('report-1')).toBe(false);
+    s.markReportProcessed('report-1');
+    expect(s.isReportAlreadyProcessed('report-1')).toBe(true);
   });
 });
 
@@ -494,29 +487,14 @@ describe('DST transition handling', () => {
   it('fall-back window fires exactly once', () => {
     const s = makeScheduler();
 
-    // Create two windows with the same UTC bounds (simulating the repeated hour)
-    const sharedUtcStart = new Date('2026-11-01T06:00:00Z'); // 2 AM EDT / 1 AM EST
-    const sharedUtcEnd = new Date('2026-11-02T06:00:00Z');
+    // Dedup is keyed on report identity, so the same report is never processed
+    // twice even if its two windows share the same UTC bounds (repeated hour).
+    expect(s.isReportAlreadyProcessed('report-1')).toBe(false);
+    s.markReportProcessed('report-1');
+    expect(s.isReportAlreadyProcessed('report-1')).toBe(true);
 
-    const w1: TimezoneWindow = {
-      wallClockStart: new Date('2026-11-01T06:00:00Z'),
-      wallClockEnd: new Date('2026-11-02T05:00:00Z'),
-      utcStart: sharedUtcStart,
-      utcEnd: sharedUtcEnd,
-      timezone: 'America/New_York',
-    };
-    const w2: TimezoneWindow = {
-      wallClockStart: new Date('2026-11-01T05:00:00Z'), // Different wall clock but same UTC
-      wallClockEnd: new Date('2026-11-02T06:00:00Z'),
-      utcStart: sharedUtcStart,
-      utcEnd: sharedUtcEnd,
-      timezone: 'America/New_York',
-    };
-
-    // Same dedup key because utcStart/utcEnd are identical
-    expect(s.isWindowAlreadyCompleted(w1)).toBe(false);
-    s.markWindowCompleted(w1);
-    expect(s.isWindowAlreadyCompleted(w2)).toBe(true);
+    // A distinct report sharing the same window is a separate distribution.
+    expect(s.isReportAlreadyProcessed('report-2')).toBe(false);
   });
 
   it('spring-forward window does not skip', () => {

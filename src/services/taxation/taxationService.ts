@@ -22,6 +22,7 @@
 import { Pool } from 'pg';
 import { InvestmentLotRepository } from '../../db/repositories/investmentLotRepository';
 import { DisposalRepository } from '../../db/repositories/disposalRepository';
+import { WashSaleDetector, WashSaleDetectionResult } from './washSaleDetector';
 import { resolveStrategy } from './costBasisStrategies';
 import {
   CostBasisStrategy,
@@ -42,6 +43,7 @@ export class TaxationService {
     private lotRepo: InvestmentLotRepository,
     private disposalRepo: DisposalRepository,
     private db: Pool,
+    private washSaleDetector?: WashSaleDetector,
   ) {}
 
   /**
@@ -239,6 +241,55 @@ export class TaxationService {
   }
 
   /**
+   * Run wash-sale detection for a completed disposal.
+   *
+   * Checks whether the disposal at a loss triggered a wash-sale condition
+   * (repurchase of substantially identical security within the configurable
+   * window). If so, creates cost-basis adjustments and emits audit events.
+   *
+   * @param input - Wash-sale detection parameters
+   * @returns WashSaleDetectionResult with any adjustments made
+   */
+  async detectWashSales(input: {
+    investor_id: string;
+    offering_id: string;
+    disposed_at: Date;
+    disposal_realized_gain_loss: number;
+    disposal_quantity: number;
+    disposal_cost_basis_per_unit: number;
+    window_days?: number;
+  }): Promise<WashSaleDetectionResult> {
+    if (!this.washSaleDetector) {
+      throw Errors.validationError('Wash-sale detector is not configured');
+    }
+    return this.washSaleDetector.detect(input);
+  }
+
+  /**
+   * Batch-run wash-sale detection for all offerings of an investor on a date.
+   */
+  async detectWashSalesForInvestor(
+    investorId: string,
+    disposedAt: Date,
+    disposalGainLoss: number,
+    disposalQuantity: number,
+    disposalCostBasisPerUnit: number,
+    windowDays?: number,
+  ): Promise<WashSaleDetectionResult[]> {
+    if (!this.washSaleDetector) {
+      throw Errors.validationError('Wash-sale detector is not configured');
+    }
+    return this.washSaleDetector.detectForInvestor(
+      investorId,
+      disposedAt,
+      disposalGainLoss,
+      disposalQuantity,
+      disposalCostBasisPerUnit,
+      windowDays,
+    );
+  }
+
+  /**
    * Preview a disposal without executing it.
    * Returns the allocations that would be made but does not commit anything.
    */
@@ -297,10 +348,14 @@ export class TaxationService {
 /**
  * Factory function to create TaxationService with dependencies.
  */
-export function createTaxationService(db: Pool): TaxationService {
+export function createTaxationService(
+  db: Pool,
+  washSaleDetector?: WashSaleDetector,
+): TaxationService {
   return new TaxationService(
     new InvestmentLotRepository(db),
     new DisposalRepository(db),
     db,
+    washSaleDetector,
   );
 }

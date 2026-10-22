@@ -4,11 +4,21 @@ import { DisputeSLARepository, DisputeSLARecord, SLABurnReportRow } from '../db/
 import { NotificationRepository } from '../db/repositories/notificationRepository';
 import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Logger } from '../lib/logger';
+import { getSLADuration, isTerminalState } from '../config/disputeSLAConfig';
 
 // Mock the repository
 jest.mock('../db/repositories/disputeSLARepository');
 jest.mock('../db/repositories/notificationRepository');
 jest.mock('../db/repositories/auditLogRepository');
+jest.mock('../config/disputeSLAConfig', () => ({
+  getSLADuration: jest.fn(),
+  isTerminalState: jest.fn(),
+  isAutoEscalateEnabled: jest.fn(),
+  getJurisdictionSLAConfig: jest.fn(),
+  DISPUTE_STATES: ['new', 'triage', 'investigating', 'awaiting_customer', 'awaiting_merchant', 'awaiting_evidence', 'under_review', 'resolution_proposed', 'escalated_internal', 'resolved', 'closed'],
+  DISPUTE_JURISDICTIONS: ['US', 'EU', 'UK', 'CA', 'AU', 'SG', 'default'],
+  JURISDICTION_SLA_CONFIGS: {},
+}));
 
 const MockedSLARepo = DisputeSLARepository as jest.MockedClass<typeof DisputeSLARepository>;
 const MockedNotificationRepo = NotificationRepository as jest.MockedClass<typeof NotificationRepository>;
@@ -63,6 +73,11 @@ describe('DisputeSLAService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
 
+    // Set up default config mocks
+    (getSLADuration as jest.Mock).mockReturnValue(4);
+    (isTerminalState as jest.Mock).mockImplementation((state: string) => state === 'resolved' || state === 'closed');
+    (require('../config/disputeSLAConfig').isAutoEscalateEnabled as jest.Mock).mockReturnValue(true);
+
     mockDB = {} as Pool;
     mockLogger = {
       info: jest.fn(),
@@ -82,6 +97,16 @@ describe('DisputeSLAService', () => {
     });
 
     mockSLARepo = (DisputeSLARepository as jest.Mock).mock.instances[0] as jest.Mocked<DisputeSLARepository>;
+  });
+
+  it('should use global logger when no logger provided', () => {
+    const serviceNoLogger = new DisputeSLAService({
+      db: mockDB,
+      notificationRepo: mockNotificationRepo,
+      auditLogRepo: mockAuditLogRepo,
+    });
+
+    expect(serviceNoLogger).toBeDefined();
   });
 
   describe('startTimer', () => {
@@ -224,6 +249,95 @@ describe('DisputeSLAService', () => {
 
       expect(result).toBeDefined();
     });
+
+    it('should escalate when SLA duration is 0 or negative for non-terminal state', async () => {
+      (getSLADuration as jest.Mock).mockReturnValue(0);
+      (isTerminalState as jest.Mock).mockReturnValue(false);
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(null);
+      const record = createMockSLARecord({ sla_duration_hours: 0, state: 'investigating' });
+      mockSLARepo.create.mockResolvedValue(record);
+      const escalatedRecord = { ...record, escalated: true, escalated_at: new Date() };
+      mockSLARepo.update.mockResolvedValue(escalatedRecord);
+      mockNotificationRepo.create.mockResolvedValue({} as any);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.startTimer({
+        disputeId: 'dispute-1',
+        jurisdiction: 'US',
+        state: 'investigating',
+      });
+
+      expect(mockSLARepo.update).toHaveBeenCalled();
+      expect(mockNotificationRepo.create).toHaveBeenCalled();
+    });
+
+    it('should resolve existing timer when breached before starting new one', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-old',
+        started_at: new Date(Date.now() - 10 * 3600 * 1000), // 10 hours ago
+        sla_duration_hours: 4,
+        paused_at: null,
+        total_paused_ms: 0,
+        escalated: false,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const newRecord = createMockSLARecord({ id: 'sla-new' });
+      mockSLARepo.create.mockResolvedValue(newRecord);
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        resolved_at: new Date(),
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.startTimer({
+        disputeId: 'dispute-1',
+        jurisdiction: 'US',
+        state: 'new',
+      });
+
+      expect(mockSLARepo.update).toHaveBeenCalledWith(
+        existing.id,
+        expect.objectContaining({ resolved_at: expect.any(Date), escalated: true }),
+      );
+    });
+
+    it('should resolve existing timer when not breached before starting new one', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-old',
+        started_at: new Date(Date.now() - 2 * 3600 * 1000), // 2 hours ago
+        sla_duration_hours: 4,
+        paused_at: null,
+        total_paused_ms: 0,
+        escalated: false,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const newRecord = createMockSLARecord({ id: 'sla-new' });
+      mockSLARepo.create.mockResolvedValue(newRecord);
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        resolved_at: new Date(),
+        escalated: false,
+        escalated_at: null,
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.startTimer({
+        disputeId: 'dispute-1',
+        jurisdiction: 'US',
+        state: 'new',
+      });
+
+      expect(mockSLARepo.update).toHaveBeenCalledWith(
+        existing.id,
+        expect.objectContaining({ resolved_at: expect.any(Date), escalated: false, escalated_at: null }),
+      );
+    });
+
   });
 
   describe('transitionState', () => {
@@ -254,6 +368,75 @@ describe('DisputeSLAService', () => {
       );
     });
 
+    it('should update jurisdiction when provided', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-1',
+        state: 'new',
+        started_at: new Date('2025-01-01T00:00:00Z'),
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const newRecord = createMockSLARecord({
+        id: 'sla-2',
+        state: 'investigating',
+        jurisdiction: 'EU',
+      });
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        resolved_at: new Date(),
+      });
+      mockSLARepo.create.mockResolvedValue(newRecord);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      const result = await service.transitionState({
+        disputeId: 'dispute-1',
+        newState: 'investigating',
+        newJurisdiction: 'EU',
+      });
+
+      expect(result).toEqual(newRecord);
+      expect(mockSLARepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ jurisdiction: 'EU' }),
+      );
+    });
+
+    it('should resolve current timer when breached during transition', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-1',
+        state: 'new',
+        started_at: new Date(Date.now() - 10 * 3600 * 1000), // 10 hours ago
+        sla_duration_hours: 4,
+        paused_at: null,
+        total_paused_ms: 0,
+        escalated: false,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const newRecord = createMockSLARecord({ id: 'sla-2', state: 'investigating' });
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        resolved_at: new Date(),
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockSLARepo.create.mockResolvedValue(newRecord);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      const result = await service.transitionState({
+        disputeId: 'dispute-1',
+        newState: 'investigating',
+      });
+
+      expect(mockSLARepo.update).toHaveBeenCalledWith(
+        existing.id,
+        expect.objectContaining({ escalated: true, escalated_at: expect.any(Date) }),
+      );
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        'SLA breached during transition',
+        expect.any(Object),
+      );
+    });
+
     it('should resolve timer when transitioning to terminal state', async () => {
       const existing = createMockSLARecord({
         id: 'sla-1',
@@ -278,7 +461,7 @@ describe('DisputeSLAService', () => {
       expect(mockSLARepo.create).not.toHaveBeenCalled();
     });
 
-    it('should return null when no active timer exists', async () => {
+    it('should return null if no active timer exists', async () => {
       mockSLARepo.findActiveByDisputeId.mockResolvedValue(null);
 
       const result = await service.transitionState({
@@ -287,16 +470,19 @@ describe('DisputeSLAService', () => {
       });
 
       expect(result).toBeNull();
-      expect(mockLogger.warn).toHaveBeenCalled();
     });
 
-    it('should return existing record when transitioning to same state', async () => {
-      const existing = createMockSLARecord({ state: 'new' });
+    it('should return existing record if state and jurisdiction unchanged', async () => {
+      const existing = createMockSLARecord({
+        state: 'investigating',
+        jurisdiction: 'US',
+      });
+
       mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
 
       const result = await service.transitionState({
         disputeId: 'dispute-1',
-        newState: 'new',
+        newState: 'investigating',
       });
 
       expect(result).toBe(existing);
@@ -324,6 +510,61 @@ describe('DisputeSLAService', () => {
       });
 
       expect(result!.jurisdiction).toBe('EU');
+    });
+
+    it('should handle assigned_user_id null when resolving terminal state', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-1',
+        state: 'under_review',
+        assigned_user_id: null,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        resolved_at: new Date(),
+        state: 'resolved',
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.transitionState({
+        disputeId: 'dispute-1',
+        newState: 'resolved',
+      });
+
+      expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_id: null,
+          action: 'dispute_sla_timer_resolved',
+        }),
+      );
+    });
+
+    it('should handle assigned_user_id null when transitioning to non-terminal state', async () => {
+      const existing = createMockSLARecord({
+        id: 'sla-1',
+        state: 'new',
+        assigned_user_id: null,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      mockSLARepo.update.mockResolvedValue({ ...existing, resolved_at: new Date() });
+      mockSLARepo.create.mockResolvedValue(
+        createMockSLARecord({ id: 'sla-2', state: 'triage', assigned_user_id: null }),
+      );
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.transitionState({
+        disputeId: 'dispute-1',
+        newState: 'triage',
+      });
+
+      expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_id: null,
+          action: 'dispute_sla_timer_transitioned',
+        }),
+      );
     });
   });
 
@@ -359,6 +600,25 @@ describe('DisputeSLAService', () => {
 
       await expect(service.pauseTimer('dispute-1')).rejects.toThrow(
         'already paused',
+      );
+    });
+
+    it('should handle assigned_user_id null when pausing timer', async () => {
+      const existing = createMockSLARecord({ assigned_user_id: null });
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        paused_at: new Date(),
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.pauseTimer('dispute-1');
+
+      expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_id: null,
+          action: 'dispute_sla_timer_paused',
+        }),
       );
     });
   });
@@ -402,6 +662,30 @@ describe('DisputeSLAService', () => {
       );
     });
 
+    it('should handle assigned_user_id null when resuming timer', async () => {
+      const pausedAt = new Date(Date.now() - 5000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        assigned_user_id: null,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      mockSLARepo.update.mockResolvedValue({
+        ...existing,
+        paused_at: null,
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.resumeTimer('dispute-1');
+
+      expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          user_id: null,
+          action: 'dispute_sla_timer_resumed',
+        }),
+      );
+    });
+
     it('should check for escalation after resume if overdue', async () => {
       const pausedAt = new Date(Date.now() - 3600 * 1000);
       const existing = createMockSLARecord({
@@ -435,6 +719,142 @@ describe('DisputeSLAService', () => {
       // Verify resume and escalation happened
       expect(mockSLARepo.update).toHaveBeenCalledTimes(2);
       expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalled();
+    });
+
+    it('should not escalate after resume if not overdue', async () => {
+      const pausedAt = new Date(Date.now() - 3600 * 1000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        total_paused_ms: 1000,
+        sla_duration_hours: 10,
+        started_at: new Date(Date.now() - 2 * 3600 * 1000), // 2 hours ago
+        jurisdiction: 'US',
+        escalated: false,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const resumed = {
+        ...existing,
+        paused_at: null,
+        total_paused_ms: existing.total_paused_ms + 3600 * 1000,
+      };
+      mockSLARepo.update.mockResolvedValue(resumed);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.resumeTimer('dispute-1');
+
+      // Only resume should happen, no escalation
+      expect(mockSLARepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not escalate after resume if already escalated', async () => {
+      const pausedAt = new Date(Date.now() - 3600 * 1000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        total_paused_ms: 1000,
+        sla_duration_hours: 1,
+        started_at: new Date(Date.now() - 5 * 3600 * 1000), // 5 hours ago
+        jurisdiction: 'US',
+        escalated: true,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const resumed = {
+        ...existing,
+        paused_at: null,
+        total_paused_ms: existing.total_paused_ms + 3600 * 1000,
+      };
+      mockSLARepo.update.mockResolvedValue(resumed);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.resumeTimer('dispute-1');
+
+      // Only resume should happen, no escalation
+      expect(mockSLARepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not escalate after resume if auto-escalate disabled', async () => {
+      const pausedAt = new Date(Date.now() - 3600 * 1000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        total_paused_ms: 1000,
+        sla_duration_hours: 1,
+        started_at: new Date(Date.now() - 5 * 3600 * 1000), // 5 hours ago
+        jurisdiction: 'US',
+        escalated: false,
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const resumed = {
+        ...existing,
+        paused_at: null,
+        total_paused_ms: existing.total_paused_ms + 3600 * 1000,
+      };
+      mockSLARepo.update.mockResolvedValue(resumed);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      // Mock isAutoEscalateEnabled to return false
+      const { isAutoEscalateEnabled } = require('../config/disputeSLAConfig');
+      isAutoEscalateEnabled.mockReturnValue(false);
+
+      await service.resumeTimer('dispute-1');
+
+      // Only resume should happen, no escalation
+      expect(mockSLARepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not escalate after resume if state is terminal', async () => {
+      const pausedAt = new Date(Date.now() - 3600 * 1000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        total_paused_ms: 1000,
+        sla_duration_hours: 1,
+        started_at: new Date(Date.now() - 5 * 3600 * 1000), // 5 hours ago
+        jurisdiction: 'US',
+        escalated: false,
+        state: 'resolved',
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const resumed = {
+        ...existing,
+        paused_at: null,
+        total_paused_ms: existing.total_paused_ms + 3600 * 1000,
+      };
+      mockSLARepo.update.mockResolvedValue(resumed);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.resumeTimer('dispute-1');
+
+      // Only resume should happen, no escalation
+      expect(mockSLARepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not escalate after resume if resolved_at is set', async () => {
+      const pausedAt = new Date(Date.now() - 3600 * 1000);
+      const existing = createMockSLARecord({
+        paused_at: pausedAt,
+        total_paused_ms: 1000,
+        sla_duration_hours: 1,
+        started_at: new Date(Date.now() - 5 * 3600 * 1000), // 5 hours ago
+        jurisdiction: 'US',
+        escalated: false,
+        resolved_at: new Date(),
+      });
+
+      mockSLARepo.findActiveByDisputeId.mockResolvedValue(existing);
+      const resumed = {
+        ...existing,
+        paused_at: null,
+        total_paused_ms: existing.total_paused_ms + 3600 * 1000,
+      };
+      mockSLARepo.update.mockResolvedValue(resumed);
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.resumeTimer('dispute-1');
+
+      // Only resume should happen, no escalation
+      expect(mockSLARepo.update).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -483,6 +903,41 @@ describe('DisputeSLAService', () => {
       );
     });
 
+    it('should not create notification when notificationRepo is null', async () => {
+      const serviceNoNotifs = new DisputeSLAService({
+        db: mockDB,
+        auditLogRepo: mockAuditLogRepo,
+        logger: mockLogger as unknown as Logger,
+      });
+
+      const record = createMockSLARecord({ escalated: false, assigned_user_id: 'user-1' });
+      const repo = (DisputeSLARepository as jest.Mock).mock.instances[1] as jest.Mocked<DisputeSLARepository>;
+      repo.update.mockResolvedValue({
+        ...record,
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await serviceNoNotifs.escalate(record);
+
+      expect(repo.update).toHaveBeenCalled();
+    });
+
+    it('should not create notification when assigned_user_id is null', async () => {
+      const record = createMockSLARecord({ escalated: false, assigned_user_id: null });
+      mockSLARepo.update.mockResolvedValue({
+        ...record,
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      await service.escalate(record);
+
+      expect(mockNotificationRepo.create).not.toHaveBeenCalled();
+    });
+
     it('should handle notification creation failure gracefully', async () => {
       const record = createMockSLARecord({ escalated: false, assigned_user_id: 'user-1' });
       mockSLARepo.update.mockResolvedValue({
@@ -498,6 +953,44 @@ describe('DisputeSLAService', () => {
 
       expect(result.escalated).toBe(true);
       expect(mockLogger.error).toHaveBeenCalled();
+    });
+
+    it('should handle audit log creation failure gracefully', async () => {
+      const record = createMockSLARecord({ escalated: false, assigned_user_id: 'user-1' });
+      mockSLARepo.update.mockResolvedValue({
+        ...record,
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockNotificationRepo.create.mockResolvedValue({} as any);
+      mockAuditLogRepo.createAuditLog.mockRejectedValue(new Error('Audit DB error'));
+
+      // Should not throw
+      const result = await service.escalate(record);
+
+      expect(result.escalated).toBe(true);
+      expect(mockLogger.error).toHaveBeenCalled();
+    });
+
+    it('should handle when auditLogRepo is null', async () => {
+      const serviceNoAudit = new DisputeSLAService({
+        db: mockDB,
+        notificationRepo: mockNotificationRepo,
+        logger: mockLogger as unknown as Logger,
+      });
+
+      const record = createMockSLARecord({ escalated: false, assigned_user_id: 'user-1' });
+      const repo = (DisputeSLARepository as jest.Mock).mock.instances[1] as jest.Mocked<DisputeSLARepository>;
+      repo.update.mockResolvedValue({
+        ...record,
+        escalated: true,
+        escalated_at: new Date(),
+      });
+      mockNotificationRepo.create.mockResolvedValue({} as any);
+
+      const result = await serviceNoAudit.escalate(record);
+
+      expect(result.escalated).toBe(true);
     });
   });
 
@@ -521,11 +1014,15 @@ describe('DisputeSLAService', () => {
 
     it('should skip default jurisdiction (auto-escalate disabled)', async () => {
       const overdue = [
-        createMockSLARecord({ id: 'sla-1', jurisdiction: 'default', escalated: false }),
+        createMockSLARecord({ id: 'sla-1', jurisdiction: 'default', escalated: false, paused_at: null, resolved_at: null }),
       ];
 
       mockSLARepo.findOverdueNonEscalated.mockResolvedValue(overdue);
       mockAuditLogRepo.createAuditLog.mockResolvedValue({} as any);
+
+      // Mock isAutoEscalateEnabled to return false for default
+      const { isAutoEscalateEnabled } = require('../config/disputeSLAConfig');
+      isAutoEscalateEnabled.mockImplementation((juris: string) => juris !== 'default');
 
       const result = await service.escalateOverdue();
 
@@ -566,6 +1063,20 @@ describe('DisputeSLAService', () => {
       expect(elapsed).toBeLessThan(11000);
     });
 
+    it('should use resolved_at time if timer is resolved', () => {
+      const resolvedAt = new Date(Date.now() - 5000);
+      const record = createMockSLARecord({
+        started_at: new Date(Date.now() - 20000), // 20 seconds ago
+        paused_at: null,
+        resolved_at: resolvedAt,
+        total_paused_ms: 0,
+      });
+
+      const elapsed = service.calculateElapsedMs(record);
+      expect(elapsed).toBeGreaterThanOrEqual(14000);
+      expect(elapsed).toBeLessThan(16000);
+    });
+
     it('should return 0 for just-started timer', () => {
       const record = createMockSLARecord({
         started_at: new Date(),
@@ -574,6 +1085,19 @@ describe('DisputeSLAService', () => {
 
       const elapsed = service.calculateElapsedMs(record);
       expect(elapsed).toBeLessThan(1000);
+    });
+
+    it('should handle paused_at when both paused and resolved', async () => {
+      const pausedAt = new Date(Date.now() - 10000);
+      const record = createMockSLARecord({
+        started_at: new Date(Date.now() - 20000),
+        paused_at: pausedAt,
+        total_paused_ms: 0,
+      });
+
+      const elapsed = service.calculateElapsedMs(record);
+      expect(elapsed).toBeGreaterThanOrEqual(9000);
+      expect(elapsed).toBeLessThan(11000);
     });
   });
 
@@ -645,6 +1169,79 @@ describe('DisputeSLAService', () => {
       expect(result.rowCount).toBe(0);
       // Should still have headers
       expect(result.csv).toContain('Dispute ID');
+    });
+
+    it('should include HMAC signature in CSV', async () => {
+      const mockRows = [createMockSLABurnRow()];
+      mockSLARepo.getSLABurnReport.mockResolvedValue(mockRows);
+
+      const result = await service.exportBurnReportCSV({
+        startDate: new Date('2025-01-01'),
+        endDate: new Date('2025-01-07'),
+      });
+
+      expect(result.csv).toContain('# HMAC-SHA256:');
+    });
+
+    it('should handle rows with null resolved_at', async () => {
+      const mockRows = [createMockSLABurnRow({ resolved_at: null })];
+      mockSLARepo.getSLABurnReport.mockResolvedValue(mockRows);
+
+      const result = await service.exportBurnReportCSV({
+        startDate: new Date('2025-01-01'),
+        endDate: new Date('2025-01-07'),
+      });
+
+      expect(result.csv).toContain('dispute-1');
+      expect(result.rowCount).toBe(1);
+    });
+
+    it('should handle rows with null assigned_user_id', async () => {
+      const mockRows = [createMockSLABurnRow({ assigned_user_id: null })];
+      mockSLARepo.getSLABurnReport.mockResolvedValue(mockRows);
+
+      const result = await service.exportBurnReportCSV({
+        startDate: new Date('2025-01-01'),
+        endDate: new Date('2025-01-07'),
+      });
+
+      expect(result.csv).toContain('dispute-1');
+      expect(result.rowCount).toBe(1);
+    });
+
+    it('should handle rows with non-null resolved_at', async () => {
+      const mockRows = [createMockSLABurnRow({ resolved_at: new Date('2025-01-05T12:00:00Z') })];
+      mockSLARepo.getSLABurnReport.mockResolvedValue(mockRows);
+
+      const result = await service.exportBurnReportCSV({
+        startDate: new Date('2025-01-01'),
+        endDate: new Date('2025-01-07'),
+      });
+
+      expect(result.csv).toContain('2025-01-05T12:00:00.000Z');
+      expect(result.rowCount).toBe(1);
+    });
+
+    it('should use SLA_REPORT_SIGNING_SECRET env var when set', async () => {
+      const originalSecret = process.env.SLA_REPORT_SIGNING_SECRET;
+      process.env.SLA_REPORT_SIGNING_SECRET = 'custom-secret-key';
+      try {
+        const mockRows = [createMockSLABurnRow()];
+        mockSLARepo.getSLABurnReport.mockResolvedValue(mockRows);
+
+        const result = await service.exportBurnReportCSV({
+          startDate: new Date('2025-01-01'),
+          endDate: new Date('2025-01-07'),
+        });
+
+        expect(result.csv).toContain('# HMAC-SHA256:');
+      } finally {
+        if (originalSecret === undefined) {
+          delete process.env.SLA_REPORT_SIGNING_SECRET;
+        } else {
+          process.env.SLA_REPORT_SIGNING_SECRET = originalSecret;
+        }
+      }
     });
   });
 });

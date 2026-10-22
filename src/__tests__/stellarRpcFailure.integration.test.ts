@@ -29,12 +29,15 @@ jest.mock('@stellar/stellar-sdk', () => {
       })),
     },
     Asset: {
-      native: jest.fn(() => ({ code: 'XLM', issuer: undefined })),
+      native: jest.fn(() => ({ isNative: () => true, code: 'XLM', issuer: undefined })),
     },
     TransactionBuilder: jest.fn(() => ({
       addOperation: jest.fn().mockReturnThis(),
       setTimeout: jest.fn().mockReturnThis(),
-      build: jest.fn().mockReturnThis(),
+      build: jest.fn().mockReturnValue({
+        hash: () => 'integration-mock-hash',
+        sign: jest.fn(),
+      }),
       sign: jest.fn(),
     })),
     Operation: {
@@ -62,6 +65,12 @@ jest.mock('../config/env', () => ({
   env: {
     STELLAR_NETWORK: 'testnet',
     STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+    STELLAR_HORIZON_URL: 'https://horizon-testnet.stellar.org',
+    STELLAR_TIMEOUT: 30000,
+    STELLAR_MAX_FEE: 100000,
+    get STELLAR_SERVER_SECRET() {
+      return process.env.STELLAR_SERVER_SECRET;
+    },
   },
 }));
 

@@ -3,528 +3,1239 @@ info:
   title: Revora Backend API
   version: "1.0.0"
   description: |
-    Backend API for tokenized revenue-sharing on Stellar (offerings, investments,
-    revenue reports, distributions, users, and notifications).
+    Backend API for the Revora (Stellar RevenueShare) platform: health/ops
+    endpoints, startup registration, offering validation, vesting claims,
+    password reset, email deliverability webhooks, admin and AML tooling,
+    compliance (sanctions) endpoints, ledger export, and per-lot taxation.
+
+    This document is the single source of truth for the HTTP surface served
+    by `src/index.ts`. The OpenAPI conformance suite
+    (`src/__tests__/openapi-conformance.test.ts`) walks every route served by
+    the Express app and asserts that request and response bodies conform to the
+    schemas declared here, and that no served route is undocumented. Any change
+    to a handler's request or response shape must be mirrored in this file.
 
 servers:
-  - url: http://localhost:3000
+  - url: http://localhost:4000
     description: Local development server
 
 tags:
+  - name: Ops
+    description: Health and server metadata endpoints
   - name: Auth
-    description: Authentication and session management
+    description: Registration, password reset and session helpers
   - name: Offerings
-    description: Startup offerings and public catalog
+    description: Offering validation and sync
   - name: Investments
-    description: Investor holdings
-  - name: Revenue
-    description: Revenue reporting and history
-  - name: Distributions
-    description: Revenue distribution runs
-  - name: Notifications
-    description: User notifications and preferences
-  - name: Users
-    description: User-specific endpoints
+    description: Vesting claims
+  - name: Admin
+    description: Admin-only operational endpoints
+  - name: AML
+    description: Anti-money laundering tooling
+  - name: Compliance
+    description: Sanctions list audit and changelog
+  - name: Ledger
+    description: Double-entry ledger export
+  - name: Taxation
+    description: Per-lot cost basis and gain/loss reporting
+  - name: Email
+    description: Inbound email deliverability webhooks
 
 paths:
+  # ─────────────────────────────────────────────────────────────────────
+  # Health & ops
+  # ─────────────────────────────────────────────────────────────────────
   /health:
     get:
-      summary: Health check
-      tags: [Users]
+      summary: Health check (liveness + database probe)
+      tags: [Ops]
       responses:
         "200":
-          description: Service is healthy
+          description: Service healthy
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: ok
-                  service:
-                    type: string
-                    example: revora-backend
-                  db:
-                    type: object
-                    additionalProperties: true
+                $ref: "#/components/schemas/SimpleHealth"
         "503":
-          description: Service is degraded
+          description: Service degraded (database unavailable)
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: degraded
-                  service:
-                    type: string
-                    example: revora-backend
-                  db:
-                    type: object
-                    additionalProperties: true
+                $ref: "#/components/schemas/SimpleHealth"
 
-  /api/overview:
+  /health/failover:
+    get:
+      summary: Failover status for the current region
+      tags: [Ops]
+      responses:
+        "200":
+          description: Failover status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FailoverStatus"
+        "503":
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FailoverStatus"
+
+  /health/live:
+    get:
+      summary: Liveness probe
+      tags: [Ops]
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveStatus"
+
+  /health/ready:
+    get:
+      summary: Readiness probe (database and Stellar Horizon)
+      tags: [Ops]
+      responses:
+        "200":
+          description: Service ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+        "503":
+          description: Dependency unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /health/startup:
+    get:
+      summary: Startup probe
+      tags: [Ops]
+      responses:
+        "200":
+          description: Service started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartupStatus"
+        "503":
+          description: Service not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StartupStatusDown"
+
+  /health/region:
+    get:
+      summary: Active region information
+      tags: [Ops]
+      responses:
+        "200":
+          description: Region metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegionStatus"
+
+  /api/v1/overview:
     get:
       summary: API overview
-      tags: [Users]
+      tags: [Ops]
       responses:
         "200":
-          description: Basic information about the API
+          description: Basic service metadata
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  name:
-                    type: string
-                  description:
-                    type: string
-                  version:
-                    type: string
-                    example: "0.1.0"
+                $ref: "#/components/schemas/Overview"
 
-  /api/auth/login:
+  # ─────────────────────────────────────────────────────────────────────
+  # Auth
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/startup/register:
     post:
-      summary: Login (email & password)
+      summary: Register a startup account
       description: |
-        Authenticate an existing user and return a JWT access token plus basic user info.
+        Rate-limited per client IP and tiered via the
+        `x-revora-rate-tier` / `x-revora-tier-secret` headers. Privileged
+        tiers are honored only when the shared secret matches.
       tags: [Auth]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/LoginRequest"
-      responses:
-        "200":
-          description: Login successful
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/LoginResponse"
-        "401":
-          description: Invalid credentials
-
-  /api/auth/investor/register:
-    post:
-      summary: Register investor
-      description: Register a new investor account using email and password.
-      tags: [Auth]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RegisterInvestorRequest"
+              $ref: "#/components/schemas/RegisterRequest"
       responses:
         "201":
-          description: Investor registered
+          description: Startup registered
           content:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required: [message]
                 properties:
-                  user:
-                    $ref: "#/components/schemas/User"
+                  message:
+                    type: string
         "400":
-          description: Validation error
-        "409":
-          description: User already exists
+          description: Malformed or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
-  /api/auth/logout:
+  /api/auth/forgot-password:
     post:
-      summary: Logout
-      description: Invalidate the current session token.
+      summary: Request a password reset link
       tags: [Auth]
-      security:
-        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForgotPasswordRequest"
       responses:
         "200":
-          description: Logged out
-        "401":
-          description: Unauthorized
-
-  /api/startup/offerings:
-    get:
-      summary: List offerings for startup
-      description: |
-        Returns offerings created by the authenticated startup user.
-      tags: [Offerings]
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: query
-          name: status
-          schema:
-            type: string
-          description: Optional status filter.
-        - in: query
-          name: limit
-          schema:
-            type: integer
-            minimum: 0
-          description: Maximum number of offerings to return.
-        - in: query
-          name: offset
-          schema:
-            type: integer
-            minimum: 0
-          description: Number of offerings to skip.
-      responses:
-        "200":
-          description: List of offerings
+          description: Generic response (does not reveal account existence)
           content:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required: [message]
                 properties:
-                  offerings:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Offering"
-                  total:
-                    type: integer
-                    description: Total number of matching offerings (if available).
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden
+                  message:
+                    type: string
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
-  /api/offerings:
-    get:
-      summary: Public offerings catalog
-      description: |
-        Public catalog of offerings, accessible without authentication.
-      tags: [Offerings]
-      parameters:
-        - in: query
-          name: status
-          schema:
-            type: string
-        - in: query
-          name: limit
-          schema:
-            type: integer
-            minimum: 0
-        - in: query
-          name: offset
-          schema:
-            type: integer
-            minimum: 0
-        - in: query
-          name: sort
-          schema:
-            type: string
+  /api/auth/reset-password:
+    post:
+      summary: Set a new password using a reset token
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetPasswordRequest"
       responses:
         "200":
-          description: List of public offerings
+          description: Password updated
           content:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
+                required: [message]
                 properties:
-                  offerings:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/PublicOffering"
-                  total:
-                    type: integer
+                  message:
+                    type: string
+        "400":
+          description: Invalid token or weak password
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
 
-  /api/offerings/{id}:
-    get:
-      summary: Get offering by ID
+  # ─────────────────────────────────────────────────────────────────────
+  # Offerings
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/offerings/validation-matrix:
+    post:
+      summary: Validate an offering action against the security matrix
+      description: |
+        Requires `x-user-id` and `x-user-role` headers asserted by trusted
+        upstream auth. Returns the full validation result with checks and
+        violations; a deny yields HTTP 422.
       tags: [Offerings]
       parameters:
-        - in: path
-          name: id
+        - in: header
+          name: x-user-id
           required: true
           schema:
             type: string
-            format: uuid
+        - in: header
+          name: x-user-role
+          required: true
+          schema:
+            type: string
+            enum: [startup, admin, compliance, investor]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OfferingValidationRequest"
       responses:
         "200":
-          description: Offering details
+          description: Action allowed
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: "#/components/schemas/Offering"
-                  - $ref: "#/components/schemas/PublicOffering"
+                $ref: "#/components/schemas/OfferingValidationResult"
+        "422":
+          description: Action denied by validation matrix
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OfferingValidationResult"
         "400":
-          description: Invalid ID format
-        "404":
-          description: Offering not found
+          description: Invalid payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing auth headers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
-  /api/investments:
-    get:
-      summary: List investments for investor
+  # ─────────────────────────────────────────────────────────────────────
+  # Investments / vesting
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/vesting/claim:
+    post:
+      summary: Process a partial vesting claim
       tags: [Investments]
       security:
         - bearerAuth: []
-      parameters:
-        - in: query
-          name: limit
-          schema:
-            type: integer
-            minimum: 0
-        - in: query
-          name: offset
-          schema:
-            type: integer
-            minimum: 0
-        - in: query
-          name: offering_id
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: List of investments
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Investment"
-        "400":
-          description: Invalid query parameters
-        "401":
-          description: Unauthorized
-
-  /api/offerings/{id}/revenue:
-    post:
-      summary: Submit revenue report for an offering
-      tags: [Revenue]
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            format: uuid
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RevenueReportInput"
+              $ref: "#/components/schemas/ClaimRequest"
       responses:
-        "201":
-          description: Revenue report recorded
+        "200":
+          description: Claim processed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [success, claimedAmount, remainingAmount]
+                properties:
+                  success:
+                    type: boolean
+                  claimedAmount:
+                    type: number
+                  remainingAmount:
+                    type: number
         "400":
-          description: Invalid input
+          description: Invalid claim request
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                  error:
+                    type: string
+                  remainingAmount:
+                    type: number
         "401":
           description: Unauthorized
-        "403":
-          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
 
-  /api/revenue-reports:
+  # ─────────────────────────────────────────────────────────────────────
+  # Email webhooks
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/email/webhooks/sendgrid:
     post:
-      summary: Submit revenue report
-      description: Alternative endpoint for submitting a revenue report.
-      tags: [Revenue]
-      security:
-        - bearerAuth: []
+      summary: Ingest SendGrid event webhook (bounces, complaints)
+      tags: [Email]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/RevenueReportInput"
-      responses:
-        "201":
-          description: Revenue report recorded
-        "400":
-          description: Invalid input
-        "401":
-          description: Unauthorized
-
-  /api/offerings/{id}/revenue-reports:
-    get:
-      summary: List revenue reports for an offering
-      tags: [Revenue]
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - in: query
-          name: periodFrom
-          schema:
-            type: string
-            description: Filter by start of period (inclusive).
-        - in: query
-          name: periodTo
-          schema:
-            type: string
-            description: Filter by end of period (inclusive).
-        - in: query
-          name: page
-          schema:
-            type: integer
-            minimum: 1
-        - in: query
-          name: pageSize
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
+              type: array
+              items:
+                type: object
+                additionalProperties: true
       responses:
         "200":
-          description: Paginated list of revenue reports
+          description: Events processed
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/RevenueReport"
-                  pagination:
-                    type: object
-                    properties:
-                      page:
-                        type: integer
-                      pageSize:
-                        type: integer
-                      total:
-                        type: integer
-                      totalPages:
-                        type: integer
-        "400":
-          description: Invalid query parameters
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden
+                $ref: "#/components/schemas/WebhookAck"
 
-  /api/offerings/{id}/distribute:
+  /api/v1/email/webhooks/ses:
     post:
-      summary: Trigger revenue distribution for an offering
-      tags: [Distributions]
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            format: uuid
+      summary: Ingest SES SNS bounce/complaint notification
+      tags: [Email]
       requestBody:
         required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DistributionRequest"
-      responses:
-        "200":
-          description: Distribution run started
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DistributionResponse"
-        "400":
-          description: Invalid input
-        "401":
-          description: Unauthorized
-        "403":
-          description: Forbidden
-        "404":
-          description: Offering not found
-
-  /api/notifications:
-    get:
-      summary: List notifications for authenticated user
-      tags: [Notifications]
-      security:
-        - bearerAuth: []
-      responses:
-        "200":
-          description: List of notifications
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  notifications:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Notification"
-        "401":
-          description: Unauthorized
-
-  /api/notifications/{id}/read:
-    patch:
-      summary: Mark notification(s) as read
-      tags: [Notifications]
-      security:
-        - bearerAuth: []
-      parameters:
-        - in: path
-          name: id
-          required: true
-          schema:
-            type: string
-            description: Notification ID (for single update) or "bulk" when using body.ids.
-      requestBody:
-        required: false
         content:
           application/json:
             schema:
               type: object
-              properties:
-                ids:
-                  type: array
-                  items:
-                    type: string
+              additionalProperties: true
       responses:
         "200":
-          description: Notifications marked as read
+          description: Notification processed
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  marked:
-                    type: integer
-        "400":
-          description: Invalid request or bulk mark not supported
+                $ref: "#/components/schemas/WebhookAck"
+
+  /api/v1/email/webhooks/smtp:
+    post:
+      summary: Ingest generic SMTP DSN bounce
+      tags: [Email]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: DSN processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookAck"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Admin
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/admin/audit-log/export.csv:
+    get:
+      summary: Export signed audit log CSV
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Signed CSV export
+          content:
+            text/csv:
+              schema:
+                type: string
         "401":
           description: Unauthorized
-        "404":
-          description: Notification not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
-  /api/users/me/notification-preferences:
+  /api/v1/admin/retention-labels/active:
     get:
-      summary: Get current user's notification preferences
-      tags: [Users, Notifications]
+      summary: List active legal holds
+      tags: [Admin]
       security:
         - bearerAuth: []
       responses:
         "200":
-          description: Current notification preferences
+          description: Active retention labels
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NotificationPreferences"
+                type: object
+                additionalProperties: false
+                required: [labels]
+                properties:
+                  labels:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/retention-labels/{periodId}:
+    get:
+      summary: Get a retention label for a period
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Retention label
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [label]
+                properties:
+                  label:
+                    type: object
+                    additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/retention-labels/{periodId}/legal-hold/propose:
+    post:
+      summary: Propose a legal hold
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason:
+                  type: string
+      responses:
+        "202":
+          description: Legal hold proposed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [label]
+                properties:
+                  label:
+                    type: object
+                    additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/retention-labels/{periodId}/legal-hold/approve:
+    post:
+      summary: Approve a proposed legal hold
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Legal hold approved
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [label]
+                properties:
+                  label:
+                    type: object
+                    additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/retention-labels/{periodId}/legal-hold/propose-release:
+    post:
+      summary: Propose release of a legal hold
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Release proposed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [label]
+                properties:
+                  label:
+                    type: object
+                    additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/retention-labels/{periodId}/legal-hold/approve-release:
+    post:
+      summary: Approve release of a legal hold
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: periodId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Legal hold released
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [label]
+                properties:
+                  label:
+                    type: object
+                    additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/admin/investors/{id}/kyc-risk-tier:
     patch:
-      summary: Update current user's notification preferences
-      tags: [Users, Notifications]
+      summary: Update an investor's KYC risk tier
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tier]
+              properties:
+                tier:
+                  type: string
+                  enum: [low, standard, elevated, high, restricted]
+                offering_cap_bps:
+                  type: integer
+                  nullable: true
+      responses:
+        "200":
+          description: KYC risk tier updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - investor_id
+                  - previous_tier
+                  - kyc_risk_tier
+                  - effective_cap_bps
+                  - multiplier
+                  - retroactive_invalidation
+                properties:
+                  investor_id:
+                    type: string
+                  previous_tier:
+                    type: string
+                  kyc_risk_tier:
+                    type: string
+                  effective_cap_bps:
+                    type: integer
+                    nullable: true
+                  multiplier:
+                    type: number
+                  retroactive_invalidation:
+                    type: boolean
+        "400":
+          description: Invalid tier
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # AML
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/aml/rules:
+    get:
+      summary: List AML rules
+      tags: [AML]
+      responses:
+        "200":
+          description: AML rules
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+    post:
+      summary: Create an AML rule
+      tags: [AML]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRuleRequest"
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Create failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/rules/enabled:
+    get:
+      summary: List enabled AML rules
+      tags: [AML]
+      responses:
+        "200":
+          description: Enabled rules
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/rules/{ruleId}/history:
+    get:
+      summary: Get rule version history
+      tags: [AML]
+      parameters:
+        - in: path
+          name: ruleId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Version history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/rules/{ruleId}:
+    put:
+      summary: Update an AML rule
+      tags: [AML]
+      parameters:
+        - in: path
+          name: ruleId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRuleRequest"
+      responses:
+        "200":
+          description: Rule updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid update
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/rules/{ruleId}/rollback:
+    post:
+      summary: Roll back a rule to a prior version
+      tags: [AML]
+      parameters:
+        - in: path
+          name: ruleId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RollbackRuleRequest"
+      responses:
+        "200":
+          description: Rule rolled back
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Rollback failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases:
+    get:
+      summary: List AML cases by status or analyst
+      tags: [AML]
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: analyst_id
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Cases
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Missing required query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+    post:
+      summary: Create an AML case
+      tags: [AML]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCaseRequest"
+      responses:
+        "201":
+          description: Case created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid case
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Create failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases/reviewer-capacities:
+    get:
+      summary: Get reviewer capacity snapshots
+      tags: [AML]
+      responses:
+        "200":
+          description: Capacities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "503":
+          description: Assignment service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases/{caseId}:
+    get:
+      summary: Get an AML case
+      tags: [AML]
+      parameters:
+        - in: path
+          name: caseId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Case details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "404":
+          description: Case not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+    put:
+      summary: Update an AML case
+      tags: [AML]
+      parameters:
+        - in: path
+          name: caseId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCaseRequest"
+      responses:
+        "200":
+          description: Case updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid update
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases/{caseId}/alerts:
+    get:
+      summary: Get alerts linked to a case
+      tags: [AML]
+      parameters:
+        - in: path
+          name: caseId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Alerts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/alerts/pending:
+    get:
+      summary: List pending AML alerts
+      tags: [AML]
+      responses:
+        "200":
+          description: Pending alerts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/alerts/investor/{investorId}:
+    get:
+      summary: List alerts for an investor
+      tags: [AML]
+      parameters:
+        - in: path
+          name: investorId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Investor alerts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/alerts/{alertId}/dismiss:
+    post:
+      summary: Dismiss an alert as a false positive
+      tags: [AML]
+      parameters:
+        - in: path
+          name: alertId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Alert dismissed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "500":
+          description: Dismiss failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases/assign-auto:
+    post:
+      summary: Auto-assign a single open case
+      tags: [AML]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [case_id]
+              properties:
+                case_id:
+                  type: string
+      responses:
+        "200":
+          description: Case assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: case_id required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "503":
+          description: Assignment service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Assignment failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/cases/assign-all:
+    post:
+      summary: Auto-assign all unassigned open cases
+      tags: [AML]
+      responses:
+        "200":
+          description: Cases assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "503":
+          description: Assignment service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Assignment failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/ofac-reviews:
+    get:
+      summary: List the OFAC review queue
+      tags: [AML]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Review queue
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "403":
+          description: Compliance role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+    post:
+      summary: Open a false-positive review for an OFAC-flagged investor
+      tags: [AML]
       security:
         - bearerAuth: []
       requestBody:
@@ -532,16 +1243,441 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/NotificationPreferencesUpdate"
+              $ref: "#/components/schemas/CreateOFACReviewRequest"
       responses:
-        "200":
-          description: Updated preferences
+        "201":
+          description: Review created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NotificationPreferences"
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid review
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "403":
+          description: Compliance role or CSRF required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Create failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  /api/v1/aml/ofac-reviews/{reviewId}/approve:
+    post:
+      summary: Record an approval on an OFAC review (dual-control)
+      tags: [AML]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: reviewId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rationale]
+              properties:
+                rationale:
+                  type: string
+      responses:
+        "200":
+          description: Approval recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "400":
+          description: Invalid rationale
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "401":
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "403":
+          description: Compliance role or CSRF required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "404":
+          description: Review not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "409":
+          description: Dual-control workflow violation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+        "500":
+          description: Approve failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvelopeFailure"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Compliance
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/compliance/sanctions-changelog/{versionId}:
+    get:
+      summary: Download a sanctions list changelog
+      tags: [Compliance]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: versionId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Plain-text changelog attachment
+          content:
+            text/plain:
+              schema:
+                type: string
         "401":
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Version not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/compliance/sanctions-versions:
+    get:
+      summary: List sanctions list versions
+      tags: [Compliance]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: source
+          schema:
+            type: string
+            enum: [ofac, eu_consolidated, un_sc, uk_hmt]
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [versions]
+                properties:
+                  versions:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "400":
+          description: Invalid source
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/compliance/sanctions-versions/{versionId}:
+    get:
+      summary: Get a sanctions list version with diff details
+      tags: [Compliance]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: versionId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Version detail
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [version, diff_details]
+                properties:
+                  version:
+                    type: object
+                    additionalProperties: true
+                  diff_details:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Version not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Ledger
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/ledger/export:
+    get:
+      summary: Export ledger entries by GL account
+      tags: [Ledger]
+      parameters:
+        - in: query
+          name: gl_account
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - in: query
+          name: cursor
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ledger export page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LedgerExport"
+        "400":
+          description: gl_account required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Export failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Taxation
+  # ─────────────────────────────────────────────────────────────────────
+  /api/v1/taxation/gains-summary:
+    get:
+      summary: Per-jurisdiction gains summary
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Gains summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/taxation/lots:
+    get:
+      summary: List investment lots
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Investment lots
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create an investment lot
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateLotRequest"
+      responses:
+        "201":
+          description: Lot created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "400":
+          description: Invalid lot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/taxation/dispose:
+    post:
+      summary: Process a disposal with a cost-basis strategy
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DisposalRequest"
+      responses:
+        "201":
+          description: Disposal processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "400":
+          description: Invalid disposal request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/taxation/preview:
+    post:
+      summary: Preview a disposal without committing
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DisposalRequest"
+      responses:
+        "200":
+          description: Disposal preview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "400":
+          description: Invalid preview request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/v1/taxation/wash-sale-detection:
+    post:
+      summary: Detect wash-sale conditions and record adjustments
+      tags: [Taxation]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WashSaleRequest"
+      responses:
+        "200":
+          description: Wash-sale detection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageEnvelope"
+        "400":
+          description: Invalid detection request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
 components:
   securitySchemes:
@@ -551,31 +1687,209 @@ components:
       bearerFormat: JWT
 
   schemas:
-    User:
+    # ── Ops ────────────────────────────────────────────────────────────
+    Overview:
       type: object
+      additionalProperties: false
+      required: [name, description, version]
       properties:
-        id:
-          type: string
-          format: uuid
-        email:
-          type: string
-          format: email
-        role:
-          type: string
-          description: User role
-          enum: [startup, investor]
         name:
           type: string
-          nullable: true
-        created_at:
+        description:
+          type: string
+        version:
+          type: string
+
+    SimpleHealth:
+      type: object
+      additionalProperties: false
+      required: [status, service, db]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+        db:
+          type: object
+          additionalProperties: true
+
+    HealthGraph:
+      type: object
+      additionalProperties: false
+      required: [status, service, version, timestamp, uptime, checks]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        service:
+          type: string
+        version:
+          type: string
+        timestamp:
           type: string
           format: date-time
-        updated_at:
+        uptime:
+          type: number
+        requestId:
+          type: string
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DependencyHealth"
+
+    DependencyHealth:
+      type: object
+      additionalProperties: false
+      required: [name, status, latencyMs, healthy]
+      properties:
+        name:
+          type: string
+          enum: [database, stellar-horizon, db-pool]
+        status:
+          type: string
+          enum: [up, down, degraded, unknown]
+        latencyMs:
+          type: number
+        healthy:
+          type: boolean
+        dependsOn:
+          type: array
+          items:
+            type: string
+        details:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+
+    FailoverStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - region
+        - activeRegion
+        - isActive
+        - db
+        - failoverActive
+        - timestamp
+      properties:
+        region:
+          type: string
+        activeRegion:
+          type: string
+        isActive:
+          type: boolean
+        db:
+          type: string
+        failoverActive:
+          type: boolean
+        timestamp:
           type: string
           format: date-time
 
-    LoginRequest:
+    LiveStatus:
       type: object
+      additionalProperties: false
+      required: [status, alive, service, timestamp, uptime]
+      properties:
+        status:
+          type: string
+        alive:
+          type: boolean
+        service:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        uptime:
+          type: number
+        requestId:
+          type: string
+
+    ReadyStatus:
+      type: object
+      additionalProperties: false
+      required: [status, ready, service, db, stellar, timestamp]
+      properties:
+        status:
+          type: string
+        ready:
+          type: boolean
+        service:
+          type: string
+        db:
+          type: string
+        stellar:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+
+    StartupStatus:
+      type: object
+      additionalProperties: false
+      required: [status, ready, service, timestamp, check]
+      properties:
+        status:
+          type: string
+        ready:
+          type: boolean
+        service:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+        check:
+          type: string
+
+    StartupStatusDown:
+      type: object
+      additionalProperties: false
+      required: [status, ready, service, timestamp]
+      properties:
+        status:
+          type: string
+        ready:
+          type: boolean
+        service:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+        code:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    RegionStatus:
+      type: object
+      additionalProperties: false
+      required: [region, activeRegion, isActive, service, timestamp]
+      properties:
+        region:
+          type: string
+        activeRegion:
+          type: string
+        isActive:
+          type: boolean
+        service:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    # ── Auth ───────────────────────────────────────────────────────────
+    RegisterRequest:
+      type: object
+      additionalProperties: false
       required: [email, password]
       properties:
         email:
@@ -584,241 +1898,400 @@ components:
         password:
           type: string
           format: password
+        name:
+          type: string
 
-    LoginResponse:
+    ForgotPasswordRequest:
       type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    ResetPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [token, password]
       properties:
         token:
           type: string
-          description: JWT access token
-        user:
-          $ref: "#/components/schemas/User"
-
-    RegisterInvestorRequest:
-      type: object
-      required: [email, password]
-      properties:
-        email:
-          type: string
-          format: email
         password:
           type: string
           format: password
-        name:
-          type: string
 
-    Offering:
+    # ── Offerings ──────────────────────────────────────────────────────
+    OfferingValidationRequest:
       type: object
+      additionalProperties: false
+      required: [action, offering]
       properties:
-        id:
+        action:
           type: string
-          format: uuid
-        issuer_id:
-          type: string
-          description: Issuer user id
-        contract_address:
-          type: string
-          description: On-chain contract address
-        name:
-          type: string
-        symbol:
-          type: string
-        status:
-          type: string
-          description: Current status on/off chain
-          enum: [draft, open, closed, paused, cancelled, active, completed]
-        total_raised:
-          type: string
-          description: Total amount raised, as a high-precision decimal string
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-
-    PublicOffering:
-      type: object
-      description: Public view of an offering
-      properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-        symbol:
-          type: string
-        status:
-          type: string
-        total_raised:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-
-    Investment:
-      type: object
-      properties:
-        id:
-          type: string
-          format: uuid
-        investor_id:
-          type: string
-        offering_id:
-          type: string
-        amount:
-          type: string
-          description: Investment amount as a decimal string
-        asset:
-          type: string
-          description: Asset code or identifier
-        status:
-          type: string
-          enum: [pending, completed, failed]
-        tx_hash:
-          type: string
-          nullable: true
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-
-    RevenueReportInput:
-      type: object
-      properties:
-        offering_id:
-          type: string
-          format: uuid
-        period_id:
-          type: string
-          description: Optional business period identifier
-        period:
+          enum:
+            - create
+            - update
+            - publish
+            - pause
+            - close
+            - cancel
+            - viewPrivate
+            - invest
+        offering:
           type: object
+          additionalProperties: false
           properties:
-            start:
+            id:
+              type: string
+            issuerId:
+              type: string
+            status:
+              type: string
+              enum: [draft, open, paused, closed, cancelled, completed]
+            targetAmount:
+              type: string
+            minimumInvestment:
+              type: string
+            investmentAmount:
+              type: string
+            subscriptionStartsAt:
               type: string
               format: date-time
-            end:
+            subscriptionEndsAt:
               type: string
               format: date-time
-        total_revenue:
-          type: string
-          description: Revenue amount as a decimal string
-        issuer_id:
-          type: string
-          description: Issuer user id (optional override)
-        amount:
-          type: string
-          description: Optional alternative amount field
+
+    OfferingValidationResult:
+      type: object
+      additionalProperties: false
       required:
-        - offering_id
-
-    RevenueReport:
-      type: object
+        - allowed
+        - decision
+        - action
+        - actor
+        - offeringId
+        - checks
+        - violations
+        - securityAssumptions
       properties:
-        id:
+        allowed:
+          type: boolean
+        decision:
           type: string
-        offering_id:
+          enum: [allow, deny]
+        action:
           type: string
-        period_id:
+        actor:
+          type: object
+          additionalProperties: false
+          required: [id, role]
+          properties:
+            id:
+              type: string
+            role:
+              type: string
+        offeringId:
           type: string
           nullable: true
-        total_revenue:
-          type: string
-          nullable: true
-        issuer_id:
-          type: string
-          nullable: true
-        amount:
-          type: string
-          nullable: true
-        period_start:
-          type: string
-          format: date-time
-          nullable: true
-        period_end:
-          type: string
-          format: date-time
-          nullable: true
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationCheck"
+        violations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValidationCheck"
+        securityAssumptions:
+          type: array
+          items:
+            type: string
 
-    DistributionRequest:
+    ValidationCheck:
       type: object
+      additionalProperties: false
+      required: [code, passed, severity, message]
       properties:
-        revenue_amount:
+        code:
+          type: string
+        passed:
+          type: boolean
+        severity:
+          type: string
+          enum: [error, warning]
+        message:
+          type: string
+
+    # ── Investments / vesting ──────────────────────────────────────────
+    ClaimRequest:
+      type: object
+      additionalProperties: false
+      required: [scheduleId, claimAmount]
+      properties:
+        scheduleId:
+          type: string
+        claimAmount:
           type: number
           minimum: 0
-        period:
-          type: object
-          properties:
-            start:
-              type: string
-              format: date-time
-            end:
-              type: string
-              format: date-time
-      required:
-        - revenue_amount
-        - period
 
-    DistributionResponse:
+    # ── Email ──────────────────────────────────────────────────────────
+    WebhookAck:
       type: object
+      additionalProperties: false
+      required: [received, processed]
       properties:
-        run_id:
+        received:
+          type: boolean
+        processed:
+          type: integer
+
+    # ── AML ────────────────────────────────────────────────────────────
+    Envelope:
+      type: object
+      additionalProperties: false
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+        data:
+          additionalProperties: true
+
+    EnvelopeFailure:
+      type: object
+      additionalProperties: false
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+        error:
           type: string
-        payouts:
+        details:
+          additionalProperties: true
+
+    CreateRuleRequest:
+      type: object
+      additionalProperties: false
+      required: [name, description, type, severity, config]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        type:
+          type: string
+          enum: [velocity, structuring, geo_mismatch, amount_threshold]
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+        config:
+          type: object
+          additionalProperties: true
+
+    UpdateRuleRequest:
+      type: object
+      additionalProperties: false
+      required: [change_reason]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        enabled:
+          type: boolean
+        config:
+          type: object
+          additionalProperties: true
+        change_reason:
+          type: string
+
+    RollbackRuleRequest:
+      type: object
+      additionalProperties: false
+      required: [version]
+      properties:
+        version:
+          type: object
+          additionalProperties: false
+          required: [major, minor, patch]
+          properties:
+            major:
+              type: integer
+              minimum: 0
+            minor:
+              type: integer
+              minimum: 0
+            patch:
+              type: integer
+              minimum: 0
+
+    CreateCaseRequest:
+      type: object
+      additionalProperties: false
+      required: [alert_ids, investor_id]
+      properties:
+        alert_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        investor_id:
+          type: string
+        assigned_to:
+          type: string
+        notes:
+          type: string
+
+    UpdateCaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [open, assigned, investigating, closed, dismissed]
+        assigned_to:
+          type: string
+        disposition:
+          type: string
+          enum: [confirmed_suspicious, false_positive, inconclusive, legitimate]
+        notes:
+          type: string
+
+    CreateOFACReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [alert_id, investor_id, matched_name, rationale]
+      properties:
+        alert_id:
+          type: string
+        case_id:
+          type: string
+        investor_id:
+          type: string
+        matched_name:
+          type: string
+        list_entry_id:
+          type: string
+        rationale:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+
+    # ── Ledger ─────────────────────────────────────────────────────────
+    LedgerExport:
+      type: object
+      additionalProperties: false
+      required: [entries, next_cursor]
+      properties:
+        entries:
           type: array
           items:
             type: object
             additionalProperties: true
+        next_cursor:
+          type: string
+          nullable: true
 
-    Notification:
+    # ── Taxation ───────────────────────────────────────────────────────
+    MessageEnvelope:
       type: object
+      additionalProperties: false
+      required: [message]
       properties:
-        id:
-          type: string
-        user_id:
-          type: string
-        type:
-          type: string
-          description: Notification type key
         message:
           type: string
-        read:
-          type: boolean
-        created_at:
+        data:
+          additionalProperties: true
+
+    DisposalRequest:
+      type: object
+      additionalProperties: false
+      required: [offering_id, quantity, disposal_price_per_unit, strategy]
+      properties:
+        offering_id:
+          type: string
+        quantity:
+          type: number
+          minimum: 0
+        disposal_price_per_unit:
+          type: number
+          minimum: 0
+        strategy:
+          type: string
+          enum: [FIFO, LIFO, HIFO]
+
+    CreateLotRequest:
+      type: object
+      additionalProperties: false
+      required: [offering_id, investment_id, asset, quantity, cost_basis_per_unit]
+      properties:
+        offering_id:
+          type: string
+        investment_id:
+          type: string
+        asset:
+          type: string
+        quantity:
+          type: number
+          minimum: 0
+        cost_basis_per_unit:
+          type: number
+          minimum: 0
+        acquired_at:
           type: string
           format: date-time
-
-    NotificationPreferences:
-      type: object
-      properties:
-        user_id:
+        cost_currency:
           type: string
-        email_notifications:
-          type: boolean
-        push_notifications:
-          type: boolean
-        sms_notifications:
-          type: boolean
-        updated_at:
+        jurisdiction:
+          type: string
+
+    WashSaleRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - offering_id
+        - disposed_at
+        - disposal_realized_gain_loss
+        - disposal_quantity
+        - disposal_cost_basis_per_unit
+      properties:
+        offering_id:
+          type: string
+        disposed_at:
           type: string
           format: date-time
+        disposal_realized_gain_loss:
+          type: number
+        disposal_quantity:
+          type: number
+          minimum: 0
+        disposal_cost_basis_per_unit:
+          type: number
+          minimum: 0
+        window_days:
+          type: integer
+          minimum: 1
+          maximum: 365
 
-    NotificationPreferencesUpdate:
+    # ── Shared errors ──────────────────────────────────────────────────
+    Error:
       type: object
+      additionalProperties: false
+      required: [code, message]
       properties:
-        email_notifications:
-          type: boolean
-        push_notifications:
-          type: boolean
-        sms_notifications:
-          type: boolean
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          additionalProperties: true
+        requestId:
+          type: string
 
+    PlainError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string

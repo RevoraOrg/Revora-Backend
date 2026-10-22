@@ -15,13 +15,15 @@ export interface TokenBalanceSnapshot {
 
 /**
  * Input for creating a snapshot
+ * snapshot_at is now REQUIRED (not optional) to enforce determinism at the repository level.
+ * Callers must always provide an explicit timestamp.
  */
 export interface CreateSnapshotInput {
   offering_id: string;
   period_id: string;
   holder_address_or_id: string;
   balance: string;
-  snapshot_at?: Date;
+  snapshot_at: Date; // REQUIRED, never defaults to now()
 }
 
 /**
@@ -34,10 +36,15 @@ export class BalanceSnapshotRepository {
 
   /**
    * Insert a new token balance snapshot
-   * @param input Snapshot data
+   * @param input Snapshot data (snapshot_at is required)
    * @returns Created snapshot
+   * @throws Error if snapshot_at is not provided
    */
   async insert(input: CreateSnapshotInput): Promise<TokenBalanceSnapshot> {
+    if (!input.snapshot_at) {
+      throw new Error('snapshot_at is required when inserting a token balance snapshot');
+    }
+
     const query = `
       INSERT INTO token_balance_snapshots (
         offering_id,
@@ -56,7 +63,7 @@ export class BalanceSnapshotRepository {
       input.period_id,
       input.holder_address_or_id,
       input.balance,
-      input.snapshot_at ?? new Date(),
+      input.snapshot_at,
     ];
 
     const result: QueryResult<TokenBalanceSnapshot> = await this.db.query(
@@ -73,12 +80,22 @@ export class BalanceSnapshotRepository {
 
   /**
    * Insert multiple snapshots in a single transaction
-   * @param inputs Array of snapshot data
+   * @param inputs Array of snapshot data (snapshot_at is required for each)
    * @returns Array of created snapshots
+   * @throws Error if any snapshot_at is not provided
    */
   async insertMany(
     inputs: CreateSnapshotInput[]
   ): Promise<TokenBalanceSnapshot[]> {
+    // Validate that all inputs have snapshot_at
+    for (let i = 0; i < inputs.length; i++) {
+      if (!inputs[i].snapshot_at) {
+        throw new Error(
+          `snapshot_at is required for all snapshots; input[${i}] is missing snapshot_at`
+        );
+      }
+    }
+
     const client = await this.db.connect();
     try {
       await client.query('BEGIN');
@@ -94,7 +111,7 @@ export class BalanceSnapshotRepository {
             input.period_id,
             input.holder_address_or_id,
             input.balance,
-            input.snapshot_at ?? new Date(),
+            input.snapshot_at,
           ]
         );
         snapshots.push(this.mapSnapshot(result.rows[0]));
@@ -130,6 +147,34 @@ export class BalanceSnapshotRepository {
     const result: QueryResult<TokenBalanceSnapshot> = await this.db.query(
       query,
       [offeringId, periodId]
+    );
+
+    return result.rows.map((row: any) => this.mapSnapshot(row));
+  }
+
+  /**
+   * Get all snapshots for a given holder across offerings for a period.
+   * Used by the investor-statement generator to resolve a holder's positions
+   * (deterministically ordered by snapshot_at so re-runs are stable).
+   * @param holderAddressOrId Holder Stellar address or internal investor ID
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of snapshots
+   */
+  async findByHolderAndPeriod(
+    holderAddressOrId: string,
+    periodId: string
+  ): Promise<TokenBalanceSnapshot[]> {
+    const query = `
+      SELECT *
+      FROM token_balance_snapshots
+      WHERE holder_address_or_id = $1
+        AND period_id = $2
+      ORDER BY snapshot_at ASC, created_at ASC, id ASC
+    `;
+
+    const result: QueryResult<TokenBalanceSnapshot> = await this.db.query(
+      query,
+      [holderAddressOrId, periodId]
     );
 
     return result.rows.map((row: any) => this.mapSnapshot(row));

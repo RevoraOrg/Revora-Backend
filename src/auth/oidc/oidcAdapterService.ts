@@ -52,6 +52,8 @@ export class OidcAdapterService {
   /** SHA-256 hex digest of the last accepted discovery document, keyed by issuer URL. */
   private readonly discoveryDigests = new Map<string, string>();
   private readonly flowStates = new Map<string, OidcFlowState>();
+  /** Set of already-consumed logout token JTIs with their exp timestamps for replay protection. */
+  private readonly consumedJtis = new Map<string, number>();
   private readonly discoveryTtlMs: number;
   private readonly metrics: OidcDiscoveryMetrics;
   private readonly now: () => number;
@@ -333,9 +335,9 @@ export class OidcAdapterService {
       this.consumedJtis.set(claims.jti, claims.exp * 1000);
       
       // Lazy cleanup
-      const now = Date.now();
+      const nowMs = this.now();
       for (const [jti, exp] of this.consumedJtis.entries()) {
-        if (now > exp) {
+        if (nowMs > exp) {
           this.consumedJtis.delete(jti);
         }
       }

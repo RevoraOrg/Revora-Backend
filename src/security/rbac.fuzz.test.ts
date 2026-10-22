@@ -100,6 +100,16 @@ jest.mock('../middleware/auth', () => {
       }
       next();
     },
+    requireCompliance: (req: any, res: any, next: any) => {
+      const role = getRole();
+      if (role === 'anonymous') {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+      if (role !== 'compliance' && role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      next();
+    },
     verifyJwt: jest.fn().mockReturnValue({ sub: 'test-user', role: 'admin' }),
   };
 });

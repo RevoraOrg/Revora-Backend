@@ -1,1 +1,4 @@
 Date,Drill Owner,Environment,Phase Reached,Emergency Unpin Tested,Pass/Fail,Notes
+2026-01-29,Platform Lead,Staging,Phase 2 (simulated swap),Yes,Pass,Q1 drill — all gates passed
+2026-04-30,SRE Lead,Staging,Phase 2 (simulated swap),Yes,Pass,Q2 drill — emergency unpin recovered within 8 min
+2026-07-30,Platform Lead,Staging,Phase 3 (full cycle),Yes,Pass,Q3 drill — tested vault promotion dry-run; next drill Q4 2026-10-29

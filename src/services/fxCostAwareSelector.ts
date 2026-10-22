@@ -148,7 +148,7 @@ export class CostAwareRateSelector {
     const hasFreeProvider = providers.some((p) => p.costUsdPerCall === 0);
     if (!hasFreeProvider) {
       throw new Error(
-        'CostAwareRateSelector requires at least one provider with costUsdPerCall === 0 ' +
+        'CostAwareRateSelector requires at least one zero-cost provider (costUsdPerCall === 0) ' +
         'to guarantee distributions are never blocked by budget exhaustion.'
       );
     }

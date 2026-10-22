@@ -1,4 +1,4 @@
-import { buildConfig } from './env';
+import { buildConfig, envBoolean, readEnvBoolean } from './env';
 
 describe('env config', () => {
   const originalEnv = process.env;
@@ -118,5 +118,162 @@ describe('env config', () => {
 
     mockExit.mockRestore();
     mockConsoleError.mockRestore();
+  });
+
+  /**
+   * Boolean environment flags — issue #1305.
+   *
+   * Regression context: `z.coerce.boolean()` applies `Boolean(value)`, so
+   * `"false"`, `"0"` and `"no"` all parsed as `true`. These tests fail on the
+   * pre-fix implementation for every "disabled" input below.
+   */
+  describe('envBoolean helper', () => {
+    const truthyValues = ['true', 'TRUE', '1', 'yes', 'YES', 'on', 'On', ' true ', '\tTRUE\n'];
+    const falsyValues = ['false', 'FALSE', '0', 'no', 'NO', 'off', 'OFF', ' false ', ' 0 '];
+
+    it.each(truthyValues)('parses %j as true', (value) => {
+      const result = envBoolean(false).safeParse(value);
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(true);
+    });
+
+    it.each(falsyValues)('parses %j as false', (value) => {
+      const result = envBoolean(true).safeParse(value);
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(false);
+    });
+
+    it('returns the default when the variable is unset', () => {
+      expect(envBoolean(false).parse(undefined)).toBe(false);
+      expect(envBoolean(true).parse(undefined)).toBe(true);
+    });
+
+    it.each(['maybe', '2', 'y', 'n', 'enabled', 'null', '', '   ', 'falsey', 'offf'])(
+      'rejects %j with a clear validation message',
+      (value) => {
+        const result = envBoolean(false).safeParse(value);
+        expect(result.success).toBe(false);
+        expect(result.error?.issues[0]?.message).toBe(
+          'must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+        );
+      },
+    );
+  });
+
+  describe('boolean feature flags via buildConfig', () => {
+    it('parses OUTBOX_DISPATCHER_ENABLED=false as false (regression: coerce returned true)', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = 'false';
+
+      const cfg = buildConfig();
+      expect(cfg.OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses OUTBOX_DISPATCHER_ENABLED=0 as false', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '0';
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses OUTBOX_DISPATCHER_ENABLED=1 as true', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '1';
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(true);
+    });
+
+    it('defaults OUTBOX_DISPATCHER_ENABLED to false when unset', () => {
+      process.env.NODE_ENV = 'test';
+      delete process.env.OUTBOX_DISPATCHER_ENABLED;
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses EMAIL_DELIVERABILITY_ENABLED=off as false (previously mounted webhooks anyway)', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'off';
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(false);
+    });
+
+    it('parses EMAIL_DELIVERABILITY_ENABLED=no as false', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'no';
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(false);
+    });
+
+    it('defaults EMAIL_DELIVERABILITY_ENABLED to true when unset (default unchanged)', () => {
+      process.env.NODE_ENV = 'test';
+      delete process.env.EMAIL_DELIVERABILITY_ENABLED;
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(true);
+    });
+
+    it('fails validation with a clear message when a boolean flag is set to "maybe"', () => {
+      const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+        throw new Error(`Process.exit called with ${code}`);
+      });
+      const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'maybe';
+
+      expect(() => buildConfig()).toThrow('Process.exit called with 1');
+      expect(mockConsoleError).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'EMAIL_DELIVERABILITY_ENABLED: must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+        ),
+      );
+
+      mockExit.mockRestore();
+      mockConsoleError.mockRestore();
+    });
+
+    it('fails validation when a boolean flag is set to an empty string', () => {
+      const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+        throw new Error(`Process.exit called with ${code}`);
+      });
+      const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '';
+
+      expect(() => buildConfig()).toThrow('Process.exit called with 1');
+      expect(mockConsoleError).toHaveBeenCalledWith(
+        expect.stringContaining('OUTBOX_DISPATCHER_ENABLED: must be one of'),
+      );
+
+      mockExit.mockRestore();
+      mockConsoleError.mockRestore();
+    });
+  });
+
+  describe('readEnvBoolean (ad-hoc process.env reads)', () => {
+    afterEach(() => {
+      delete process.env.TEST_BOOL_FLAG;
+    });
+
+    it('reads the shared accepted value set at call time', () => {
+      process.env.TEST_BOOL_FLAG = 'yes';
+      expect(readEnvBoolean('TEST_BOOL_FLAG', false)).toBe(true);
+
+      process.env.TEST_BOOL_FLAG = '0';
+      expect(readEnvBoolean('TEST_BOOL_FLAG', true)).toBe(false);
+    });
+
+    it('returns the default when the variable is unset', () => {
+      delete process.env.TEST_BOOL_FLAG;
+      expect(readEnvBoolean('TEST_BOOL_FLAG', false)).toBe(false);
+      expect(readEnvBoolean('TEST_BOOL_FLAG', true)).toBe(true);
+    });
+
+    it('throws a clear error naming the variable for invalid values', () => {
+      process.env.TEST_BOOL_FLAG = 'maybe';
+      expect(() => readEnvBoolean('TEST_BOOL_FLAG', false)).toThrow(
+        'TEST_BOOL_FLAG must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+      );
+    });
   });
 });

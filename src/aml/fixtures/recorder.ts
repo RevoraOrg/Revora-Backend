@@ -21,6 +21,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { readEnvBoolean } from '../../config/env';
 import {
   redactObject,
   createRedactionContext,
@@ -88,6 +89,52 @@ export interface RecorderOptions {
   redactionOptions?: RedactionOptions;
 }
 
+function ensureString(value: unknown, fieldName: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new TypeError(`${fieldName} must be a non-empty string`);
+  }
+  return value;
+}
+
+function ensureRecord(value: unknown, fieldName: string): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError(`${fieldName} must be a plain object of string keys and values`);
+  }
+
+  for (const [key, entryValue] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entryValue !== 'string') {
+      throw new TypeError(`${fieldName}.${key} must be a string value`);
+    }
+  }
+
+  return value as Record<string, string>;
+}
+
+function ensureRequest(
+  req: { method: string; path: string; headers: Record<string, string>; body?: unknown },
+  label: string,
+): void {
+  ensureString(req.method, `${label}.request.method`);
+  ensureString(req.path, `${label}.request.path`);
+  if (!req.path.startsWith('/')) {
+    throw new TypeError(`${label}.request.path must start with '/'`);
+  }
+  ensureRecord(req.headers, `${label}.request.headers`);
+}
+
+function ensureResponse(
+  res: { status: number; headers: Record<string, string>; body: unknown },
+  label: string,
+): void {
+  if (!Number.isInteger(res.status) || res.status < 100 || res.status > 599) {
+    throw new TypeError(`${label}.response.status must be an HTTP status code between 100 and 599`);
+  }
+  ensureRecord(res.headers, `${label}.response.headers`);
+  if (res.body === undefined) {
+    throw new TypeError(`${label}.response.body is required`);
+  }
+}
+
 // ── Recorder ─────────────────────────────────────────────────────────────────
 
 /**
@@ -102,6 +149,9 @@ export interface RecorderOptions {
  */
 export function createRecorder(options: RecorderOptions) {
   const { fixtureDir, provider, redactionOptions } = options;
+  ensureString(fixtureDir, 'fixtureDir');
+  ensureString(provider, 'provider');
+
   const ctx = createRedactionContext();
   const interactions: RecordedInteraction[] = [];
   let totalRedactions = 0;
@@ -133,6 +183,10 @@ export function createRecorder(options: RecorderOptions) {
         body: unknown;
       },
     ): void {
+      ensureString(label, 'label');
+      ensureRequest(req, label);
+      ensureResponse(res, label);
+
       interactions.push({
         request: redact({
           method: req.method,
@@ -223,7 +277,9 @@ export async function hasFixtures(
  * or replay existing ones.
  */
 export function shouldRecord(): boolean {
-  return process.env.RECORD_FIXTURES === 'true';
+  // Shared envBoolean value set (issue #1305); read at call time so tests
+  // and local runs can flip RECORD_FIXTURES without re-importing the module.
+  return readEnvBoolean('RECORD_FIXTURES', false);
 }
 
 export const __test = {

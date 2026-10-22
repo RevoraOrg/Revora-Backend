@@ -89,25 +89,34 @@ export interface ReplayCache {
 }
 
 export class InMemoryReplayCache implements ReplayCache {
-  private seen = new Map<string, number>();
+  private _seen = new Map<string, number>();
 
   seen(key: string, maxAgeMs = 180_000): boolean {
     const now = Date.now();
 
     // Evict stale entries opportunistically (amortised O(1)).
-    if (this.seen.size > 10_000) {
-      for (const [k, ts] of this.seen) {
-        if (now - ts > maxAgeMs) this.seen.delete(k);
+    if (this._seen.size > 10_000) {
+      for (const [k, ts] of this._seen) {
+        if (now - ts > maxAgeMs) this._seen.delete(k);
       }
     }
 
-    if (this.seen.has(key)) return true;
-    this.seen.set(key, now);
+    const ts = this._seen.get(key);
+    if (ts !== undefined) {
+      // A stale entry may be reused after its window elapses.
+      if (now - ts > maxAgeMs) {
+        this._seen.delete(key);
+        this._seen.set(key, now);
+        return false;
+      }
+      return true;
+    }
+    this._seen.set(key, now);
     return false;
   }
 
   clear(): void {
-    this.seen.clear();
+    this._seen.clear();
   }
 }
 
@@ -156,8 +165,9 @@ export function verifyEd25519(
 ): boolean {
   try {
     const sigBuffer = Buffer.from(signatureB64, 'base64url');
-    const verifier = crypto.createVerify(null as any);
-    // Ed25519 verify via the low-level key object
+    // Ed25519 verify via the low-level key object. NOTE: the top-level
+    // `crypto.verify` accepts a null algorithm (implying EdDSA), whereas
+    // `crypto.createVerify` requires a string and cannot be used here.
     const keyObj = crypto.createPublicKey(publicKeyPem);
     return crypto.verify(null as any, Buffer.from(payload), keyObj as any, sigBuffer as any);
   } catch {
@@ -220,7 +230,7 @@ export function createDeviceSignatureMiddleware(
       // ── Clock-skew check ────────────────────────────────────────────
       const requestTime = new Date(timestamp).getTime();
       if (Number.isNaN(requestTime)) {
-        next(Errors.badRequest('X-Device-Timestamp must be a valid ISO-8601 date'));
+        next(Errors.badRequest('X-Device-Timestamp must be a valid ISO-8601 timestamp'));
         return;
       }
       const skew = Math.abs(Date.now() - requestTime);

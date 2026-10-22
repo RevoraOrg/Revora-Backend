@@ -256,6 +256,90 @@ export interface DualKeyVerificationResult {
 }
 
 /**
+ * @notice Configuration for outbound dual-key signing during HMAC rotation.
+ * @dev Used by the outbox dispatcher when a rotation overlap window is active.
+ *
+ * During the overlap window the dispatcher signs with the **current** key only,
+ * but exposes the previous key so that receivers can validate either.
+ */
+export interface OutboundSigningConfig {
+  /** Current active HMAC secret — always used for signing. */
+  currentSecret: string;
+  /**
+   * Previous secret still valid during the overlap window.
+   * Receivers MUST accept signatures produced with either key until
+   * `overlapExpiresAtMs` elapses.
+   */
+  previousSecret?: string;
+  /**
+   * Epoch ms at which the previous secret's acceptance window closes.
+   * Must be set when `previousSecret` is provided.
+   */
+  overlapExpiresAtMs?: number;
+}
+
+/**
+ * @notice Result of an outbound signing operation.
+ */
+export interface OutboundSigningResult {
+  /** The generated signature string (`sha256=<hex>`). */
+  signature: string;
+  /** The version of the secret that produced this signature. */
+  usedKey: 'current';
+  /**
+   * When `true`, a rotation overlap window is active and the receiver should
+   * accept signatures produced with either the current or previous secret.
+   */
+  overlapWindowActive: boolean;
+  /**
+   * Epoch ms at which the overlap window closes (0 when no overlap is active).
+   */
+  overlapExpiresAtMs: number;
+}
+
+/**
+ * @notice Signs a webhook payload using the outbound signing config.
+ * @dev Always signs with the `currentSecret`.  The previous key is only
+ *   surfaced so that receivers can build their own dual-key verification config.
+ *
+ * Signing always uses the current secret regardless of whether the overlap
+ * window is active — this ensures all new deliveries carry the up-to-date
+ * signature.  Receivers that still have the old key cached can still verify
+ * in-flight deliveries using the overlap window information.
+ *
+ * @param config  Outbound signing configuration (current + optional previous key).
+ * @param body    Raw request body string.
+ * @param timestamp Timestamp string for replay protection.
+ * @returns Signing result including overlap window metadata.
+ *
+ * @example
+ * ```typescript
+ * const result = signOutboundPayload(rotationSvc.getOutboundSigningConfig(), body, timestamp);
+ * // result.signature → attach to X-Revora-Signature header
+ * // result.overlapWindowActive → inform receiver that old key is still valid
+ * ```
+ */
+export function signOutboundPayload(
+  config: OutboundSigningConfig,
+  body: string,
+  timestamp: string,
+): OutboundSigningResult {
+  const signature = signPayload(config.currentSecret, body, timestamp);
+
+  const overlapActive =
+    config.previousSecret !== undefined &&
+    config.overlapExpiresAtMs !== undefined &&
+    Date.now() <= config.overlapExpiresAtMs;
+
+  return {
+    signature,
+    usedKey: 'current',
+    overlapWindowActive: overlapActive,
+    overlapExpiresAtMs: overlapActive ? config.overlapExpiresAtMs! : 0,
+  };
+}
+
+/**
  * @notice Verifies an HMAC signature against payload with dual-key rotation support.
  * @dev Tries primary secret first. If failed, tries nextSecret if not expired.
  *

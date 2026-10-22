@@ -26,16 +26,16 @@ function mockService(result: any): ChangePasswordService {
     let err: AppError;
     switch (result.reason) {
       case 'VALIDATION_ERROR':
-        err = new AppError(ErrorCode.VALIDATION_ERROR, result.message, 400);
+        err = new AppError(ErrorCode.VALIDATION_ERROR, 400, result.message);
         break;
       case 'WRONG_PASSWORD':
-        err = new AppError(ErrorCode.UNAUTHORIZED, result.message, 401);
+        err = new AppError(ErrorCode.UNAUTHORIZED, 401, result.message);
         break;
       case 'USER_NOT_FOUND':
-        err = new AppError(ErrorCode.NOT_FOUND, result.message, 404);
+        err = new AppError(ErrorCode.NOT_FOUND, 404, result.message);
         break;
       default:
-        err = new AppError(ErrorCode.INTERNAL_ERROR, 'Unknown', 500);
+        err = new AppError(ErrorCode.INTERNAL_ERROR, 500, 'Unknown');
     }
     execute.mockRejectedValue(err);
   }

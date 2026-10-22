@@ -3,8 +3,6 @@ import {
   ErrorCode,
   ErrorResponse,
   Errors,
-  createError,
-  sendAppError,
   throwError,
 } from './errors';
 
@@ -27,7 +25,7 @@ describe('ErrorCode', () => {
 describe('AppError', () => {
   describe('constructor', () => {
     it('sets all properties', () => {
-      const err = new AppError(ErrorCode.NOT_FOUND, 'thing not found', 404);
+      const err = new AppError(ErrorCode.NOT_FOUND, 404, 'thing not found');
       expect(err.code).toBe(ErrorCode.NOT_FOUND);
       expect(err.message).toBe('thing not found');
       expect(err.statusCode).toBe(404);
@@ -37,24 +35,24 @@ describe('AppError', () => {
 
     it('stores optional details', () => {
       const details = { field: 'amount', reason: 'must be positive' };
-      const err = new AppError(ErrorCode.VALIDATION_ERROR, 'invalid input', 400, details);
+      const err = new AppError(ErrorCode.VALIDATION_ERROR, 400, 'invalid input', details);
       expect(err.details).toEqual(details);
     });
 
     it('is an instance of Error', () => {
-      const err = new AppError(ErrorCode.INTERNAL_ERROR, 'boom', 500);
+      const err = new AppError(ErrorCode.INTERNAL_ERROR, 500, 'boom');
       expect(err).toBeInstanceOf(Error);
     });
 
     it('passes instanceof AppError after transpilation', () => {
-      const err = new AppError(ErrorCode.FORBIDDEN, 'no access', 403);
+      const err = new AppError(ErrorCode.FORBIDDEN, 403, 'no access');
       expect(err).toBeInstanceOf(AppError);
     });
   });
 
   describe('toResponse()', () => {
     it('returns code and message without details when details is undefined', () => {
-      const err = new AppError(ErrorCode.UNAUTHORIZED, 'not logged in', 401);
+      const err = new AppError(ErrorCode.UNAUTHORIZED, 401, 'not logged in');
       const response: ErrorResponse = err.toResponse();
       expect(response).toEqual({ code: 'UNAUTHORIZED', message: 'not logged in' });
       expect(Object.prototype.hasOwnProperty.call(response, 'details')).toBe(false);
@@ -62,7 +60,7 @@ describe('AppError', () => {
 
     it('includes details when present', () => {
       const details = { ids: ['a', 'b'] };
-      const err = new AppError(ErrorCode.CONFLICT, 'duplicate', 409, details);
+      const err = new AppError(ErrorCode.CONFLICT, 409, 'duplicate', details);
       expect(err.toResponse()).toEqual({
         code: 'CONFLICT',
         message: 'duplicate',
@@ -71,31 +69,15 @@ describe('AppError', () => {
     });
 
     it('includes details even when details is null', () => {
-      const err = new AppError(ErrorCode.BAD_REQUEST, 'bad', 400, null);
+      const err = new AppError(ErrorCode.BAD_REQUEST, 400, 'bad', null);
       expect(err.toResponse().details).toBeNull();
     });
   });
 });
 
-// ─── createError ──────────────────────────────────────────────────────────────
-
-describe('createError', () => {
-  it('returns an AppError with the given properties', () => {
-    const err = createError(ErrorCode.NOT_FOUND, 'resource missing', 404);
-    expect(err).toBeInstanceOf(AppError);
-    expect(err.code).toBe(ErrorCode.NOT_FOUND);
-    expect(err.message).toBe('resource missing');
-    expect(err.statusCode).toBe(404);
-  });
-
-  it('forwards details', () => {
-    const details = { resource: 'offering' };
-    const err = createError(ErrorCode.NOT_FOUND, 'not found', 404, details);
-    expect(err.details).toEqual(details);
-  });
-});
-
 // ─── Errors convenience factories ─────────────────────────────────────────────
+// (The internal `createError` helper is exercised indirectly through every
+// factory below; it is not part of the public API.)
 
 describe('Errors', () => {
   describe('validationError', () => {
@@ -200,23 +182,17 @@ describe('throwError', () => {
   });
 });
 
-// ─── sendAppError ─────────────────────────────────────────────────────────────
+// ─── Error forwarding via the Express error handler ───────────────────────────
+// The `errorHandler` middleware (src/middleware/errorHandler.ts) is responsible
+// for translating AppErrors into HTTP responses; handlers forward errors to
+// `next(err)` and the middleware reads `statusCode`/`message`/`toResponse()`.
 
-describe('sendAppError', () => {
-  it('calls next() with the AppError instance', () => {
-    const next = jest.fn();
-    const err = Errors.unauthorized();
-    sendAppError(next, err);
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(next).toHaveBeenCalledWith(err);
-  });
-
-  it('does not modify the error before forwarding', () => {
-    const next = jest.fn();
+describe('AppError contract consumed by the error handler', () => {
+  it('produces a response whose code and message match the constructor args', () => {
     const err = Errors.notFound('Offering 42 not found');
-    sendAppError(next, err);
-    const forwarded = next.mock.calls[0][0] as AppError;
-    expect(forwarded.message).toBe('Offering 42 not found');
-    expect(forwarded.statusCode).toBe(404);
+    const response = err.toResponse();
+    expect(response.code).toBe(ErrorCode.NOT_FOUND);
+    expect(response.message).toBe('Offering 42 not found');
+    expect(err.statusCode).toBe(404);
   });
 });

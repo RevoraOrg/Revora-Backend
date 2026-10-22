@@ -2,6 +2,7 @@ import { Pool, PoolClient } from 'pg';
 import { InvestmentRepository, CreateInvestmentInput, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { UserRepository } from '../db/repositories/userRepository';
+import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 import { Errors, AppError, ErrorCode } from '../lib/errors';
 import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
@@ -23,6 +24,8 @@ export interface CreateInvestmentRequest {
   offering_id: string;
   amount: string;
   asset: string;
+  /** Optional beneficial-owner names (e.g. UBOs) to screen alongside the investor. */
+  beneficial_owners?: string[];
 }
 
 /**
@@ -201,7 +204,12 @@ export class InvestmentService {
 /**
  * Factory function to create InvestmentService with dependencies
  */
-export function createInvestmentService(db: Pool, amlService?: AMLService): InvestmentService {
+export function createInvestmentService(
+  db: Pool,
+  amlService?: AMLService,
+  screeningService?: SanctionsScreeningService,
+  auditLogRepo?: AuditLogRepository,
+): InvestmentService {
   return new InvestmentService(
     new InvestmentRepository(db),
     new OfferingRepository(db),

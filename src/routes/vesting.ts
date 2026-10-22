@@ -1,13 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { VestingService, PartialClaimRequest } from '../services/vestingService';
-import { requireAuth } from '../middleware/auth';
+import { createRequireAuth } from '../middleware/auth';
+import { SessionRepository } from '../db/repositories/sessionRepository';
+import { pool } from '../db/pool';
 
 const router = Router();
 const vestingService = new VestingService();
+const requireAuth = createRequireAuth(new SessionRepository(pool));
 
 /**
  * POST /api/v1/vesting/claim
  * Process a partial claim for a vesting schedule
+ *
+ * Authenticated via the session-hardened `createRequireAuth` middleware.
  */
 router.post('/claim', requireAuth, async (req: Request, res: Response) => {
   try {

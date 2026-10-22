@@ -214,6 +214,12 @@ describe('StellarSubmissionService', () => {
     );
   });
 
+  it('should throw validation error for empty idempotency key', async () => {
+    await expect(service.submitPayment('G-DESTINATION', '10.0', undefined, '   ')).rejects.toThrow(
+      'Idempotency key must be a non-empty string when provided'
+    );
+  });
+
   it('should return the public key', () => {
     expect(service.getPublicKey()).toBe('G-MOCK-PUBLIC-KEY');
   });
@@ -331,6 +337,32 @@ describe('StellarSubmissionService', () => {
 
       expect(result.status).toBe('PENDING');
       expect(attemptCount).toBe(2);
+    });
+
+    it('should retry getAccount in submitPayment and eventually succeed', async () => {
+      let accountAttempts = 0;
+      const timeoutError = new Error('Request timeout');
+      timeoutError.name = 'AbortError';
+
+      mockServer.getAccount = jest.fn()
+        .mockImplementationOnce(() => {
+          accountAttempts++;
+          return Promise.reject(timeoutError);
+        })
+        .mockImplementationOnce(() => {
+          accountAttempts++;
+          return Promise.resolve({
+            accountId: () => 'G-MOCK-PUBLIC-KEY',
+            sequenceNumber: () => '2',
+            incrementSequenceNumber: jest.fn(),
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.status).toBe('PENDING');
+      expect(accountAttempts).toBe(2);
+      expect(mockServer.sendTransaction).toHaveBeenCalledTimes(1);
     });
 
     it('should exhaust max retries and throw error', async () => {
@@ -555,6 +587,48 @@ describe('StellarSubmissionService', () => {
       // Should succeed
       expect(sendTransactionSpy).toHaveBeenCalledTimes(1);
     });
+
+    it('should return cached result for repeated idempotency key without resubmitting', async () => {
+      const sendTransactionSpy = jest.fn().mockResolvedValue({
+        hash: 'idempotent-hash',
+        status: 'PENDING',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      mockServer.sendTransaction = sendTransactionSpy;
+
+      const first = await service.submitPayment('G-DESTINATION', '10.0', undefined, 'idem-key-1');
+      const second = await service.submitPayment('G-DESTINATION', '10.0', undefined, 'idem-key-1');
+
+      expect(first).toBe(second);
+      expect(second.hash).toBe('idempotent-hash');
+      expect(sendTransactionSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should coalesce concurrent submissions with the same idempotency key', async () => {
+      let resolveSubmission: (value: any) => void = jest.fn();
+      const pendingSubmission = new Promise((resolve) => {
+        resolveSubmission = resolve;
+      });
+      const sendTransactionSpy = jest.fn().mockReturnValue(pendingSubmission);
+
+      mockServer.sendTransaction = sendTransactionSpy;
+
+      const first = service.submitPayment('G-DESTINATION', '10.0', undefined, 'idem-key-concurrent');
+      const second = service.submitPayment('G-DESTINATION', '10.0', undefined, 'idem-key-concurrent');
+
+      resolveSubmission({
+        hash: 'concurrent-hash',
+        status: 'PENDING',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      await expect(first).resolves.toEqual(expect.objectContaining({ hash: 'concurrent-hash' }));
+      await expect(second).resolves.toEqual(expect.objectContaining({ hash: 'concurrent-hash' }));
+      expect(sendTransactionSpy).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('getAccountWithRetry', () => {
@@ -735,7 +809,35 @@ describe('StellarSubmissionService', () => {
       );
     });
 
-    it('should handle TRY_AGAIN_LATER status from server', async () => {
+    it('should retry TRY_AGAIN_LATER status from server and eventually succeed', async () => {
+      let attemptCount = 0;
+      mockServer.sendTransaction = jest.fn()
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'rate-limited-hash',
+            status: 'TRY_AGAIN_LATER',
+            latestLedger: 12345,
+            latestLedgerCloseTime: 1234567890,
+          });
+        })
+        .mockImplementationOnce(() => {
+          attemptCount++;
+          return Promise.resolve({
+            hash: 'success-after-rate-limit',
+            status: 'PENDING',
+            latestLedger: 12346,
+            latestLedgerCloseTime: 1234567891,
+          });
+        });
+
+      const result = await service.submitPayment('G-DESTINATION', '10.0');
+
+      expect(result.hash).toBe('success-after-rate-limit');
+      expect(attemptCount).toBe(2);
+    });
+
+    it('should classify TRY_AGAIN_LATER as rate limited after retry budget is exhausted', async () => {
       mockServer.sendTransaction = jest.fn().mockResolvedValue({
         hash: 'rate-limited-hash',
         status: 'TRY_AGAIN_LATER',
@@ -744,8 +846,23 @@ describe('StellarSubmissionService', () => {
       });
 
       await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
-        'Transaction rate limited, try again later'
+        'Stellar network rate limit exceeded'
       );
+      expect(mockServer.sendTransaction).toHaveBeenCalledTimes(3);
+    });
+
+    it('should classify terminal Stellar submission statuses as transaction failures', async () => {
+      mockServer.sendTransaction = jest.fn().mockResolvedValue({
+        hash: 'failed-hash',
+        status: 'ERROR',
+        latestLedger: 12345,
+        latestLedgerCloseTime: 1234567890,
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
+        'Stellar transaction failed'
+      );
+      expect(mockServer.sendTransaction).toHaveBeenCalledTimes(1);
     });
 
     it('should handle Horizon result codes (tx_bad_seq)', async () => {
@@ -792,6 +909,75 @@ describe('StellarSubmissionService', () => {
 
       // op_underfunded is a protocol error, should not retry
       expect(attemptCount).toBe(1);
+    });
+  });
+
+  describe('Private Helper Branches', () => {
+    it('should classify unexpected transaction build failures without exposing raw messages', async () => {
+      (StellarSdk.TransactionBuilder as unknown as jest.Mock).mockImplementationOnce(() => {
+        throw new SyntaxError('raw parser secret');
+      });
+
+      await expect(service.submitPayment('G-DESTINATION', '10.0')).rejects.toThrow(
+        'Invalid response from Stellar network'
+      );
+    });
+
+    it('should map retryable Stellar failures to client-safe service unavailable errors', () => {
+      const createAppErrorFromFailure = (service as any).createAppErrorFromFailure.bind(service);
+      const timestamp = new Date().toISOString();
+
+      for (const failureClass of [
+        StellarRPCFailureClass.RATE_LIMIT,
+        StellarRPCFailureClass.UPSTREAM_ERROR,
+        StellarRPCFailureClass.NETWORK_ERROR,
+      ]) {
+        const result = createAppErrorFromFailure({
+          class: failureClass,
+          context: { operation: 'send_transaction' },
+          originalError: { message: 'UPSTREAM_MESSAGE_REDACTED' },
+          timestamp,
+          shouldRetry: true,
+        });
+
+        expect(result.code).toBe('SERVICE_UNAVAILABLE');
+        expect(result.message).not.toContain('secret');
+      }
+    });
+
+    it('should map bad sequence to a client-safe bad request', () => {
+      const createAppErrorFromFailure = (service as any).createAppErrorFromFailure.bind(service);
+      const result = createAppErrorFromFailure({
+        class: StellarRPCFailureClass.BAD_SEQUENCE,
+        context: { operation: 'send_transaction' },
+        originalError: { message: 'UPSTREAM_MESSAGE_REDACTED' },
+        timestamp: new Date().toISOString(),
+        shouldRetry: false,
+      });
+
+      expect(result.code).toBe('BAD_REQUEST');
+      expect(result.message).toBe('Stellar sequence number invalid');
+    });
+
+    it('should expose maximum retry fallback errors from account and submission helpers', async () => {
+      (service as any).maxRetries = 0;
+
+      await expect(
+        (service as any).getAccountWithRetry('G-MOCK-PUBLIC-KEY', { operation: 'get_account' })
+      ).rejects.toThrow('Failed to retrieve Stellar account after maximum retries');
+
+      await expect(
+        (service as any).sendTransactionWithRetry(mockTransaction, { operation: 'send_transaction' })
+      ).rejects.toThrow('Failed to submit Stellar transaction after maximum retries');
+    });
+
+    it('should use the real delay helper when not mocked', async () => {
+      (service as any).delay.mockRestore();
+
+      const pendingDelay = (service as any).delay(10);
+      jest.advanceTimersByTime(10);
+
+      await expect(pendingDelay).resolves.toBeUndefined();
     });
   });
 });

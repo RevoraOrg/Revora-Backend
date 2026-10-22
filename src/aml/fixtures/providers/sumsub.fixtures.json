@@ -1,0 +1,110 @@
+{
+  "provider": "sumsub",
+  "version": 1,
+  "recordedAt": "2026-01-15T12:00:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v3/applicants",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "body": {
+          "applicant": {
+            "applicantId": "[REDACTED_APPLICANTID_0000]",
+            "email": "__EMAIL__",
+            "phone": "__PHONE__",
+            "dateOfBirth": "[REDACTED_DATEOFBIRTH_0000]",
+            "countryOfResidence": "GB",
+            "firstName": "[REDACTED_FIRSTNAME_0000]",
+            "lastName": "[REDACTED_LASTNAME_0000]"
+          },
+          "emailVerification": "on"
+        },
+        "timestamp": "2026-01-15T12:00:00.000Z"
+      },
+      "response": {
+        "status": 201,
+        "headers": {},
+        "body": {
+          "id": "[REDACTED_ID_0000]",
+          "type": "applicant",
+          "email": "__EMAIL__",
+          "reviewStatus": "passed"
+        },
+        "timestamp": "2026-01-15T12:00:00.250Z"
+      },
+      "label": "applicant_created"
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v3/applicants/{applicantId}/identity",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "body": {
+          "applicantId": "[REDACTED_APPLICANTID_0000]",
+          "type": "identity",
+          "countryOfResidence": "GB",
+          "ipAddress": "__IP__",
+          "document": {
+            "type": "passport",
+            "issuingCountry": "GB",
+            "number": "[REDACTED_NUMBER_0000]",
+            "firstName": "[REDACTED_FIRSTNAME_0000]",
+            "lastName": "[REDACTED_LASTNAME_0000]",
+            "dateOfBirth": "[REDACTED_DATEOFBIRTH_0000]"
+          }
+        },
+        "timestamp": "2026-01-15T12:00:05.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "id": "[REDACTED_ID_0001]",
+          "type": "identity",
+          "reviewStatus": "passed"
+        },
+        "timestamp": "2026-01-15T12:00:05.400Z"
+      },
+      "label": "identity_verified"
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v3/applicants/{applicantId}/checks",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "body": {
+          "applicantId": "[REDACTED_APPLICANTID_0000]",
+          "type": "document_and_visual",
+          "options": { "documentCamera": "on" }
+        },
+        "timestamp": "2026-01-15T12:00:10.000Z"
+      },
+      "response": {
+        "status": 201,
+        "headers": {},
+        "body": {
+          "id": "[REDACTED_ID_0002]",
+          "status": "complete",
+          "result": "clear",
+          "applicantId": "[REDACTED_APPLICANTID_0000]"
+        },
+        "timestamp": "2026-01-15T12:00:12.100Z"
+      },
+      "label": "check_complete"
+    }
+  ],
+  "redaction": {
+    "totalRedactions": 4,
+    "placeholderCount": 18
+  }
+}

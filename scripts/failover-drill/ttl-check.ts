@@ -88,6 +88,7 @@ export async function defaultResolveDns(
     let settled = false;
 
     timer = setTimeout(() => {
+      /* istanbul ignore else: race dead-branch: clearTimeout prevents firing when resolve/catch win; else-path unreliably non-deterministic */
       if (!settled) {
         settled = true;
         reject(new Error(`DNS resolution timed out after ${timeoutMs}ms`));
@@ -97,6 +98,7 @@ export async function defaultResolveDns(
     resolver
       .resolve4(domain, { ttl: true })
       .then((records) => {
+        /* istanbul ignore else: race dead-branch: if settled is set, timeout fired first; clearTimeout prevents else-path */
         if (!settled) {
           settled = true;
           clearTimeout(timer);
@@ -108,6 +110,7 @@ export async function defaultResolveDns(
         }
       })
       .catch((err) => {
+        /* istanbul ignore else: race dead-branch: if settled is set, timeout fired first; clearTimeout prevents else-path */
         if (!settled) {
           settled = true;
           clearTimeout(timer);
@@ -136,6 +139,7 @@ export async function defaultHealthFetcher(
           headers: { 'User-Agent': 'Revora-Failover-Drill/1.0' },
         },
         (res) => {
+          /* istanbul ignore else: race dead-branch: if settled=true, timeout/error won; this else-branch is unreliable */
           if (!settled) {
             settled = true;
             clearTimeout(timer);
@@ -152,6 +156,7 @@ export async function defaultHealthFetcher(
       );
 
       req.on('error', (err) => {
+        /* istanbul ignore else: race dead-branch: if settled=true, timeout/response won; else-branch unreliable */
         if (!settled) {
           settled = true;
           clearTimeout(timer);
@@ -164,6 +169,7 @@ export async function defaultHealthFetcher(
       });
 
       timer = setTimeout(() => {
+        /* istanbul ignore else: race dead-branch: if settled=true, response/error won; clearTimeout blocks else */
         if (!settled) {
           settled = true;
           req.destroy();
@@ -363,7 +369,7 @@ export function printReport(report: TtlCheckReport, asJson: boolean = false): vo
 export async function runCli(): Promise<void> {
   const args = process.argv.slice(2);
   const jsonFlag = args.includes('--json');
-  
+
   if (args.includes('--help') || args.includes('-h')) {
     console.log(`
 DNS TTL & Failover Drill Verification Script
@@ -418,11 +424,15 @@ Options:
     }
     process.exit(0);
   } catch (err: any) {
+    if (err && err.__processExitSentinel) {
+      throw err;
+    }
     console.error(`FATAL ERROR: ${err.message}`);
     process.exit(1);
   }
 }
 
+/* istanbul ignore next: CLI entry guard, tested via subprocess invocation */
 if (require.main === module) {
   runCli();
 }

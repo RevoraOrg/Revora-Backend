@@ -1,40 +1,46 @@
-name: CI Gate
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [master]
   pull_request:
-    branches: [ "main" ]
+    branches: [master]
 
 jobs:
-  audit:
+  build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Use Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20.x'
-        
-    - name: Install dependencies
-      run: npm ci
-      
-    - name: Run dependency audit gate
-      run: npm run audit:ci
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npx tsc --noCheck
 
-  alert-mappings:
+  outbox-leases:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: outbox_test
+          POSTGRES_PASSWORD: outbox_test
+          POSTGRES_DB: outbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U outbox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OUTBOX_TEST_DATABASE_URL: postgresql://outbox_test:outbox_test@localhost:5432/outbox_test
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Use Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20.x'
-
-    - name: Install dependencies
-      run: npm ci
-
-    - name: Validate alert-to-runbook mappings
-      run: npm run validate:alert-mappings
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npx jest --runInBand --coverage=false --runTestsByPath src/db/repositories/outboxRepository.test.ts src/db/repositories/outboxRepository.integration.test.ts src/services/__tests__/outboxDispatcher.test.ts

@@ -17,6 +17,7 @@ import { NullKycProvider } from '../providers/NullKycProvider';
 import { KycProvider, KycApplicantInfo, KycCheckResult } from '../KycProvider';
 import { SecurityAuditRepository } from '../../../security/types';
 import { globalMetrics } from '../../../lib/metrics';
+import { AppError, ErrorCode } from '../../../lib/errors';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -578,6 +579,168 @@ describe('KycCircuit', () => {
       expect(circuit.getState()).toBe(CircuitState.OPEN);
       // Even without waiting, should stay OPEN because window hasn't elapsed
       expect(circuit['tryEnterHalfOpen']()).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Regression coverage for the failure/empty-result paths of
+  // getCachedDecision (kycCircuitBreaker.ts lines 271/274):
+  //   L271 — `if (!cached) return null;`  → cache-miss contract
+  //   L274 — stale entry → evict + return null
+  //
+  // These branches are the security boundary of the degraded-mode fallback:
+  // getCachedDecision returning non-null is what allows a cached decision to
+  // be served while the provider is failing.
+  // -----------------------------------------------------------------------
+
+  describe('getCachedDecision failure and boundary paths (#1103)', () => {
+    it('treats an uncached investor as a miss even when other entries exist', async () => {
+      const nullProvider = new NullKycProvider();
+      const circuit = new KycCircuit(nullProvider, auditRepo);
+
+      // Warm the cache for a different investor: the miss must be scoped to
+      // the exact cache key (investorId), not to the cache as a whole.
+      await circuit.initiateCheck('inv-cached', makeApplicant());
+      expect(circuit.getCacheSize()).toBe(1);
+
+      const provider = new AlwaysFailsProvider();
+      const circuit2 = new KycCircuit(provider, auditRepo, {
+        tripErrorCount: Number.MAX_SAFE_INTEGER, // never trips; isolates the miss path
+        halfOpenAfterMs: 60_000,
+      });
+      // 'inv-2' was never cached → L271 returns null → original error propagates
+      await expect(circuit2.initiateCheck('inv-2', makeApplicant())).rejects.toThrow('Provider is down');
+      expect(circuit2.getState()).toBe(CircuitState.CLOSED);
+    });
+
+    it('never serves a fallback derived from rejected decisions', async () => {
+      // Rejected decisions must never enter the cache (cacheDecision blacklist),
+      // so a failing provider can never mask its failure with a stale `rejected`
+      // result — the caller keeps seeing the real error.
+      const rejector = new AlwaysRejectsProvider();
+      const circuit = new KycCircuit(rejector, auditRepo, {
+        tripErrorCount: Number.MAX_SAFE_INTEGER,
+        halfOpenAfterMs: 60_000,
+      });
+      await circuit.initiateCheck('inv-1', makeApplicant());
+      expect(circuit.getCacheSize()).toBe(0);
+
+      await expect(circuit.initiateCheck('inv-1', makeApplicant())).resolves.toMatchObject({
+        status: 'rejected',
+      });
+    });
+
+    it('expires entries exactly at the TTL boundary (age == cacheTtlMs)', async () => {
+      const realDateNow = Date.now;
+      try {
+        const base = 1_700_000_000_000;
+        let now = base;
+        Date.now = () => now;
+
+        const flip = new FlipFlopProvider(0);
+        const circuit = new KycCircuit(flip, auditRepo, {
+          cacheTtlMs: 5_000,
+          tripErrorCount: Number.MAX_SAFE_INTEGER, // keep CLOSED: isolate the cache path
+          halfOpenAfterMs: 60_000,
+        });
+
+        // t=0: success caches the decision at `base`.
+        await circuit.initiateCheck('inv-1', makeApplicant());
+        expect(circuit.getCacheSize()).toBe(1);
+
+        // t=4_999: still fresh (age < TTL) → provider failure is masked by the
+        // cached decision.
+        now = base + 4_999;
+        flip.setFailCount(100);
+        await expect(circuit.initiateCheck('inv-1', makeApplicant())).resolves.toMatchObject({
+          status: 'approved',
+          referenceId: 'ref-flipflop',
+        });
+
+        // t=5_000: age == TTL → isCacheFresh is strict (< TTL) → the entry is
+        // invalid, deleted from the map, and L274 returns null → error propagates.
+        now = base + 5_000;
+        await expect(circuit.initiateCheck('inv-1', makeApplicant())).rejects.toThrow('FlipFlop failure');
+        expect(circuit.getCacheSize()).toBe(0);
+
+        // The stale entry was evicted, not just bypassed: a later lookup must
+        // not resurrect it.
+        now = base + 5_001;
+        await expect(circuit.initiateCheck('inv-1', makeApplicant())).rejects.toThrow('FlipFlop failure');
+        expect(circuit.getCacheSize()).toBe(0);
+      } finally {
+        Date.now = realDateNow;
+      }
+    });
+
+    it('propagates AppError with SERVICE_UNAVAILABLE when OPEN and cache is empty', async () => {
+      const failer = new AlwaysFailsProvider();
+      const circuit = new KycCircuit(failer, auditRepo, {
+        tripErrorCount: 1,
+        halfOpenAfterMs: 60_000,
+      });
+      await expect(circuit.initiateCheck('inv-1', makeApplicant())).rejects.toThrow(); // trips
+
+      // OPEN, no cache → serveCachedOrFail throws Errors.serviceUnavailable(...)
+      await expect(circuit.initiateCheck('inv-1', makeApplicant())).rejects.toMatchObject({
+        code: ErrorCode.SERVICE_UNAVAILABLE,
+        statusCode: 503,
+      });
+    });
+
+    it('propagates AppError with SERVICE_UNAVAILABLE when OPEN and the only entry is expired', async () => {
+      const flip = new FlipFlopProvider(0);
+      const circuit = new KycCircuit(flip, auditRepo, {
+        tripErrorCount: 1,
+        cacheTtlMs: 0, // expire immediately
+        halfOpenAfterMs: 60_000,
+      });
+      await circuit.initiateCheck('inv-1', makeApplicant()); // cached but already stale
+
+      flip.reset();
+      flip.setFailCount(100);
+      await expect(circuit.initiateCheck('inv-2', makeApplicant())).rejects.toThrow(); // trips OPEN
+
+      // Stale entry is evicted → miss → serviceUnavailable, not the stale result
+      await expect(circuit.initiateCheck('inv-1', makeApplicant())).rejects.toMatchObject({
+        code: ErrorCode.SERVICE_UNAVAILABLE,
+        statusCode: 503,
+      });
+      expect(circuit.getCacheSize()).toBe(0);
+    });
+
+    it('degrades to the cached decision (not the error) while CLOSED with a fresh cache', async () => {
+      const flip = new FlipFlopProvider(0);
+      const circuit = new KycCircuit(flip, auditRepo, {
+        tripErrorCount: Number.MAX_SAFE_INTEGER, // stay CLOSED: isolate getCachedDecision-on-failure
+        halfOpenAfterMs: 60_000,
+      });
+      await circuit.initiateCheck('inv-1', makeApplicant()); // fresh cache
+
+      flip.setFailCount(100);
+      // Failure while CLOSED with a fresh cache: the result contract is the
+      // cached decision, and no 503 may leak to the caller.
+      await expect(circuit.initiateCheck('inv-1', makeApplicant())).resolves.toMatchObject({
+        status: 'approved',
+        referenceId: 'ref-flipflop',
+      });
+    });
+
+    it('returns the cached decision verbatim (no re-fetch, no mutation) as fallback', async () => {
+      const flip = new FlipFlopProvider(0);
+      const circuit = new KycCircuit(flip, auditRepo, {
+        tripErrorCount: Number.MAX_SAFE_INTEGER,
+        halfOpenAfterMs: 60_000,
+      });
+      await circuit.initiateCheck('inv-1', makeApplicant());
+
+      flip.setFailCount(100);
+      const fallback = await circuit.initiateCheck('inv-1', makeApplicant());
+      expect(fallback).toEqual({
+        status: 'approved',
+        provider: 'flipflop',
+        referenceId: 'ref-flipflop',
+      });
     });
   });
 });

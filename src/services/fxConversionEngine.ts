@@ -20,6 +20,11 @@ export interface ExchangeRate {
   ttlMs: number;
 }
 
+export enum FxFallbackReason {
+  SUBSTITUTE_PROVIDER_USED = 'SUBSTITUTE_PROVIDER_USED',
+  STALE_RATE_TOLERATED = 'STALE_RATE_TOLERATED',
+}
+
 /**
  * @notice A single hop in a triangulation chain.
  * @dev    Per-hop records are attached to FxConversionResult.hops so auditors
@@ -81,6 +86,7 @@ const DEFAULT_MAX_HOPS = 2;
 export class FxConversionEngine {
   private readonly defaultBucketIncrement: Decimal;
   private readonly metrics?: MetricsCollector;
+  private readonly fallbackRateProvider?: RateProvider;
   /**
    * Maximum number of intermediate hops permitted in a triangulation chain.
    * A two-currency triangulation (A→B→C) has 2 hops.
@@ -94,6 +100,7 @@ export class FxConversionEngine {
     options?: {
       defaultBucketIncrement?: string;
       metrics?: MetricsCollector;
+      fallbackRateProvider?: RateProvider;
       /**
        * Maximum hops allowed in a triangulation chain (default: 2).
        * Must be a positive integer ≥ 1.
@@ -103,6 +110,7 @@ export class FxConversionEngine {
   ) {
     this.defaultBucketIncrement = new Decimal(options?.defaultBucketIncrement ?? '0.01');
     this.metrics = options?.metrics;
+    this.fallbackRateProvider = options?.fallbackRateProvider;
 
     const maxHops = options?.maxHops ?? DEFAULT_MAX_HOPS;
     if (!Number.isInteger(maxHops) || maxHops < 1) {
@@ -122,6 +130,7 @@ export class FxConversionEngine {
       allowStaleFallback?: boolean;
       auditUserId?: string;
       auditSessionId?: string;
+      frozenContext?: string;
     }
   ): Promise<FxConversionResult> {
     if (amount.isZero()) {
@@ -129,6 +138,27 @@ export class FxConversionEngine {
     }
     if (amount.isNegative()) {
       throw Errors.badRequest('Cannot convert negative amount', { from, to });
+    }
+    if (options?.frozenContext) {
+      const frozen = this.getFrozenRate(options.frozenContext);
+      if (frozen) {
+        const side = options?.side ?? 'mid';
+        const effectiveRate = this.resolveSide(frozen, side);
+        const rawOutput = amount.multiply(effectiveRate);
+        const bucketInc = options?.bucketIncrement ?? this.defaultBucketIncrement;
+        const outputAmount = this.roundToBucketIncrement(rawOutput, bucketInc);
+        const rounded = outputAmount.toString() !== rawOutput.toString();
+        return {
+          inputAmount: amount,
+          inputCurrency: from,
+          outputAmount,
+          outputCurrency: to,
+          rate: frozen,
+          path: { type: 'direct', description: `frozen:${options.frozenContext}` },
+          roundedToIncrement: rounded,
+          hops: [],
+        };
+      }
     }
     if (from === to) {
       return {
@@ -166,9 +196,10 @@ export class FxConversionEngine {
       );
     }
 
+    let activeRate: ExchangeRate = rate;
     const maxAge = options?.maxRateAgeMs ?? 300000;
     
-    let isStale = this.isRateStale(rate, maxAge);
+    let isStale = this.isRateStale(activeRate, maxAge);
     let fallbackUsed = false;
     let fallbackReason: FxFallbackReason | undefined;
     
@@ -182,7 +213,7 @@ export class FxConversionEngine {
         }
       }
       if (fRate && !this.isRateStale(fRate, maxAge)) {
-        rate = fRate;
+        activeRate = fRate;
         isStale = false;
         fallbackUsed = true;
         fallbackReason = FxFallbackReason.SUBSTITUTE_PROVIDER_USED;
@@ -194,15 +225,15 @@ export class FxConversionEngine {
       fallbackUsed = true;
       fallbackReason = FxFallbackReason.STALE_RATE_TOLERATED;
     } else if (isStale) {
-      this.metrics?.incrementCounter(METRIC_STALE_RATE_REJECTED, { pair: rate.pair });
+      this.metrics?.incrementCounter(METRIC_STALE_RATE_REJECTED, { pair: activeRate.pair });
       throw Errors.serviceUnavailable(
-        `Exchange rate for ${rate.pair} is stale (age: ${this.rateAgeMs(rate)}ms, max: ${maxAge}ms)`,
-        { pair: rate.pair, ageMs: this.rateAgeMs(rate), maxAgeMs: maxAge }
+        `Exchange rate for ${activeRate.pair} is stale (age: ${this.rateAgeMs(activeRate)}ms, max: ${maxAge}ms)`,
+        { pair: activeRate.pair, ageMs: this.rateAgeMs(activeRate), maxAgeMs: maxAge }
       );
     }
 
     const side = options?.side ?? 'mid';
-    const effectiveRate = this.resolveSide(rate, side);
+    const effectiveRate = this.resolveSide(activeRate, side);
     const rawOutput = amount.multiply(effectiveRate);
 
     const bucketInc = options?.bucketIncrement ?? this.defaultBucketIncrement;
@@ -220,7 +251,7 @@ export class FxConversionEngine {
       inputCurrency: from,
       outputAmount,
       outputCurrency: to,
-      rate,
+      rate: activeRate,
       path: { type: 'direct', description: `${from}/${to}` },
       roundedToIncrement: rounded,
       hops: [],
@@ -455,6 +486,10 @@ export class FxConversionEngine {
 
   getFrozenRate(context: string): ExchangeRate | null {
     return this.frozenRates.get(context) ?? null;
+  }
+
+  setFrozenRate(context: string, rate: ExchangeRate): void {
+    this.frozenRates.set(context, rate);
   }
 
   clearFrozenRate(context: string): void {

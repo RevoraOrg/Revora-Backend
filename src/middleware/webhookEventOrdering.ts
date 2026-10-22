@@ -49,7 +49,11 @@ export class EventOrderingTracker {
   
   // Track last processed sequence per entity
   private lastProcessedSequence: Map<string, number> = new Map();
-  
+
+  // Track the sequence most recently dispatched as 'process' but not yet
+  // marked processed, so concurrent duplicate arrivals are rejected.
+  private dispatchedSequence: Map<string, number> = new Map();
+
   // Buffer for out-of-order events
   private eventBuffer: Map<string, EventSequence[]> = new Map();
 
@@ -76,9 +80,11 @@ export class EventOrderingTracker {
     timestamp: Date
   ): EventOrderingDecision {
     const lastSequence = this.lastProcessedSequence.get(entityId) ?? -1;
+    const dispatchedSequence = this.dispatchedSequence.get(entityId);
 
-    // Check for duplicate event
-    if (sequence <= lastSequence) {
+    // Check for duplicate event (either already processed or already
+    // dispatched as 'process' but not yet marked processed)
+    if (sequence <= lastSequence || sequence === dispatchedSequence) {
       this.logger.warn('Duplicate or stale event detected', {
         entityId,
         eventId,
@@ -95,6 +101,10 @@ export class EventOrderingTracker {
 
     // Check if event is next in sequence
     if (sequence === lastSequence + 1) {
+      // Record the dispatched sequence so a concurrent duplicate arrival
+      // for the same sequence is rejected instead of processed twice.
+      this.dispatchedSequence.set(entityId, sequence);
+
       this.logger.debug('Event in correct sequence', {
         entityId,
         eventId,
@@ -175,7 +185,13 @@ export class EventOrderingTracker {
    */
   markProcessed(entityId: string, sequence: number): EventSequence[] {
     this.lastProcessedSequence.set(entityId, sequence);
-    
+
+    // Clear the dispatched marker once the sequence is marked processed
+    const dispatched = this.dispatchedSequence.get(entityId);
+    if (dispatched !== undefined && dispatched <= sequence) {
+      this.dispatchedSequence.delete(entityId);
+    }
+
     this.logger.debug('Event marked as processed', {
       entityId,
       sequence,

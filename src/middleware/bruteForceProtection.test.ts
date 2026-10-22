@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from "express";
+import { AppError } from "../lib/errors";
 import {
   createRateTierMiddleware,
   createStartupAuthBruteForceProtection,
@@ -104,7 +105,8 @@ describe("createStartupAuthBruteForceProtection", () => {
     // The last call should pass an error to next()
     const lastCallError = next.mock.calls[5][0];
     expect(lastCallError).toBeDefined();
-    expect(lastCallError.httpCode).toBe(429);
+    expect(lastCallError).toBeInstanceOf(AppError);
+    expect(lastCallError.statusCode).toBe(429);
   });
 
   it("uses custom tier when provided", () => {
@@ -248,7 +250,8 @@ describe("createRateTierMiddleware", () => {
     expect(next).toHaveBeenCalledTimes(101); // 100 allowed + 1 error
     const lastCallError = next.mock.calls[100][0];
     expect(lastCallError).toBeDefined();
-    expect(lastCallError.httpCode).toBe(429);
+    expect(lastCallError).toBeInstanceOf(AppError);
+    expect(lastCallError.statusCode).toBe(429);
   });
 
   it("uses user ID when authenticated", () => {

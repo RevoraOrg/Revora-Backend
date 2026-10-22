@@ -33,6 +33,9 @@ router.post('/dispose', taxationHandler.processDisposal);
 // Preview a disposal without committing
 router.post('/preview', taxationHandler.previewDisposal);
 
+// Detect wash-sale conditions and record adjustments
+router.post('/wash-sale-detection', taxationHandler.detectWashSales);
+
 // Get per-jurisdiction gains summary
 router.get('/gains-summary', taxationHandler.getGainsSummary);
 

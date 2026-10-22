@@ -11,6 +11,42 @@ singleton and are emitted on demand.
 
 ---
 
+## Scheduled Execution
+
+Reconciliation ticks run on a fixed cadence in-process via
+`createReconciliationSchedulerRuntime()` (in `src/index.ts`), so drift and
+dead-letter alarms are produced continuously without an operator-triggered
+reconcile call. The scheduler shares the same `globalMetrics` collector that
+backs the endpoint below, so the emitted `reconciliation_*` series are always
+visible.
+
+### Cadence
+
+- The interval is read from `RECONCILIATION_INTERVAL_MS` (milliseconds),
+  falling back to `DEFAULT_RECONCILIATION_INTERVAL_MS` (30 minutes).
+- A tick starts immediately on bootstrap, then on the interval.
+- **Concurrency safety:** a new tick is never started while a previous tick is
+  still in flight (overlapping ticks are skipped), so an offering can never be
+  double-reconciled.
+- **Failure isolation:** a tick that throws is caught and logged — it never
+  crashes the process. The dead-letter alarm stays open until a subsequent
+  balanced run clears it.
+
+### Worker-role gating
+
+The scheduler is launched only for roles that claim the `reconciliation`
+capability (default: `batch` and `all` via the `ROLE_MATRIX`). The hot-path
+`api` role does not run it. Set `ROLE` at boot to select the deployment shape.
+
+### Run-summary persistence
+
+Each completed run is persisted to the `reconciliation_run_summaries` table via
+`PostgresReconciliationRunStore` (parameterised `INSERT ... ON CONFLICT DO
+NOTHING`, keyed by `(offering_id, period_id, started_at)`). Subsequent ticks
+read the latest run to compute drift windows without re-deriving history.
+
+---
+
 ## Endpoint
 
 ```

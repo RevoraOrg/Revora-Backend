@@ -32,6 +32,7 @@ export const KNOWN_ALERTS: AlertEntry[] = [
   { name: 'migration_rolled_back', source: 'src/db/migrations/safety/monitoring.ts' },
   { name: 'email_alarm_alignment_failure', source: 'src/services/emailDeliverabilityService.ts' },
   { name: 'email_alarm_high_bounce_ratio', source: 'src/services/emailDeliverabilityService.ts' },
+  { name: 'CertPinningMismatch', source: 'docs/runbooks/mobile-cert-pinning.md' },
 ];
 
 export interface AlertEntry {

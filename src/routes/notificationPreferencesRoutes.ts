@@ -47,7 +47,7 @@ export const createNotificationPreferencesRouter = (dependencies: {
       const preferences = await notificationPreferencesService.getPreferences(userId);
       res.status(200).json(preferences);
     } catch (error) {
-      logger.error(`Failed to export notification preferences for user ${userId}:`, error);
+      logger.error(`Failed to export notification preferences for user ${userId}:`, { error });
       next(error);
     }
   });
@@ -74,7 +74,7 @@ export const createNotificationPreferencesRouter = (dependencies: {
       const updatedPreferences = await notificationPreferencesService.updatePreferences(userId, input);
       res.status(200).json(updatedPreferences);
     } catch (error) {
-      logger.error(`Failed to update notification preferences for user ${userId}:`, error, { input });
+      logger.error(`Failed to update notification preferences for user ${userId}:`, { error, input });
       next(error);
     }
   });
@@ -93,7 +93,7 @@ export const createNotificationPreferencesRouter = (dependencies: {
       await notificationPreferencesService.deletePreferences(userId);
       res.status(204).send();
     } catch (error) {
-      logger.error(`Failed to delete notification preferences for user ${userId}:`, error);
+      logger.error(`Failed to delete notification preferences for user ${userId}:`, { error });
       next(error);
     }
   });

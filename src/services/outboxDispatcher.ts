@@ -1,19 +1,27 @@
 /**
- * OutboxDispatcher — drains webhook_outbox rows and delivers them to subscribers.
- * See architecture map for how the outbox participates in the producer transaction.
- *
- * @see ../../docs/architecture/distribution-reconciliation.md
- * @see ../docs/transactional-outbox.md
- * @see ../docs/webhook-queue-backpressure.md
- * @see ../docs/webhook-dead-letters.md
+ * @fileoverview Dispatches pending events from the transactional outbox to configured webhooks.
+ * 
+ * @remarks
+ * Ensures at-least-once delivery semantics for subsystem hand-offs (e.g., Distribution -> Reconciliation).
+ * For the complete sequence diagrams mapping outbox integration,
+ * @see {@link file://../../docs/architecture/distribution-reconciliation.md | Distribution & Reconciliation Architecture}
+ * 
+ * Related Component Documentation:
+ * @see {@link file://../../docs/transactional-outbox.md | Transactional Outbox}
+ * @see {@link file://../../docs/webhook-queue-backpressure.md | Webhook Queue Backpressure}
+ * @see {@link file://../../docs/webhook-dead-letters.md | Webhook Dead Letters}
  */
 import { OutboxRepository, OutboxRow } from '../db/repositories/outboxRepository';
 import { WebhookEventType } from './webhookService';
 import { PressureGauge, PressureTier, PressureGaugeConfig, PressureStateChangeCallback, PressureState } from '../lib/pressureGauge';
 import { MetricsCollector } from '../lib/metrics';
+import { OutboxHmacRotationService } from './outboxHmacRotationService';
+import { signOutboundPayload } from '../lib/webhookSignature';
 
 // Re-export for convenient access
-export { PressureTier, PressureGaugeConfig, PressureStateChangeCallback } from '../lib/pressureGauge';
+export { PressureTier } from '../lib/pressureGauge';
+export type { PressureGaugeConfig, PressureStateChangeCallback } from '../lib/pressureGauge';
+export { OutboxHmacRotationService } from './outboxHmacRotationService';
 
 /**
  * Callback type that the dispatcher uses to hand a row to the delivery layer.
@@ -25,6 +33,8 @@ export type DispatchFn = (row: OutboxRow) => Promise<boolean>;
 export interface OutboxDispatcherOptions {
   /** How many rows to claim per poll cycle. Default: 50. */
   batchSize?: number;
+  /** Lease duration for the entire sequential batch in milliseconds. Default: 60000. */
+  leaseMs?: number;
   /** Milliseconds between poll cycles. Default: 5000. */
   intervalMs?: number;
   /** Max retry attempts before a row is marked failed. Default: 5. */
@@ -42,8 +52,8 @@ export interface OutboxDispatcherOptions {
  * to the provided `dispatch` function (typically WebhookQueue.processDelivery).
  *
  * Guarantees:
- * - A row is only claimed by one worker at a time (SKIP LOCKED in OutboxRepository).
- * - A crash mid-dispatch leaves the row pending; the next poll retries it with
+ * - An atomic lease gives each row one owner until expiry; stale completions are fenced.
+ * - A crash mid-dispatch leaves the row leased; a poll after expiry retries it with
  *   the same event_id, so the receiver can deduplicate via webhookEventOrdering.
  * - After maxAttempts failures the row is marked 'failed' (dead-letter).
  *
@@ -54,6 +64,7 @@ export interface OutboxDispatcherOptions {
  */
 export class OutboxDispatcher {
   private readonly batchSize: number;
+  private readonly leaseMs: number;
   private readonly intervalMs: number;
   private readonly maxAttempts: number;
   private readonly retryBaseMs: number;
@@ -68,6 +79,7 @@ export class OutboxDispatcher {
     options: OutboxDispatcherOptions = {}
   ) {
     this.batchSize = options.batchSize ?? 50;
+    this.leaseMs = options.leaseMs ?? 60_000;
     this.intervalMs = options.intervalMs ?? 5000;
     this.maxAttempts = options.maxAttempts ?? 5;
     this.retryBaseMs = options.retryBaseMs ?? 1000;
@@ -138,7 +150,7 @@ export class OutboxDispatcher {
     // Measure lag before draining
     await this.measureAndUpdateLag();
 
-    const rows = await this.outboxRepo.drainPending(this.batchSize);
+    const rows = await this.outboxRepo.drainPending(this.batchSize, this.leaseMs);
     for (const row of rows) {
       await this.processRow(row);
     }
@@ -230,19 +242,19 @@ export class OutboxDispatcher {
     }
 
     if (success) {
-      await this.outboxRepo.markDispatched(row.id);
+      await this.outboxRepo.markDispatched(row.id, row.lease_token);
       return;
     }
 
     const nextAttempts = row.attempts + 1;
     if (nextAttempts >= this.maxAttempts) {
       // Exhausted retries – mark failed (dead-letter)
-      await this.outboxRepo.markFailed(row.id);
+      await this.outboxRepo.markFailed(row.id, row.lease_token);
     } else {
       // Exponential back-off: retryBaseMs * 2^attempt
       const delayMs = this.retryBaseMs * Math.pow(2, nextAttempts - 1);
       const retryAfter = new Date(Date.now() + delayMs);
-      await this.outboxRepo.markFailed(row.id, retryAfter);
+      await this.outboxRepo.markFailed(row.id, row.lease_token, retryAfter);
     }
   }
 }
@@ -253,10 +265,22 @@ export class OutboxDispatcher {
  * The event_id from the outbox row is forwarded as the webhook payload `id` so
  * the receiver's webhookEventOrdering middleware sees the same UUID on every
  * retry and can deduplicate.
+ *
+ * When a `rotationService` is provided, outbound signatures are produced using
+ * `signOutboundPayload()` with the current secret from the rotation service.
+ * The caller is responsible for ensuring `rotationService.start()` has been
+ * called before dispatching rows.
+ *
+ * @param processDelivery  Function that delivers a payload to a single URL.
+ * @param listActiveByEvent  Function that returns active endpoints for an event.
+ * @param rotationService  Optional rotation service for HMAC signing.
+ *   When omitted, the signing secret must be supplied per-endpoint by the
+ *   `processDelivery` implementation (legacy path — kept for backward compat).
  */
 export function makeWebhookDispatchFn(
   processDelivery: (url: string, payload: unknown, deliveryId?: string) => Promise<boolean>,
-  listActiveByEvent: (event: string) => Promise<Array<{ url: string }>>
+  listActiveByEvent: (event: string) => Promise<Array<{ url: string }>>,
+  rotationService?: OutboxHmacRotationService,
 ): DispatchFn {
   return async (row: OutboxRow): Promise<boolean> => {
     const endpoints = await listActiveByEvent(row.event_type);
@@ -272,8 +296,44 @@ export function makeWebhookDispatchFn(
       timestamp: row.created_at.toISOString(),
     };
 
+    // If a rotation service is available, annotate the payload with the current
+    // signing context so that processDelivery can produce a properly-signed
+    // delivery.  The body is pre-serialised here to ensure the signature covers
+    // exactly the bytes that will be sent.
+    if (rotationService) {
+      const body = JSON.stringify(webhookPayload);
+      const timestamp = Date.now().toString();
+      const signingConfig = rotationService.getDualKeyConfig();
+      const signingResult = signOutboundPayload(
+        {
+          currentSecret: signingConfig.secret,
+          previousSecret: signingConfig.nextSecret,
+          overlapExpiresAtMs: signingConfig.nextSecretExpiry,
+        },
+        body,
+        timestamp,
+      );
+
+      // Attach signing metadata so processDelivery can use pre-computed values
+      const enrichedPayload = {
+        ...webhookPayload,
+        __signing: {
+          signature: signingResult.signature,
+          timestamp,
+          overlapWindowActive: signingResult.overlapWindowActive,
+          overlapExpiresAtMs: signingResult.overlapExpiresAtMs,
+        },
+      };
+
+      const results = await Promise.all(
+        endpoints.map((ep) => processDelivery(ep.url, enrichedPayload)),
+      );
+      return results.every(Boolean);
+    }
+
+    // Legacy path — no rotation service; processDelivery handles signing
     const results = await Promise.all(
-      endpoints.map((ep) => processDelivery(ep.url, webhookPayload))
+      endpoints.map((ep) => processDelivery(ep.url, webhookPayload)),
     );
     return results.every(Boolean);
   };

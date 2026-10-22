@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import crypto from 'crypto';
 
 export interface Session {
@@ -39,7 +39,7 @@ export interface CreateWebSessionInput {
 export class SessionRepository {
   constructor(private db: Pool) {}
 
-  async createSession(input: CreateSessionInput, client?: Pool): Promise<Session> {
+  async createSession(input: CreateSessionInput, client?: Pool | PoolClient): Promise<Session> {
     const db = client || this.db;
     // allow explicit session id (for upstream session id generation) or default DB uuid.
     if (input.id) {
@@ -82,7 +82,7 @@ export class SessionRepository {
     );
   }
 
-  async setSessionConsumed(sessionId: string, client?: Pool): Promise<void> {
+  async setSessionConsumed(sessionId: string, client?: Pool | PoolClient): Promise<void> {
     const db = client || this.db;
     await db.query(`UPDATE sessions SET token_consumed_at = NOW() WHERE id = $1`, [sessionId]);
   }
@@ -116,20 +116,20 @@ export class SessionRepository {
     return session.id;
   }
 
-  async findById(id: string, client?: Pool): Promise<Session | null> {
+  async findById(id: string, client?: Pool | PoolClient): Promise<Session | null> {
     const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1`;
     const result: QueryResult<Session> = await db.query(query, [id]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
-  async findByIdForUpdate(id: string, client: Pool): Promise<Session | null> {
+  async findByIdForUpdate(id: string, client: Pool | PoolClient): Promise<Session | null> {
     const query = `SELECT * FROM sessions WHERE id = $1 LIMIT 1 FOR UPDATE`;
     const result: QueryResult<Session> = await client.query(query, [id]);
     return result.rows.length > 0 ? this.mapSession(result.rows[0]) : null;
   }
 
-  async findByParentId(parentId: string, client?: Pool): Promise<Session | null> {
+  async findByParentId(parentId: string, client?: Pool | PoolClient): Promise<Session | null> {
     const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE parent_id = $1 LIMIT 1`;
     const result: QueryResult<Session> = await db.query(query, [parentId]);
@@ -139,7 +139,7 @@ export class SessionRepository {
   /**
    * Revoke a session and all its descendants.
    */
-  async revokeSessionAndDescendants(sessionId: string, client?: Pool): Promise<void> {
+  async revokeSessionAndDescendants(sessionId: string, client?: Pool | PoolClient): Promise<void> {
     const db = client || this.db;
     const query = `
       WITH RECURSIVE descendants AS (
@@ -167,7 +167,7 @@ export class SessionRepository {
   /**
    * Delete all sessions belonging to a user (e.g. on password change).
    */
-  async deleteAllSessionsByUserId(userId: string, client?: Pool): Promise<void> {
+  async deleteAllSessionsByUserId(userId: string, client?: Pool | PoolClient): Promise<void> {
     const db = client || this.db;
     await db.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
   }
@@ -182,7 +182,7 @@ export class SessionRepository {
    * Create a browser session row carrying an authorization `role`.
    * The caller is responsible for hashing the token before it reaches here.
    */
-  async createWebSession(input: CreateWebSessionInput, client?: Pool): Promise<Session> {
+  async createWebSession(input: CreateWebSessionInput, client?: Pool | PoolClient): Promise<Session> {
     const db = client || this.db;
     const query = `
       INSERT INTO sessions (id, user_id, role, token_hash, expires_at, created_at)
@@ -206,7 +206,7 @@ export class SessionRepository {
    * constant-time hash comparison and the expiry/revocation checks so those
    * decisions live in one auditable place.
    */
-  async findByTokenHash(tokenHash: string, client?: Pool): Promise<Session | null> {
+  async findByTokenHash(tokenHash: string, client?: Pool | PoolClient): Promise<Session | null> {
     const db = client || this.db;
     const query = `SELECT * FROM sessions WHERE token_hash = $1 LIMIT 1`;
     const result: QueryResult<Session> = await db.query(query, [tokenHash]);
@@ -214,13 +214,13 @@ export class SessionRepository {
   }
 
   /** Delete a single session by its token hash (used for logout). Idempotent. */
-  async deleteByTokenHash(tokenHash: string, client?: Pool): Promise<void> {
+  async deleteByTokenHash(tokenHash: string, client?: Pool | PoolClient): Promise<void> {
     const db = client || this.db;
     await db.query(`DELETE FROM sessions WHERE token_hash = $1`, [tokenHash]);
   }
 
   /** Extend a session's expiry (sliding window) by token hash. */
-  async touchExpiryByTokenHash(tokenHash: string, expiresAt: Date, client?: Pool): Promise<void> {
+  async touchExpiryByTokenHash(tokenHash: string, expiresAt: Date, client?: Pool | PoolClient): Promise<void> {
     const db = client || this.db;
     await db.query(
       `UPDATE sessions SET expires_at = $1 WHERE token_hash = $2`,
@@ -232,14 +232,14 @@ export class SessionRepository {
    * Delete all sessions whose expiry has passed. Returns the number removed.
    * Backs the periodic cleanupExpired job.
    */
-  async deleteExpired(client?: Pool): Promise<number> {
+  async deleteExpired(client?: Pool | PoolClient): Promise<number> {
     const db = client || this.db;
     const result = await db.query(`DELETE FROM sessions WHERE expires_at <= NOW()`);
     return result.rowCount ?? 0;
   }
 
   /** Count sessions that are neither expired nor revoked. */
-  async countActive(client?: Pool): Promise<number> {
+  async countActive(client?: Pool | PoolClient): Promise<number> {
     const db = client || this.db;
     const result = await db.query(
       `SELECT COUNT(*)::int AS count FROM sessions
@@ -252,7 +252,7 @@ export class SessionRepository {
    * Get the date of the oldest expired or revoked session.
    * Useful for calculating retention lag before compaction.
    */
-  async getOldestCompactedSessionDate(cutoffDate: Date, client?: Pool): Promise<Date | null> {
+  async getOldestCompactedSessionDate(cutoffDate: Date, client?: Pool | PoolClient): Promise<Date | null> {
     const db = client || this.db;
     const query = `
       SELECT MIN(LEAST(COALESCE(expires_at, 'infinity'::timestamp), COALESCE(revoked_at, 'infinity'::timestamp))) AS oldest
@@ -269,7 +269,7 @@ export class SessionRepository {
    * 
    * Returns the number of rows deleted in this batch.
    */
-  async purgeOlderThan(cutoffDate: Date, batchSize: number, client?: Pool): Promise<number> {
+  async purgeOlderThan(cutoffDate: Date, batchSize: number, client?: Pool | PoolClient): Promise<number> {
     const db = client || this.db;
     const query = `
       DELETE FROM sessions 

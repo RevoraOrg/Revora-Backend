@@ -960,6 +960,99 @@ describe('DatabaseBackupService – createBackup', () => {
     const rp = await backupService.createBackup('mig-3', 'differential');
     expect(rp.backupType).toBe('differential');
   });
+
+  it('generates the expected empty-table backups for each supported strategy', async () => {
+    const generateBackupSql = (backupType: string) =>
+      (backupService as any).generateBackupSql(backupType, []);
+
+    await expect(generateBackupSql('full')).resolves.toBe('');
+    await expect(generateBackupSql('incremental')).resolves.toContain(
+      '-- Incremental backup'
+    );
+    await expect(generateBackupSql('differential')).resolves.toContain(
+      '-- Differential backup'
+    );
+  });
+
+  it('surfaces an unsupported backup strategy through the createBackup error contract', async () => {
+    await expect(
+      backupService.createBackup('mig-invalid', 'snapshot' as any)
+    ).rejects.toMatchObject({
+      message: 'Backup creation failed: Unsupported backup type: snapshot',
+      details: expect.objectContaining({
+        migrationId: 'mig-invalid',
+        backupType: 'snapshot',
+      }),
+    });
+    expect(repo.getAllRecoveryPoints()).toHaveLength(0);
+  });
+});
+
+describe('MigrationRollbackService – rollback step validation', () => {
+  let rollbackService: MigrationRollbackService;
+  let client: any;
+
+  beforeEach(() => {
+    const rollbackRepo = new InMemoryMigrationRollbackRepository();
+    const auditLogger = new MigrationAuditLogger(
+      new InMemoryMigrationAuditRepository()
+    );
+    const mockPool = makeMockPool();
+    client = mockPool.client;
+    rollbackService = new MigrationRollbackService(
+      mockPool.pool,
+      new DatabaseBackupService(mockPool.pool, rollbackRepo),
+      auditLogger
+    );
+  });
+
+  it('accepts a dropped table when the table no longer exists', async () => {
+    client.query.mockResolvedValueOnce({ rows: [{ exists: false }] });
+
+    await expect(
+      (rollbackService as any).validateRollbackStep({
+        type: 'drop',
+        sql: 'DROP TABLE IF EXISTS accounts;',
+        validations: ['table_exists'],
+      }, client)
+    ).resolves.toBeUndefined();
+  });
+
+  it('rejects a dropped table that still exists after rollback', async () => {
+    client.query.mockResolvedValueOnce({ rows: [{ exists: true }] });
+
+    await expect(
+      (rollbackService as any).validateRollbackStep({
+        type: 'drop',
+        sql: 'DROP TABLE IF EXISTS accounts;',
+        validations: ['table_exists'],
+      }, client)
+    ).rejects.toThrow('Table accounts still exists after rollback');
+  });
+
+  it('accepts a dropped index when the index no longer exists', async () => {
+    client.query.mockResolvedValueOnce({ rows: [{ exists: false }] });
+
+    await expect(
+      (rollbackService as any).validateRollbackStep({
+        type: 'drop',
+        sql: 'DROP INDEX IF EXISTS accounts_email_idx;',
+        validations: ['index_exists'],
+      }, client)
+    ).resolves.toBeUndefined();
+  });
+
+  it('rejects a dropped index that still exists after rollback', async () => {
+    client.query.mockResolvedValueOnce({ rows: [{ exists: true }] });
+
+    await expect(
+      (rollbackService as any).validateRollbackStep({
+        type: 'drop',
+        sql: 'DROP INDEX IF EXISTS accounts_email_idx;',
+        validations: ['index_exists'],
+      }, client)
+    ).rejects.toThrow('Index accounts_email_idx still exists after rollback');
+  });
 });
 
 // ─── MigrationRollbackService – emergency rollback ───────────────────────────

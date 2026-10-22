@@ -217,6 +217,32 @@ export class PdfRenderJobRepository {
     );
   }
 
+  /**
+   * Find the completed statement artifact for an investor + period.
+   *
+   * This is the persisted `(statement_id, sha256, generated_at)` triple the
+   * fetch endpoint re-verifies before serving: the job `id` is the statement
+   * id, `checksum` is the sha256 over the PDF bytes, and `updated_at` records
+   * when the render was checkpointed. Only `completed` rows are returned so a
+   * pending/failed/dead-lettered render can never be served as canonical.
+   */
+  async findCompletedByInvestorAndPeriod(
+    investorId: string,
+    periodId: string,
+  ): Promise<PdfRenderJobRow | null> {
+    const result: QueryResult<PdfRenderJobRow> = await this.db.query(
+      `SELECT *
+       FROM pdf_render_jobs
+       WHERE investor_id = $1
+         AND period_id = $2
+         AND status = 'completed'
+       ORDER BY updated_at DESC, created_at DESC
+       LIMIT 1`,
+      [investorId, periodId],
+    );
+    return result.rows[0] ? this.mapJob(result.rows[0]) : null;
+  }
+
   async getBatch(batchId: string): Promise<PdfRenderBatchRow | null> {
     const result: QueryResult<PdfRenderBatchRow> = await this.db.query(
       `SELECT * FROM pdf_render_batches WHERE id = $1`,

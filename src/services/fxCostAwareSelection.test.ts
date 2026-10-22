@@ -9,6 +9,9 @@
  *  - Spend recording on successful and null rate retrieval
  *  - Metric emission (fx.provider.spend_month gauge, degraded counter)
  *  - Security / abuse edge cases (negative spend, misconfiguration)
+ *  - METRIC_SPEND_MONTH failure / empty-result regression coverage (#1094):
+ *    a listTenantSpend rejection or an empty spend list must neither throw nor
+ *    emit the gauge, while a present record must surface its exact spendUsd.
  */
 
 import {
@@ -573,6 +576,120 @@ describe('CostAwareRateSelector', () => {
       const { selector } = makeSelector(store, registry); // no metrics
       // Should not throw
       await expect(selector.emitSpendGauges(TENANT, MONTH)).resolves.toBeUndefined();
+    });
+
+    // ── METRIC_SPEND_MONTH failure / empty-result regression (#1094) ─────────
+    //
+    // The spend-month gauge is emitted inside selectRate() from
+    // registry.listTenantSpend(tenantId, month):
+    //   - rejection  → caught, gauge not emitted, selection still resolves
+    //   - empty list / provider absent → spendUsd defaults to 0 (?? 0 branch)
+    // These tests pin that contract so it cannot change silently.
+
+    it('selectRate does not throw when listTenantSpend rejects (gauge emission failure is swallowed)', async () => {
+      const failingSpendStore: SpendStore = {
+        increment: jest.fn().mockResolvedValue(undefined),
+        get: jest.fn().mockResolvedValue(0),
+        listByTenant: jest.fn().mockRejectedValue(new Error('spend list unavailable')),
+      };
+      const failingRegistry = new FxProviderBudgetRegistry(failingSpendStore);
+      failingRegistry.configureProvider(TENANT, { providerId: 'bloomberg', monthlyCapUsd: 10, degradationThreshold: 0.8 });
+
+      const expensiveProvider = makeRateProvider('USD/EUR', '0.92');
+      const freeProvider = makeRateProvider('USD/EUR', '0.90');
+      const selector = new CostAwareRateSelector(
+        [
+          { providerId: 'bloomberg', provider: expensiveProvider, costUsdPerCall: 0.05, accuracyRank: 100 },
+          { providerId: 'ecb', provider: freeProvider, costUsdPerCall: 0, accuracyRank: 50 },
+        ],
+        failingRegistry,
+        { metrics }
+      );
+
+      const result = await selector.selectRate(TENANT, 'USD', 'EUR', MONTH);
+
+      // Selection result contract is unchanged despite the metric failure
+      expect(result.providerId).toBe('bloomberg');
+      expect(result.rate).not.toBeNull();
+      expect(result.degraded).toBe(false);
+      expect(result.exhaustedSkipCount).toBe(0);
+      expect(result.nearLimitSkipCount).toBe(0);
+
+      // listTenantSpend was consulted for the gauge, then its rejection was swallowed
+      expect(failingSpendStore.listByTenant).toHaveBeenCalledWith(TENANT, MONTH);
+
+      // The selection/degraded counters still emit; the spend gauge does not
+      const prom = metrics.exportPrometheus();
+      expect(prom).toContain(METRIC_SELECTION_TOTAL);
+      expect(prom).not.toContain(METRIC_SPEND_MONTH);
+      expect(prom).not.toContain(METRIC_DEGRADED_TOTAL);
+    });
+
+    it('selectRate emits spend gauge 0 when listTenantSpend returns no records (empty result)', async () => {
+      // Free provider only: no spend record is ever written (recordSpend is
+      // skipped for costUsdPerCall === 0), so listTenantSpend resolves [] and
+      // the gauge value falls back to the `?? 0` branch deterministically.
+      const freeProvider = makeRateProvider('USD/EUR', '0.90');
+      const selector = new CostAwareRateSelector(
+        [{ providerId: 'ecb', provider: freeProvider, costUsdPerCall: 0, accuracyRank: 1 }],
+        registry,
+        { metrics }
+      );
+
+      const result = await selector.selectRate(TENANT, 'USD', 'EUR', MONTH);
+
+      expect(result.providerId).toBe('ecb');
+      expect(result.rate).not.toBeNull();
+      expect(await registry.listTenantSpend(TENANT, MONTH)).toHaveLength(0);
+
+      const prom = metrics.exportPrometheus();
+      expect(prom).toContain(METRIC_SPEND_MONTH);
+      expect(prom).toContain(`fx_provider_spend_month{provider_id="ecb"} 0`);
+    });
+
+    it('selectRate emits the recorded spendUsd of the selected paid provider (normal path)', async () => {
+      // 0.25 is exactly representable in binary floating point, so the gauge
+      // value assertion is deterministic.
+      const paidProvider = makeRateProvider('USD/EUR', '0.92');
+      const freeProvider = makeRateProvider('USD/EUR', '0.90');
+      const selector = new CostAwareRateSelector(
+        [
+          { providerId: 'bloomberg', provider: paidProvider, costUsdPerCall: 0.25, accuracyRank: 100 },
+          { providerId: 'ecb', provider: freeProvider, costUsdPerCall: 0, accuracyRank: 50 },
+        ],
+        registry,
+        { metrics }
+      );
+
+      const result = await selector.selectRate(TENANT, 'USD', 'EUR', MONTH);
+
+      expect(result.providerId).toBe('bloomberg');
+      expect(result.rate).not.toBeNull();
+      expect(await store.get(TENANT, 'bloomberg', MONTH)).toBe(0.25);
+
+      const prom = metrics.exportPrometheus();
+      expect(prom).toContain(`fx_provider_spend_month{provider_id="bloomberg"} 0.25`);
+    });
+
+    it('emitSpendGauges propagates listTenantSpend rejection and emits no gauge', async () => {
+      const failingSpendStore: SpendStore = {
+        increment: jest.fn().mockResolvedValue(undefined),
+        get: jest.fn().mockResolvedValue(0),
+        listByTenant: jest.fn().mockRejectedValue(new Error('spend list unavailable')),
+      };
+      const failingRegistry = new FxProviderBudgetRegistry(failingSpendStore);
+      const selector = new CostAwareRateSelector(
+        [{ providerId: 'ecb', provider: makeRateProvider('USD/EUR', '0.90'), costUsdPerCall: 0, accuracyRank: 1 }],
+        failingRegistry,
+        { metrics }
+      );
+
+      // Unlike selectRate, emitSpendGauges has no try/catch: the rejection is
+      // part of its error contract and must stay observable.
+      await expect(selector.emitSpendGauges(TENANT, MONTH)).rejects.toThrow('spend list unavailable');
+
+      const prom = metrics.exportPrometheus();
+      expect(prom).not.toContain(METRIC_SPEND_MONTH);
     });
   });
 

@@ -40,6 +40,7 @@ export interface Payout {
   amount: string;
   status: 'pending' | 'processed' | 'failed';
   tx_hash?: string | null; // From migration (replaces transaction_hash)
+  frozen_fx_rate_id?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -65,6 +66,7 @@ export interface CreatePayoutInput {
   amount: string;
   status?: 'pending' | 'processed' | 'failed';
   tx_hash?: string | null;
+  frozen_fx_rate_id?: string | null;
 }
 
 /**
@@ -91,10 +93,11 @@ export class DistributionRepository {
         total_amount,
         run_at,
         status,
+        frozen_fx_rate_id,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
 
@@ -106,6 +109,7 @@ export class DistributionRepository {
       input.total_amount,
       runAt,
       status,
+      input.frozen_fx_rate_id || null,
     ];
 
     const queryable = client || this.db;
@@ -135,10 +139,11 @@ export class DistributionRepository {
         amount,
         status,
         tx_hash,
+        frozen_fx_rate_id,
         created_at,
         updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+      VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
       RETURNING *
     `;
 
@@ -149,6 +154,7 @@ export class DistributionRepository {
       input.amount,
       status,
       input.tx_hash || null,
+      input.frozen_fx_rate_id || null,
     ];
 
     const queryable = client || this.db;
@@ -228,6 +234,77 @@ export class DistributionRepository {
   }
 
   /**
+   * List distribution runs for a business period.
+   * Used by the investor-statement generator to derive period fees
+   * (total_amount minus distributed payouts) and cross-offering summaries.
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of distribution runs ordered by run_at for deterministic output
+   */
+  async listByPeriod(periodId: string): Promise<DistributionRun[]> {
+    const query = `
+      SELECT *
+      FROM distributions
+      WHERE period_id = $1
+      ORDER BY run_at ASC, created_at ASC, id ASC
+    `;
+
+    const result: QueryResult<DistributionRun> = await this.db.query(query, [
+      periodId,
+    ]);
+
+    return result.rows.map((row) => this.mapDistributionRun(row));
+  }
+
+  /**
+   * List payouts for an investor belonging to distributions of a business period.
+   * Joins `distribution_payouts` to `distributions` on `period_id` so statements
+   * only surface distributions that actually belong to the reported period.
+   * @param investorId Investor ID
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of payouts ordered by created_at for deterministic output
+   */
+  async listPayoutsByInvestorForPeriod(
+    investorId: string,
+    periodId: string
+  ): Promise<Payout[]> {
+    const query = `
+      SELECT p.*
+      FROM distribution_payouts p
+      INNER JOIN distributions d ON d.id = p.distribution_id
+      WHERE p.investor_id = $1
+        AND d.period_id = $2
+      ORDER BY p.created_at ASC, p.id ASC
+    `;
+
+    const result: QueryResult<Payout> = await this.db.query(query, [
+      investorId,
+      periodId,
+    ]);
+
+    return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  /**
+   * List all payouts for a business period (any investor).
+   * Used to compute period-level fees (retained revenue) on investor statements.
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of payouts ordered by created_at for deterministic output
+   */
+  async listPayoutsByPeriod(periodId: string): Promise<Payout[]> {
+    const query = `
+      SELECT p.*
+      FROM distribution_payouts p
+      INNER JOIN distributions d ON d.id = p.distribution_id
+      WHERE d.period_id = $1
+      ORDER BY p.created_at ASC, p.id ASC
+    `;
+
+    const result: QueryResult<Payout> = await this.db.query(query, [periodId]);
+
+    return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  /**
    * List distribution runs by offering
    * @param offeringId Offering ID
    * @returns Array of distribution runs
@@ -268,6 +345,67 @@ export class DistributionRepository {
   }
 
   /**
+   * Fetch distributions and their payouts for a double-entry accounting export.
+   *
+   * Scope is intentionally additive: this query only READS existing
+   * `distributions` and `distribution_payouts` rows and never mutates state,
+   * so it is safe to call concurrently with distribution execution and
+   * preserves existing API/storage compatibility.
+   *
+   * @param offeringId Offering identifier to scope the export.
+   * @param periodId   Optional period filter; when omitted all periods for the
+   *                   offering are returned.
+   * @returns A stable, deterministic list of runs (each with its payouts)
+   *          ordered by `run_at` then `id`.
+   */
+  async listForAccountingExport(
+    offeringId: string,
+    periodId?: string,
+  ): Promise<Array<DistributionRun & { payouts: Payout[] }>> {
+    const runParams: unknown[] = [offeringId];
+    let runQuery = `
+      SELECT *
+      FROM distributions
+      WHERE offering_id = $1
+    `;
+    if (periodId) {
+      runParams.push(periodId);
+      runQuery += ` AND period_id = $${runParams.length}`;
+    }
+    runQuery += ` ORDER BY run_at ASC, id ASC`;
+
+    const runsResult = await this.db.query<DistributionRun>(runQuery, runParams);
+
+    const accounts: string[] = [];
+    const payoutParams: unknown[] = [];
+    for (const run of runsResult.rows) {
+      payoutParams.push(run.id);
+      accounts.push(`$${payoutParams.length}`);
+    }
+
+    const payoutsByRun = new Map<string, Payout[]>();
+    if (accounts.length > 0) {
+      const payoutQuery = `
+        SELECT *
+        FROM distribution_payouts
+        WHERE distribution_id IN (${accounts.join(', ')})
+        ORDER BY id ASC
+      `;
+      const payoutsResult = await this.db.query<Payout>(payoutQuery, payoutParams);
+      for (const payout of payoutsResult.rows) {
+        const list = payoutsByRun.get(payout.distribution_id) ?? [];
+        list.push(payout);
+        payoutsByRun.set(payout.distribution_id, list);
+      }
+    }
+
+    return runsResult.rows.map((run) => ({
+      ...run,
+      payouts: payoutsByRun.get(run.id) ?? [],
+    }));
+  }
+
+  /**
    * Get aggregate stats for an offering
    * @param offeringId Offering ID
    * @returns Aggregate statistics
@@ -302,6 +440,7 @@ export class DistributionRepository {
       run_at: row.run_at,
       status: row.status,
       tx_batch_id: row.tx_batch_id,
+      frozen_fx_rate_id: row.frozen_fx_rate_id || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
@@ -318,6 +457,7 @@ export class DistributionRepository {
       amount: row.amount,
       status: row.status,
       tx_hash: row.tx_hash || undefined,
+      frozen_fx_rate_id: row.frozen_fx_rate_id || undefined,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };

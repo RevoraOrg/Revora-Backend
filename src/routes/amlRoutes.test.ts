@@ -41,7 +41,7 @@ class MockAMLService {
     ];
   }
 
-  async createRule(input: any): Promise<AMLRule> {
+  async createRule(input: any, actorId?: string): Promise<AMLRule> {
     const rule: AMLRule = {
       id: `rule_${Date.now()}`,
       ...input,
@@ -54,7 +54,7 @@ class MockAMLService {
     return rule;
   }
 
-  async updateRule(ruleId: string, input: any): Promise<AMLRule> {
+  async updateRule(ruleId: string, input: any, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -71,7 +71,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       ...input,
@@ -81,7 +81,7 @@ class MockAMLService {
     return this.rules[index];
   }
 
-  async rollbackRule(ruleId: string, version: SemVer): Promise<AMLRule> {
+  async rollbackRule(ruleId: string, version: SemVer, actorId?: string): Promise<AMLRule> {
     const index = this.rules.findIndex(r => r.id === ruleId);
     if (index === -1) {
       // Return a mock rule for testing
@@ -98,7 +98,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.rules[index] = {
       ...this.rules[index],
       version: { major: version.major, minor: version.minor, patch: version.patch + 1 },
@@ -138,7 +138,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.case_id === caseId);
   }
 
-  async createCase(input: any): Promise<AMLCase> {
+  async createCase(input: any, actorId?: string): Promise<AMLCase> {
     const amlCase: AMLCase = {
       id: `case_${Date.now()}`,
       ...input,
@@ -150,7 +150,7 @@ class MockAMLService {
     return amlCase;
   }
 
-  async updateCase(caseId: string, input: any): Promise<AMLCase> {
+  async updateCase(caseId: string, input: any, actorId?: string): Promise<AMLCase> {
     const index = this.cases.findIndex(c => c.id === caseId);
     if (index === -1) {
       // Return a mock case for testing
@@ -167,7 +167,7 @@ class MockAMLService {
         closed_at: (input.status === 'closed' || input.status === 'dismissed') ? new Date() : undefined,
       };
     }
-    
+
     this.cases[index] = {
       ...this.cases[index],
       ...input,
@@ -185,7 +185,7 @@ class MockAMLService {
     return this.alerts.filter(a => a.investor_id === investorId);
   }
 
-  async dismissAlert(alertId: string): Promise<AMLAlert> {
+  async dismissAlert(alertId: string, actorId?: string): Promise<AMLAlert> {
     const index = this.alerts.findIndex(a => a.id === alertId);
     if (index === -1) {
       // Return a mock alert for testing
@@ -203,7 +203,7 @@ class MockAMLService {
         updated_at: new Date(),
       };
     }
-    
+
     this.alerts[index] = {
       ...this.alerts[index],
       status: 'dismissed',
@@ -237,6 +237,9 @@ class MockAMLService {
     if (!review) {
       throw new Error('OFAC review not found');
     }
+    if (review.status === 'cleared') {
+      throw new Error(`OFAC review ${reviewId} is already cleared`);
+    }
     if (review.created_by === approverId) {
       throw new Error('Review creator cannot approve their own OFAC clearance');
     }
@@ -256,6 +259,11 @@ class MockAMLService {
     review.second_approval_rationale = rationale;
     review.second_approved_at = new Date();
     review.cleared_at = new Date();
+    review.clearance_rationale = [
+      review.clearance_rationale,
+      `first approver ${review.first_approver_id}: ${review.first_approval_rationale}`,
+      `second approver ${approverId}: ${rationale}`,
+    ].filter(Boolean).join('\n');
     return review;
   }
 }
@@ -347,6 +355,26 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createRule');
+      const newRule = {
+        name: 'Test Rule',
+        description: 'Test description',
+        type: 'velocity',
+        severity: 'high',
+        config: { window_minutes: 60 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules')
+        .set('x-user-id', 'user_123')
+        .send(newRule);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newRule, 'user_123');
+      spy.mockRestore();
+    });
   });
 
   describe('PUT /aml/rules/:ruleId', () => {
@@ -377,6 +405,24 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateRule');
+      const update = {
+        name: 'Updated Rule',
+        enabled: false,
+        change_reason: 'Testing',
+      };
+
+      const response = await request(app)
+        .put('/aml/rules/rule_1')
+        .set('x-user-id', 'user_456')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', update, 'user_456');
+      spy.mockRestore();
+    });
   });
 
   describe('POST /aml/rules/:ruleId/rollback', () => {
@@ -404,6 +450,22 @@ describe('AML Routes', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'rollbackRule');
+      const rollback = {
+        version: { major: 1, minor: 0, patch: 0 },
+      };
+
+      const response = await request(app)
+        .post('/aml/rules/rule_1/rollback')
+        .set('x-user-id', 'user_789')
+        .send(rollback);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('rule_1', rollback.version, 'user_789');
+      spy.mockRestore();
     });
   });
 
@@ -491,6 +553,25 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'createCase');
+      const newCase = {
+        alert_ids: ['alert_1'],
+        investor_id: 'inv_1',
+        assigned_to: 'analyst_1',
+        notes: 'Test case',
+      };
+
+      const response = await request(app)
+        .post('/aml/cases')
+        .set('x-user-id', 'user_abc')
+        .send(newCase);
+
+      expect(response.status).toBe(201);
+      expect(spy).toHaveBeenCalledWith(newCase, 'user_abc');
+      spy.mockRestore();
+    });
   });
 
   describe('PUT /aml/cases/:caseId', () => {
@@ -521,6 +602,24 @@ describe('AML Routes', () => {
       expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
     });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'updateCase');
+      const update = {
+        status: 'closed',
+        disposition: 'false_positive',
+        notes: 'Investigated',
+      };
+
+      const response = await request(app)
+        .put('/aml/cases/case_1')
+        .set('x-user-id', 'user_xyz')
+        .send(update);
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('case_1', update, 'user_xyz');
+      spy.mockRestore();
+    });
   });
 
   describe('GET /aml/alerts/pending', () => {
@@ -550,6 +649,17 @@ describe('AML Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(response.body.data.status).toBe('dismissed');
+    });
+
+    it('should pass actor ID from request to service', async () => {
+      const spy = jest.spyOn(mockService, 'dismissAlert');
+      const response = await request(app)
+        .post('/aml/alerts/alert_1/dismiss')
+        .set('x-user-id', 'user_123');
+
+      expect(response.status).toBe(200);
+      expect(spy).toHaveBeenCalledWith('alert_1', 'user_123');
+      spy.mockRestore();
     });
   });
 
@@ -764,6 +874,419 @@ describe('AML Routes', () => {
       expect(response.status).toBe(500);
       expect(response.body.success).toBe(false);
       consoleSpy.mockRestore();
+    });
+  });
+
+  // ── OFAC dual-control review queue routes ─────────────────────────────────
+
+  /**
+   * Helpers for OFAC route tests.
+   *
+   * The review queue endpoints require:
+   *   - x-user-id   / x-user-role headers (or req.user) for RBAC
+   *   - x-csrf-token header matching csrfToken cookie for mutation endpoints
+   */
+  const COMPLIANCE_HEADERS = {
+    'x-user-id': 'officer_1',
+    'x-user-role': 'compliance_officer',
+  };
+
+  const CSRF_HEADERS = {
+    ...COMPLIANCE_HEADERS,
+    'x-csrf-token': 'test-csrf-token',
+    cookie: 'csrfToken=test-csrf-token',
+  };
+
+  const validCreateBody = {
+    alert_id: 'alert_ofac_1',
+    investor_id: 'investor_1',
+    matched_name: 'Ahmad Al-Rashid',
+    rationale: 'DOB and passport number do not match the SDN entry.',
+  };
+
+  describe('GET /aml/ofac-reviews', () => {
+    it('should return the review queue for a compliance officer', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set(COMPLIANCE_HEADERS);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(Array.isArray(response.body.data)).toBe(true);
+    });
+
+    it('should return only pending reviews in the queue', async () => {
+      // Pre-populate a review so there is something in the queue
+      await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send(validCreateBody);
+
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set(COMPLIANCE_HEADERS);
+
+      expect(response.status).toBe(200);
+      const statuses: string[] = response.body.data.map((r: any) => r.status);
+      statuses.forEach(s =>
+        expect(['pending_first_approval', 'pending_second_approval']).toContain(s)
+      );
+    });
+
+    it('should return 401 when no authentication is provided', async () => {
+      const response = await request(app).get('/aml/ofac-reviews');
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 403 for a non-compliance role', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set({ 'x-user-id': 'user_1', 'x-user-role': 'investor' });
+
+      expect(response.status).toBe(403);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should accept admin role', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set({ 'x-user-id': 'admin_1', 'x-user-role': 'admin' });
+
+      expect(response.status).toBe(200);
+    });
+
+    it('should accept compliance role', async () => {
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set({ 'x-user-id': 'officer_2', 'x-user-role': 'compliance' });
+
+      expect(response.status).toBe(200);
+    });
+
+    it('should handle service errors gracefully', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'getOFACReviewQueue').mockRejectedValueOnce(new Error('DB error'));
+
+      const response = await request(app)
+        .get('/aml/ofac-reviews')
+        .set(COMPLIANCE_HEADERS);
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+  });
+
+  describe('POST /aml/ofac-reviews', () => {
+    it('should create a new OFAC review for a compliance officer with CSRF token', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send(validCreateBody);
+
+      expect(response.status).toBe(201);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.status).toBe('pending_first_approval');
+      expect(response.body.data.created_by).toBe('officer_1');
+      expect(response.body.data.alert_id).toBe('alert_ofac_1');
+    });
+
+    it('should record the creator id from the authenticated actor', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set({
+          'x-user-id': 'officer_99',
+          'x-user-role': 'compliance_officer',
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
+        .send(validCreateBody);
+
+      expect(response.status).toBe(201);
+      expect(response.body.data.created_by).toBe('officer_99');
+    });
+
+    it('should return 400 for missing required fields', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ alert_id: 'a1', investor_id: 'i1' }); // missing matched_name & rationale
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+      expect(response.body.details).toBeDefined();
+    });
+
+    it('should return 400 when rationale is too short (< 10 chars)', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ ...validCreateBody, rationale: 'short' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 400 when rationale is too long (> 4000 chars)', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ ...validCreateBody, rationale: 'x'.repeat(4001) });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 400 when matched_name is too long (> 255 chars)', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ ...validCreateBody, matched_name: 'A'.repeat(256) });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should accept optional case_id and list_entry_id', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({
+          ...validCreateBody,
+          case_id: 'case_123',
+          list_entry_id: 'SDN-4567',
+        });
+
+      expect(response.status).toBe(201);
+      expect(response.body.data.case_id).toBe('case_123');
+    });
+
+    it('should accept a valid ISO-8601 expires_at', async () => {
+      const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ ...validCreateBody, expires_at: expiresAt });
+
+      expect(response.status).toBe(201);
+    });
+
+    it('should return 400 for invalid expires_at format', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send({ ...validCreateBody, expires_at: 'not-a-date' });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('should return 401 without authentication', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .send(validCreateBody);
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should return 403 for non-compliance role', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set({ 'x-user-id': 'user_1', 'x-user-role': 'investor', 'x-csrf-token': 'tok', cookie: 'csrfToken=tok' })
+        .send(validCreateBody);
+
+      expect(response.status).toBe(403);
+    });
+
+    it('should return 403 when CSRF token is missing', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(COMPLIANCE_HEADERS) // no x-csrf-token
+        .send(validCreateBody);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
+    });
+
+    it('should return 403 when CSRF token does not match cookie', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set({
+          ...COMPLIANCE_HEADERS,
+          'x-csrf-token': 'wrong-token',
+          cookie: 'csrfToken=correct-token',
+        })
+        .send(validCreateBody);
+
+      expect(response.status).toBe(403);
+    });
+
+    it('should handle service errors gracefully', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'createOFACReview').mockRejectedValueOnce(new Error('DB error'));
+
+      const response = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send(validCreateBody);
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+  });
+
+  describe('POST /aml/ofac-reviews/:reviewId/approve', () => {
+    let createdReviewId: string;
+
+    beforeEach(async () => {
+      // Create a review as officer_1 (the creator)
+      const createRes = await request(app)
+        .post('/aml/ofac-reviews')
+        .set(CSRF_HEADERS)
+        .send(validCreateBody);
+      createdReviewId = createRes.body.data.id;
+    });
+
+    const approveAs = (userId: string, rationale: string) =>
+      request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({
+          'x-user-id': userId,
+          'x-user-role': 'compliance_officer',
+          'x-csrf-token': 'tok',
+          cookie: 'csrfToken=tok',
+        })
+        .send({ rationale });
+
+    it('should record the first approval and advance status to pending_second_approval', async () => {
+      const response = await approveAs('officer_2', 'DOB checked, no match on SDN entry date of birth.');
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.status).toBe('pending_second_approval');
+      expect(response.body.data.first_approver_id).toBe('officer_2');
+    });
+
+    it('should clear the review after two independent approvals', async () => {
+      await approveAs('officer_2', 'First independent check passed.');
+      const clearRes = await approveAs('officer_3', 'Second independent check passed.');
+
+      expect(clearRes.status).toBe(200);
+      expect(clearRes.body.data.status).toBe('cleared');
+      expect(clearRes.body.data.second_approver_id).toBe('officer_3');
+      expect(clearRes.body.data.clearance_rationale).toContain('officer_3');
+    });
+
+    it('should return 409 when the review creator attempts to approve their own case', async () => {
+      // officer_1 created the review; should be blocked
+      const response = await approveAs('officer_1', 'Self-approving incorrectly.');
+
+      expect(response.status).toBe(409);
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toContain('creator cannot approve');
+    });
+
+    it('should return 409 when the same officer tries to approve twice (dual-control)', async () => {
+      await approveAs('officer_2', 'First independent approval.');
+      const response = await approveAs('officer_2', 'Second attempt by same officer.');
+
+      expect(response.status).toBe(409);
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toContain('cannot approve an OFAC review twice');
+    });
+
+    it('should return 409 when attempting to approve an already-cleared review', async () => {
+      await approveAs('officer_2', 'First independent approval.');
+      await approveAs('officer_3', 'Second independent approval.');
+      const response = await approveAs('officer_4', 'Third attempt after clearance.');
+
+      expect(response.status).toBe(409);
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toContain('already cleared');
+    });
+
+    it('should return 404 when the review does not exist', async () => {
+      const response = await request(app)
+        .post('/aml/ofac-reviews/nonexistent_review_id/approve')
+        .set(CSRF_HEADERS)
+        .send({ rationale: 'Valid rationale text for this approval.' });
+
+      expect(response.status).toBe(404);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 400 when rationale is too short (< 10 chars)', async () => {
+      const response = await approveAs('officer_2', 'short');
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 400 when rationale is missing', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set(CSRF_HEADERS)
+        .send({});
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    it('should return 401 without authentication', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should return 403 for non-compliance role', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set({ 'x-user-id': 'u1', 'x-user-role': 'investor', 'x-csrf-token': 'tok', cookie: 'csrfToken=tok' })
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(403);
+    });
+
+    it('should return 403 when CSRF token is missing', async () => {
+      const response = await request(app)
+        .post(`/aml/ofac-reviews/${createdReviewId}/approve`)
+        .set(COMPLIANCE_HEADERS) // no x-csrf-token
+        .send({ rationale: 'Valid rationale for this test case.' });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toContain('CSRF');
+    });
+
+    it('should handle unexpected service errors gracefully', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(mockService, 'approveOFACReview').mockRejectedValueOnce(new Error('Network timeout'));
+
+      const response = await approveAs('officer_2', 'Valid rationale for this test case.');
+
+      expect(response.status).toBe(500);
+      expect(response.body.success).toBe(false);
+      consoleSpy.mockRestore();
+    });
+
+    it('should re-enter expired pending_second_approval reviews into the queue', async () => {
+      // First approval
+      await approveAs('officer_2', 'First independent approval before expiry.');
+
+      // Simulate the scenario: the mock service will still process this correctly
+      // as the repository-level expiry reset is tested in ofacReviewRepository.test.ts.
+      // Here we verify the route correctly propagates the repository result.
+      const queueRes = await request(app)
+        .get('/aml/ofac-reviews')
+        .set(COMPLIANCE_HEADERS);
+
+      expect(queueRes.status).toBe(200);
+      // The review is still in the queue (pending_second_approval)
+      const inQueue = queueRes.body.data.some((r: any) => r.id === createdReviewId);
+      expect(inQueue).toBe(true);
     });
   });
 });

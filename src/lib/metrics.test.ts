@@ -697,4 +697,166 @@ describe('MetricsCollector', () => {
       expect(output).toContain('beta');
     });
   });
+
+  describe('MetricPoint Failure Handling (regression #1040)', () => {
+    /**
+     * Branch evidence: src/lib/metrics.ts collectDatabaseMetrics()
+     *   `if (!pool) return null;`
+     *
+     * This suite locks the snapshot's database-metrics contract so the
+     * failure/empty-result path cannot silently change:
+     * - a missing/undefined/null pool yields a deterministic `null` result and
+     *   never rejects (error contract is a resolved snapshot, not a throw)
+     * - a supplied pool yields the exact derived DatabaseMetrics shape
+     * - boundary pool states (empty, fully idle, saturated, inconsistent,
+     *   very large) stay observable and deterministic
+     * - the empty custom MetricPoint result stays an explicit `[]`
+     */
+    it('returns null database metrics and does not reject when no pool is supplied', async () => {
+      await expect(metrics.getSnapshot()).resolves.toBeDefined();
+
+      const snapshot = await metrics.getSnapshot();
+
+      expect(snapshot.database).toBeNull();
+      expect(snapshot.custom).toEqual([]);
+    });
+
+    it('treats an explicit undefined pool as the same failure path', async () => {
+      const snapshot = await metrics.getSnapshot(undefined);
+
+      expect(snapshot.database).toBeNull();
+    });
+
+    it('treats a null pool defensively as the same failure path', async () => {
+      const snapshot = await metrics.getSnapshot(null as unknown as Pool);
+
+      expect(snapshot.database).toBeNull();
+    });
+
+    it('exercises the private branch directly and returns null without a pool', () => {
+      const result = metrics['collectDatabaseMetrics']();
+
+      expect(result).toBeNull();
+    });
+
+    it('returns the full database contract for the normal path', async () => {
+      const mockPool = {
+        totalCount: 25,
+        idleCount: 20,
+        waitingCount: 3,
+      } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(mockPool);
+
+      expect(snapshot.database).toEqual({
+        totalCount: 25,
+        idleCount: 20,
+        activeCount: 5,
+        waitingCount: 3,
+      });
+    });
+
+    it('derives activeCount from totalCount - idleCount, ignoring any pool.activeCount', async () => {
+      const mockPool = {
+        totalCount: 8,
+        idleCount: 2,
+        activeCount: 999, // deliberately misleading; must not be trusted
+        waitingCount: 0,
+      } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(mockPool);
+
+      expect(snapshot.database?.activeCount).toBe(6);
+    });
+
+    it('returns an all-zero contract for an empty pool (boundary)', async () => {
+      const emptyPool = { totalCount: 0, idleCount: 0, waitingCount: 0 } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(emptyPool);
+
+      expect(snapshot.database).toEqual({
+        totalCount: 0,
+        idleCount: 0,
+        activeCount: 0,
+        waitingCount: 0,
+      });
+    });
+
+    it('computes zero active connections for a fully idle pool (boundary)', async () => {
+      const idlePool = { totalCount: 10, idleCount: 10, waitingCount: 0 } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(idlePool);
+
+      expect(snapshot.database?.activeCount).toBe(0);
+    });
+
+    it('computes all connections active for a saturated pool (boundary)', async () => {
+      const saturatedPool = { totalCount: 10, idleCount: 0, waitingCount: 7 } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(saturatedPool);
+
+      expect(snapshot.database?.activeCount).toBe(10);
+      expect(snapshot.database?.waitingCount).toBe(7);
+    });
+
+    it('preserves the negative activeCount for an inconsistent pool without throwing (boundary)', async () => {
+      const inconsistentPool = { totalCount: 3, idleCount: 5, waitingCount: 0 } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(inconsistentPool);
+
+      expect(snapshot.database).toEqual({
+        totalCount: 3,
+        idleCount: 5,
+        activeCount: -2,
+        waitingCount: 0,
+      });
+    });
+
+    it('handles very large connection counts deterministically (boundary)', async () => {
+      const largePool = {
+        totalCount: Number.MAX_SAFE_INTEGER,
+        idleCount: 1,
+        waitingCount: Number.MAX_SAFE_INTEGER,
+      } as unknown as Pool;
+
+      const snapshot = await metrics.getSnapshot(largePool);
+
+      expect(snapshot.database).toEqual({
+        totalCount: Number.MAX_SAFE_INTEGER,
+        idleCount: 1,
+        activeCount: Number.MAX_SAFE_INTEGER - 1,
+        waitingCount: Number.MAX_SAFE_INTEGER,
+      });
+    });
+
+    it('keeps the empty custom MetricPoint and empty histogram results observable', async () => {
+      const snapshot = await metrics.getSnapshot();
+
+      expect(snapshot.custom).toHaveLength(0);
+      expect(snapshot.application.httpDuration.count).toBe(0);
+      expect(snapshot.application.httpDuration.sum).toBe(0);
+      expect(snapshot.application.httpDuration.buckets).toHaveLength(
+        metrics['config'].histogramBuckets.length
+      );
+    });
+
+    it('does not expose custom MetricPoints when collection is disabled (empty-result path)', async () => {
+      const disabled = new MetricsCollector({ enabled: false });
+
+      const snapshot = await disabled.getSnapshot();
+
+      expect(snapshot.database).toBeNull();
+      expect(snapshot.custom).toEqual([]);
+    });
+
+    it('clears the custom MetricPoint set after reset (empty-result path)', async () => {
+      metrics.incrementCounter('transient_metric');
+      expect((await metrics.getSnapshot()).custom).toHaveLength(1);
+
+      metrics.reset();
+
+      const snapshot = await metrics.getSnapshot();
+      expect(snapshot.custom).toEqual([]);
+    });
+  });
 });

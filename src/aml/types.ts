@@ -372,3 +372,101 @@ export interface AssignmentResult {
   /** Snapshot of all reviewer capacities at the time of assignment. */
   reviewer_capacities: ReviewerCapacity[];
 }
+
+// ── OFAC dual-control review queue ────────────────────────────────────────────
+
+/**
+ * Workflow status of an OFAC false-positive review.
+ *
+ * - `pending_first_approval`  – newly created; awaiting first compliance officer.
+ * - `pending_second_approval` – first approval recorded; awaiting a second,
+ *                               independent compliance officer.
+ * - `cleared`                 – both approvals recorded; investor may proceed.
+ * - `expired`                 – review window elapsed without being fully cleared
+ *                               (set by a background sweep; row re-enters queue as
+ *                               `pending_first_approval` on next `findQueue` call).
+ * - `rejected`                – manually rejected by a compliance officer.
+ */
+export type OFACReviewStatus =
+  | 'pending_first_approval'
+  | 'pending_second_approval'
+  | 'cleared'
+  | 'expired'
+  | 'rejected';
+
+/**
+ * A persisted OFAC false-positive review case.
+ *
+ * Two independent compliance officers must approve the clearance; the second
+ * approver must differ from both the case creator and the first approver.
+ * All state transitions are mirrored as immutable security audit events by
+ * `AMLService`.
+ */
+export interface OFACReview {
+  /** Unique review ID (e.g. `ofac_review_<timestamp>_<random>`). */
+  id: string;
+  /** AML alert that triggered this review. */
+  alert_id: string;
+  /** Optional AML case the alert belongs to. */
+  case_id?: string;
+  /** Investor who was flagged. */
+  investor_id: string;
+  /** The OFAC list entry name that collided with the investor name. */
+  matched_name: string;
+  /** Optional OFAC SDN list entry identifier for traceability. */
+  list_entry_id?: string;
+  /** Current workflow status. */
+  status: OFACReviewStatus;
+  /** User ID of the compliance officer who opened the review. */
+  created_by: string;
+  created_at: Date;
+  /** User ID of the first approving compliance officer. */
+  first_approver_id?: string;
+  /** Rationale recorded by the first approver. */
+  first_approval_rationale?: string;
+  first_approved_at?: Date;
+  /** User ID of the second approving compliance officer. */
+  second_approver_id?: string;
+  /** Rationale recorded by the second approver. */
+  second_approval_rationale?: string;
+  second_approved_at?: Date;
+  /**
+   * Combined clearance narrative: original creator rationale + first approver
+   * statement + second approver statement, joined by newlines.
+   */
+  clearance_rationale?: string;
+  cleared_at?: Date;
+  /**
+   * ISO-8601 datetime after which a `pending_second_approval` review that has
+   * not been fully cleared is reset to `pending_first_approval` so that the
+   * dual-control window cannot be gamed by waiting indefinitely.
+   */
+  expires_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * Input required to open a new OFAC false-positive review.
+ */
+export interface CreateOFACReviewInput {
+  /** AML alert that triggered the review. */
+  alert_id: string;
+  /** Optional AML case the alert belongs to. */
+  case_id?: string;
+  /** Investor flagged by the OFAC screen. */
+  investor_id: string;
+  /** The OFAC list entry name that collided with the investor name. */
+  matched_name: string;
+  /** Optional OFAC SDN list entry identifier. */
+  list_entry_id?: string;
+  /**
+   * Initial rationale provided by the creator explaining why this is a
+   * false positive (minimum 10 characters).
+   */
+  rationale: string;
+  /**
+   * Optional override for the review expiry window. Defaults to 24 hours
+   * from creation.
+   */
+  expires_at?: Date;
+}

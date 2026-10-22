@@ -1,78 +1,116 @@
 /**
- * Pressure Gauge: Backpressure Signal Management
+ * PressureGauge — monitors outbox lag and signals backpressure via tiered thresholds.
  *
- * Provides a thread-safe mechanism to signal backpressure to producers when
- * system capacity is exceeded. Implements escalating severity tiers (info, warning, critical)
- * for monitoring and alerting.
+ * Tracks the age of the oldest unsent outbox record and transitions through
+ * escalating pressure tiers (NORMAL → INFO → WARNING → CRITICAL) as lag
+ * increases. Registered callbacks fire on every tier transition, allowing
+ * the dispatcher and external consumers to react (e.g. emit alerts, pause
+ * producers).
  *
- * Security Assumptions:
- * - Gauge state is process-local; in multi-replica deployments each replica
- *   maintains its own pressure state. Synchronize via external coordination if needed.
- * - Pressure release should be checked regularly and transitions validated.
- *
- * @module lib/pressureGauge
+ * @see ../../docs/architecture/distribution-reconciliation.md
+ * @see ../docs/webhook-queue-backpressure.md
+ * @see ../services/outboxDispatcher.ts
  */
 
+/**
+ * Escalating pressure tiers ordered by severity.
+ * Producers should pause when the tier reaches WARNING or above.
+ */
 export enum PressureTier {
-  /** Normal operation: no pressure. */
+  /** No backpressure – lag within normal range (or empty outbox). */
   NORMAL = 'normal',
-  /** Info level: lag is building, monitor closely. */
+  /** Mild backpressure – lag is elevated but manageable. */
   INFO = 'info',
-  /** Warning level: significant lag, producers should slow down. */
+  /** Significant backpressure – producers should consider slowing down. */
   WARNING = 'warning',
-  /** Critical level: severe lag, producers must pause. */
+  /** Critical backpressure – producers MUST pause. */
   CRITICAL = 'critical',
 }
 
+/** Ordinal ranking for tier comparisons. */
+const TIER_ORDER: Record<PressureTier, number> = {
+  [PressureTier.NORMAL]: 0,
+  [PressureTier.INFO]: 1,
+  [PressureTier.WARNING]: 2,
+  [PressureTier.CRITICAL]: 3,
+};
+
 /**
- * Configuration for pressure gauge thresholds and behavior.
+ * Configuration for pressure gauge thresholds (in seconds).
  */
 export interface PressureGaugeConfig {
-  /** Seconds of lag that triggers INFO tier. Default: 30. */
+  /**
+   * Lag (seconds) above which the tier escalates to INFO.
+   * Default: 30.
+   */
   infoThresholdSeconds?: number;
-  /** Seconds of lag that triggers WARNING tier. Default: 60. */
+
+  /**
+   * Lag (seconds) above which the tier escalates to WARNING.
+   * Default: 60.
+   */
   warningThresholdSeconds?: number;
-  /** Seconds of lag that triggers CRITICAL tier. Default: 120. */
+
+  /**
+   * Lag (seconds) above which the tier escalates to CRITICAL.
+   * Default: 120.
+   */
   criticalThresholdSeconds?: number;
-  /** Seconds of lag recovery before tier downgrade. Default: 15. */
+
+  /**
+   * Hysteresis window in seconds. When a tier would be downgraded, the gauge
+   * holds the current tier until the lag drops `recoveryBufferSeconds` below
+   * that tier's threshold, preventing rapid oscillation at a boundary.
+   * Default: 0 (no hysteresis).
+   */
   recoveryBufferSeconds?: number;
 }
 
+/** Default thresholds in seconds. */
+const DEFAULT_INFO_THRESHOLD = 30;
+const DEFAULT_WARNING_THRESHOLD = 60;
+const DEFAULT_CRITICAL_THRESHOLD = 120;
+
+/**
+ * Snapshot of the current pressure gauge state.
+ */
 export interface PressureState {
-  /** Current tier of backpressure. */
+  /** Current pressure tier. */
   tier: PressureTier;
-  /** Age of oldest unsent record in seconds (or -1 if no pending records). */
+  /** Current lag in seconds, or -1 if the outbox is empty. */
   lagSeconds: number;
-  /** Timestamp when tier last changed. */
-  tierChangedAt: Date;
-  /** Number of tier transitions since startup. */
-  transitionCount: number;
+  /** Epoch ms when the current tier was entered (unset before the first transition). */
+  tierChangedAt?: number;
+  /** Number of tier transitions observed since construction / reset. */
+  transitionCount?: number;
 }
 
 /**
- * Callback invoked when pressure state changes.
- * @param oldState Previous pressure state.
- * @param newState New pressure state.
+ * Callback invoked whenever the pressure tier changes.
+ * Receives the old state and the new state so consumers can
+ * inspect the transition direction and magnitude.
  */
-export type PressureStateChangeCallback = (oldState: PressureState, newState: PressureState) => void;
+export type PressureStateChangeCallback = (
+  oldState: PressureState,
+  newState: PressureState
+) => void;
 
 /**
- * PressureGauge: Monitors and signals backpressure based on configured thresholds.
+ * Monitors outbox lag and signals backpressure via tiered thresholds.
  *
- * Usage:
- * ```typescript
- * const gauge = new PressureGauge();
- * gauge.onStateChange((oldState, newState) => {
- *   console.log(`Pressure: ${oldState.tier} → ${newState.tier}`);
- *   if (newState.tier === PressureTier.CRITICAL) {
- *     pauseProducers();
- *   }
+ * ## Usage
+ * ```ts
+ * const gauge = new PressureGauge({
+ *   infoThresholdSeconds: 60,
+ *   warningThresholdSeconds: 300,
+ *   criticalThresholdSeconds: 900,
  * });
  *
- * // Periodically update with current lag
- * const oldestRow = await outboxRepo.getOldestPending();
- * const lagSeconds = oldestRow ? (Date.now() - oldestRow.created_at.getTime()) / 1000 : -1;
- * gauge.updateLag(lagSeconds);
+ * gauge.onStateChange((oldState, newState) => {
+ *   console.log(`Tier changed: ${oldState.tier} → ${newState.tier}`);
+ * });
+ *
+ * gauge.updateLag(400);  // Lag is 400s → WARNING
  * ```
  */
 export class PressureGauge {
@@ -80,73 +118,131 @@ export class PressureGauge {
   private readonly warningThreshold: number;
   private readonly criticalThreshold: number;
   private readonly recoveryBuffer: number;
-  private state: PressureState;
-  private stateChangeCallbacks: PressureStateChangeCallback[] = [];
+
+  private state: PressureState = {
+    tier: PressureTier.NORMAL,
+    lagSeconds: -1,
+    tierChangedAt: undefined,
+    transitionCount: 0,
+  };
+  private listeners: PressureStateChangeCallback[] = [];
 
   constructor(config: PressureGaugeConfig = {}) {
-    this.infoThreshold = config.infoThresholdSeconds ?? 30;
-    this.warningThreshold = config.warningThresholdSeconds ?? 60;
-    this.criticalThreshold = config.criticalThresholdSeconds ?? 120;
-    this.recoveryBuffer = config.recoveryBufferSeconds ?? 15;
+    this.infoThreshold = config.infoThresholdSeconds ?? DEFAULT_INFO_THRESHOLD;
+    this.warningThreshold = config.warningThresholdSeconds ?? DEFAULT_WARNING_THRESHOLD;
+    this.criticalThreshold = config.criticalThresholdSeconds ?? DEFAULT_CRITICAL_THRESHOLD;
+    this.recoveryBuffer = config.recoveryBufferSeconds ?? 0;
 
-    this.state = {
-      tier: PressureTier.NORMAL,
-      lagSeconds: -1,
-      tierChangedAt: new Date(),
-      transitionCount: 0,
-    };
-  }
-
-  /**
-   * Register a callback to be invoked when pressure state changes.
-   * @param callback Function to invoke on state transitions.
-   */
-  onStateChange(callback: PressureStateChangeCallback): void {
-    this.stateChangeCallbacks.push(callback);
-  }
-
-  /**
-   * Remove a callback from state change listeners.
-   * @param callback Function to remove.
-   */
-  offStateChange(callback: PressureStateChangeCallback): void {
-    const index = this.stateChangeCallbacks.indexOf(callback);
-    if (index !== -1) {
-      this.stateChangeCallbacks.splice(index, 1);
+    // Validate thresholds are in ascending order
+    if (this.infoThreshold <= 0) {
+      throw new Error('infoThresholdSeconds must be > 0');
+    }
+    if (this.warningThreshold <= this.infoThreshold) {
+      throw new Error('warningThresholdSeconds must be > infoThresholdSeconds');
+    }
+    if (this.criticalThreshold <= this.warningThreshold) {
+      throw new Error('criticalThresholdSeconds must be > warningThresholdSeconds');
     }
   }
 
   /**
-   * Update the gauge with current outbox lag.
-   * Automatically computes and transitions to appropriate pressure tier.
-   *
-   * @param lagSeconds Age of oldest pending record in seconds.
-   *                   Use -1 if no pending records (pressure releases).
+   * Determine the pressure tier for a given lag value.
+   * A lag of -1 (no pending records) always maps to NORMAL.
    */
+  private computeTier(lagSeconds: number): PressureTier {
+    if (lagSeconds < 0) {
+      return PressureTier.NORMAL;
+    }
+    if (lagSeconds >= this.criticalThreshold) {
+      return PressureTier.CRITICAL;
+    }
+    if (lagSeconds >= this.warningThreshold) {
+      return PressureTier.WARNING;
+    }
+    if (lagSeconds >= this.infoThreshold) {
+      return PressureTier.INFO;
+    }
+    return PressureTier.NORMAL;
+  }
+
+  /**
+   * Update the gauge with the current outbox lag.
+   *
+   * @param lagSeconds Age of the oldest unsent record in seconds,
+   *   or -1 when the outbox is empty.
+   */
+  /**
+   * Returns the lower lag boundary for a given tier, used to apply the
+   * recovery buffer when deciding whether to downgrade.
+   */
+  private thresholdForTier(tier: PressureTier): number {
+    switch (tier) {
+      case PressureTier.INFO:
+        return this.infoThreshold;
+      case PressureTier.WARNING:
+        return this.warningThreshold;
+      case PressureTier.CRITICAL:
+        return this.criticalThreshold;
+      default:
+        return 0;
+    }
+  }
+
   updateLag(lagSeconds: number): void {
-    const newTier = this.computeTier(lagSeconds);
+    const proposed = this.computeTier(lagSeconds);
+    const current = this.state.tier;
+
+    // Hysteresis: hold the current tier when recovering until lag drops
+    // `recoveryBufferSeconds` below the tier's threshold.
+    let newTier = proposed;
+    if (
+      proposed !== current &&
+      TIER_ORDER[proposed] < TIER_ORDER[current] &&
+      this.recoveryBuffer > 0
+    ) {
+      const lowerBound = this.thresholdForTier(current);
+      if (lagSeconds >= lowerBound - this.recoveryBuffer) {
+        newTier = current;
+      }
+    }
+
+    if (newTier === current && lagSeconds === this.state.lagSeconds) {
+      // No change — nothing to do
+      return;
+    }
+
     const oldState = { ...this.state };
 
-    if (newTier !== this.state.tier) {
-      this.state.tier = newTier;
-      this.state.tierChangedAt = new Date();
-      this.state.transitionCount++;
-
-      // Create immutable copies before passing to callbacks
-      const callbackNewState = { ...this.state };
-
-      // Notify all listeners of the state change
-      this.stateChangeCallbacks.forEach((callback) => {
-        callback(oldState, callbackNewState);
-      });
+    if (newTier !== current) {
+      this.state = {
+        tier: newTier,
+        lagSeconds,
+        tierChangedAt: Date.now(),
+        transitionCount: (this.state.transitionCount ?? 0) + 1,
+      };
+      this.fireListeners(oldState, { ...this.state });
+    } else {
+      // Same tier — only the lag observation changed.
+      this.state = { ...this.state, lagSeconds };
     }
-
-    this.state.lagSeconds = lagSeconds;
   }
 
   /**
-   * Get the current pressure state.
-   * @returns Copy of current pressure state.
+   * Register a callback to be invoked on every tier transition.
+   */
+  onStateChange(callback: PressureStateChangeCallback): void {
+    this.listeners.push(callback);
+  }
+
+  /**
+   * Remove a previously registered callback.
+   */
+  removeListener(callback: PressureStateChangeCallback): void {
+    this.listeners = this.listeners.filter((l) => l !== callback);
+  }
+
+  /**
+   * Get the current pressure state snapshot.
    */
   getState(): PressureState {
     return { ...this.state };
@@ -154,92 +250,44 @@ export class PressureGauge {
 
   /**
    * Get the current pressure tier.
-   * @returns Current tier.
    */
   getTier(): PressureTier {
     return this.state.tier;
   }
 
   /**
-   * Check if pressure is at or above a given tier.
-   * @param tier Tier to check.
-   * @returns True if current tier equals or exceeds the given tier.
+   * Check whether the current pressure is at or above a given tier.
+   *
+   * @param tier Tier to compare against.
+   * @returns `true` if the current tier is at least as severe as `tier`.
    */
   isAtLeast(tier: PressureTier): boolean {
-    const tierOrder = [PressureTier.NORMAL, PressureTier.INFO, PressureTier.WARNING, PressureTier.CRITICAL];
-    const currentIndex = tierOrder.indexOf(this.state.tier);
-    const targetIndex = tierOrder.indexOf(tier);
-    return currentIndex >= targetIndex;
+    return TIER_ORDER[this.state.tier] >= TIER_ORDER[tier];
   }
 
   /**
-   * Compute pressure tier based on lag seconds.
-   * Implements hysteresis to prevent rapid tier oscillations.
-   *
-   * Hysteresis works by using different thresholds for climbing vs. descending:
-   * - Climbing (NORMAL→INFO→WARNING→CRITICAL): uses full thresholds
-   * - Descending: uses recovery thresholds (threshold - buffer) for downgrade
-   *
-   * @param lagSeconds Current outbox lag in seconds.
-   * @returns Appropriate pressure tier.
+   * Reset the gauge to its initial state (useful for testing).
    */
-  private computeTier(lagSeconds: number): PressureTier {
-    // No pending records → always NORMAL
-    if (lagSeconds < 0) {
-      return PressureTier.NORMAL;
-    }
+  reset(): void {
+    this.state = {
+      tier: PressureTier.NORMAL,
+      lagSeconds: -1,
+      tierChangedAt: undefined,
+      transitionCount: 0,
+    };
+  }
 
-    // Check CRITICAL tier (highest severity)
-    // Descend from CRITICAL only if lag drops below (criticalThreshold - buffer)
-    // Climb to CRITICAL if lag exceeds criticalThreshold
-    const criticalClimbThreshold = this.criticalThreshold;
-    const criticalDescentThreshold = this.criticalThreshold - this.recoveryBuffer;
-
-    if (this.state.tier === PressureTier.CRITICAL) {
-      // Already CRITICAL: use descent threshold to downgrade
-      if (lagSeconds < criticalDescentThreshold) {
-        return PressureTier.WARNING;
+  private fireListeners(
+    oldState: PressureState,
+    newState: PressureState
+  ): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(oldState, newState);
+      } catch (error) {
+        // Swallow listener errors — they shouldn't break the gauge
+        console.error('[PressureGauge] Listener error:', error);
       }
-      return PressureTier.CRITICAL;
     }
-
-    if (lagSeconds >= criticalClimbThreshold) {
-      return PressureTier.CRITICAL;
-    }
-
-    // Check WARNING tier
-    const warningClimbThreshold = this.warningThreshold;
-    const warningDescentThreshold = this.warningThreshold - this.recoveryBuffer;
-
-    if (this.state.tier === PressureTier.WARNING) {
-      // Already WARNING: use descent threshold to downgrade
-      if (lagSeconds < warningDescentThreshold) {
-        return PressureTier.INFO;
-      }
-      return PressureTier.WARNING;
-    }
-
-    if (lagSeconds >= warningClimbThreshold) {
-      return PressureTier.WARNING;
-    }
-
-    // Check INFO tier
-    const infoClimbThreshold = this.infoThreshold;
-    const infoDescentThreshold = this.infoThreshold - this.recoveryBuffer;
-
-    if (this.state.tier === PressureTier.INFO) {
-      // Already INFO: use descent threshold to downgrade
-      if (lagSeconds < infoDescentThreshold) {
-        return PressureTier.NORMAL;
-      }
-      return PressureTier.INFO;
-    }
-
-    if (lagSeconds >= infoClimbThreshold) {
-      return PressureTier.INFO;
-    }
-
-    // Default to NORMAL
-    return PressureTier.NORMAL;
   }
 }

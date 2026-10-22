@@ -2,7 +2,7 @@
 
 > **Authoritative end-to-end map** of how offerings, revenue reports, the
 > distribution engine, the reconciliation service, and the transactional webhook
-> outbox interlock. Every flow diagram in this document is rendered from a
+> outbox interlock for the revoraorg/revora-backend repository. Every flow diagram in this document is rendered from a
 > committed Mermaid source block, so it can be diff-reviewed and regenerated
 > deterministically.
 >
@@ -13,17 +13,17 @@
 
 ---
 
-## 1. Subsystem map
+## 1. Subsystem Map
 
 The five logical subsystems and their primary files:
 
 | Subsystem | Primary code | Primary doc |
 |---|---|---|
-| Offerings (catalog) | `src/services/offeringSyncService.ts`, `src/db/repositories/offeringRepository.ts` | `docs/offering-validation-matrix.md`, `docs/offering-status-transition-guardrails.md` |
-| Revenue reports | `src/services/revenueService.ts`, `src/db/repositories/revenueReportRepository.ts` | `docs/revenue-report-ingestion-validation.md` |
-| Distribution engine | `src/services/distributionEngine.ts`, `src/services/distributionScheduler.ts`, `src/routes/distributions.ts`, `src/db/repositories/distributionRepository.ts` | `docs/distribution-engine-retry-strategy.md`, `docs/distribution-advisory-lock.md`, `docs/distribution-engine-atomic-transactions.md`, `docs/distribution-scheduler-idempotency.md`, `docs/distribution-engine-safety.md` |
-| Reconciliation | `src/services/revenueReconciliationService.ts`, `src/services/reconciliationScheduler.ts`, `src/routes/reconciliationRoutes.ts` | `docs/revenue-reconciliation.md`, `docs/revenue-reconciliation-checks.md`, `docs/stellar-rpc-failure-behavior.md` |
-| Transactional webhook outbox | `src/services/outboxDispatcher.ts`, `src/services/webhookService.ts`, `src/db/repositories/outboxRepository.ts` | `docs/transactional-outbox.md`, `docs/webhooks-implementation.md`, `docs/webhook-queue-backpressure.md` |
+| **Offerings (catalog)** | `src/services/offeringSyncService.ts`, `src/db/repositories/offeringRepository.ts` | `docs/offering-validation-matrix.md`, `docs/offering-status-transition-guardrails.md` |
+| **Revenue reports** | `src/services/revenueService.ts`, `src/db/repositories/revenueReportRepository.ts` | `docs/revenue-report-ingestion-validation.md` |
+| **Distribution engine** | `src/services/distributionEngine.ts`, `src/services/distributionScheduler.ts`, `src/routes/distributions.ts`, `src/db/repositories/distributionRepository.ts` | `docs/distribution-engine-retry-strategy.md`, `docs/distribution-advisory-lock.md`, `docs/distribution-engine-atomic-transactions.md`, `docs/distribution-scheduler-idempotency.md`, `docs/distribution-engine-safety.md` |
+| **Reconciliation** | `src/services/revenueReconciliationService.ts`, `src/services/reconciliationScheduler.ts`, `src/routes/reconciliationRoutes.ts` | `docs/revenue-reconciliation.md`, `docs/revenue-reconciliation-checks.md`, `docs/stellar-rpc-failure-behavior.md`, `docs/runbooks/payout-reconciliation.md` |
+| **Transactional webhook outbox**| `src/services/outboxDispatcher.ts`, `src/services/webhookService.ts`, `src/db/repositories/outboxRepository.ts` | `docs/transactional-outbox.md`, `docs/webhooks-implementation.md`, `docs/webhook-queue-backpressure.md` |
 
 ```mermaid
 flowchart LR
@@ -95,7 +95,7 @@ flowchart LR
 
 ---
 
-## 2. End-to-end sequence — distribution run
+## 2. End-to-End Sequence - Distribution Run
 
 This is the canonical flow from "approved revenue report" to "all payouts
 written and webhook delivered". Every block corresponds to a real method in the
@@ -145,7 +145,7 @@ sequenceDiagram
   WH->>Out: markDispatched(row.id) | markFailed(row.id, retryAfter)
 ```
 
-### Idempotency invariants
+### Idempotency Invariants
 
 1. **Report claim** — `DistributionScheduler` atomically transitions
    `revenue_reports.distribution_status` from `NULL` / `failed` / stale
@@ -162,7 +162,7 @@ sequenceDiagram
 
 ---
 
-## 3. End-to-end sequence — reconciliation
+## 3. End-to-End Sequence - Reconciliation
 
 Two entry points run the same `RevenueReconciliationService.reconcile()` core:
 
@@ -216,7 +216,7 @@ sequenceDiagram
   RS->>Met: reconciliation_discrepancy_total / reconciliation_alarm_open
 ```
 
-### Alarm semantics
+### Alarm Semantics
 
 `ReconciliationScheduler` raises the **dead-letter alarm** gauge for an offering
 if any scheduled run is imbalanced **or errors**. A subsequent balanced run
@@ -224,9 +224,21 @@ clears the alarm. Overflow offerings (beyond `cardinalityLimit`, default 50)
 share a single `offering_id="overflow"` label to keep Prometheus cardinality
 bounded.
 
+### Payout Drift Alarm (nightly)
+
+On its nightly tick, `ReconciliationScheduler` also emits a **payout drift**
+report that compares the `payouts` table against indexed on-chain Stellar
+payments and publishes the per-offering drift counts (missing, duplicated,
+under-funded) to `MetricsCollector` as `reconciliation_payout_drift_total`. A
+**pager alarm** fires when a non-zero drift count persists for older than 24
+hours, signalling an unreconciled payout that needs operator triage. The
+triage steps, severity rubric, owner, and replay procedure for clearing this
+alarm are documented in the
+[payout reconciliation runbook](../runbooks/payout-reconciliation.md).
+
 ---
 
-## 4. State machines
+## 4. State Machines
 
 ### 4.1 `distribution_runs.status`
 
@@ -288,7 +300,7 @@ stateDiagram-v2
 
 ---
 
-## 5. Database tables and ownership
+## 5. Database Tables and Ownership
 
 | Table | Owned by | Written from | Read from |
 |---|---|---|---|
@@ -306,7 +318,7 @@ same PR.
 
 ---
 
-## 6. Cross-reference matrix
+## 6. Cross-Reference Matrix
 
 | Service / file | Cross-links to |
 |---|---|
@@ -324,7 +336,7 @@ same PR.
 
 ---
 
-## 7. Security assumptions
+## 7. Security Assumptions
 
 1. **Source of truth** — for *payouts*, the on-chain Stellar transaction is
    authoritative; local `payouts` rows may be rebuilt from chain data via the
@@ -350,7 +362,7 @@ same PR.
 
 ---
 
-## 8. Failure-mode index
+## 8. Failure-Mode Index
 
 | Failure | Detection | Recovery |
 |---|---|---|
@@ -366,7 +378,7 @@ same PR.
 
 ---
 
-## 9. Test and CI hooks
+## 9. Test and CI Hooks
 
 - Engine contract tests: `npm test -- src/services/distributionEngine.test.ts`
 - Reconciliation tests: `npm test -- src/services/revenueReconciliationService.test.ts src/services/reconciliationScheduler.test.ts`
@@ -381,7 +393,7 @@ by the relevant suite in the same PR.
 
 ---
 
-## 10. How to keep this doc correct
+## 10. How to Keep This Doc Correct
 
 When you change any of the subsystems in §1, you MUST update this document in
 the same PR:
