@@ -8,6 +8,7 @@
  */
 
 import { LedgerLine, LedgerExport } from './accountingLedgerService';
+import { toCsvField } from '../lib/csv';
 
 export const LEDGER_CSV_COLUMNS = [
   'id',
@@ -24,15 +25,8 @@ export const LEDGER_CSV_COLUMNS = [
   'run_id',
 ] as const;
 
-function csvEscape(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
-
 function toCsvRow(values: Array<string | undefined>): string {
-  return values.map((v) => csvEscape(v ?? '')).join(',');
+  return values.map((v) => toCsvField(v ?? '')).join(',');
 }
 
 /**

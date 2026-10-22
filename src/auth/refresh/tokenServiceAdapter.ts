@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
-import { issueToken, verifyToken, TOKEN_EXPIRY, REFRESH_TOKEN_EXPIRY } from '../../lib/jwt';
+import { issueToken, verifyToken, TOKEN_EXPIRY, REFRESH_TOKEN_EXPIRY } from '../../lib/jvt';
 import { RefreshTokenPayload, TokenService } from './types';
 import { UserRole } from '../login/types';
 
 export class JwtTokenServiceAdapter implements TokenService {
     verifyRefreshToken(token: string): RefreshTokenPayload {
-        const payload = verifyToken(token);
+        const payload = verifyToken(token, { expectedType: 'refresh' });
         return {
             userId: payload.sub,
             sessionId: payload.sid as string,
@@ -17,21 +17,23 @@ export class JwtTokenServiceAdapter implements TokenService {
         accessToken: string;
         refreshToken: string;
     } {
-        const accessToken = issueToken({
+        const accessToken = issueToken( {
             subject: payload.userId,
             expiresIn: TOKEN_EXPIRY,
             additionalPayload: {
                 sid: payload.sessionId,
                 role: payload.role,
+                typ: 'access',
             },
         });
 
-        const refreshToken = issueToken({
+        const refreshToken = issueToken( {
             subject: payload.userId,
             expiresIn: REFRESH_TOKEN_EXPIRY,
             additionalPayload: {
                 sid: payload.sessionId,
                 role: payload.role,
+                typ: 'refresh',
             },
         });
 

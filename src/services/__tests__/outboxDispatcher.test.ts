@@ -21,7 +21,9 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     event_id: 'evt-uuid-stable',
     event_type: WebhookEventType.PAYOUT_COMPLETED,
     payload: { investor_id: 'inv-1', amount: '10.00' },
-    status: 'pending',
+    status: 'dispatching',
+    locked_until: new Date(Date.now() + 60_000),
+    lease_token: 'lease-1',
     attempts: 0,
     available_at: new Date(),
     created_at: new Date('2024-01-01T00:00:00Z'),
@@ -41,6 +43,16 @@ function makeOutboxRepo(rows: OutboxRow[] = []): jest.Mocked<OutboxRepository> {
 }
 
 beforeEach(() => jest.clearAllMocks());
+
+it('passes configured batch size and lease duration to the atomic claim', async () => {
+  const repo = makeOutboxRepo();
+  const dispatcher = new OutboxDispatcher(repo, jest.fn(), { batchSize: 3, leaseMs: 120_000 });
+  await dispatcher.drainOnce();
+  expect(repo.drainPending).toHaveBeenCalledWith(3, 120_000);
+  expect(dispatcher.isUnderPressure()).toBe(false);
+  dispatcher.stop(); // stopping before start is safe
+  dispatcher.stop(); // and remains idempotent
+});
 
 // ─── 1. Producer rollback discards the outbox row ────────────────────────────
 
@@ -76,7 +88,7 @@ describe('OutboxDispatcher', () => {
     await dispatcher.drainOnce();
 
     expect(dispatch).toHaveBeenCalledWith(row);
-    expect(repo.markDispatched).toHaveBeenCalledWith(row.id);
+    expect(repo.markDispatched).toHaveBeenCalledWith(row.id, row.lease_token);
     expect(repo.markFailed).not.toHaveBeenCalled();
   });
 
@@ -89,9 +101,9 @@ describe('OutboxDispatcher', () => {
     await dispatcher.drainOnce();
 
     expect(repo.markDispatched).not.toHaveBeenCalled();
-    expect(repo.markFailed).toHaveBeenCalledWith(row.id, expect.any(Date));
+    expect(repo.markFailed).toHaveBeenCalledWith(row.id, row.lease_token, expect.any(Date));
     // retryAfter should be in the future
-    const retryAfter: Date = (repo.markFailed as jest.Mock).mock.calls[0][1];
+    const retryAfter: Date = (repo.markFailed as jest.Mock).mock.calls[0][2];
     expect(retryAfter.getTime()).toBeGreaterThan(Date.now() - 10);
   });
 
@@ -104,10 +116,10 @@ describe('OutboxDispatcher', () => {
     await dispatcher.drainOnce();
 
     // markFailed called with no retryAfter → dead-letter
-    expect(repo.markFailed).toHaveBeenCalledWith(row.id);
+    expect(repo.markFailed).toHaveBeenCalledWith(row.id, row.lease_token);
     expect(repo.markFailed).toHaveBeenCalledTimes(1);
     const call = (repo.markFailed as jest.Mock).mock.calls[0];
-    expect(call[1]).toBeUndefined();
+    expect(call[2]).toBeUndefined();
   });
 
   it('treats a dispatch exception as a failure', async () => {

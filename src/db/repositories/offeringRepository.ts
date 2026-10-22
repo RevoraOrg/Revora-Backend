@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import { sanitizeObject } from '../../lib/sanitize';
 
 export type OfferingStatus =
@@ -28,6 +28,7 @@ export interface Offering {
   status?: OfferingStatus;
   total_raised?: string;
   target_amount?: string;
+  max_investor_share_bps?: number | null;
   timezone?: string;
   created_at?: Date;
   updated_at?: Date;
@@ -89,11 +90,11 @@ export class OfferingRepository {
   /**
    * Find an offering by ID
    */
-  async findById(id: string): Promise<Offering | null> {
-    return this.getById(id);
+  async findById(id: string, client?: PoolClient): Promise<Offering | null> {
+    return this.getById(id, client);
   }
 
-  async getById(id: string): Promise<Offering | null> {
+  async getById(id: string, client?: PoolClient): Promise<Offering | null> {
     const query = `
       SELECT *
       FROM offerings
@@ -101,7 +102,8 @@ export class OfferingRepository {
       LIMIT 1
     `;
 
-    const result: QueryResult<Offering> = await this.db.query(query, [id]);
+    const executor = client ?? this.db;
+    const result: QueryResult<Offering> = await executor.query(query, [id]);
     if (result.rows.length === 0) {
       return null;
     }

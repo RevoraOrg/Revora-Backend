@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { randomBytes, createHash } from 'node:crypto';
 import { PasswordResetRateLimiter, RateLimitResult } from './passwordResetRateLimiter';
+import { validatePasswordStrength } from '../auth/register/validatePasswordStrength';
 
 export type EmailSender = (to: string, subject: string, body: string) => Promise<void>;
 
@@ -10,6 +11,11 @@ export interface PasswordResetServiceOptions {
   appUrl?: string;
   rateLimiter?: PasswordResetRateLimiter;
 }
+
+export type PasswordResetResult =
+  | { ok: true }
+  | { ok: false; reason: 'invalid_token' }
+  | { ok: false; reason: 'weak_password'; errors: string[] };
 
 export class PasswordResetRateLimitedError extends Error {
   constructor(
@@ -49,6 +55,9 @@ export class PasswordResetService {
           );
         }
       } catch (err) {
+        if (err instanceof PasswordResetRateLimitedError) {
+          throw err;
+        }
         console.error('[password-reset] Rate limiter error, failing open:', err);
       }
     }
@@ -75,7 +84,17 @@ export class PasswordResetService {
     );
   }
 
-  async resetPassword(tokenRaw: string, newPassword: string): Promise<boolean> {
+  async resetPassword(tokenRaw: string, newPassword: string): Promise<PasswordResetResult> {
+    const strengthResult = validatePasswordStrength(newPassword);
+    if (!strengthResult.valid) {
+      return { ok: false, reason: 'weak_password', errors: strengthResult.errors };
+    }
+
+    const tokenResult = await this.applyReset(tokenRaw, newPassword);
+    return tokenResult;
+  }
+
+  private async applyReset(tokenRaw: string, newPassword: string): Promise<PasswordResetResult> {
     const tokenHash = this.hashToken(tokenRaw);
     let client: PoolClient | null = null;
     try {
@@ -85,20 +104,20 @@ export class PasswordResetService {
       const { rows } = await client.query(
         `SELECT id, user_id, expires_at, used_at
          FROM password_reset_tokens
-         WHERE token_hash = $1
+         WHERE TOKEN_HASH = $1
          FOR UPDATE`,
         [tokenHash],
       );
 
       if (rows.length === 0) {
         await client.query('ROLLBACK');
-        return false;
+        return { ok: false, reason: 'invalid_token' };
       }
 
       const row = rows[0] as { id: string; user_id: string; expires_at: Date; used_at: Date | null };
       if (row.used_at || new Date(row.expires_at) < new Date()) {
         await client.query('ROLLBACK');
-        return false;
+        return { ok: false, reason: 'invalid_token' };
       }
 
       const passwordHash = this.hashPassword(newPassword);
@@ -109,12 +128,19 @@ export class PasswordResetService {
       );
 
       await client.query(
-        `UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`,
-        [row.id],
+        `UPDATE sessions SET reoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+        [row.user_id],
+      );
+
+      await client.query(
+        `UPDATE password_reset_tokens
+         SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL `,
+        [row.user_id],
       );
 
       await client.query('COMMIT');
-      return true;
+      return { ok: true };
     } catch {
       if (client) {
         try {
@@ -143,9 +169,4 @@ export class PasswordResetService {
   private hashToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
   }
-
-  private hashPassword(plaintext: string): string {
-    return createHash('sha256').update(plaintext).digest('hex');
-  }
 }
-

@@ -22,6 +22,10 @@ const VALID_STATUSES = new Set<string>(['pending', 'processed', 'failed']);
 /**
  * @dev Allowed column names for the `sortBy` query parameter.
  * Restricting to a known allowlist prevents injection of arbitrary sort keys.
+ * This set is intentionally the same as
+ * `DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS`: validation happens
+ * here at the HTTP boundary so that invalid values are rejected with 400
+ * before reaching the repository layer.
  */
 const VALID_SORT_FIELDS = new Set<string>(['created_at', 'amount', 'status']);
 
@@ -35,14 +39,20 @@ const VALID_SORT_ORDERS = new Set<string>(['asc', 'desc']);
 /**
  * @title Payout
  * @dev Represents a single payout record belonging to a distribution run.
+ *
+ * Field names match the `distribution_payouts` table and the repository's
+ * `Payout` interface:
+ * - `distribution_id`  — FK to `distributions.id`  (not `distribution_run_id`)
+ * - `tx_hash`          — Stellar transaction hash   (not `transaction_hash`)
  */
 export interface Payout {
   id: string;
-  distribution_run_id: string;
+  distribution_id: string;
   investor_id: string;
   amount: string;
   status: 'pending' | 'processed' | 'failed';
-  transaction_hash?: string;
+  tx_hash?: string | null;
+  frozen_fx_rate_id?: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -50,10 +60,22 @@ export interface Payout {
 /**
  * @title PayoutRepo
  * @dev Repository interface consumed by the handler.
- * The handler performs in-memory filtering/sorting on the returned list.
+ * The handler delegates all filtering, sorting, and pagination to the
+ * repository so that the database — not Node — performs the heavy lifting.
  */
 export interface PayoutRepo {
-  listPayoutsByInvestor: (investorId: string) => Promise<Payout[]>;
+  searchPayoutsByInvestor: (params: {
+    investorId: string;
+    status?: 'pending' | 'processed' | 'failed';
+    minAmount?: number;
+    maxAmount?: number;
+    from?: Date;
+    to?: Date;
+    sortBy?: 'created_at' | 'amount' | 'status';
+    sortOrder?: 'asc' | 'desc';
+    limit: number;
+    offset: number;
+  }) => Promise<{ payouts: Payout[]; total: number }>;
 }
 
 /**
@@ -88,37 +110,6 @@ function parseNonNegativeInt(
   return { value: parsed };
 }
 
-/**
- * @dev Compare two payout records by the given field and order.
- * For `amount` fields, comparison is numeric (parseFloat).
- * For `created_at` fields, comparison is by timestamp.
- * For `status` fields, comparison is lexicographic.
- */
-function comparator(
-  a: Payout,
-  b: Payout,
-  sortBy: 'created_at' | 'amount' | 'status',
-  ascending: boolean,
-): number {
-  let cmp: number;
-
-  switch (sortBy) {
-    case 'amount':
-      cmp = parseFloat(a.amount) - parseFloat(b.amount);
-      break;
-    case 'created_at':
-      cmp = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-      break;
-    case 'status':
-      cmp = a.status.localeCompare(b.status);
-      break;
-    default:
-      cmp = 0;
-  }
-
-  return ascending ? cmp : -cmp;
-}
-
 // ─── Handler Factory ──────────────────────────────────────────────────────────
 
 /**
@@ -134,9 +125,16 @@ function comparator(
  *   data.
  * - All query parameters are validated before use.  Unknown status values,
  *   non-numeric pagination values, and invalid sort fields are rejected
- *   with 400.
+ *   with 400 — the repository is never called with invalid inputs.
  * - The `limit` is capped at `MAX_LIMIT` to prevent clients from fetching
  *   the entire table in one request.
+ * - The investor id passed to the repository is always taken from
+ *   `req.user.id` (the authenticated token), never from query parameters,
+ *   preventing IDOR enumeration.
+ * - Filtering, sorting, and pagination are performed in SQL by the
+ *   repository (using parameterised queries and a whitelisted ORDER BY
+ *   column), not in JavaScript — response time and memory are constant
+ *   regardless of an investor's total payout history.
  *
  * @param payoutRepo  Repository providing investor payout data.
  */
@@ -146,10 +144,14 @@ export function createPayoutsHandlers(payoutRepo: PayoutRepo) {
    * @dev GET handler — returns the authenticated investor's payouts with
    *      optional filters, sorting, and pagination.
    *
+   * All filtering, sorting, and pagination are delegated to the repository
+   * layer (SQL LIMIT / OFFSET, parameterised WHERE, whitelisted ORDER BY).
+   * The handler performs no in-memory filtering, sorting, or slicing.
+   *
    * Query parameters:
    *   status    — filter by payout status (pending | processed | failed)
-   *   minAmount — filter payouts with amount >= minAmount
-   *   maxAmount — filter payouts with amount <= maxAmount
+   *   minAmount — filter payouts with amount >= minAmount (SQL NUMERIC)
+   *   maxAmount — filter payouts with amount <= maxAmount (SQL NUMERIC)
    *   from      — filter payouts created on or after this ISO-8601 date
    *   to        — filter payouts created on or before this ISO-8601 date
    *   sortBy    — column to sort by (created_at | amount | status)
@@ -232,35 +234,22 @@ export function createPayoutsHandlers(payoutRepo: PayoutRepo) {
         return res.status(400).json({ error: 'Invalid sortOrder. Allowed: asc, desc' });
       }
 
-      // ── Fetch data ──────────────────────────────────────────────────────
-      let payouts = await payoutRepo.listPayoutsByInvestor(user.id);
+      // ── Delegate everything to the repository ───────────────────────────
+      // The investor id is always sourced from the authenticated token, never
+      // from query parameters, to prevent IDOR enumeration attacks.
+      const { payouts, total } = await payoutRepo.searchPayoutsByInvestor({
+        investorId: user.id,
+        status: status as 'pending' | 'processed' | 'failed' | undefined,
+        minAmount,
+        maxAmount,
+        from: fromDate,
+        to: toDate,
+        sortBy: sortBy as 'created_at' | 'amount' | 'status',
+        sortOrder: sortOrder as 'asc' | 'desc',
+        limit,
+        offset,
+      });
 
-      // ── Apply filters ───────────────────────────────────────────────────
-      if (status !== undefined) {
-        payouts = payouts.filter((p) => p.status === status);
-      }
-      if (minAmount !== undefined) {
-        payouts = payouts.filter((p) => parseFloat(p.amount) >= minAmount!);
-      }
-      if (maxAmount !== undefined) {
-        payouts = payouts.filter((p) => parseFloat(p.amount) <= maxAmount!);
-      }
-      if (fromDate !== undefined) {
-        payouts = payouts.filter((p) => new Date(p.created_at).getTime() >= fromDate!.getTime());
-      }
-      if (toDate !== undefined) {
-        payouts = payouts.filter((p) => new Date(p.created_at).getTime() <= toDate!.getTime());
-      }
-
-      // ── Sort ────────────────────────────────────────────────────────────
-      const ascending = sortOrder === 'asc';
-      payouts.sort((a, b) =>
-        comparator(a, b, sortBy as 'created_at' | 'amount' | 'status', ascending),
-      );
-
-      // ── Paginate ────────────────────────────────────────────────────────
-      const total = payouts.length;
-      payouts = payouts.slice(offset, offset + limit);
       const hasMore = offset + limit < total;
 
       // ── Respond ─────────────────────────────────────────────────────────

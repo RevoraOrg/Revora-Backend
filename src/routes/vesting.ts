@@ -5,7 +5,7 @@ import { SessionRepository } from '../db/repositories/sessionRepository';
 import { pool } from '../db/pool';
 
 const router = Router();
-const vestingService = new VestingService();
+const vestingService = new VestingService(pool);
 const requireAuth = createRequireAuth(new SessionRepository(pool));
 
 /**
