@@ -30,6 +30,9 @@ jest.mock("../config/env", () => ({
     ALLOWED_ORIGINS: "",
     ALLOWED_ORIGINS_ARRAY: [] as string[],
   },
+  // Re-exported from the real module so the shared boolean-flag parser is
+  // exercised against live process.env (issue #1305).
+  readEnvBoolean: jest.requireActual("../config/env").readEnvBoolean,
 }));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -319,6 +322,26 @@ describe("Boundary inputs: origin validation edge cases", () => {
       .set("Access-Control-Request-Method", "GET");
 
     expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  // issue #1305: the shared envBoolean value set is used for ad-hoc env reads
+  it("allows a request with no origin when CORS_ALLOW_NO_ORIGIN=yes (shared envBoolean value set)", async () => {
+    const app = makeApp({
+      allowedOrigins: ["https://app.example.com"],
+      corsAllowNoOrigin: "yes",
+    });
+
+    const res = await request(app).get("/ping");
+    expect(res.status).toBe(200);
+  });
+
+  it("throws a clear error when CORS_ALLOW_NO_ORIGIN is not a boolean flag value", () => {
+    expect(() =>
+      makeApp({
+        allowedOrigins: ["https://app.example.com"],
+        corsAllowNoOrigin: "maybe",
+      }),
+    ).toThrow("CORS_ALLOW_NO_ORIGIN must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)");
   });
 
   it("is case-sensitive: mixed-case origin is denied even if lower-case is listed", async () => {

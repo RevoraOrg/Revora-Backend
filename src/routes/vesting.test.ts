@@ -57,10 +57,12 @@ jest.mock('../middleware/auth', () => ({
 
 // 4. Mock VestingService so we can control what processPartialClaim returns.
 const mockProcessPartialClaim = jest.fn();
+const mockSetRepository = jest.fn();
 
 jest.mock('../services/vestingService', () => ({
   VestingService: jest.fn().mockImplementation(() => ({
     processPartialClaim: mockProcessPartialClaim,
+    setRepository: mockSetRepository,
   })),
 }));
 

@@ -2,6 +2,82 @@ import "dotenv/config";
 import { z } from "zod";
 
 /**
+ * Boolean environment flag parsing.
+ *
+ * SECURITY CONTEXT (issue #1305):
+ * `z.coerce.boolean()` applies JavaScript `Boolean(value)`, so every
+ * non-empty string — including `"false"`, `"0"` and `"no"` — coerces to
+ * `true`. An operator who set `OUTBOX_DISPATCHER_ENABLED=false` silently got
+ * the outbox dispatcher started, and `EMAIL_DELIVERABILITY_ENABLED=false`
+ * still mounted the SendGrid/SES/SMTP webhook routes. Kill switches that
+ * cannot be switched off are a security-relevant failure mode, so boolean
+ * flags are parsed from an explicit value set instead.
+ *
+ * Accepted values (case-insensitive, surrounding whitespace ignored):
+ * - Truthy:  `true`, `1`, `yes`, `on`
+ * - Falsy:   `false`, `0`, `no`, `off`
+ *
+ * Security assumptions:
+ * - An unset variable falls back to the caller-provided default.
+ * - An empty string is rejected with a clear validation error (it used to
+ *   coerce to `false` under `Boolean()`, which masked operator typos).
+ * - Anything outside the accepted set fails validation at startup rather
+ *   than silently enabling or disabling a feature.
+ */
+const TRUE_FLAG_VALUES = new Set(["true", "1", "yes", "on"]);
+const FALSE_FLAG_VALUES = new Set(["false", "0", "no", "off"]);
+const BOOLEAN_FLAG_VALUES = "true, false, 1, 0, yes, no, on, off";
+
+/**
+ * Zod schema factory for boolean environment flags.
+ *
+ * Use in place of `z.coerce.boolean()` (which treats `"false"` as `true`):
+ *
+ * ```ts
+ * MY_FEATURE_ENABLED: envBoolean(false), // default: disabled
+ * ```
+ *
+ * @param defaultValue - Value used when the variable is unset.
+ * @returns Zod schema producing a `boolean`.
+ */
+export function envBoolean(defaultValue: boolean) {
+  return z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) return defaultValue;
+      const normalized = value.trim().toLowerCase();
+      if (TRUE_FLAG_VALUES.has(normalized)) return true;
+      if (FALSE_FLAG_VALUES.has(normalized)) return false;
+      ctx.addIssue({
+        code: "custom",
+        message: `must be one of: ${BOOLEAN_FLAG_VALUES} (case-insensitive)`,
+      });
+      return z.NEVER;
+    });
+}
+
+/**
+ * Reads a boolean flag directly from `process.env` at call time.
+ *
+ * For ad-hoc reads that intentionally bypass the startup schema (e.g.
+ * middleware that is constructed per request or per test). Shares the same
+ * accepted value set as {@link envBoolean}; invalid values throw a clear
+ * error instead of silently coercing.
+ *
+ * @param name - Environment variable name (used in the error message).
+ * @param defaultValue - Value used when the variable is unset.
+ * @throws Error when the variable is set to a value outside the accepted set.
+ */
+export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
+  const parsed = envBoolean(defaultValue).safeParse(process.env[name]);
+  if (parsed.success) return parsed.data;
+  throw new Error(
+    `${name} must be one of: ${BOOLEAN_FLAG_VALUES} (case-insensitive)`,
+  );
+}
+
+/**
  * Environment Configuration
  * 
  * | Variable                    | Required | Default                 | Description                                      |
@@ -38,11 +114,12 @@ import { z } from "zod";
  * | CURSOR_SIGNING_SECRET       | No       | dev-cursor-secret...    | Secret for HMAC-signed opaque pagination cursors |
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
- * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking             |
+ * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking; accepts true/false/1/0/yes/no/on/off |
  * | SENDGRID_EVENT_WEBHOOK_SECRET| No      | (empty)                 | Secret for SendGrid event webhook verification   |
  * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
  * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
  * | BOUNCE_RATIO_ALARM_THRESHOLD| No       | 0.05                    | Bounce ratio threshold for alarms (e.g. 0.05=5%)|
+ * | OUTBOX_DISPATCHER_ENABLED   | No       | false                   | Start the transactional outbox dispatcher worker; accepts true/false/1/0/yes/no/on/off |
  * | OFAC_LIST_URL               | No       | (empty)                 | URL for OFAC SDN list CSV                         |
  * | OFAC_SIG_URL                | No       | (empty)                 | URL for OFAC SDN list Ed25519 signature (hex)     |
  * | OFAC_TRUST_ANCHOR_BASE64    | No       | (empty)                 | Base64-encoded Ed25519 public key for OFAC sig vfy |
@@ -92,7 +169,10 @@ const envSchema = z.object({
   HOLIDAY_CALENDAR_FILE_PATH: z.string().optional(),
   HOLIDAY_CALENDAR_SECRET: z.string().optional(),
   HOLIDAY_FALLBACK_SHIFT_POLICY: z.enum(['previous', 'next']).default('previous'),
-  EMAIL_DELIVERABILITY_ENABLED: z.coerce.boolean().default(true),
+  // Boolean flags use envBoolean() rather than z.coerce.boolean():
+  // Boolean("false") === true, so coerce silently turned "disabled" values
+  // into enabled features (issue #1305).
+  EMAIL_DELIVERABILITY_ENABLED: envBoolean(true),
   SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
   SES_SNS_TOPIC_ARN: z.string().optional(),
   KYC_CIRCUIT_TRIP_ERRORS: z.coerce.number().int().positive().default(3),
@@ -100,7 +180,7 @@ const envSchema = z.object({
   KYC_CIRCUIT_HALF_OPEN_MS: z.coerce.number().int().positive().default(30000),
   SUPPRESSION_AUTO_EXPIRE_DAYS: z.coerce.number().int().positive().default(365),
   BOUNCE_RATIO_ALARM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.05),
-  OUTBOX_DISPATCHER_ENABLED: z.coerce.boolean().default(false),
+  OUTBOX_DISPATCHER_ENABLED: envBoolean(false),
 }).refine(data => {
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
@@ -143,7 +223,12 @@ export function buildConfig(): Config {
   const result = envSchema.safeParse(process.env);
 
   if (!result.success) {
-    const errorMessages = result.error.issues.map((e: any) => `${e.path.join('.')}: [REDACTED/INVALID]`).join(', ');
+    // Issue messages for this schema never embed the raw environment value:
+    // zod's built-in messages describe the expected shape (e.g. "Too small:
+    // expected string to have >=16 characters") and custom messages are
+    // authored locally without interpolating input. Path + message are
+    // therefore safe to log without leaking secrets such as DATABASE_URL.
+    const errorMessages = result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`).join(', ');
     console.error(`[FATAL] Configuration validation failed: Missing or invalid required environment variables: ${errorMessages}`);
     process.exit(1);
   }

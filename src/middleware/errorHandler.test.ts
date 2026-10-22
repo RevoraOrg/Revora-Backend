@@ -72,6 +72,32 @@ describe('mapUnknownErrorToAppError', () => {
     const err = Errors.forbidden('Nope');
     expect(mapUnknownErrorToAppError(err)).toBe(err);
   });
+  it('maps malformed JSON to 400 INVALID_JSON', () => {
+    const mapped = mapUnknownErrorToAppError({ type: 'entity.parse.failed' });
+    expect(mapped.statusCode).toBe(400);
+    expect(mapped.code).toBe(ErrorCode.INVALID_JSON);
+  });
+
+  it('maps a too-large body to 413 PAYLOAD_TOO_LARGE', () => {
+    const mapped = mapUnknownErrorToAppError({ type: 'entity.too.large' });
+    expect(mapped.statusCode).toBe(413);
+    expect(mapped.code).toBe(ErrorCode.PAYLOAD_TOO_LARGE);
+  });
+
+  it('maps pg 22P02 (bad UUID) to 400', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '22P02' });
+    expect(mapped.statusCode).toBe(400);
+  });
+
+  it('maps pg 23505 (duplicate) to 409', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '23505' });
+    expect(mapped.statusCode).toBe(409);
+  });
+
+  it('maps pg 23503 (bad link) to 409', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '23503' });
+    expect(mapped.statusCode).toBe(409);
+  });
 
   it('sanitizes unknown errors into INTERNAL_ERROR', () => {
     const mapped = mapUnknownErrorToAppError(new Error('secret db password'));

@@ -221,6 +221,11 @@ export class LedgerService {
     const result = await withTransaction(
       this.pool,
       async (client) => {
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtext($1))',
+          [offeringId]
+        );
+
         // Materialize export
         const export_ = await this.materializeExport(
           offeringId,

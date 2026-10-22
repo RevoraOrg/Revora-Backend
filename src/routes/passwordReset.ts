@@ -5,7 +5,6 @@ import { PasswordResetRateLimiter } from '../services/passwordResetRateLimiter';
 import { EmailService } from '../services/emailService';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MIN_PASSWORD_LENGTH = 8;
 
 export interface CreatePasswordResetRouterOptions {
   db: Pool;
@@ -55,13 +54,17 @@ export function createPasswordResetRouter(options: CreatePasswordResetRouterOpti
 
   router.post('/api/auth/reset-password', async (req: Request, res: Response) => {
     const { token, password } = req.body ?? {};
-    if (typeof token !== 'string' || typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+    if (typeof token !== 'string' || typeof password !== 'string') {
       res.status(400).json({ error: 'Invalid token or password' });
       return;
     }
     try {
-      const ok = await service.resetPassword(token, password);
-      if (!ok) {
+      const result = await service.resetPassword(token, password);
+      if (!result.ok) {
+        if (result.reason === 'weak_password') {
+          res.status(400).json({ error: 'Password does not meet strength requirements', errors: result.errors });
+          return;
+        }
         res.status(400).json({ error: 'Invalid or expired token' });
         return;
       }

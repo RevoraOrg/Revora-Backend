@@ -8,6 +8,7 @@ import {
 } from '../lib/webhookSignature';
 import { Logger } from '../lib/logger';
 import { OutboxRepository } from '../db/repositories/outboxRepository';
+import { safeFetch } from '../lib/ssrfProtection';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -196,7 +197,7 @@ export class WebhookService {
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const response = await fetch(endpoint.url, {
+      const response = await safeFetch(endpoint.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -206,6 +207,7 @@ export class WebhookService {
         },
         body,
         signal: controller.signal,
+        redirect: 'manual',
       });
 
       return {
@@ -261,9 +263,9 @@ export class WebhookService {
         const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
         const timestamp = Date.now().toString();
-        let response: Response;
+        let response;
         try {
-          response = await fetch(endpoint.url, {
+          response = await safeFetch(endpoint.url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -273,6 +275,7 @@ export class WebhookService {
             },
             body,
             signal: controller.signal,
+            redirect: 'manual',
           });
         } finally {
           clearTimeout(timeoutId);

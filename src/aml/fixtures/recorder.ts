@@ -21,6 +21,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { readEnvBoolean } from '../../config/env';
 import {
   redactObject,
   createRedactionContext,
@@ -276,7 +277,9 @@ export async function hasFixtures(
  * or replay existing ones.
  */
 export function shouldRecord(): boolean {
-  return process.env.RECORD_FIXTURES === 'true';
+  // Shared envBoolean value set (issue #1305); read at call time so tests
+  // and local runs can flip RECORD_FIXTURES without re-importing the module.
+  return readEnvBoolean('RECORD_FIXTURES', false);
 }
 
 export const __test = {
