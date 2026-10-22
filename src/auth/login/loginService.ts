@@ -1,4 +1,5 @@
-import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { comparePassword } from '../../utils/password';
 import {
     JwtIssuer,
     LoginSuccessResponse,
@@ -11,7 +12,8 @@ import { hashSessionToken, SESSION_TTL_MS } from '../session';
  * Domain service that orchestrates the login flow:
  *
  *  1. Look up the user by email.
- *  2. Compare the provided password against the stored hash.
+ *  2. Compare the provided password against the stored hash and reject
+ *     deactivated accounts.
  *  3. Generate a new session ID.
  *  4. Issue tokens embedding the session ID.
  *  5. Persist the session with the refresh token hash.
@@ -40,8 +42,15 @@ export class LoginService {
             return null;
         }
 
-        // 2. Verify password
-        if (!this.verifyPassword(password, user.passwordHash)) {
+        // 2. Verify password (supports scrypt and legacy SHA-256)
+        const isMatch = await comparePassword(password, user.passwordHash);
+        if (!isMatch) {
+            return null;
+        }
+
+        // Deactivated (#1300). Same result as a wrong password, and checked
+        // after it so the timing doesn't give the account state away.
+        if (user.isActive === false) {
             return null;
         }
 
@@ -59,7 +68,7 @@ export class LoginService {
         const tokenHash = createHash('sha256')
             .update(tokens.refreshToken)
             .digest('hex');
-        
+
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
 
@@ -78,31 +87,5 @@ export class LoginService {
                 role: user.role,
             },
         };
-    }
-
-    // ── Private helpers ─────────────────────────────────────────────────
-
-    /**
-     * Timing-safe comparison of a plain-text password against a SHA-256
-     * hex digest.
-     *
-     * SHA-256 is used here because the existing project has no bcrypt /
-     * argon2 dependency and `package.json` must not be modified.
-     * In production you would swap this for a proper password-hashing
-     * algorithm (bcrypt / argon2) via the same interface boundary.
-     */
-    private verifyPassword(plaintext: string, storedHash: string): boolean {
-        const candidateHash = createHash('sha256')
-            .update(plaintext)
-            .digest('hex');
-
-        const a = Buffer.from(candidateHash, 'utf-8');
-        const b = Buffer.from(storedHash, 'utf-8');
-
-        if (a.length !== b.length) {
-            return false;
-        }
-
-        return timingSafeEqual(a, b);
     }
 }

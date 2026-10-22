@@ -27,7 +27,7 @@ tags:
   - name: Offerings
     description: Offering validation and sync
   - name: Investments
-    description: Vesting claims
+    description: Investor payout listing and vesting claims
   - name: Admin
     description: Admin-only operational endpoints
   - name: AML
@@ -152,6 +152,117 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Overview"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Investments – payouts
+  # ─────────────────────────────────────────────────────────────────────
+  /api/investments/payouts:
+    get:
+      summary: List authenticated investor's payouts
+      description: |
+        Returns a paginated, filtered, and sorted list of payout records for
+        the authenticated investor. All filtering, sorting, and pagination are
+        performed in SQL (LIMIT/OFFSET, parameterised WHERE, NUMERIC ORDER BY)
+        so response time is independent of the investor's total payout history.
+
+        Amount range comparisons use SQL NUMERIC so "10.5" sorts after "9.99".
+
+        Requires a valid JWT with `role: investor`. Startups, issuers, and
+        admins receive 403.
+      tags: [Investments]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, processed, failed]
+          description: Filter by payout status.
+        - name: minAmount
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: Include only payouts with amount >= minAmount (NUMERIC comparison).
+        - name: maxAmount
+          in: query
+          schema:
+            type: number
+            minimum: 0
+          description: Include only payouts with amount <= maxAmount (NUMERIC comparison).
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Include only payouts created on or after this ISO-8601 timestamp.
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Include only payouts created on or before this ISO-8601 timestamp.
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [created_at, amount, status]
+            default: created_at
+          description: Column to sort by. `amount` uses NUMERIC ordering.
+        - name: sortOrder
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: Sort direction.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100
+            default: 20
+          description: Page size. Capped at 100.
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Number of records to skip.
+      responses:
+        "200":
+          description: Paginated payout list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayoutListResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
+        "403":
+          description: Authenticated user does not have the investor role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
+        "500":
+          description: Unexpected server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlainError"
 
   # ─────────────────────────────────────────────────────────────────────
   # Auth
@@ -2295,3 +2406,72 @@ components:
       properties:
         error:
           type: string
+
+    # ── Investments – payouts ──────────────────────────────────────────
+    Payout:
+      type: object
+      description: |
+        A single payout record produced by a distribution run.
+        Field names match the `distribution_payouts` table:
+          - `distribution_id` is the FK to `distributions.id`
+          - `tx_hash` is the Stellar transaction hash
+      additionalProperties: false
+      required: [id, distribution_id, investor_id, amount, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        distribution_id:
+          type: string
+          format: uuid
+          description: FK to distributions.id (the distribution run that generated this payout).
+        investor_id:
+          type: string
+          format: uuid
+        amount:
+          type: string
+          description: Decimal amount as a string (e.g. "123.4567890000"). Use SQL NUMERIC for comparisons.
+        status:
+          type: string
+          enum: [pending, processed, failed]
+        tx_hash:
+          type: string
+          nullable: true
+          description: Stellar transaction hash, present when status is processed.
+        frozen_fx_rate_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PayoutListResponse:
+      type: object
+      description: Paginated list of payouts with total count from the database.
+      additionalProperties: false
+      required: [payouts, total, limit, offset, hasMore]
+      properties:
+        payouts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Payout"
+        total:
+          type: integer
+          minimum: 0
+          description: Total number of payouts matching the applied filters (COUNT(*) OVER()).
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Page size used for this response.
+        offset:
+          type: integer
+          minimum: 0
+          description: Number of records skipped.
+        hasMore:
+          type: boolean
+          description: True when offset + limit < total.

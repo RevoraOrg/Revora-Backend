@@ -19,7 +19,8 @@ import { OutboxHmacRotationService } from './outboxHmacRotationService';
 import { signOutboundPayload } from '../lib/webhookSignature';
 
 // Re-export for convenient access
-export { PressureTier, PressureGaugeConfig, PressureStateChangeCallback } from '../lib/pressureGauge';
+export { PressureTier } from '../lib/pressureGauge';
+export type { PressureGaugeConfig, PressureStateChangeCallback } from '../lib/pressureGauge';
 export { OutboxHmacRotationService } from './outboxHmacRotationService';
 
 /**
@@ -32,6 +33,8 @@ export type DispatchFn = (row: OutboxRow) => Promise<boolean>;
 export interface OutboxDispatcherOptions {
   /** How many rows to claim per poll cycle. Default: 50. */
   batchSize?: number;
+  /** Lease duration for the entire sequential batch in milliseconds. Default: 60000. */
+  leaseMs?: number;
   /** Milliseconds between poll cycles. Default: 5000. */
   intervalMs?: number;
   /** Max retry attempts before a row is marked failed. Default: 5. */
@@ -49,8 +52,8 @@ export interface OutboxDispatcherOptions {
  * to the provided `dispatch` function (typically WebhookQueue.processDelivery).
  *
  * Guarantees:
- * - A row is only claimed by one worker at a time (SKIP LOCKED in OutboxRepository).
- * - A crash mid-dispatch leaves the row pending; the next poll retries it with
+ * - An atomic lease gives each row one owner until expiry; stale completions are fenced.
+ * - A crash mid-dispatch leaves the row leased; a poll after expiry retries it with
  *   the same event_id, so the receiver can deduplicate via webhookEventOrdering.
  * - After maxAttempts failures the row is marked 'failed' (dead-letter).
  *
@@ -61,6 +64,7 @@ export interface OutboxDispatcherOptions {
  */
 export class OutboxDispatcher {
   private readonly batchSize: number;
+  private readonly leaseMs: number;
   private readonly intervalMs: number;
   private readonly maxAttempts: number;
   private readonly retryBaseMs: number;
@@ -75,6 +79,7 @@ export class OutboxDispatcher {
     options: OutboxDispatcherOptions = {}
   ) {
     this.batchSize = options.batchSize ?? 50;
+    this.leaseMs = options.leaseMs ?? 60_000;
     this.intervalMs = options.intervalMs ?? 5000;
     this.maxAttempts = options.maxAttempts ?? 5;
     this.retryBaseMs = options.retryBaseMs ?? 1000;
@@ -145,7 +150,7 @@ export class OutboxDispatcher {
     // Measure lag before draining
     await this.measureAndUpdateLag();
 
-    const rows = await this.outboxRepo.drainPending(this.batchSize);
+    const rows = await this.outboxRepo.drainPending(this.batchSize, this.leaseMs);
     for (const row of rows) {
       await this.processRow(row);
     }
@@ -237,19 +242,19 @@ export class OutboxDispatcher {
     }
 
     if (success) {
-      await this.outboxRepo.markDispatched(row.id);
+      await this.outboxRepo.markDispatched(row.id, row.lease_token);
       return;
     }
 
     const nextAttempts = row.attempts + 1;
     if (nextAttempts >= this.maxAttempts) {
       // Exhausted retries – mark failed (dead-letter)
-      await this.outboxRepo.markFailed(row.id);
+      await this.outboxRepo.markFailed(row.id, row.lease_token);
     } else {
       // Exponential back-off: retryBaseMs * 2^attempt
       const delayMs = this.retryBaseMs * Math.pow(2, nextAttempts - 1);
       const retryAfter = new Date(Date.now() + delayMs);
-      await this.outboxRepo.markFailed(row.id, retryAfter);
+      await this.outboxRepo.markFailed(row.id, row.lease_token, retryAfter);
     }
   }
 }

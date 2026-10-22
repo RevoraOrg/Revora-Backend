@@ -88,4 +88,27 @@ describe('RefreshTokenRepositoryAdapter', () => {
 
         expect(mockSessionRepo.setSessionConsumed).toHaveBeenCalledWith('s-consumed', mockClient);
     });
+
+    describe('isUserActive (#1300)', () => {
+        const withRows = (rows: Array<{ is_active: boolean | null }>) =>
+            ({ query: jest.fn().mockResolvedValue({ rows }) }) as unknown as PoolClient;
+
+        it('reads the user row FOR SHARE on the transaction client', async () => {
+            const client = withRows([{ is_active: true }]);
+
+            await expect(adapter.isUserActive('u-1', client)).resolves.toBe(true);
+            expect(client.query).toHaveBeenCalledWith(
+                'SELECT is_active FROM users WHERE id = $1 FOR SHARE',
+                ['u-1'],
+            );
+        });
+
+        it('returns false for a deactivated user', async () => {
+            await expect(adapter.isUserActive('u-1', withRows([{ is_active: false }]))).resolves.toBe(false);
+        });
+
+        it('fails closed when the user row no longer exists', async () => {
+            await expect(adapter.isUserActive('u-gone', withRows([]))).resolves.toBe(false);
+        });
+    });
 });

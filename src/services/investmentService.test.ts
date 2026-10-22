@@ -1,4 +1,4 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository, Offering } from '../db/repositories/offeringRepository';
 import { UserRepository, User } from '../db/repositories/userRepository';
@@ -11,8 +11,16 @@ import { AuditLogRepository } from '../db/repositories/auditLogRepository';
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeMockPool(): { query: jest.Mock } {
-  return { query: jest.fn() };
+function makeMockPool(): { query: jest.Mock; connect: jest.Mock; mockClient: { query: jest.Mock; release: jest.Mock } } {
+  const mockClient = {
+    query: jest.fn(),
+    release: jest.fn(),
+  };
+  return {
+    query: jest.fn(),
+    connect: jest.fn().mockResolvedValue(mockClient),
+    mockClient,
+  };
 }
 
 function makeInvestmentRow(override: Partial<Investment> = {}): Investment {
@@ -36,6 +44,7 @@ function makeOfferingRow(override: Partial<Offering> = {}): Offering {
     status: 'active',
     total_raised: '10000.00',
     target_amount: '1000000.00',
+    max_investor_share_bps: null,
     created_at: new Date('2024-01-01'),
     updated_at: new Date('2024-01-01'),
     ...override,
@@ -59,12 +68,34 @@ function mockQueryResult(rows: unknown[]): QueryResult<any> {
   return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
+function setupTransactionMocks(mockPool: { query: jest.Mock; connect: jest.Mock; mockClient: { query: jest.Mock; release: jest.Mock } }) {
+  const mockClient = mockPool.mockClient;
+  
+  // Reset query mock for this test
+  mockClient.query.mockReset();
+  
+  // Mock BEGIN, advisory lock queries
+  mockClient.query
+    .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'BEGIN', oid: 0, fields: [] }) // BEGIN
+    .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'SELECT', oid: 0, fields: [] }); // pg_advisory_xact_lock
+  
+  return mockClient;
+}
+
+function expectRollbackCalled(mockClient: { query: jest.Mock }) {
+  expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
+}
+
+function expectCommitCalled(mockClient: { query: jest.Mock }) {
+  expect(mockClient.query).toHaveBeenCalledWith('COMMIT');
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe('InvestmentService', () => {
-  let mockPool: { query: jest.Mock };
+  let mockPool: { query: jest.Mock; connect: jest.Mock; mockClient: { query: jest.Mock; release: jest.Mock } };
   let investmentRepo: InvestmentRepository;
   let offeringRepo: OfferingRepository;
   let service: InvestmentService;
@@ -73,7 +104,7 @@ describe('InvestmentService', () => {
     mockPool = makeMockPool();
     investmentRepo = new InvestmentRepository(mockPool as unknown as Pool);
     offeringRepo = new OfferingRepository(mockPool as unknown as Pool);
-    service = new InvestmentService(investmentRepo, offeringRepo);
+    service = new InvestmentService(investmentRepo, offeringRepo, undefined, undefined, mockPool as unknown as Pool);
   });
 
   describe('createInvestment', () => {
@@ -85,26 +116,35 @@ describe('InvestmentService', () => {
     };
 
     it('creates an investment when offering exists and is active', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const offeringRow = makeOfferingRow({ status: 'active' });
       const investmentRow = makeInvestmentRow();
 
-      mockPool.query
+      // Offering query (no cap check since max_investor_share_bps is null)
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>);
+        // create investment
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        // COMMIT
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       const result = await service.createInvestment(baseInput);
 
       expect(result).toEqual(investmentRow);
-      expect(mockPool.query).toHaveBeenCalledTimes(2);
+      expect(mockClient.query).toHaveBeenCalledWith('BEGIN');
+      expect(mockClient.query).toHaveBeenCalledWith('SELECT pg_advisory_xact_lock(hashtext($1))', ['investor:investor-123:offering:offering-abc']);
+      expectCommitCalled(mockClient);
     });
 
     it('creates an investment when offering status is "open"', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const offeringRow = makeOfferingRow({ status: 'open' });
       const investmentRow = makeInvestmentRow();
 
-      mockPool.query
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       const result = await service.createInvestment(baseInput);
 
@@ -112,49 +152,53 @@ describe('InvestmentService', () => {
     });
 
     it('throws NOT_FOUND error when offering does not exist', async () => {
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([]));
+      const mockClient = setupTransactionMocks(mockPool);
+      mockClient.query
+        .mockResolvedValueOnce(mockQueryResult([])) // offering not found
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
 
       await expect(service.createInvestment(baseInput)).rejects.toThrow('Offering offering-abc not found');
+      expectRollbackCalled(mockClient);
     });
 
     it('throws VALIDATION_ERROR when offering is not active', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const offeringRow = makeOfferingRow({ status: 'closed' });
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
+      mockClient.query
+        .mockResolvedValueOnce(mockQueryResult([offeringRow]))
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
 
       await expect(service.createInvestment(baseInput)).rejects.toThrow('Offering is not active');
+      expectRollbackCalled(mockClient);
     });
 
     it('throws VALIDATION_ERROR when amount is invalid', async () => {
-      const offeringRow = makeOfferingRow({ status: 'active' });
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
-
       await expect(service.createInvestment({ ...baseInput, amount: '-100' })).rejects.toThrow(
         'Invalid amount: must be a positive number',
       );
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
       await expect(service.createInvestment({ ...baseInput, amount: '0' })).rejects.toThrow(
         'Invalid amount: must be a positive number',
       );
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
-      await expect(service.createInvestment({ ...baseInput, amount: 'abc' })).rejects.toThrow(
-        'Invalid amount: must be a positive number',
-      );
+      await expect(service.createInvestment({ ...baseInput, amount: 'abc' })).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        message: expect.stringContaining('Invalid decimal string format'),
+      });
     });
 
     it('throws VALIDATION_ERROR when asset is empty', async () => {
-      const offeringRow = makeOfferingRow({ status: 'active' });
-      mockPool.query.mockResolvedValueOnce(mockQueryResult([offeringRow]));
-
+      // Asset validation happens before transaction starts, so no ROLLBACK expected
       await expect(service.createInvestment({ ...baseInput, asset: '' })).rejects.toThrow('Asset is required');
     });
 
     it('creates investment with pending status by default', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const offeringRow = makeOfferingRow({ status: 'active' });
       const investmentRow = makeInvestmentRow({ status: 'pending' });
 
-      mockPool.query
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       const result = await service.createInvestment(baseInput);
 
@@ -172,7 +216,7 @@ describe('InvestmentService', () => {
 
     function serviceWithUserRepo(user: User | null): {
       service: InvestmentService;
-      mockPool: { query: jest.Mock };
+      mockPool: { query: jest.Mock; connect: jest.Mock; mockClient: { query: jest.Mock; release: jest.Mock } };
     } {
       const pool = makeMockPool();
       const invRepo = new InvestmentRepository(pool as unknown as Pool);
@@ -181,7 +225,7 @@ describe('InvestmentService', () => {
         findById: jest.fn().mockResolvedValue(user),
       } as unknown as UserRepository;
       return {
-        service: new InvestmentService(invRepo, offRepo, undefined, userRepo),
+        service: new InvestmentService(invRepo, offRepo, undefined, userRepo, pool as unknown as Pool),
         mockPool: pool,
       };
     }
@@ -190,7 +234,8 @@ describe('InvestmentService', () => {
       const { service: svc, mockPool: pool } = serviceWithUserRepo(
         makeUser({ kyc_risk_tier: 'high' }),
       );
-      pool.query
+      const mockClient = setupTransactionMocks(pool);
+      mockClient.query
         .mockResolvedValueOnce(
           mockQueryResult([
             makeOfferingRow({
@@ -199,9 +244,12 @@ describe('InvestmentService', () => {
             }),
           ]),
         )
-        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]));
+        // sumInvestorCommitment (cap check runs because effectiveCapBps = 250)
+        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]))
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
 
       await expect(svc.createInvestment(baseInput)).rejects.toThrow(/KYC risk-tier adjusted cap/);
+      expectRollbackCalled(mockClient);
     });
 
     it('allows the same intent after tier upgrade on the next createInvestment call', async () => {
@@ -215,38 +263,42 @@ describe('InvestmentService', () => {
       const pool = makeMockPool();
       const invRepo = new InvestmentRepository(pool as unknown as Pool);
       const offRepo = new OfferingRepository(pool as unknown as Pool);
-      const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo);
+      const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, pool as unknown as Pool);
       const offering = makeOfferingRow({
         max_investor_share_bps: 1_000,
         target_amount: '1000000',
       });
       const investmentRow = makeInvestmentRow({ amount: '60000.00' });
 
-      pool.query
-        .mockResolvedValueOnce(mockQueryResult([offering]))
-        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]));
-      await expect(svc.createInvestment(baseInput)).rejects.toThrow(/KYC risk-tier adjusted cap/);
-
-      pool.query
+      // First call - blocked (high tier, effectiveCapBps = 250)
+      let mockClient = setupTransactionMocks(pool);
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offering]))
         .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]))
-        .mockResolvedValueOnce({
-          rows: [investmentRow],
-          rowCount: 1,
-          command: 'INSERT',
-          oid: 0,
-          fields: [],
-        } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
+
+      await expect(svc.createInvestment(baseInput)).rejects.toThrow(/KYC risk-tier adjusted cap/);
+      expectRollbackCalled(mockClient);
+
+      // Second call - allowed (standard tier, effectiveCapBps = 1000)
+      mockClient = setupTransactionMocks(pool);
+      mockClient.query
+        .mockResolvedValueOnce(mockQueryResult([offering]))
+        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]))
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       const created = await svc.createInvestment(baseInput);
       expect(created.amount).toBe('60000.00');
+      expectCommitCalled(mockClient);
     });
 
     it('does not invalidate existing over-cap commitments — only rejects additional amount', async () => {
       const { service: svc, mockPool: pool } = serviceWithUserRepo(
         makeUser({ kyc_risk_tier: 'elevated' }),
       );
-      pool.query
+      const mockClient = setupTransactionMocks(pool);
+      mockClient.query
         .mockResolvedValueOnce(
           mockQueryResult([
             makeOfferingRow({
@@ -255,34 +307,31 @@ describe('InvestmentService', () => {
             }),
           ]),
         )
-        .mockResolvedValueOnce(mockQueryResult([{ total: '80000' }]));
+        .mockResolvedValueOnce(mockQueryResult([{ total: '80000' }]))
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
 
       await expect(
         svc.createInvestment({ ...baseInput, amount: '1' }),
       ).rejects.toThrow(/KYC risk-tier adjusted cap/);
-      const sql = pool.query.mock.calls.map((c) => String(c[0]));
+      expectRollbackCalled(mockClient);
+      const sql = mockClient.query.mock.calls.map((c) => String(c[0]));
       expect(sql.some((s) => /DELETE\s+FROM\s+investments/i.test(s))).toBe(false);
       expect(sql.some((s) => /INSERT\s+INTO\s+investments/i.test(s))).toBe(false);
     });
 
-
     it('invokes AML evaluation when amlService is configured', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const amlService = {
         evaluateTransaction: jest.fn().mockResolvedValue([]),
       } as unknown as AMLService;
-      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService);
+      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService, undefined, mockPool as unknown as Pool);
       const offeringRow = makeOfferingRow({ status: 'active' });
       const investmentRow = makeInvestmentRow();
 
-      mockPool.query
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({
-          rows: [investmentRow],
-          rowCount: 1,
-          command: 'INSERT',
-          oid: 0,
-          fields: [],
-        } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       const result = await svc.createInvestment(baseInput);
       expect(result).toEqual(investmentRow);
@@ -291,23 +340,19 @@ describe('InvestmentService', () => {
     });
 
     it('does not fail investment creation when AML evaluation rejects asynchronously', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const amlService = {
         evaluateTransaction: jest.fn().mockRejectedValue(new Error('aml failed')),
       } as unknown as AMLService;
-      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService);
+      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService, undefined, mockPool as unknown as Pool);
       const offeringRow = makeOfferingRow({ status: 'active' });
       const investmentRow = makeInvestmentRow();
 
-      mockPool.query
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({
-          rows: [investmentRow],
-          rowCount: 1,
-          command: 'INSERT',
-          oid: 0,
-          fields: [],
-        } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       await expect(svc.createInvestment(baseInput)).resolves.toEqual(investmentRow);
       await new Promise((r) => setImmediate(r));
@@ -316,25 +361,21 @@ describe('InvestmentService', () => {
     });
 
     it('does not fail investment creation when AML setup throws synchronously', async () => {
+      const mockClient = setupTransactionMocks(mockPool);
       const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
       const amlService = {
         evaluateTransaction: jest.fn(() => {
           throw new Error('sync aml');
         }),
       } as unknown as AMLService;
-      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService);
+      const svc = new InvestmentService(investmentRepo, offeringRepo, amlService, undefined, mockPool as unknown as Pool);
       const offeringRow = makeOfferingRow({ status: 'active' });
       const investmentRow = makeInvestmentRow();
 
-      mockPool.query
+      mockClient.query
         .mockResolvedValueOnce(mockQueryResult([offeringRow]))
-        .mockResolvedValueOnce({
-          rows: [investmentRow],
-          rowCount: 1,
-          command: 'INSERT',
-          oid: 0,
-          fields: [],
-        } as QueryResult<Investment>);
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
 
       await expect(svc.createInvestment(baseInput)).resolves.toEqual(investmentRow);
       expect(consoleSpy).toHaveBeenCalledWith('AML evaluation setup failed:', expect.any(Error));
@@ -345,7 +386,8 @@ describe('InvestmentService', () => {
       const { service: svc, mockPool: pool } = serviceWithUserRepo(
         makeUser({ kyc_risk_tier: 'restricted' }),
       );
-      pool.query
+      const mockClient = setupTransactionMocks(pool);
+      mockClient.query
         .mockResolvedValueOnce(
           mockQueryResult([
             makeOfferingRow({
@@ -354,9 +396,47 @@ describe('InvestmentService', () => {
             }),
           ]),
         )
-        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]));
+        // sumInvestorCommitment (cap check runs because effectiveCapBps = 0 for restricted)
+        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]))
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'ROLLBACK', oid: 0, fields: [] });
 
       await expect(svc.createInvestment(baseInput)).rejects.toThrow(/KYC risk-tier adjusted cap/);
+      expectRollbackCalled(mockClient);
+    });
+
+    it('uses the same transaction client for sumInvestorCommitment and create', async () => {
+      const pool = makeMockPool();
+      const invRepo = new InvestmentRepository(pool as unknown as Pool);
+      const offRepo = new OfferingRepository(pool as unknown as Pool);
+      const userRepo = {
+        findById: jest.fn().mockResolvedValue(makeUser({ kyc_risk_tier: 'standard' })),
+      } as unknown as UserRepository;
+      const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, pool as unknown as Pool);
+      const mockClient = setupTransactionMocks(pool);
+      const offering = makeOfferingRow({
+        max_investor_share_bps: 1_000,
+        target_amount: '1000000',
+      });
+      const investmentRow = makeInvestmentRow({ amount: '50000.00' });
+
+      mockClient.query
+        .mockResolvedValueOnce(mockQueryResult([offering]))
+        .mockResolvedValueOnce(mockQueryResult([{ total: '0' }]))
+        .mockResolvedValueOnce({ rows: [investmentRow], rowCount: 1, command: 'INSERT', oid: 0, fields: [] } as QueryResult<Investment>)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0, command: 'COMMIT', oid: 0, fields: [] });
+
+      // Capture the client passed to repository methods
+      const sumSpy = jest.spyOn(invRepo, 'sumInvestorCommitment');
+      const createSpy = jest.spyOn(invRepo, 'create');
+
+      await svc.createInvestment({ ...baseInput, amount: '50000.00' });
+
+      // Both methods should be called with the same client (mockClient)
+      expect(sumSpy).toHaveBeenCalledWith('investor-123', 'offering-abc', mockClient);
+      expect(createSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ investor_id: 'investor-123', offering_id: 'offering-abc', amount: '50000.00' }),
+        mockClient
+      );
     });
   });
 });

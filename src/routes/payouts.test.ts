@@ -1,5 +1,6 @@
 import assert from 'assert';
 import { createPayoutsHandlers, Payout, PayoutListResponse } from './payouts';
+import { DistributionRepository } from '../db/repositories/distributionRepository';
 import {
   classifyStellarRPCFailure,
   isStellarRPCRetryable,
@@ -10,10 +11,75 @@ import {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/**
+ * MockPayoutRepo implements the `PayoutRepo` interface consumed by the handler.
+ * It mimics what the real `DistributionRepository.searchPayoutsByInvestor` does
+ * in SQL — filter, sort, slice — entirely in-process so that unit tests remain
+ * fast and deterministic without a real database.
+ */
 class MockPayoutRepo {
   constructor(private rows: Payout[]) {}
-  async listPayoutsByInvestor(investorId: string): Promise<Payout[]> {
-    return this.rows.filter((p) => p.investor_id === investorId);
+
+  async searchPayoutsByInvestor(params: {
+    investorId: string;
+    status?: 'pending' | 'processed' | 'failed';
+    minAmount?: number;
+    maxAmount?: number;
+    from?: Date;
+    to?: Date;
+    sortBy?: 'created_at' | 'amount' | 'status';
+    sortOrder?: 'asc' | 'desc';
+    limit: number;
+    offset: number;
+  }): Promise<{ payouts: Payout[]; total: number }> {
+    const {
+      investorId,
+      status,
+      minAmount,
+      maxAmount,
+      from,
+      to,
+      sortBy = 'created_at',
+      sortOrder = 'desc',
+      limit,
+      offset,
+    } = params;
+
+    let rows = this.rows.filter((p) => p.investor_id === investorId);
+
+    if (status !== undefined) {
+      rows = rows.filter((p) => p.status === status);
+    }
+    if (minAmount !== undefined) {
+      rows = rows.filter((p) => parseFloat(p.amount) >= minAmount);
+    }
+    if (maxAmount !== undefined) {
+      rows = rows.filter((p) => parseFloat(p.amount) <= maxAmount);
+    }
+    if (from !== undefined) {
+      rows = rows.filter((p) => new Date(p.created_at).getTime() >= from.getTime());
+    }
+    if (to !== undefined) {
+      rows = rows.filter((p) => new Date(p.created_at).getTime() <= to.getTime());
+    }
+
+    const asc = sortOrder === 'asc' ? 1 : -1;
+    rows = [...rows].sort((a, b) => {
+      switch (sortBy) {
+        case 'amount':
+          return asc * (parseFloat(a.amount) - parseFloat(b.amount));
+        case 'created_at':
+          return asc * (new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+        case 'status':
+          return asc * a.status.localeCompare(b.status);
+        default:
+          return 0;
+      }
+    });
+
+    const total = rows.length;
+    const payouts = rows.slice(offset, offset + limit);
+    return { payouts, total };
   }
 }
 
@@ -31,14 +97,19 @@ function makeRes() {
   } as any;
 }
 
+/**
+ * @dev Builds a Payout fixture using the correct field names:
+ *   `distribution_id` (not `distribution_run_id`)
+ *   `tx_hash`         (not `transaction_hash`)
+ */
 function makePayout(overrides: Partial<Payout> = {}): Payout {
   return {
     id: 'pay-1',
-    distribution_run_id: 'run-1',
+    distribution_id: 'dist-1',
     investor_id: 'inv-1',
     amount: '50.00',
     status: 'processed',
-    transaction_hash: '0xabc',
+    tx_hash: '0xabc',
     created_at: new Date('2024-01-10'),
     updated_at: new Date('2024-01-10'),
     ...overrides,
@@ -518,7 +589,7 @@ describe('payouts routes', () => {
 
   describe('error handling', () => {
     it('calls next(err) on repository failure', async () => {
-      const failingRepo = { listPayoutsByInvestor: async () => { throw new Error('DB error'); } };
+      const failingRepo = { searchPayoutsByInvestor: async () => { throw new Error('DB error'); } };
       const failHandlers = createPayoutsHandlers(failingRepo as any);
       let capturedErr: any = null;
       const res = makeRes();
@@ -762,10 +833,11 @@ describe('payout repo retry storm', () => {
   class FlakyPayoutRepo {
     public callCount = 0;
     constructor(private failTimes: number, private rows: Payout[]) {}
-    async listPayoutsByInvestor(investorId: string): Promise<Payout[]> {
+    async searchPayoutsByInvestor(params: { investorId: string; limit: number; offset: number }): Promise<{ payouts: Payout[]; total: number }> {
       this.callCount++;
       if (this.callCount <= this.failTimes) throw new Error('transient error');
-      return this.rows.filter((p) => p.investor_id === investorId);
+      const payouts = this.rows.filter((p) => p.investor_id === params.investorId);
+      return { payouts: payouts.slice(params.offset, params.offset + params.limit), total: payouts.length };
     }
   }
 
@@ -801,13 +873,13 @@ describe('payout repo retry storm', () => {
       status: 400,
       extras: { result_codes: { transaction: 'tx_bad_seq' } },
     });
-    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(txErr) };
+    const repo = { searchPayoutsByInvestor: jest.fn().mockRejectedValue(txErr) };
     const handlers = createPayoutsHandlers(repo as any);
     let capturedErr: any = null;
     const res = makeRes();
     await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr !== null, 'error must propagate');
-    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1, 'no retry on protocol error');
+    assert.strictEqual((repo.searchPayoutsByInvestor as jest.Mock).mock.calls.length, 1, 'no retry on protocol error');
     // Verify the error is classified as non-retryable
     assert.strictEqual(
       isStellarRPCRetryable(classifyStellarRPCFailure(txErr).class),
@@ -817,13 +889,13 @@ describe('payout repo retry storm', () => {
 
   it('does not retry after a RATE_LIMIT error (429)', async () => {
     const rateLimitErr = { status: 429, message: 'Too Many Requests' };
-    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(rateLimitErr) };
+    const repo = { searchPayoutsByInvestor: jest.fn().mockRejectedValue(rateLimitErr) };
     const handlers = createPayoutsHandlers(repo as any);
     let capturedErr: any = null;
     const res = makeRes();
     await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr !== null);
-    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
+    assert.strictEqual((repo.searchPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
     assert.strictEqual(classifyStellarRPCFailure(rateLimitErr).class, StellarRPCFailureClass.RATE_LIMIT);
     assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.RATE_LIMIT), false);
   });
@@ -832,13 +904,13 @@ describe('payout repo retry storm', () => {
     // The handler itself never retries — retryability is advisory for the
     // caller (e.g. a job queue or middleware).
     const timeoutErr = Object.assign(new Error('Request timeout'), { name: 'AbortError' });
-    const repo = { listPayoutsByInvestor: jest.fn().mockRejectedValue(timeoutErr) };
+    const repo = { searchPayoutsByInvestor: jest.fn().mockRejectedValue(timeoutErr) };
     const handlers = createPayoutsHandlers(repo as any);
     let capturedErr: any = null;
     const res = makeRes();
     await handlers.listPayouts(makeReq({ id: 'inv-r', role: 'investor' }), res, (e: any) => { capturedErr = e; });
     assert(capturedErr !== null);
-    assert.strictEqual((repo.listPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
+    assert.strictEqual((repo.searchPayoutsByInvestor as jest.Mock).mock.calls.length, 1);
     assert.strictEqual(classifyStellarRPCFailure(timeoutErr).class, StellarRPCFailureClass.TIMEOUT);
     assert.strictEqual(isStellarRPCRetryable(StellarRPCFailureClass.TIMEOUT), true);
   });
@@ -887,7 +959,7 @@ describe('payouts routes – allowlist injection prevention', () => {
     it.each(injectionProbes)(
       'rejects sortBy="%s" with 400 (never reaches repo)',
       async (probe) => {
-        const repoSpy = jest.spyOn(repo, 'listPayoutsByInvestor');
+        const repoSpy = jest.spyOn(repo, 'searchPayoutsByInvestor');
         const res = makeRes();
         await handlers.listPayouts(makeReq(INVESTOR, { sortBy: probe }), res, next);
         const { statusCode, jsonData } = res._get();
@@ -1261,7 +1333,7 @@ describe('payouts routes – response shape contract', () => {
 describe('payouts routes – IDOR prevention', () => {
   it('repo is called with the authenticated user id, not a query-supplied id', async () => {
     const repoMock = {
-      listPayoutsByInvestor: jest.fn().mockResolvedValue([]),
+      searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }),
     };
     const handlers = createPayoutsHandlers(repoMock as any);
 
@@ -1274,9 +1346,13 @@ describe('payouts routes – IDOR prevention', () => {
     const res = makeRes();
     await handlers.listPayouts(req, res, next);
 
-    expect(repoMock.listPayoutsByInvestor).toHaveBeenCalledTimes(1);
-    expect(repoMock.listPayoutsByInvestor).toHaveBeenCalledWith('inv-attacker');
-    expect(repoMock.listPayoutsByInvestor).not.toHaveBeenCalledWith('inv-victim');
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledTimes(1);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ investorId: 'inv-attacker' }),
+    );
+    expect(repoMock.searchPayoutsByInvestor).not.toHaveBeenCalledWith(
+      expect.objectContaining({ investorId: 'inv-victim' }),
+    );
   });
 
   it('two different investors only see their own payouts from the same repo', async () => {
@@ -1330,4 +1406,272 @@ describe('payouts routes – all valid allowlist values accepted', () => {
       assert.strictEqual(res._get().statusCode, 200, `expected 200 for status="${status}"`);
     },
   );
+});
+
+// ─── Handler delegates to repo with correct params ────────────────────────────
+//
+// Acceptance criteria:
+//   "The repository is called with filters and LIMIT/OFFSET. The handler no
+//   longer calls listPayoutsByInvestor."
+
+describe('payouts routes – handler delegates all params to searchPayoutsByInvestor', () => {
+  it('calls searchPayoutsByInvestor with investorId from token, not from query', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(
+      makeReq({ id: 'inv-real', role: 'investor' }, { investor_id: 'inv-fake' }),
+      res,
+      next,
+    );
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ investorId: 'inv-real' }),
+    );
+    expect(repoMock.searchPayoutsByInvestor).not.toHaveBeenCalledWith(
+      expect.objectContaining({ investorId: 'inv-fake' }),
+    );
+  });
+
+  it('forwards status filter to repo', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { status: 'pending' }), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'pending' }),
+    );
+  });
+
+  it('forwards minAmount and maxAmount as numbers to repo', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { minAmount: '10.5', maxAmount: '99.99' }), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ minAmount: 10.5, maxAmount: 99.99 }),
+    );
+  });
+
+  it('forwards from and to as Date objects to repo', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { from: '2024-01-01', to: '2024-12-31' }), res, next);
+    const call = (repoMock.searchPayoutsByInvestor as jest.Mock).mock.calls[0][0];
+    assert(call.from instanceof Date, 'from must be a Date');
+    assert(call.to instanceof Date, 'to must be a Date');
+    assert.strictEqual(call.from.toISOString().startsWith('2024-01-01'), true);
+    assert.strictEqual(call.to.toISOString().startsWith('2024-12-31'), true);
+  });
+
+  it('forwards sortBy and sortOrder to repo', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { sortBy: 'amount', sortOrder: 'asc' }), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: 'amount', sortOrder: 'asc' }),
+    );
+  });
+
+  it('forwards capped limit and explicit offset to repo', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    // limit=500 must be capped to 100 before reaching repo; offset is forwarded as-is
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '500', offset: '25' }), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 100, offset: 25 }),
+    );
+  });
+
+  it('uses default limit=20 and offset=0 when both are omitted', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, {}), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 20, offset: 0 }),
+    );
+  });
+
+  it('uses default sortBy=created_at and sortOrder=desc when both are omitted', async () => {
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: [], total: 0 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, {}), res, next);
+    expect(repoMock.searchPayoutsByInvestor).toHaveBeenCalledWith(
+      expect.objectContaining({ sortBy: 'created_at', sortOrder: 'desc' }),
+    );
+  });
+
+  it('uses total from repo result for hasMore — no in-memory slice', async () => {
+    // Repo returns total=50 but only 2 payouts (the page). The handler must
+    // derive hasMore from the repo-supplied total, not from array length.
+    const page = [
+      makePayout({ id: 'p1', investor_id: 'inv-1' }),
+      makePayout({ id: 'p2', investor_id: 'inv-1' }),
+    ];
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: page, total: 50 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '2', offset: '0' }), res, next);
+    const { jsonData } = res._get();
+    assert.strictEqual(jsonData.total, 50);
+    assert.strictEqual(jsonData.payouts.length, 2);
+    assert.strictEqual(jsonData.hasMore, true);  // 0 + 2 < 50
+  });
+
+  it('hasMore=false when offset+limit >= total from repo', async () => {
+    const page = [makePayout({ id: 'p1', investor_id: 'inv-1' })];
+    const repoMock = { searchPayoutsByInvestor: jest.fn().mockResolvedValue({ payouts: page, total: 3 }) };
+    const handlers = createPayoutsHandlers(repoMock as any);
+    const res = makeRes();
+    await handlers.listPayouts(makeReq(INVESTOR, { limit: '2', offset: '2' }), res, next);
+    const { jsonData } = res._get();
+    assert.strictEqual(jsonData.hasMore, false);  // 2 + 2 >= 3
+  });
+});
+
+// ─── DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS SQL whitelist ─────────
+//
+// Acceptance criteria:
+//   "A repository test asserting the SQL whitelist rejects unknown sort columns."
+
+describe('DistributionRepository.searchPayoutsByInvestor – SQL column whitelist', () => {
+  it('ALLOWED_PAYOUT_SORT_COLUMNS contains exactly created_at, amount, status', () => {
+    const allowed = DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS;
+    assert(allowed.has('created_at'), 'must allow created_at');
+    assert(allowed.has('amount'),     'must allow amount');
+    assert(allowed.has('status'),     'must allow status');
+    assert.strictEqual(allowed.size, 3, 'must contain exactly 3 entries');
+  });
+
+  it('rejects unknown sort column with a thrown Error (never issues SQL)', async () => {
+    // We instantiate with a null db — the method must throw before any query.
+    const repo = new DistributionRepository(null as any);
+    await assert.rejects(
+      () => repo.searchPayoutsByInvestor({
+        investorId: 'inv-test',
+        sortBy: 'hacker_column' as any,
+        limit: 10,
+        offset: 0,
+      }),
+      (err: Error) => {
+        assert(err instanceof Error, 'must throw an Error');
+        assert(
+          err.message.includes('hacker_column'),
+          `error message must name the rejected column, got: "${err.message}"`,
+        );
+        return true;
+      },
+    );
+  });
+
+  it('rejects SQL fragment as sort column', async () => {
+    const repo = new DistributionRepository(null as any);
+    await assert.rejects(
+      () => repo.searchPayoutsByInvestor({
+        investorId: 'inv-test',
+        sortBy: 'created_at; DROP TABLE distribution_payouts--' as any,
+        limit: 10,
+        offset: 0,
+      }),
+      (err: Error) => {
+        assert(err instanceof Error);
+        return true;
+      },
+    );
+  });
+
+  it('rejects UNION injection as sort column', async () => {
+    const repo = new DistributionRepository(null as any);
+    await assert.rejects(
+      () => repo.searchPayoutsByInvestor({
+        investorId: 'inv-test',
+        sortBy: 'amount UNION SELECT password FROM users--' as any,
+        limit: 10,
+        offset: 0,
+      }),
+    );
+  });
+
+  it('rejects empty string as sort column', async () => {
+    const repo = new DistributionRepository(null as any);
+    await assert.rejects(
+      () => repo.searchPayoutsByInvestor({
+        investorId: 'inv-test',
+        sortBy: '' as any,
+        limit: 10,
+        offset: 0,
+      }),
+    );
+  });
+
+  it('does NOT throw for each explicitly allowed column', async () => {
+    // We cannot run real SQL (no DB), but we can verify the guard passes for
+    // valid columns by checking the mock throws at the query step, not the
+    // whitelist step.
+    for (const col of ['created_at', 'amount', 'status'] as const) {
+      const mockDb = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+      const repo = new DistributionRepository(mockDb as any);
+      // Must not throw a whitelist error — the query() call may throw but
+      // that's fine since mockDb succeeds here.
+      await assert.doesNotReject(
+        () => repo.searchPayoutsByInvestor({ investorId: 'inv-test', sortBy: col, limit: 10, offset: 0 }),
+        `column "${col}" must pass the whitelist`,
+      );
+    }
+  });
+
+  it('sortBy=amount uses NUMERIC cast — "10.5" sorts after "9.99"', async () => {
+    // Verify the SQL built for amount includes a NUMERIC cast by checking the
+    // query string passed to db.query().
+    const queries: string[] = [];
+    const mockDb = {
+      query: jest.fn().mockImplementation((sql: string) => {
+        queries.push(sql);
+        return Promise.resolve({ rows: [] });
+      }),
+    };
+    const repo = new DistributionRepository(mockDb as any);
+    await repo.searchPayoutsByInvestor({
+      investorId: 'inv-test',
+      sortBy: 'amount',
+      sortOrder: 'asc',
+      limit: 10,
+      offset: 0,
+    });
+    assert(queries.length === 1, 'exactly one query must be issued');
+    const sql = queries[0].toUpperCase();
+    assert(
+      sql.includes('AMOUNT::NUMERIC') || sql.includes('AMOUNT :: NUMERIC'),
+      `ORDER BY must cast amount to NUMERIC for correct numeric ordering, got SQL: ${queries[0]}`,
+    );
+  });
+
+  it('COUNT(*) OVER() window function is present in the query for total calculation', async () => {
+    const queries: string[] = [];
+    const mockDb = {
+      query: jest.fn().mockImplementation((sql: string) => {
+        queries.push(sql);
+        return Promise.resolve({ rows: [] });
+      }),
+    };
+    const repo = new DistributionRepository(mockDb as any);
+    await repo.searchPayoutsByInvestor({ investorId: 'inv-test', limit: 10, offset: 0 });
+    const sql = queries[0].toUpperCase().replace(/\s+/g, ' ');
+    assert(
+      sql.includes('COUNT(*) OVER()'),
+      `Query must include COUNT(*) OVER() window function, got: ${queries[0]}`,
+    );
+  });
+
+  it('total is zero when db returns no rows', async () => {
+    const mockDb = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const repo = new DistributionRepository(mockDb as any);
+    const result = await repo.searchPayoutsByInvestor({ investorId: 'inv-test', limit: 10, offset: 0 });
+    assert.strictEqual(result.total, 0);
+    assert.deepStrictEqual(result.payouts, []);
+  });
 });
