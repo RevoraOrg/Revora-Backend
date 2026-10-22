@@ -71,10 +71,22 @@ describe('SessionRepositoryAdapter', () => {
       user_id: 'user-1',
       token_hash: 'sha256-token-hash',
       expires_at: VALID_INPUT.expiresAt,
+      // No family deadline supplied → forwarded as null (DB default applies).
+      family_expires_at: null,
     });
   });
 
-  it('passes exactly the four documented fields (no extra keys leak through)', async () => {
+  it('forwards an explicit familyExpiresAt as snake_case to the DB layer', async () => {
+    const familyExpiresAt = new Date('2030-01-31T00:00:00.000Z');
+
+    await adapter.createSession({ ...VALID_INPUT, familyExpiresAt });
+
+    expect(dbRepo.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ family_expires_at: familyExpiresAt }),
+    );
+  });
+
+  it('passes exactly the five documented fields (no extra keys leak through)', async () => {
     await adapter.createSession({
       ...VALID_INPUT,
       // An unknown property must not be forwarded to the DB layer.
@@ -84,6 +96,7 @@ describe('SessionRepositoryAdapter', () => {
     const forwarded = dbRepo.createSession.mock.calls[0][0];
     expect(Object.keys(forwarded).sort()).toEqual([
       'expires_at',
+      'family_expires_at',
       'id',
       'token_hash',
       'user_id',
@@ -164,6 +177,7 @@ describe('SessionRepositoryAdapter', () => {
       user_id: '',
       token_hash: '',
       expires_at: new Date(0),
+      family_expires_at: null,
     });
   });
 

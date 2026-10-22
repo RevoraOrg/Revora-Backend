@@ -95,8 +95,7 @@ export class RevenueService {
 
         // 2. Validate amount format and value
         const amountStr = input.amount;
-        const amountRegex = /^\d+(\.\d+)?$/;
-        if (!amountRegex.test(amountStr)) {
+        if (!isPositiveDecimalAmount(amountStr)) {
             throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string');
         }
 
@@ -111,9 +110,6 @@ export class RevenueService {
         }
 
         const numValue = parseFloat(amountStr);
-        if (!Number.isFinite(numValue) || numValue <= 0) {
-            throw Errors.validationError('Amount must be a positive number greater than zero');
-        }
 
         const maxNum = parseFloat(DECIMAL_LIMITS.MAX_AMOUNT);
         if (numValue > maxNum) {

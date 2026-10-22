@@ -10,6 +10,12 @@ export interface Session {
   parent_id?: string;
   revoked_at?: Date;
   token_consumed_at?: Date | null;
+  /**
+   * Immutable absolute deadline for the refresh-token family this session
+   * belongs to. Set once at login and inherited verbatim by every rotated
+   * child; rotation is refused once this timestamp has passed.
+   */
+  family_expires_at?: Date | null;
   /** Authorization role carried by the session (web/browser sessions). */
   role?: string | null;
 }
@@ -20,6 +26,11 @@ export interface CreateSessionInput {
   token_hash: string;
   expires_at: Date;
   parent_id?: string;
+  /**
+   * Absolute family deadline. When omitted the DB default (`created_at + 30
+   * days`) is applied to new roots.
+   */
+  family_expires_at?: Date | null;
 }
 
 export interface CreateWebSessionInput {
@@ -44,8 +55,8 @@ export class SessionRepository {
     // allow explicit session id (for upstream session id generation) or default DB uuid.
     if (input.id) {
       const query = `
-        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, parent_id)
-        VALUES ($1, $2, $3, $4, NOW(), $5)
+        INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, parent_id, family_expires_at)
+        VALUES ($1, $2, $3, $4, NOW(), $5, $6)
         RETURNING *
       `;
       const result: QueryResult<Session> = await db.query(query, [
@@ -54,14 +65,15 @@ export class SessionRepository {
         input.token_hash,
         input.expires_at,
         input.parent_id || null,
+        input.family_expires_at ?? null,
       ]);
       if (result.rows.length === 0) throw new Error('Failed to create session');
       return this.mapSession(result.rows[0]);
     }
 
     const query = `
-      INSERT INTO sessions (id, user_id, token_hash, expires_at, parent_id, created_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
+      INSERT INTO sessions (id, user_id, token_hash, expires_at, parent_id, created_at, family_expires_at)
+      VALUES ($1, $2, $3, $4, $5, NOW(), $6)
       RETURNING *
     `;
     const result: QueryResult<Session> = await db.query(query, [
@@ -70,6 +82,7 @@ export class SessionRepository {
       input.token_hash,
       input.expires_at,
       input.parent_id || null,
+      input.family_expires_at ?? null,
     ]);
     if (result.rows.length === 0) throw new Error('Failed to create session');
     return this.mapSession(result.rows[0]);
@@ -303,6 +316,7 @@ export class SessionRepository {
       parent_id: row.parent_id,
       revoked_at: row.revoked_at,
       token_consumed_at: row.token_consumed_at,
+      family_expires_at: row.family_expires_at ?? null,
       role: row.role ?? null,
     };
   }

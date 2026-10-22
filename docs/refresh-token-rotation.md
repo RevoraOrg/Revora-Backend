@@ -36,6 +36,17 @@ We added the following columns to the `sessions` table:
 - `parent_id`: UUID, references `sessions(id)`.
 - `revoked_at`: Timestamp, set when a session is revoked due to reuse detection or logout.
 - `token_consumed_at`: Timestamp, set when a refresh token has successfully rotated and must not be accepted again.
+- `family_expires_at`: Timestamp, the immutable absolute deadline for the token
+  family. Set at login and inherited by every rotated child; rotation is refused
+  past this point. See
+  [refresh-token-absolute-lifetime-and-reauth.md](./refresh-token-absolute-lifetime-and-reauth.md).
+
+### Re-authorisation on rotation
+
+Rotation additionally reloads the user's current role and account status from
+the database and rejects missing/disabled users (revoking the family). The role
+embedded in the refresh-token payload is never trusted for authorisation. See
+[refresh-token-absolute-lifetime-and-reauth.md](./refresh-token-absolute-lifetime-and-reauth.md).
 
 ## API Endpoints
 

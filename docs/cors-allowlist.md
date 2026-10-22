@@ -34,6 +34,9 @@ This document describes the CORS (Cross-Origin Resource Sharing) middleware impl
 ALLOWED_ORIGINS="https://app.revora.com,https://admin.revora.com"
 
 # Optional: Allow requests without Origin header (default: false)
+# Accepts the shared boolean-flag value set (case-insensitive):
+# true/false, 1/0, yes/no, on/off. Anything else fails at startup
+# with a clear error instead of silently coercing (issue #1305).
 CORS_ALLOW_NO_ORIGIN="true"
 ```
 

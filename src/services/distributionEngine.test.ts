@@ -10,13 +10,25 @@ class MockDistributionRepo {
   public failNextRunCount = 0;
   public failNextPayoutCount = 0;
   public failSpecificPayouts: number[] = []; // indices of payouts that should fail
+  public failNextRunUniqueViolation = false;
 
-  async findRunByParams(offeringId: string, periodId: string, amount: string): Promise<any> {
-    return this.runs.find(r => 
-      r.offering_id === offeringId && 
-      r.period_id === periodId && 
-      r.total_amount === amount
+  async findRunByOfferingAndPeriod(offeringId: string, periodId: string): Promise<any> {
+    const matching = this.runs.filter(
+      r => r.offering_id === offeringId && r.period_id === periodId
     );
+    if (matching.length === 0) return null;
+    return matching[matching.length - 1];
+  }
+
+  async findRunByParams(offeringId: string, periodId: string, amount?: string): Promise<any> {
+    if (amount !== undefined) {
+      return this.runs.find(r => 
+        r.offering_id === offeringId && 
+        r.period_id === periodId && 
+        r.total_amount === amount
+      ) || null;
+    }
+    return this.findRunByOfferingAndPeriod(offeringId, periodId);
   }
 
   async getPayoutsForRun(runId: string): Promise<any[]> {
@@ -37,9 +49,23 @@ class MockDistributionRepo {
   }
 
   async createDistributionRun(input: any): Promise<any> {
+    if (this.failNextRunUniqueViolation) {
+      this.failNextRunUniqueViolation = false;
+      const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+      err.code = '23505';
+      throw err;
+    }
     if (this.failNextRunCount > 0) {
       this.failNextRunCount--;
       throw new Error('Database error (run)');
+    }
+    const existingActive = this.runs.find(
+      r => r.offering_id === input.offering_id && r.period_id === input.period_id && r.status !== 'failed'
+    );
+    if (existingActive) {
+      const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+      err.code = '23505';
+      throw err;
     }
     const run = { 
       id: `run-${this.runs.length + 1}`, 
@@ -97,7 +123,7 @@ describe('DistributionEngine', () => {
     const result = await engine.distribute(
       'off-1',
       { id: 'p1', start: new Date('2026-01-01'), end: new Date('2026-01-31') },
-      100,
+      '100',
     );
 
     expect(result.payouts).toEqual([
@@ -121,13 +147,217 @@ describe('DistributionEngine', () => {
 
     const period = { id: 'p1', start: new Date(), end: new Date() };
 
-    const res1 = await engine.distribute('off-1', period, 50);
-    const res2 = await engine.distribute('off-1', period, 50);
+    const res1 = await engine.distribute('off-1', period, '50');
+    const res2 = await engine.distribute('off-1', period, '50');
 
     expect(res1.distributionRun.id).toBe(res2.distributionRun.id);
     expect(res1.payouts).toEqual(res2.payouts);
     expect(repo.runs).toHaveLength(1);
     expect(repo.payouts).toHaveLength(1);
+  });
+
+  describe('Offering-period idempotency and conflict handling', () => {
+    it('returns cached completed result when called with the same amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 60 },
+        { investor_id: 'i2', balance: 40 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-same', start: new Date(), end: new Date() };
+
+      const res1 = await engine.distribute('off-same', period, 100);
+      expect(res1.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Second call with identical amount
+      const res2 = await engine.distribute('off-same', period, 100);
+      expect(res2.distributionRun.id).toBe(res1.distributionRun.id);
+      expect(res2.payouts).toEqual(res1.payouts);
+      // No duplicate runs or payouts
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+    });
+
+    it('throws 409 conflict and creates no payouts when called with a different amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 60 },
+        { investor_id: 'i2', balance: 40 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-diff', start: new Date(), end: new Date() };
+
+      // Initial run for 1000
+      await engine.distribute('off-diff', period, 1000);
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Second call with different amount: 1000.01
+      let conflictErr: any;
+      try {
+        await engine.distribute('off-diff', period, 1000.01);
+      } catch (err: any) {
+        conflictErr = err;
+      }
+
+      expect(conflictErr).toBeDefined();
+      expect(conflictErr.statusCode).toBe(409);
+      expect(conflictErr.code).toBe('CONFLICT');
+      expect(conflictErr.message).toMatch(/already exists with a different amount/);
+      // Ensure no second run and no second batch of payouts was created
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+    });
+
+    it('handles concurrent insert race hitting 23505 and returns cached result on same amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [{ investor_id: 'i1', balance: 100 }];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-race-1', start: new Date(), end: new Date() };
+
+      // Simulate concurrent worker creating the run in DB between findRun and createRun
+      let firstFind = true;
+      const originalFind = repo.findRunByOfferingAndPeriod.bind(repo);
+      repo.findRunByOfferingAndPeriod = async (offId: string, perId: string) => {
+        if (firstFind) {
+          firstFind = false;
+          return null; // Initial check finds nothing
+        }
+        return originalFind(offId, perId); // Re-read finds it
+      };
+
+      // Mock createDistributionRun to simulate another transaction having inserted it first
+      const originalCreate = repo.createDistributionRun.bind(repo);
+      repo.createDistributionRun = async (input: any) => {
+        // Concurrent worker creates completed run
+        await originalCreate({
+          ...input,
+          status: 'completed',
+        });
+        await repo.createPayout({
+          distribution_id: repo.runs[0].id,
+          investor_id: 'i1',
+          amount: '50.00',
+        });
+
+        // Current worker gets 23505
+        const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+        err.code = '23505';
+        throw err;
+      };
+
+      const result = await engine.distribute('off-race-1', period, 50);
+
+      expect(result.distributionRun.id).toBe(repo.runs[0].id);
+      expect(result.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(1);
+    });
+
+    it('handles concurrent insert race hitting 23505 and throws 409 conflict on different amount', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [{ investor_id: 'i1', balance: 100 }];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-race-2', start: new Date(), end: new Date() };
+
+      let firstFind = true;
+      const originalFind = repo.findRunByOfferingAndPeriod.bind(repo);
+      repo.findRunByOfferingAndPeriod = async (offId: string, perId: string) => {
+        if (firstFind) {
+          firstFind = false;
+          return null;
+        }
+        return originalFind(offId, perId);
+      };
+
+      const originalCreate = repo.createDistributionRun.bind(repo);
+      repo.createDistributionRun = async (input: any) => {
+        // Concurrent worker inserted with total_amount = 50.00
+        await originalCreate({
+          ...input,
+          total_amount: '50.00',
+          status: 'completed',
+        });
+
+        const err: any = new Error('duplicate key value violates unique constraint "idx_distributions_offering_period_unique"');
+        err.code = '23505';
+        throw err;
+      };
+
+      // Current worker attempts to distribute 75
+      await expect(engine.distribute('off-race-2', period, 75)).rejects.toMatchObject({
+        statusCode: 409,
+        code: 'CONFLICT',
+      });
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(0);
+    });
+
+    it('regression: calling distribute with 1000 and then 1000.01 rejects with 409 without creating duplicate runs or payouts', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'inv-1', balance: 600 },
+        { investor_id: 'inv-2', balance: 400 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const offeringId = 'off-repro';
+      const period = { id: 'p-repro', start: new Date('2026-01-01'), end: new Date('2026-01-31') };
+
+      // Initial trigger for revenueAmount = 1000
+      const firstRun = await engine.distribute(offeringId, period, 1000);
+      expect(firstRun.distributionRun.status).toBe('completed');
+      expect(repo.runs).toHaveLength(1);
+      expect(repo.payouts).toHaveLength(2);
+
+      // Repro: second trigger for the same (offering, period) with slightly different revenue_amount (1000.01)
+      let rejectedError: any;
+      try {
+        await engine.distribute(offeringId, period, 1000.01);
+      } catch (err: any) {
+        rejectedError = err;
+      }
+
+      // Assertions
+      expect(rejectedError).toBeDefined();
+      expect(rejectedError.statusCode).toBe(409);
+      expect(rejectedError.code).toBe('CONFLICT');
+      // Verify no second distribution run was created
+      expect(repo.runs).toHaveLength(1);
+      // Verify no second set of payouts was created (money correctness: investors not paid twice)
+      expect(repo.payouts).toHaveLength(2);
+    });
   });
 
   it('resumes from a partial failure', async () => {
@@ -149,7 +379,7 @@ describe('DistributionEngine', () => {
 
     const period = { id: 'p2', start: new Date(), end: new Date() };
 
-    await expect(engine.distribute('off-2', period, 100)).rejects.toThrow();
+    await expect(engine.distribute('off-2', period, '100')).rejects.toThrow();
     
     expect(repo.runs).toHaveLength(1);
     expect(repo.payouts).toHaveLength(1); // First payout should have succeeded
@@ -159,7 +389,7 @@ describe('DistributionEngine', () => {
     repo.failSpecificPayouts = [];
 
     // Second run should resume
-    const res2 = await engine.distribute('off-2', period, 100);
+    const res2 = await engine.distribute('off-2', period, '100');
     
     expect(repo.runs).toHaveLength(1); // Same run
     expect(repo.payouts).toHaveLength(2); // Now both payouts
@@ -179,26 +409,26 @@ describe('DistributionEngine', () => {
       { maxRetries: 2, initialDelayMs: 0, backoffFactor: 1 },
     );
 
-    const result = await engine.distribute('off-3', { id: 'p3', start: new Date(), end: new Date() }, 10);
+    const result = await engine.distribute('off-3', { id: 'p3', start: new Date(), end: new Date() }, '10');
     expect(result.payouts[0].amount).toBe('10.00');
   });
 
   it('throws after exhausting retries for balance fetching', async () => {
     const provider = new MockBalanceProvider([], 3); // Fails 3 times
     const engine = new DistributionEngine(null, new MockDistributionRepo(), provider, { maxRetries: 2, initialDelayMs: 0 });
-    await expect(engine.distribute('off-fail', { id: 'p', start: new Date(), end: new Date() }, 100)).rejects.toThrow(/Failed to acquire balances/);
+    await expect(engine.distribute('off-fail', { id: 'p', start: new Date(), end: new Date() }, '100')).rejects.toThrow(/Failed to acquire balances/);
   });
 
   it('throws if no balances are found', async () => {
     const provider = new MockBalanceProvider([]);
     const engine = new DistributionEngine(null, new MockDistributionRepo(), provider, { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-empty', { id: 'p', start: new Date(), end: new Date() }, 100)).rejects.toThrow(/No investors or balances found/);
+    await expect(engine.distribute('off-empty', { id: 'p', start: new Date(), end: new Date() }, '100')).rejects.toThrow(/No investors or balances found/);
   });
 
   it('throws if total balance is zero', async () => {
     const provider = new MockBalanceProvider([{ investor_id: 'i1', balance: 0 }]);
     const engine = new DistributionEngine(null, new MockDistributionRepo(), provider, { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-zero', { id: 'p', start: new Date(), end: new Date() }, 100)).rejects.toThrow(/Total balance must be > 0/);
+    await expect(engine.distribute('off-zero', { id: 'p', start: new Date(), end: new Date() }, '100')).rejects.toThrow(/Total balance must be > 0/);
   });
 
   it('adjusts rounding to match revenue amount', async () => {
@@ -208,7 +438,7 @@ describe('DistributionEngine', () => {
       { investor_id: 'i3', balance: 1 },
     ];
     const engine = new DistributionEngine(null, new MockDistributionRepo(), new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-round', { id: 'p', start: new Date(), end: new Date() }, 100);
+    const result = await engine.distribute('off-round', { id: 'p', start: new Date(), end: new Date() }, '100');
     const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
     expect(sum).toBe(100.00);
     // One should be 33.34, others 33.33
@@ -221,7 +451,7 @@ describe('DistributionEngine', () => {
     const repo = new MockDistributionRepo();
     repo.failNextRunCount = 5;
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]), { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-run-fail', { id: 'p', start: new Date(), end: new Date() }, 100)).rejects.toThrow(/Failed to initialize distribution run/);
+    await expect(engine.distribute('off-run-fail', { id: 'p', start: new Date(), end: new Date() }, '100')).rejects.toThrow(/Failed to initialize distribution run/);
   });
 
   it('uses offeringRepo if balanceProvider is missing', async () => {
@@ -229,7 +459,7 @@ describe('DistributionEngine', () => {
       getInvestors: jest.fn().mockResolvedValue([{ investor_id: 'i1', balance: 100 }])
     };
     const engine = new DistributionEngine(offeringRepo, new MockDistributionRepo(), undefined, { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-repo', { id: 'p', start: new Date(), end: new Date() }, 100);
+    const result = await engine.distribute('off-repo', { id: 'p', start: new Date(), end: new Date() }, '100');
     expect(result.payouts).toHaveLength(1);
     expect(offeringRepo.getInvestors).toHaveBeenCalled();
   });
@@ -239,14 +469,14 @@ describe('DistributionEngine', () => {
       listInvestors: jest.fn().mockResolvedValue([{ investor_id: 'i1', balance: 100 }])
     };
     const engine = new DistributionEngine(offeringRepo, new MockDistributionRepo(), undefined, { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-list', { id: 'p', start: new Date(), end: new Date() }, 100);
+    const result = await engine.distribute('off-list', { id: 'p', start: new Date(), end: new Date() }, '100');
     expect(result.payouts).toHaveLength(1);
     expect(offeringRepo.listInvestors).toHaveBeenCalled();
   });
 
   it('throws if no balance source is available', async () => {
     const engine = new DistributionEngine(null, new MockDistributionRepo(), undefined, { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-none', { id: 'p', end: new Date() } as any, 100)).rejects.toThrow(/Failed to acquire balances: UNKNOWN/);
+    await expect(engine.distribute('off-none', { id: 'p', end: new Date() } as any, '100')).rejects.toThrow(/Failed to acquire balances: UNKNOWN/);
   });
 
   // ── Retry storm: exhausted budget throws, does not loop forever ────────────
@@ -263,7 +493,7 @@ describe('DistributionEngine', () => {
     const engine = new DistributionEngine(null, repo, flakyProvider, { maxRetries: 3, initialDelayMs: 0 });
 
     await expect(
-      engine.distribute('off-5', { id: 'p5', start: new Date(), end: new Date() }, 10),
+      engine.distribute('off-5', { id: 'p5', start: new Date(), end: new Date() }, '10'),
     ).rejects.toThrow(/Failed to acquire balances: UNKNOWN/);
 
     expect(calls).toBe(3); // exactly maxRetries, no infinite loop
@@ -279,7 +509,7 @@ describe('DistributionEngine', () => {
     );
 
     await expect(
-      engine.distribute('off-6', { id: 'p6', start: new Date(), end: new Date() }, 10),
+      engine.distribute('off-6', { id: 'p6', start: new Date(), end: new Date() }, '10'),
     ).rejects.toThrow(/Distribution failed: UNKNOWN/);
   });
 
@@ -292,7 +522,7 @@ describe('DistributionEngine', () => {
       { maxRetries: 3, initialDelayMs: 0 },
     );
 
-    const result = await engine.distribute('off-7', { id: 'p7', start: new Date(), end: new Date() }, 50);
+    const result = await engine.distribute('off-7', { id: 'p7', start: new Date(), end: new Date() }, '50');
     expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '50.00' }]);
   });
 
@@ -311,7 +541,7 @@ describe('DistributionEngine', () => {
     );
 
     const start = Date.now();
-    await engine.distribute('off-backoff', { id: 'p-backoff', start: new Date(), end: new Date() }, 100);
+    await engine.distribute('off-backoff', { id: 'p-backoff', start: new Date(), end: new Date() }, '100');
     const duration = Date.now() - start;
 
     // Expected delays: 10ms (1st retry) + 20ms (2nd retry) = 30ms total
@@ -347,26 +577,26 @@ describe('DistributionEngine', () => {
   it('throws when offeringId is empty', async () => {
     const repo = new MockDistributionRepo();
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('', { id: 'p', start: new Date(), end: new Date() }, 10)).rejects.toThrow('offeringId is required');
+    await expect(engine.distribute('', { id: 'p', start: new Date(), end: new Date() }, '10')).rejects.toThrow('offeringId is required');
   });
 
   it('throws when revenueAmount is zero', async () => {
     const repo = new MockDistributionRepo();
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider([{ investor_id: 'i1', balance: 1 }]), { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-x', { id: 'p', start: new Date(), end: new Date() }, 0)).rejects.toThrow('revenueAmount must be > 0');
+    await expect(engine.distribute('off-x', { id: 'p', start: new Date(), end: new Date() }, '0')).rejects.toThrow('revenueAmount must be > 0');
   });
 
   it('throws when no investors found', async () => {
     const repo = new MockDistributionRepo();
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider([]), { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-x', { id: 'px', start: new Date(), end: new Date() }, 10)).rejects.toThrow('No investors or balances found');
+    await expect(engine.distribute('off-x', { id: 'px', start: new Date(), end: new Date() }, '10')).rejects.toThrow('No investors or balances found');
   });
 
   it('uses offeringRepo.getInvestors when no balanceProvider', async () => {
     const repo = new MockDistributionRepo();
     const offeringRepo = { getInvestors: async () => [{ investor_id: 'i1', balance: 100 }] };
     const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-8', { id: 'p8', start: new Date(), end: new Date() }, 10);
+    const result = await engine.distribute('off-8', { id: 'p8', start: new Date(), end: new Date() }, '10');
     expect(result.payouts).toEqual([{ investor_id: 'i1', amount: '10.00' }]);
   });
 
@@ -374,14 +604,14 @@ describe('DistributionEngine', () => {
     const repo = new MockDistributionRepo();
     const offeringRepo = { listInvestors: async () => [{ investor_id: 'i2', balance: 50 }] };
     const engine = new DistributionEngine(offeringRepo, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-9', { id: 'p9', start: new Date(), end: new Date() }, 20);
+    const result = await engine.distribute('off-9', { id: 'p9', start: new Date(), end: new Date() }, '20');
     expect(result.payouts).toEqual([{ investor_id: 'i2', amount: '20.00' }]);
   });
 
   it('throws when no balance source is available', async () => {
     const repo = new MockDistributionRepo();
     const engine = new DistributionEngine(null, repo, undefined, { maxRetries: 1, initialDelayMs: 0 });
-    await expect(engine.distribute('off-x', { id: 'px', start: new Date(), end: new Date() }, 10)).rejects.toThrow(/Failed to acquire balances: UNKNOWN/);
+    await expect(engine.distribute('off-x', { id: 'px', start: new Date(), end: new Date() }, '10')).rejects.toThrow(/Failed to acquire balances: UNKNOWN/);
   });
 
   it('logs retries when logRetries is true', async () => {
@@ -393,7 +623,7 @@ describe('DistributionEngine', () => {
       new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
       { maxRetries: 2, initialDelayMs: 0, logRetries: true },
     );
-    await engine.distribute('off-log', { id: 'plog', start: new Date(), end: new Date() }, 5);
+    await engine.distribute('off-log', { id: 'plog', start: new Date(), end: new Date() }, '5');
     expect(spy).toHaveBeenCalledWith(expect.stringContaining('[DistributionEngine]'));
     spy.mockRestore();
   });
@@ -407,7 +637,7 @@ describe('DistributionEngine', () => {
     ];
 
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
-    const result = await engine.distribute('off-large', { id: 'p', start: new Date(), end: new Date() }, 1);
+    const result = await engine.distribute('off-large', { id: 'p', start: new Date(), end: new Date() }, '1');
 
     const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
     expect(sum).toBeCloseTo(1.00, 2);
@@ -420,7 +650,7 @@ describe('DistributionEngine', () => {
     const balances = [ { investor_id: 'i1', balance: 1 }, { investor_id: 'i2', balance: 1 } ];
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
 
-    const result = await engine.distribute('off-halfup', { id: 'p', start: new Date(), end: new Date() }, 0.01);
+    const result = await engine.distribute('off-halfup', { id: 'p', start: new Date(), end: new Date() }, '0.01');
     // One should be 0.00 and one 0.01 after reconciliation (sum == 0.01)
     const amounts = result.payouts.map(p => p.amount).sort().reverse();
     expect(amounts).toEqual(expect.arrayContaining(['0.01', '0.00']));
@@ -434,7 +664,7 @@ describe('DistributionEngine', () => {
     const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances), { maxRetries: 1, initialDelayMs: 0 });
 
     const revenue = 1; // $1 across 101 investors -> many will get $0.00, one adjusted
-    const result = await engine.distribute('off-dust', { id: 'p', start: new Date(), end: new Date() }, revenue);
+    const result = await engine.distribute('off-dust', { id: 'p', start: new Date(), end: new Date() }, String(revenue));
     const sum = result.payouts.reduce((s, p) => s + Number(p.amount), 0);
     expect(sum).toBeCloseTo(revenue, 2);
     // Exactly one payout should be non-zero in many tiny-distribution scenarios
@@ -464,7 +694,7 @@ describe('DistributionEngine', () => {
     repo.failNextUpdateStatusCount = 1;
     
     await expect(
-      engine.distribute('off-update-fail', period, 100)
+      engine.distribute('off-update-fail', period, '100')
     ).rejects.toThrow(/Failed to update distribution status/);
   });
 
@@ -501,7 +731,7 @@ describe('DistributionEngine', () => {
     };
 
     // This should NOT throw because the final update is wrapped in a try/catch that just logs
-    const result = await engine.distribute('off-final-fail', period, 100);
+    const result = await engine.distribute('off-final-fail', period, '100');
     // The status should still be 'processing' because the final update failed
     expect(repo.runs[0].status).toBe('processing');
   });
@@ -524,7 +754,7 @@ describe('DistributionEngine', () => {
       );
 
       const period = { id: 'p-batch', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-batch', period, 12000);
+      const result = await engine.distributeWithBatch('off-batch', period, '12000');
 
       expect(result.successfulPayouts).toHaveLength(investorCount);
       expect(result.totalPayouts).toBe(investorCount);
@@ -564,7 +794,7 @@ describe('DistributionEngine', () => {
       );
 
       const period = { id: 'p-partial-stellar', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-partial-stellar', period, 300);
+      const result = await engine.distributeWithBatch('off-partial-stellar', period, '300');
 
       expect(result.successfulPayouts).toHaveLength(2);
       expect(result.failedPayouts).toHaveLength(1);
@@ -601,7 +831,7 @@ describe('DistributionEngine', () => {
       );
 
       const period = { id: 'p-batch-error', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-batch-error', period, 200);
+      const result = await engine.distributeWithBatch('off-batch-error', period, '200');
 
       // The loop for i1 fails, caught by inner try/catch
       // i2 should still be processed
@@ -626,7 +856,7 @@ describe('DistributionEngine', () => {
       );
 
       const period = { id: 'p-dist-error', start: new Date(), end: new Date() };
-      await expect(engine.distribute('off-dist-error', period, 100))
+      await expect(engine.distribute('off-dist-error', period, '100'))
         .rejects.toThrow(`Distribution failed: ${StellarRPCFailureClass.UPSTREAM_ERROR}`);
     });
 
@@ -667,7 +897,7 @@ describe('DistributionEngine', () => {
         return b;
       };
 
-      const result = await engine.distributeWithBatch('off-outer-fail', period, 100);
+      const result = await engine.distributeWithBatch('off-outer-fail', period, '100');
       expect(result.distributionRun.status).toBe('failed');
     });
 
@@ -695,7 +925,7 @@ describe('DistributionEngine', () => {
         return originalUpdate(runId, status);
       };
 
-      const result = await engine.distributeWithBatch('off-final-fail-batch', period, 100);
+      const result = await engine.distributeWithBatch('off-final-fail-batch', period, '100');
       // It should be 'processing' because the final update failed and line 349 was never reached.
       expect(result.distributionRun.status).toBe('processing');
     });
@@ -706,13 +936,13 @@ describe('DistributionEngine', () => {
       const engine = new DistributionEngine(null, repo, new MockBalanceProvider(balances));
       
       const period = { id: 'p-default-opts', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-default', period, 100);
+      const result = await engine.distributeWithBatch('off-default', period, '100');
       expect(result.distributionRun.status).toBe('completed');
     });
 
     it('throws error for invalid period in distributeWithBatch', async () => {
       const engine = new DistributionEngine(null, null);
-      await expect(engine.distributeWithBatch('off-1', {} as any, 100))
+      await expect(engine.distributeWithBatch('off-1', {} as any, '100'))
         .rejects.toThrow('Valid distribution period with ID is required');
     });
 
@@ -729,7 +959,7 @@ describe('DistributionEngine', () => {
       const period = { id: 'p-partial-fail', start: new Date(), end: new Date() };
       
       // Since it has errorClass 'UNKNOWN' by default for random errors
-      await expect(engine.distribute('off-partial', period, 100))
+      await expect(engine.distribute('off-partial', period, '100'))
         .rejects.toThrow(/Distribution failed: UNKNOWN/);
     });
 
@@ -747,7 +977,7 @@ describe('DistributionEngine', () => {
       );
       
       const period = { id: 'p-max-adj', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-max-adj', period, 100);
+      const result = await engine.distributeWithBatch('off-max-adj', period, '100');
       
       const sum = result.successfulPayouts.reduce((s, p) => s + Number(p.amount), 0);
       expect(sum).toBe(100);
@@ -762,7 +992,7 @@ describe('DistributionEngine', () => {
         new MockBalanceProvider([{ investor_id: 'i1', balance: 10 }, { investor_id: 'i2', balance: 20 }]),
         { maxRetries: 1, initialDelayMs: 0 }
       );
-      const result2 = await engine2.distributeWithBatch('off-max-adj-2', period, 100.01);
+      const result2 = await engine2.distributeWithBatch('off-max-adj-2', period, '100.01');
       expect(result2.successfulPayouts.length).toBe(2);
     });
 
@@ -785,7 +1015,7 @@ describe('DistributionEngine', () => {
         status: 'pending'
       });
       
-      const result = await engine.distributeWithBatch('off-resume', period, 100);
+      const result = await engine.distributeWithBatch('off-resume', period, '100');
        expect(result.distributionRun.status).toBe('completed');
      });
  
@@ -803,7 +1033,7 @@ describe('DistributionEngine', () => {
         };
   
         const period = { id: 'p-string-err', start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch('off-string-err', period, 100);
+        const result = await engine.distributeWithBatch('off-string-err', period, '100');
         // It uses the failure class message
         expect(result.failedPayouts[0].error).toBe('Action failed with UNKNOWN');
       });
@@ -824,7 +1054,7 @@ describe('DistributionEngine', () => {
       };
 
       const period = { id: 'p-class-fail', start: new Date(), end: new Date() };
-      await expect(engine.distribute('off-class', period, 100))
+      await expect(engine.distribute('off-class', period, '100'))
         .rejects.toThrow(/Distribution failed: RATE_LIMIT/);
     });
  
@@ -848,7 +1078,7 @@ describe('DistributionEngine', () => {
         });
         
         repo.failNextUpdateStatusCount = 1;
-        await expect(engine.distributeWithBatch('off-init-fail', period, 100))
+        await expect(engine.distributeWithBatch('off-init-fail', period, '100'))
           .rejects.toThrow(/Failed to update distribution status: UNKNOWN/);
       });
     });
@@ -871,7 +1101,7 @@ describe('DistributionEngine', () => {
       );
 
       const period = { id: 'p-single', start: new Date(), end: new Date() };
-      const result = await engine.distributeWithBatch('off-single', period, 123.45);
+      const result = await engine.distributeWithBatch('off-single', period, '123.45');
 
       expect(result.successfulPayouts).toHaveLength(1);
       expect(result.successfulPayouts[0].investor_id).toBe('i1');
@@ -898,7 +1128,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-equal', start: new Date(), end: new Date() };
       const revenue = 100.00;
-      const result = await engine.distributeWithBatch('off-equal', period, revenue);
+      const result = await engine.distributeWithBatch('off-equal', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(3);
 
@@ -932,7 +1162,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-dust', start: new Date(), end: new Date() };
       const revenue = 100.00;
-      const result = await engine.distributeWithBatch('off-dust', period, revenue);
+      const result = await engine.distributeWithBatch('off-dust', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(3);
 
@@ -967,7 +1197,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-large', start: new Date(), end: new Date() };
       const revenue = 500000.00;
-      const result = await engine.distributeWithBatch('off-large', period, revenue);
+      const result = await engine.distributeWithBatch('off-large', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(2);
 
@@ -1001,7 +1231,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-frac', start: new Date(), end: new Date() };
       const revenue = 777.77;
-      const result = await engine.distributeWithBatch('off-frac', period, revenue);
+      const result = await engine.distributeWithBatch('off-frac', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(7);
 
@@ -1035,7 +1265,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-asym', start: new Date(), end: new Date() };
       const revenue = 10000.00;
-      const result = await engine.distributeWithBatch('off-asym', period, revenue);
+      const result = await engine.distributeWithBatch('off-asym', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(3);
 
@@ -1081,7 +1311,7 @@ describe('DistributionEngine', () => {
       const period = { id: 'p-frac-revenue', start: new Date(), end: new Date() };
       // Revenue with 3 decimal places - 99.999 rounds to 100.00 at 2 decimals
       const revenue = 99.999;
-      const result = await engine.distributeWithBatch('off-frac-revenue', period, revenue);
+      const result = await engine.distributeWithBatch('off-frac-revenue', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(3);
 
@@ -1112,7 +1342,7 @@ describe('DistributionEngine', () => {
         );
 
         const period = { id: `p-consistency-${attempt}`, start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch(`off-consistency-${attempt}`, period, revenue);
+        const result = await engine.distributeWithBatch(`off-consistency-${attempt}`, period, String(revenue));
         results.push(result.successfulPayouts);
       }
 
@@ -1142,7 +1372,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-neg-adj', start: new Date(), end: new Date() };
       const revenue = 50.00;
-      const result = await engine.distributeWithBatch('off-neg-adj', period, revenue);
+      const result = await engine.distributeWithBatch('off-neg-adj', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(3);
 
@@ -1174,7 +1404,7 @@ describe('DistributionEngine', () => {
       const period = { id: 'p-zero-rem', start: new Date(), end: new Date() };
       // Revenue that divides evenly
       const revenue = 100.00;
-      const result = await engine.distributeWithBatch('off-zero-rem', period, revenue);
+      const result = await engine.distributeWithBatch('off-zero-rem', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(2);
 
@@ -1206,7 +1436,7 @@ describe('DistributionEngine', () => {
 
       const period = { id: 'p-penny', start: new Date(), end: new Date() };
       const revenue = 1.00; // Only $1 to distribute across 100 investors
-      const result = await engine.distributeWithBatch('off-penny', period, revenue);
+      const result = await engine.distributeWithBatch('off-penny', period, String(revenue));
 
       expect(result.successfulPayouts).toHaveLength(100);
 
@@ -1221,6 +1451,100 @@ describe('DistributionEngine', () => {
       const amounts = result.successfulPayouts.map(p => Number(p.amount));
       const nonZero = amounts.filter(a => a > 0);
       expect(nonZero.length).toBeGreaterThan(0);
+    });
+
+    it('distributes 0.34/0.33/0.33 for three 0.0049 balances with revenue 1 instead of throwing', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-3', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-3', period, 1);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
+    });
+
+    it('does not perturb pro-rata shares for small holders [0.004, 0.006]', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.004 },
+        { investor_id: 'i2', balance: 0.006 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-small-pair', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-small-pair', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '40.00' },
+        { investor_id: 'i2', amount: '60.00' },
+      ]);
+    });
+
+    it('distributes correctly with 7-decimal Stellar string balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances: BalanceRow[] = [
+        { investor_id: 'i1', balance: '0.0000001' },
+        { investor_id: 'i2', balance: '0.0000002' },
+        { investor_id: 'i3', balance: '0.0000007' },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-stellar-str', start: new Date(), end: new Date() };
+      const result = await engine.distribute('off-stellar-str', period, 100);
+
+      expect(result.payouts).toEqual([
+        { investor_id: 'i1', amount: '10.00' },
+        { investor_id: 'i2', amount: '20.00' },
+        { investor_id: 'i3', amount: '70.00' },
+      ]);
+    });
+
+    it('previewRun uses the same full-precision calculation for small balances', async () => {
+      const repo = new MockDistributionRepo();
+      const balances = [
+        { investor_id: 'i1', balance: 0.0049 },
+        { investor_id: 'i2', balance: 0.0049 },
+        { investor_id: 'i3', balance: 0.0049 },
+      ];
+      const engine = new DistributionEngine(
+        null,
+        repo,
+        new MockBalanceProvider(balances),
+        { maxRetries: 1, initialDelayMs: 0 },
+      );
+
+      const period = { id: 'p-prev-small', start: new Date(), end: new Date() };
+      const preview = await engine.previewRun('off-prev-small', period, 1);
+
+      expect(preview.projections).toEqual([
+        { investor_id: 'i1', amount: '0.34' },
+        { investor_id: 'i2', amount: '0.33' },
+        { investor_id: 'i3', amount: '0.33' },
+      ]);
     });
   });
 
@@ -1253,7 +1577,7 @@ describe('DistributionEngine – property-based rounding invariants', () => {
       fc.asyncProperty(balancesArb, revenueArb, async (balances, revenue) => {
         const engine = makeEngine(balances);
         const period = { id: 'p-prop', start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch('off-prop', period, revenue);
+        const result = await engine.distributeWithBatch('off-prop', period, String(revenue));
 
         const sumCents = result.successfulPayouts.reduce(
           (s, p) => s + Math.round(Number(p.amount) * 100),
@@ -1271,7 +1595,7 @@ describe('DistributionEngine – property-based rounding invariants', () => {
       fc.asyncProperty(balancesArb, revenueArb, async (balances, revenue) => {
         const engine = makeEngine(balances);
         const period = { id: 'p-nonneg', start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch('off-nonneg', period, revenue);
+        const result = await engine.distributeWithBatch('off-nonneg', period, String(revenue));
 
         return result.successfulPayouts.every((p) => Number(p.amount) >= 0);
       }),
@@ -1291,8 +1615,8 @@ describe('DistributionEngine – property-based rounding invariants', () => {
         );
         const period = { id: 'p-idem', start: new Date(), end: new Date() };
 
-        const r1 = await engine.distributeWithBatch('off-idem', period, revenue);
-        const r2 = await engine.distributeWithBatch('off-idem', period, revenue);
+        const r1 = await engine.distributeWithBatch('off-idem', period, String(revenue));
+        const r2 = await engine.distributeWithBatch('off-idem', period, String(revenue));
 
         // Same run id
         if (r1.distributionRun.id !== r2.distributionRun.id) return false;
@@ -1314,7 +1638,7 @@ describe('DistributionEngine – property-based rounding invariants', () => {
         async (balances, revenue) => {
           const engine = makeEngine(balances);
           const period = { id: 'p-solo', start: new Date(), end: new Date() };
-          const result = await engine.distributeWithBatch('off-solo', period, revenue);
+          const result = await engine.distributeWithBatch('off-solo', period, String(revenue));
 
           const payout = result.successfulPayouts[0];
           const payoutCents = Math.round(Number(payout.amount) * 100);
@@ -1337,7 +1661,7 @@ describe('DistributionEngine – property-based rounding invariants', () => {
       fc.asyncProperty(mixedBalancesArb, revenueArb, async (balances, revenue) => {
         const engine = makeEngine(balances);
         const period = { id: 'p-zero', start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch('off-zero', period, revenue);
+        const result = await engine.distributeWithBatch('off-zero', period, String(revenue));
 
         // Zero-balance investors should receive 0.00 (or be absent)
         const zeroIds = new Set(balances.filter((b) => b.balance === 0).map((b) => b.investor_id));
@@ -1371,7 +1695,7 @@ describe('DistributionEngine – property-based rounding invariants', () => {
         ];
         const engine = makeEngine(balances);
         const period = { id: 'p-dust2', start: new Date(), end: new Date() };
-        const result = await engine.distributeWithBatch('off-dust2', period, revenue);
+        const result = await engine.distributeWithBatch('off-dust2', period, String(revenue));
 
         const sumCents = result.successfulPayouts.reduce(
           (s, p) => s + Math.round(Number(p.amount) * 100),
@@ -1381,5 +1705,303 @@ describe('DistributionEngine – property-based rounding invariants', () => {
       }),
       { numRuns: 200 },
     );
+  });
+
+  it('sum(payouts) === revenueAmount for small holders and 7-decimal Stellar balances', async () => {
+    // Arbitrary: fractional / small / Stellar-precision balances (including < 0.005 and strings)
+    const smallBalancesArb = fc
+      .array(
+        fc.oneof(
+          // Small floating point numbers (e.g. 0.0001 to 0.01)
+          fc.integer({ min: 1, max: 100 }).map((n) => n / 10000),
+          // 7-decimal Stellar stroops as decimal string (e.g. "0.0000001" to "0.0050000")
+          fc.integer({ min: 1, max: 50000 }).map((stroops) => (stroops / 10000000).toFixed(7)),
+          // Standard integer balance
+          fc.integer({ min: 1, max: 1000 }),
+        ),
+        { minLength: 1, maxLength: 8 },
+      )
+      .map((bals) => bals.map((b, i) => ({ investor_id: `i${i}`, balance: b })));
+
+    await fc.assert(
+      fc.asyncProperty(smallBalancesArb, revenueArb, async (balances, revenue) => {
+        const engine = makeEngine(balances);
+        const period = { id: 'p-small-prop', start: new Date(), end: new Date() };
+        const result = await engine.distributeWithBatch('off-small-prop', period, revenue);
+
+        const sumCents = result.successfulPayouts.reduce(
+          (s, p) => s + Math.round(Number(p.amount) * 100),
+          0,
+        );
+        const expectedCents = Math.round(revenue * 100);
+        return sumCents === expectedCents;
+      }),
+      { numRuns: 200 },
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// TEST: Decimal-string revenue amounts (issue #1281)
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionEngine – decimal-string revenue amounts (issue #1281)', () => {
+  const period = { id: 'p-dec', start: new Date('2026-01-01'), end: new Date('2026-01-31') };
+
+  function makeEngine(balances: BalanceRow[] = [{ investor_id: 'i1', balance: 100 }]) {
+    const repo = new MockDistributionRepo();
+    return {
+      repo,
+      engine: new DistributionEngine(null, repo, new MockBalanceProvider(balances), {
+        maxRetries: 1,
+        initialDelayMs: 0,
+      }),
+    };
+  }
+
+  it('round-trips a revenue amount above Number precision into total_amount exactly', async () => {
+    const { repo, engine } = makeEngine();
+    const result = await engine.distribute('off-prec', period, '12345678901234567.89');
+
+    expect(repo.runs[0].total_amount).toBe('12345678901234567.89');
+    expect(result.distributionRun.total_amount).toBe('12345678901234567.89');
+    expect(result.successfulPayouts).toEqual([
+      { investor_id: 'i1', amount: '12345678901234567.89' },
+    ]);
+  });
+
+  it('never rounds amounts with more than two decimal places', async () => {
+    const { repo, engine } = makeEngine();
+    await engine.distribute('off-hr', period, '10.567');
+    expect(repo.runs[0].total_amount).toBe('10.567');
+  });
+
+  it('stores amounts with fewer than two decimals in the historic toFixed(2) layout', async () => {
+    const { repo, engine } = makeEngine();
+    await engine.distribute('off-pad', period, '1000');
+    expect(repo.runs[0].total_amount).toBe('1000.00');
+  });
+
+  it('rejects non-string revenue amounts with statusCode 400', async () => {
+    const { engine } = makeEngine();
+    for (const bad of [1000, null, undefined, true, {}]) {
+      await expect(
+        engine.distribute('off-bad', period, bad as unknown as string),
+      ).rejects.toMatchObject({ statusCode: 400 });
+    }
+  });
+
+  it.each(['1e3', '0x10', '-5', ' 12 ', 'abc', 'NaN', 'Infinity', '', '1.', '.5', '1,000'])(
+    'rejects malformed revenue amount %p with statusCode 400',
+    async (bad) => {
+      const { engine } = makeEngine();
+      await expect(engine.distribute('off-bad', period, bad)).rejects.toMatchObject({ statusCode: 400 });
+    },
+  );
+
+  it('rejects zero revenue amount with statusCode 400', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.distribute('off-zero', period, '0')).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('previewRun echoes the exact submitted amount', async () => {
+    const { engine } = makeEngine();
+    const preview = await engine.previewRun('off-prev', period, '12345678901234567.89');
+    expect(preview.revenue_amount).toBe('12345678901234567.89');
+  });
+
+  it('previewRun rejects malformed revenue amounts with statusCode 400', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.previewRun('off-bad', period, '1e3')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(engine.previewRun('off-bad', period, '-5')).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// REGRESSION: large-value precision loss (issue #1281)
+//
+// This describe block contains a test that is explicitly designed to FAIL on
+// the pre-refactor master branch (where revenueAmount was a JS number) and
+// PASS after the fix. It documents the exact coercion bug:
+//
+//   Number("12345678901234567.89").toFixed(2) === "12345678901234568.00"
+//                                              ^^^^ wrong — off by 0.11
+//
+// The engine now accepts only a decimal string and stores it verbatim, so
+// the round-trip from the HTTP body into distributions.total_amount is exact.
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionEngine – regression: large-value precision (issue #1281)', () => {
+  const period = { id: 'reg-period', start: new Date('2026-01-01'), end: new Date('2026-01-31') };
+
+  /**
+   * Demonstrate the old broken behaviour so the diff is self-explanatory.
+   * On master, `revenueAmount: number` was passed to `toFixed(2)`:
+   *
+   *   Number("12345678901234567.89").toFixed(2) → "12345678901234568.00"
+   *
+   * This test asserts that the engine does NOT silently truncate/round when
+   * the value exceeds JS float precision (~15–16 significant digits).
+   */
+  it('REGRESSION: total_amount is not altered by JS float coercion for >15-digit values', async () => {
+    const largeAmount = '12345678901234567.89'; // 18 significant digits — above Number precision
+
+    // Demonstrate what the old code would have done:
+    const oldBehaviourResult = Number(largeAmount).toFixed(2);
+    // On any conforming JS engine this is "12345678901234568.00" (wrong — rounds up by 0.11)
+    expect(oldBehaviourResult).not.toBe(largeAmount); // proves the bug existed
+
+    // The fixed engine must preserve the exact string:
+    const repo = new MockDistributionRepo();
+    const engine = new DistributionEngine(
+      null,
+      repo,
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+
+    const result = await engine.distribute('off-regression', period, largeAmount);
+
+    // total_amount stored in the DB run row must be the exact input string
+    expect(repo.runs[0].total_amount).toBe(largeAmount);
+    // The payout for the sole investor must also carry the exact amount
+    expect(result.successfulPayouts[0].amount).toBe(largeAmount);
+    // And crucially it must NOT equal what Number() + toFixed(2) would have produced
+    expect(repo.runs[0].total_amount).not.toBe(oldBehaviourResult);
+  });
+
+  it('REGRESSION: "1e3" is rejected with 400 — was silently accepted as 1000 via Number()', async () => {
+    // Old master: Number("1e3") === 1000, so "1e3" would slip through the > 0 check
+    // and be stored as 1000.00 — masking a malformed client submission.
+    const engine = new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+    await expect(
+      engine.distribute('off-e3', period, '1e3'),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: "0x10" is rejected with 400 — was silently accepted as 16 via Number()', async () => {
+    // Old master: Number("0x10") === 16
+    const engine = new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+    await expect(
+      engine.distribute('off-hex', period, '0x10'),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: " 12 " (whitespace) is rejected with 400 — was silently accepted via Number()', async () => {
+    // Old master: Number(" 12 ") === 12 (trims whitespace)
+    const engine = new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+    await expect(
+      engine.distribute('off-ws', period, ' 12 '),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: "-5" is rejected with 400 — was silently accepted as -5 via Number()', async () => {
+    const engine = new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+    await expect(
+      engine.distribute('off-neg', period, '-5'),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: a JS number (not a string) is rejected with 400', async () => {
+    // Old master accepted revenueAmount: number; callers passed Number(req.body.revenue_amount).
+    // Post-fix the parameter is typed string and parsePositiveDecimal rejects non-strings.
+    const engine = new DistributionEngine(
+      null,
+      new MockDistributionRepo(),
+      new MockBalanceProvider([{ investor_id: 'i1', balance: 100 }]),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+    await expect(
+      engine.distribute('off-jsnum', period, 1000 as unknown as string),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// REGRESSION: large-value precision loss (issue #1281)
+//
+// These tests are designed to FAIL on pre-refactor master (where
+// revenueAmount was typed as `number` and passed through Number() +
+// toFixed(2)) and PASS after the fix.
+//
+// The canonical broken behaviour on master:
+//   Number("12345678901234567.89").toFixed(2) === "12345678901234568.00"
+//                                                ^^^^ wrong — off by 0.11
+// ─────────────────────────────────────────────────────────────────────────
+describe('DistributionEngine – regression: large-value precision (issue #1281)', () => {
+  const period = { id: 'reg-period', start: new Date('2026-01-01'), end: new Date('2026-01-31') };
+
+  function makeEngine(balances: BalanceRow[] = [{ investor_id: 'i1', balance: 100 }]) {
+    const repo = new MockDistributionRepo();
+    return {
+      repo,
+      engine: new DistributionEngine(null, repo, new MockBalanceProvider(balances), {
+        maxRetries: 1,
+        initialDelayMs: 0,
+      }),
+    };
+  }
+
+  it('REGRESSION: total_amount is not altered by JS float coercion for >15-digit values', async () => {
+    const largeAmount = '12345678901234567.89'; // 18 significant digits
+
+    // Prove what old master produced (Number() round-trip is lossy here):
+    const oldBehaviourResult = Number(largeAmount).toFixed(2);
+    expect(oldBehaviourResult).not.toBe(largeAmount); // "12345678901234568.00" ≠ input
+
+    const { repo, engine } = makeEngine();
+    const result = await engine.distribute('off-regression', period, largeAmount);
+
+    // total_amount in the DB run row must be the exact submitted string
+    expect(repo.runs[0].total_amount).toBe(largeAmount);
+    // The sole investor receives the exact amount — no float truncation
+    expect(result.successfulPayouts[0].amount).toBe(largeAmount);
+    // Explicitly confirm it does NOT equal the corrupt old value
+    expect(repo.runs[0].total_amount).not.toBe(oldBehaviourResult);
+  });
+
+  it('REGRESSION: "1e3" is rejected 400 — old master silently coerced it to 1000 via Number()', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.distribute('off-e3', period, '1e3')).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: "0x10" is rejected 400 — old master silently coerced it to 16 via Number()', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.distribute('off-hex', period, '0x10')).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: " 12 " (whitespace) is rejected 400 — old master trimmed it via Number()', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.distribute('off-ws', period, ' 12 ')).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: "-5" is rejected 400 — old master accepted negative values via Number()', async () => {
+    const { engine } = makeEngine();
+    await expect(engine.distribute('off-neg', period, '-5')).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('REGRESSION: a JS number (not a string) is rejected 400 — old signature was revenueAmount: number', async () => {
+    const { engine } = makeEngine();
+    await expect(
+      engine.distribute('off-jsnum', period, 1000 as unknown as string),
+    ).rejects.toMatchObject({ statusCode: 400 });
   });
 });

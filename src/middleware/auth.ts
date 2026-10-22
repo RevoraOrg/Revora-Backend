@@ -21,6 +21,7 @@ import { SessionRepository as DbSessionRepository } from "../db/repositories/ses
 import { hashSessionToken, isSessionExpired } from "../auth/session";
 import { Errors } from "../lib/errors";
 import { globalLogger } from "../lib/logger";
+import { pool } from "../db/pool";
 
 export interface AdminSignatureContext {
   kid: string;
@@ -146,51 +147,174 @@ interface JwtPayloadInternal {
  * @returns Decoded payload if signature and expiry are valid.
  * @throws {Error} If the token format, signature, or expiry is invalid.
  */
-export function verifyJwt(
-  token: string,
-  secretOrSecrets: string | string[],
-): JwtPayloadInternal {
-  const secrets = Array.isArray(secretOrSecrets)
-    ? secretOrSecrets
-    : [secretOrSecrets];
-  const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("Invalid token format");
+/** @deprecated Use verifyToken and the session-aware role middleware. */
+export function verifyJwt(token: string, _secretOrSecrets: string | string[]): JwtPayloadInternal {
+  return verifyExpiringToken(token) as JwtPayloadInternal;
+}
 
-  const [headerB64, payloadB64, signatureB64] = parts;
+type SessionValidationFailure =
+  | "missing_subject_or_session"
+  | "not_found_or_user_mismatch"
+  | "revoked"
+  | "expired"
+  | "token_mismatch";
 
-  let payload: JwtPayloadInternal | null = null;
-  for (const secret of secrets) {
-    const expectedSig = crypto
-      .createHmac("sha256", secret)
-      .update(`${headerB64}.${payloadB64}`)
-      .digest("base64url");
-
-    if (expectedSig === signatureB64) {
-      try {
-        payload = JSON.parse(
-          Buffer.from(payloadB64, "base64url").toString("utf8"),
-        ) as JwtPayloadInternal;
-        break;
-      } catch {
-        continue;
-      }
-    }
+function verifyExpiringToken(token: string): JwtPayload {
+  const payload = verifyToken(token, getDefaultClaimValidationOptions());
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(payload.exp) || payload.exp! <= now) {
+    throw new Error("Token is missing or has an expired exp claim");
   }
-
-  if (!payload) throw new Error("Invalid token signature");
-
-  if (
-    payload.exp !== undefined &&
-    payload.exp < Math.floor(Date.now() / 1000)
-  ) {
-    throw new Error("Token expired");
-  }
-
   return payload;
 }
 
+async function validateSession(
+  payload: JwtPayload,
+  token: string,
+  sessionRepository: DbSessionRepository,
+): Promise<SessionValidationFailure | undefined> {
+  if (!payload.sub || !payload.sid) return "missing_subject_or_session";
+
+  const session = await sessionRepository.findById(payload.sid);
+  if (!session || session.user_id !== payload.sub) {
+    return "not_found_or_user_mismatch";
+  }
+  if (session.revoked_at) return "revoked";
+  if (
+    !(session.expires_at instanceof Date) ||
+    !Number.isFinite(session.expires_at.getTime()) ||
+    isSessionExpired(session.expires_at)
+  ) {
+    return "expired";
+  }
+
+  const expectedHash = hashSessionToken(token);
+  const storedHash = session.token_hash;
+  if (
+    typeof storedHash !== "string" ||
+    storedHash.length !== expectedHash.length ||
+    !crypto.timingSafeEqual(Buffer.from(storedHash), Buffer.from(expectedHash))
+  ) {
+    return "token_mismatch";
+  }
+  return undefined;
+}
+
+function createRoleAuth(
+  sessionRepository: DbSessionRepository,
+  rolePolicy: (role: unknown) => boolean,
+  requiredRole: string,
+): RequestHandler {
+  return async (req: Request, _res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      next(Errors.unauthorized("Missing or invalid Authorization header"));
+      return;
+    }
+
+    let payload: JwtPayload;
+    try {
+      payload = verifyExpiringToken(authHeader.slice(7));
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("JWT_SECRET")) {
+        next(Errors.internal("Server configuration error"));
+        return;
+      }
+      globalLogger.warn(`Auth failed: ${requiredRole} token verification failed`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+        path: req.path,
+      });
+      next(Errors.unauthorized("Invalid or expired token"));
+      return;
+    }
+
+    let sessionFailure: SessionValidationFailure | undefined;
+    try {
+      sessionFailure = await validateSession(
+        payload,
+        authHeader.slice(7),
+        sessionRepository,
+      );
+    } catch (error) {
+      globalLogger.error(`Auth failed: ${requiredRole} session lookup failed`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+        path: req.path,
+      });
+      next(Errors.internal("Authentication service unavailable"));
+      return;
+    }
+
+    if (sessionFailure) {
+      globalLogger.warn(`Auth failed: ${requiredRole} session is not active`, {
+        reason: sessionFailure,
+        userId: payload.sub,
+        sessionId: payload.sid,
+        path: req.path,
+      });
+      next(Errors.unauthorized("Invalid or expired token"));
+      return;
+    }
+
+    if (!rolePolicy(payload.role)) {
+      globalLogger.warn(`Auth failed: Forbidden role for ${requiredRole} route`, {
+        role: payload.role,
+        userId: payload.sub,
+        path: req.path,
+      });
+      next(Errors.forbidden(`Forbidden: ${requiredRole} role required`));
+      return;
+    }
+
+    const authRequest = req as AuthenticatedRequest;
+    if (requiredRole === "admin") {
+      authRequest.user = {
+        sub: payload.sub,
+        id: payload.sub,
+        role: "admin",
+        sessionToken: payload.sid,
+      };
+    } else {
+      authRequest.user = {
+        id: payload.sub,
+        role: payload.role as string,
+      };
+    }
+    next();
+  };
+}
+
+/** Create investor authorization bound to the injected session repository. */
+export function createRequireInvestor(
+  sessionRepository: DbSessionRepository,
+): RequestHandler {
+  return createRoleAuth(sessionRepository, (role) => role === "investor", "investor");
+}
+
+/** Create compliance/admin authorization bound to the injected session repository. */
+export function createRequireCompliance(
+  sessionRepository: DbSessionRepository,
+): RequestHandler {
+  return createRoleAuth(
+    sessionRepository,
+    (role) => role === "compliance" || role === "admin",
+    "compliance",
+  );
+}
+
+/** Create admin authorization bound to the injected session repository. */
+export function createRequireAdmin(
+  sessionRepository: DbSessionRepository,
+): RequestHandler {
+  return createRoleAuth(sessionRepository, (role) => role === "admin", "admin");
+}
+
+const roleSessionRepository = new DbSessionRepository(pool);
+export const requireInvestor = createRequireInvestor(roleSessionRepository);
+export const requireCompliance = createRequireCompliance(roleSessionRepository);
+export const requireAdmin = createRequireAdmin(roleSessionRepository);
+
 // ── requireInvestor ───────────────────────────────────────────────────────────
-export function requireInvestor(
+function legacyRequireInvestor(
   req: Request,
   _res: Response,
   next: NextFunction,
@@ -250,7 +374,7 @@ export function requireInvestor(
  * - JWT is verified by this middleware; no upstream auth is assumed.
  * - Role is read from the verified payload, never from a request header.
  */
-export function requireCompliance(
+function legacyRequireCompliance(
   req: Request,
   _res: Response,
   next: NextFunction,
@@ -304,7 +428,7 @@ export function requireCompliance(
 }
 
 // ── requireAdmin ──────────────────────────────────────────────────────────────
-export function requireAdmin(
+function legacyRequireAdmin(
   req: Request,
   _res: Response,
   next: NextFunction,
@@ -453,8 +577,7 @@ export function createRequireAuth(
     let payload: JwtPayload;
 
     try {
-      const claimOpts = getDefaultClaimValidationOptions();
-      payload = verifyToken(token, claimOpts);
+      payload = verifyExpiringToken(token);
     } catch (err) {
       globalLogger.warn("Auth failed: JWT verification error", {
         error: err instanceof Error ? err.message : "Unknown error",
@@ -464,47 +587,25 @@ export function createRequireAuth(
       return;
     }
 
-    if (!payload.sub || !payload.sid) {
-      globalLogger.warn("Auth failed: Token missing sub or sid", {
+    let failure: SessionValidationFailure | undefined;
+    try {
+      failure = await validateSession(payload, token, sessionRepository);
+    } catch (error) {
+      globalLogger.error("Auth failed: Session lookup failed", {
+        error: error instanceof Error ? error.message : "Unknown error",
         path: req.path,
       });
-      next(
-        Errors.unauthorized("Unauthorized: token missing subject or session"),
-      );
+      next(Errors.internal("Authentication service unavailable"));
       return;
     }
-
-    const session = await sessionRepository.findById(payload.sid);
-
-    if (!session || session.user_id !== payload.sub) {
-      globalLogger.warn("Auth failed: Session not found or user mismatch", {
+    if (failure) {
+      globalLogger.warn("Auth failed: Session validation failed", {
+        reason: failure,
         sessionId: payload.sid,
         userId: payload.sub,
         path: req.path,
       });
-      next(
-        Errors.unauthorized("Unauthorized: session not found or user mismatch"),
-      );
-      return;
-    }
-
-    if (isSessionExpired(session.expires_at)) {
-      globalLogger.warn("Auth failed: Session expired", {
-        sessionId: payload.sid,
-        userId: payload.sub,
-        path: req.path,
-      });
-      next(Errors.unauthorized("Unauthorized: session expired"));
-      return;
-    }
-
-    if (hashSessionToken(token) !== session.token_hash) {
-      globalLogger.warn("Auth failed: Token hash mismatch", {
-        sessionId: payload.sid,
-        userId: payload.sub,
-        path: req.path,
-      });
-      next(Errors.unauthorized("Unauthorized: token mismatch"));
+      next(Errors.unauthorized("Unauthorized: invalid or inactive session"));
       return;
     }
 
@@ -620,8 +721,7 @@ export function requireAdminWithEd25519Signature(options?: {
     }
     const token = authHeader.slice(7);
     try {
-      const secrets = getJwtSecretsForVerification();
-      const adminPayload = verifyJwt(token, secrets);
+      const adminPayload = verifyJwt(token, getJwtSecretsForVerification());
       if (adminPayload.role !== "admin") {
         globalLogger.warn("[AdminEd25519] Session role is not admin", {
           role: adminPayload.role,

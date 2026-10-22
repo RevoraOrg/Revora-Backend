@@ -1,0 +1,18 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "master",
+    "origin",
+    "security/issue-1304-fix-distributions-a-failed-payout-batch-in"
+  ],
+  "parent": {
+    "master": null,
+    "origin": "master",
+    "security/issue-1304-fix-distributions-a-failed-payout-batch-in": "master"
+  },
+  "order": [
+    "master",
+    "origin",
+    "security/issue-1304-fix-distributions-a-failed-payout-batch-in"
+  ]
+}

@@ -1,4 +1,5 @@
 import { Pool, PoolClient, QueryResult } from 'pg';
+import { Decimal } from '../../lib/decimal';
 
 /**
  * Investment entity
@@ -90,9 +91,10 @@ export class InvestmentRepository {
   /**
    * Create a new investment
    * @param input Investment data
+   * @param client Optional transaction client (for atomic operations)
    * @returns Created investment
    */
-  async create(input: CreateInvestmentInput): Promise<Investment> {
+  async create(input: CreateInvestmentInput, client?: PoolClient): Promise<Investment> {
     const query = `
       INSERT INTO investments (
         investor_id,
@@ -124,7 +126,8 @@ export class InvestmentRepository {
       input.screening_result ? JSON.stringify(input.screening_result) : null,
     ];
 
-    const result: QueryResult<Investment> = await this.db.query(query, values);
+    const executor = client ?? this.db;
+    const result: QueryResult<Investment> = await executor.query(query, values);
 
     if (result.rows.length === 0) {
       throw new Error('Failed to create investment');
@@ -208,19 +211,47 @@ export class InvestmentRepository {
   }
 
   /**
-   * Sum non-failed investments for an investor in an offering (pool-backed).
-   * Used by the investment service for KYC-tier cap checks on new intents.
+   * Sum non-failed investments for an investor in an offering.
+   * Accepts an optional transaction client for atomic operations.
+   * @param investorId Investor ID
+   * @param offeringId Offering ID
+   * @param client Optional transaction client
+   * @returns Sum as string
    */
-  async sumInvestorCommitment(investorId: string, offeringId: string): Promise<string> {
-    const result = await this.db.query<{ total: string }>(
-      `SELECT COALESCE(SUM(amount), 0)::text AS total
+  async sumInvestorCommitment(
+    investorId: string,
+    offeringId: string,
+    client?: PoolClient,
+  ): Promise<string> {
+    const query = `
+      SELECT COALESCE(SUM(amount), 0)::text AS total
          FROM investments
         WHERE investor_id = $1
           AND offering_id = $2
-          AND status != 'failed'`,
-      [investorId, offeringId],
-    );
+          AND status != 'failed'
+    `;
+
+    const executor = client ?? this.db;
+    const result = await executor.query<{ total: string }>(query, [investorId, offeringId]);
     return result.rows[0]?.total ?? '0';
+  }
+
+  /**
+   * Acquire a transaction-scoped advisory lock for a given investor+offering pair.
+   * This serializes concurrent cap checks for the same investor on the same offering.
+   * Must be called within an open transaction.
+   * @param client Active PoolClient with an open transaction
+   * @param investorId Investor ID
+   * @param offeringId Offering ID
+   */
+  async acquireInvestorOfferingLock(
+    client: PoolClient,
+    investorId: string,
+    offeringId: string,
+  ): Promise<void> {
+    const lockKey = `investor:${investorId}:offering:${offeringId}`;
+    // Use hashtext for a deterministic 64-bit lock key
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [lockKey]);
   }
 
   /**
