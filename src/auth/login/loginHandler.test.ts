@@ -63,6 +63,21 @@ describe('createLoginHandler', () => {
     expect(response.body).toBe(successResponse);
   });
 
+  it('normalises email to lowercase before delegating to the service', async () => {
+    const loginService = createService();
+    const handler = createLoginHandler(loginService);
+    const response = new MockResponse();
+
+    await handler(
+      createRequest({ email: 'ALICE@Example.COM', password: 'secret' }),
+      response as unknown as Response,
+      createNext(),
+    );
+
+    expect(loginService.login).toHaveBeenCalledWith('alice@example.com', 'secret');
+    expect(response.statusCode).toBe(200);
+  });
+
   it.each([
     ['missing body', undefined],
     ['missing email', { password: 'secret' }],

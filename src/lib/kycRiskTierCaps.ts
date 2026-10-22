@@ -14,6 +14,8 @@
  *   offering has no static cap configured.
  */
 
+import { Decimal } from './decimal';
+
 export const KYC_RISK_TIERS = [
   'low',
   'standard',
@@ -30,12 +32,12 @@ export const DEFAULT_KYC_RISK_TIER: KycRiskTier = 'standard';
  * Multiplier applied to the offering's `max_investor_share_bps`.
  * High-risk tiers receive strictly lower multipliers.
  */
-export const TIER_CAP_MULTIPLIERS: Readonly<Record<KycRiskTier, number>> = {
-  low: 1.0,
-  standard: 1.0,
-  elevated: 0.5,
-  high: 0.25,
-  restricted: 0,
+export const TIER_CAP_MULTIPLIERS: Readonly<Record<KycRiskTier, string>> = {
+  low: '1.0',
+  standard: '1.0',
+  elevated: '0.5',
+  high: '0.25',
+  restricted: '0',
 };
 
 export function isKycRiskTier(value: unknown): value is KycRiskTier {
@@ -48,7 +50,7 @@ export function parseKycRiskTier(value: unknown, fallback: KycRiskTier = DEFAULT
 
 export interface CapResolution {
   tier: KycRiskTier;
-  multiplier: number;
+  multiplier: Decimal;
   /** Offering baseline in bps, or null when the offering has no static cap. */
   offeringCapBps: number | null;
   /**
@@ -66,7 +68,7 @@ export interface CapResolution {
  * @param tier            Investor KYC risk tier.
  */
 export function resolveEffectiveCap(offeringCapBps: number | null | undefined, tier: KycRiskTier): CapResolution {
-  const multiplier = TIER_CAP_MULTIPLIERS[tier];
+  const multiplier = new Decimal(TIER_CAP_MULTIPLIERS[tier]);
   const base = offeringCapBps == null ? null : offeringCapBps;
 
   if (tier === 'restricted') {
@@ -87,8 +89,10 @@ export function resolveEffectiveCap(offeringCapBps: number | null | undefined, t
     };
   }
 
-  const scaled = Math.floor(base * multiplier);
-  const effectiveCapBps = Math.min(10_000, Math.max(0, scaled));
+  const scaled = new Decimal(String(base)).multiply(multiplier);
+  // Floor the result and clamp to [0, 10000]
+  const floored = Math.floor(Number(scaled.toString()));
+  const effectiveCapBps = Math.min(10_000, Math.max(0, floored));
 
   return {
     tier,
@@ -104,30 +108,32 @@ export function resolveEffectiveCap(offeringCapBps: number | null | undefined, t
  */
 export function effectiveCapAmount(
   resolution: CapResolution,
-  totalOfferingAmount: number,
-): number | null {
+  totalOfferingAmount: Decimal,
+): Decimal | null {
   if (resolution.effectiveCapBps == null) return null;
-  if (!Number.isFinite(totalOfferingAmount) || totalOfferingAmount < 0) {
-    throw new Error('totalOfferingAmount must be a non-negative finite number');
+  if (totalOfferingAmount.isNegative()) {
+    throw new Error('totalOfferingAmount must be a non-negative number');
   }
-  return (resolution.effectiveCapBps / 10_000) * totalOfferingAmount;
+  const bpsDecimal = new Decimal(String(resolution.effectiveCapBps));
+  const divisor = new Decimal('10000');
+  return bpsDecimal.divide(divisor).multiply(totalOfferingAmount);
 }
 
 export interface CapCheckInput {
-  existingTotal: number;
-  newAmount: number;
-  totalOfferingAmount: number;
+  existingTotal: Decimal;
+  newAmount: Decimal;
+  totalOfferingAmount: Decimal;
   resolution: CapResolution;
 }
 
 export type CapCheckResult =
-  | { allowed: true; resolution: CapResolution; capAmount: number | null }
+  | { allowed: true; resolution: CapResolution; capAmount: Decimal | null }
   | {
       allowed: false;
       resolution: CapResolution;
-      capAmount: number;
-      existingTotal: number;
-      newAmount: number;
+      capAmount: Decimal;
+      existingTotal: Decimal;
+      newAmount: Decimal;
       reason: string;
     };
 
@@ -143,7 +149,8 @@ export function evaluateInvestmentAgainstCap(input: CapCheckInput): CapCheckResu
     return { allowed: true, resolution, capAmount: null };
   }
 
-  if (existingTotal + newAmount > capAmount) {
+  const proposedTotal = existingTotal.add(newAmount);
+  if (proposedTotal.compareTo(capAmount) > 0) {
     return {
       allowed: false,
       resolution,
@@ -152,8 +159,8 @@ export function evaluateInvestmentAgainstCap(input: CapCheckInput): CapCheckResu
       newAmount,
       reason:
         `Investment would exceed the KYC risk-tier adjusted cap of ${resolution.effectiveCapBps} bps` +
-        ` (${capAmount} units) for tier "${resolution.tier}".` +
-        ` Investor has already committed ${existingTotal} units.`,
+        ` (${capAmount.toString()} units) for tier "${resolution.tier}".` +
+        ` Investor has already committed ${existingTotal.toString()} units.`,
     };
   }
 

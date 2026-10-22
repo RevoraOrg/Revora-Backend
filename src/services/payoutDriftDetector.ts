@@ -9,10 +9,52 @@ import {
 } from '../db/repositories/payoutDriftRepository';
 import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
 
+/**
+ * Fixed-point decimal scale used for all amount arithmetic. Ten decimal
+ * places let us sum 10-decimal inputs exactly without float rounding.
+ */
+const DECIMAL_SCALE = 10;
+const SCALE_FACTOR = 10n ** BigInt(DECIMAL_SCALE);
+
+/**
+ * Parse a decimal amount string into BigInt units at DECIMAL_SCALE precision.
+ * Exact for stellar-style amounts (up to 7 decimals) and 10-decimal inputs.
+ */
+function toBigIntUnits(amount: string): bigint {
+  const [intPart, fracPart = ''] = amount.split('.');
+  const sign = intPart.startsWith('-') ? -1 : 1;
+  const cleanInt = intPart.replace(/^-/, '');
+  const padded = (fracPart + '0'.repeat(DECIMAL_SCALE)).slice(0, DECIMAL_SCALE);
+  return (
+    sign *
+    (BigInt(cleanInt || '0') * SCALE_FACTOR + BigInt(padded))
+  );
+}
+
+/**
+ * Format BigInt units back to a decimal string at full precision, stripping
+ * insignificant trailing zeros but never rounding.
+ */
+function formatUnits(units: bigint): string {
+  const sign = units < 0 ? '-' : '';
+  const abs = units < 0 ? -units : units;
+  const intPart = (abs / SCALE_FACTOR).toString();
+  const fracRaw = (abs % SCALE_FACTOR)
+    .toString()
+    .padStart(DECIMAL_SCALE, '0');
+  const frac = fracRaw.replace(/0+$/, '');
+  return frac.length > 0 ? `${sign}${intPart}.${frac}` : `${sign}${intPart}`;
+}
+
 export interface PayoutDriftDetectorOptions {
   intervalMs?: number;
   driftThresholdHours?: number;
   logger?: Logger;
+  /**
+   * Tolerance for drift classification, as a decimal string.
+   * Default "0.0000001" (one stroop).
+   */
+  toleranceAmount?: string;
 }
 
 export interface PayoutDriftRunResult {
@@ -40,6 +82,7 @@ export class PayoutDriftDetector {
   private readonly intervalMs: number;
   private readonly driftThresholdHours: number;
   private readonly logger: Logger;
+  private readonly toleranceUnits: bigint;
 
   constructor(
     private readonly pool: Pool,
@@ -51,6 +94,9 @@ export class PayoutDriftDetector {
     this.intervalMs = options.intervalMs ?? 24 * 60 * 60 * 1000;
     this.driftThresholdHours = options.driftThresholdHours ?? 24;
     this.logger = options.logger ?? globalLogger;
+    this.toleranceUnits = toBigIntUnits(
+      options.toleranceAmount ?? '0.0000001'
+    );
   }
 
   start(): void {
@@ -75,6 +121,8 @@ export class PayoutDriftDetector {
     this.logger.info('PayoutDriftDetector started', {
       intervalMs: this.intervalMs,
       driftThresholdHours: this.driftThresholdHours,
+      verifierEnabled: !!this.txVerifier,
+      toleranceAmount: formatUnits(this.toleranceUnits),
     });
   }
 
@@ -105,9 +153,16 @@ export class PayoutDriftDetector {
     try {
       const grouped = await this.driftRepo.getPayoutsByOffering();
 
+      let totalDriftUnits = 0n;
+
       for (const group of grouped) {
         try {
-          await this.detectDriftForOffering(group.offering_id, group.payouts, result);
+          const driftUnits = await this.detectDriftForOffering(
+            group.offering_id,
+            group.payouts,
+            result
+          );
+          totalDriftUnits += driftUnits;
           result.offeringsChecked++;
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -119,10 +174,11 @@ export class PayoutDriftDetector {
         }
       }
 
+      result.totalDriftAmount = formatUnits(totalDriftUnits);
+
       const summary = await this.driftRepo.getAggregatedDriftSummary();
       result.totalMissing = summary.total_missing;
       result.totalDuplicateTx = summary.total_duplicate_tx;
-      result.totalDriftAmount = summary.total_drift_amount;
       result.oldestDriftHours = summary.oldest_drift_hours;
 
       this.emitAggregatedMetrics(result);
@@ -160,7 +216,7 @@ export class PayoutDriftDetector {
     offeringId: string,
     payouts: PayoutForVerification[],
     result: PayoutDriftRunResult
-  ): Promise<void> {
+  ): Promise<bigint> {
     const details: DriftDetail[] = [];
     const label = this.shortLabel(offeringId);
 
@@ -168,6 +224,7 @@ export class PayoutDriftDetector {
     let underfundedCount = 0;
     let overfundedCount = 0;
     let duplicateCount = 0;
+    let driftUnits = 0n;
 
     const txHashMap = new Map<string, PayoutForVerification[]>();
 
@@ -201,10 +258,13 @@ export class PayoutDriftDetector {
           if (!verification.isValid) {
             const actual = verification.actualAmount ?? '0';
             const expected = payout.amount;
-            const diff = (parseFloat(expected) - parseFloat(actual)).toFixed(2);
+            const expectedUnits = toBigIntUnits(expected);
+            const actualUnits = toBigIntUnits(actual);
+            const diff = expectedUnits - actualUnits;
 
-            if (parseFloat(diff) > 0.01) {
+            if (diff > this.toleranceUnits) {
               underfundedCount++;
+              driftUnits += diff > 0n ? diff : -diff;
               details.push({
                 payout_id: payout.id,
                 investor_id: payout.investor_id,
@@ -213,10 +273,11 @@ export class PayoutDriftDetector {
                 drift_type: 'underfunded',
                 expected_amount: expected,
                 actual_amount: actual,
-                discrepancy: diff,
+                discrepancy: formatUnits(diff),
               });
-            } else if (parseFloat(diff) < -0.01) {
+            } else if (diff < -this.toleranceUnits) {
               overfundedCount++;
+              driftUnits += diff > 0n ? diff : -diff;
               details.push({
                 payout_id: payout.id,
                 investor_id: payout.investor_id,
@@ -225,7 +286,7 @@ export class PayoutDriftDetector {
                 drift_type: 'overfunded',
                 expected_amount: expected,
                 actual_amount: actual,
-                discrepancy: diff,
+                discrepancy: formatUnits(diff),
               });
             }
           }
@@ -258,10 +319,6 @@ export class PayoutDriftDetector {
     }
 
     if (details.length > 0) {
-      const totalDriftAmount = details
-        .reduce((sum, d) => sum + Math.abs(parseFloat(d.discrepancy) || 0), 0)
-        .toFixed(2);
-
       const oldestCreated = payouts
         .filter((p) => !p.tx_hash)
         .reduce((oldest, p) => (p.created_at < oldest ? p.created_at : oldest),
@@ -280,9 +337,6 @@ export class PayoutDriftDetector {
       result.totalOverfunded += overfundedCount;
       result.totalDuplicateTx += duplicateCount;
 
-      const currentTotal = parseFloat(result.totalDriftAmount);
-      result.totalDriftAmount = (currentTotal + parseFloat(totalDriftAmount)).toFixed(2);
-
       if (oldestAgeHours > result.oldestDriftHours) {
         result.oldestDriftHours = oldestAgeHours;
       }
@@ -295,11 +349,13 @@ export class PayoutDriftDetector {
         underfunded_count: underfundedCount,
         overfunded_count: overfundedCount,
         duplicate_tx_count: duplicateCount,
-        total_drift_amount: totalDriftAmount,
+        total_drift_amount: formatUnits(driftUnits),
         oldest_drift_age_hours: oldestAgeHours,
         details,
       });
     }
+
+    return driftUnits;
   }
 
   private emitAggregatedMetrics(result: PayoutDriftRunResult): void {

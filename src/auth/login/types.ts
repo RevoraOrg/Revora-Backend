@@ -22,6 +22,8 @@ export interface UserRecord {
   email: string;
   role: UserRole;
   passwordHash: string;
+  /** False once the account is deprovisioned (#1300). Missing means active. */
+  isActive?: boolean;
 }
 
 // ── Repositories ────────────────────────────────────────────────────────

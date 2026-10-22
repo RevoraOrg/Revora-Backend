@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { createHash } from 'crypto';
+import { hashPassword } from '../../utils/password';
 import { LoginService } from './loginService';
 import { JwtIssuer, SessionRepository, UserRecord, UserRepository } from './types';
 
@@ -66,6 +67,16 @@ const validUser: UserRecord = {
   passwordHash: sha256(VALID_PASSWORD),
 };
 
+// Helper to create a user with scrypt hash
+async function createScryptUser(id: string, email: string): Promise<UserRecord> {
+  return {
+    id,
+    email,
+    role: 'investor',
+    passwordHash: await hashPassword(VALID_PASSWORD),
+  };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 describe('LoginService failure handling', () => {
@@ -88,6 +99,22 @@ describe('LoginService failure handling', () => {
     expect(result).toBeNull();
     expect(sessionRepo.created).toHaveLength(0);
     expect(jwtIssuer.signCalls).toHaveLength(0);
+  });
+
+  it('accepts login with scrypt hash format', async () => {
+    const scryptUser = await createScryptUser('user-2', 'scrypt@example.com');
+    const { service, sessionRepo, jwtIssuer } = buildService([scryptUser]);
+
+    const result = await service.login('scrypt@example.com', VALID_PASSWORD);
+
+    expect(result).not.toBeNull();
+    expect(result?.user).toEqual({
+      id: 'user-2',
+      email: 'scrypt@example.com',
+      role: 'investor',
+    });
+    expect(sessionRepo.created).toHaveLength(1);
+    expect(jwtIssuer.signCalls).toHaveLength(1);
   });
 
   it('returns null when the stored hash has a different length (length guard)', async () => {
@@ -156,6 +183,33 @@ describe('LoginService failure handling', () => {
       (familyExpiresAt!.getTime() - Date.now()) / (24 * 60 * 60 * 1000);
     expect(daysFromNow).toBeGreaterThan(29.99);
     expect(daysFromNow).toBeLessThan(30.01);
+  });
+});
+
+describe('LoginService email normalisation and timing safety', () => {
+  it('logs in when the stored email matches the normalised lookup', async () => {
+    const normalisedUser: UserRecord = {
+      ...validUser,
+      email: 'alice@example.com',
+    };
+    const { service } = buildService([normalisedUser]);
+
+    const result = await service.login('ALICE@Example.COM', VALID_PASSWORD);
+
+    expect(result).not.toBeNull();
+    expect(result?.user.email).toBe('alice@example.com');
+  });
+
+  it('runs password verification once even when the user is missing', async () => {
+    const { service } = buildService([validUser]);
+    const spy = jest.spyOn((service as any), 'verifyPassword');
+
+    const result = await service.login('missing@example.com', VALID_PASSWORD);
+
+    expect(result).toBeNull();
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(VALID_PASSWORD, expect.any(String));
+    spy.mockRestore();
   });
 });
 

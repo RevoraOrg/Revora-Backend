@@ -174,6 +174,16 @@ export class RefreshService {
                 return null;
             }
 
+            // 2c.5 Reject deactivated users (#1300)
+            if (!(await this.repository.isUserActive(session.user_id, client))) {
+                this.logger.warn('Attempted refresh for inactive user', {
+                    userId,
+                    sessionId,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
             // 2d. Check for reuse detection: if this session already has a child
             const childSession = await this.repository.findSessionByParentId(sessionId, client);
             if (childSession) {

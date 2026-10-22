@@ -74,7 +74,10 @@ describe('RevenueReconciliationService', () => {
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRevenueReports);
       (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockDistributionRuns);
-      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([]);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue([{ investor_id: 'i1', status: 'completed' }]);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue([
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'i1', amount: '1000.00', status: 'processed' },
+      ]);
       (OfferingRepository.prototype.findById as jest.Mock).mockResolvedValue({ id: offeringId, contract_address: contractAddress });
       mockStellarClient.getRevenueState.mockResolvedValue({ totalDistributed: '1000.00' });
       (DistributionRepository.prototype.getAggregateStats as jest.Mock).mockResolvedValue({ totalDistributed: '1000.00' });
@@ -606,6 +609,259 @@ describe('RevenueReconciliationService', () => {
       expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-1', '1000.00');
       expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-2', '2000.00');
       expect(result.discrepancies.filter(d => d.type === 'STELLAR_TX_FAILED')).toHaveLength(0);
+    });
+  });
+
+  describe('checkPayoutCompleteness and countFailedPayouts', () => {
+    const runDate = new Date('2023-01-15');
+
+    it('complete: should report balanced when all expected investors have matching payouts and sum matches', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+        { investor_id: 'inv-2', status: 'completed' },
+      ];
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '100.00', status: 'processed' },
+        { id: 'p-2', distribution_id: 'run-1', investor_id: 'inv-2', amount: '200.00', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '300.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(true);
+      expect(result.discrepancies).toHaveLength(0);
+      expect(result.summary.payoutsFailed).toBe(0);
+      expect(result.summary.failedPayouts).toBe(0);
+      expect(result.summary.totalPayouts).toBe('300.00');
+    });
+
+    it('missing: a completed run missing one investor payout yields a MISSING_PAYOUT error', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+        { investor_id: 'inv-2', status: 'completed' },
+      ];
+      // inv-2 has no payout
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '300.00', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '300.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(false);
+      const missingDiscrepancy = result.discrepancies.find((d) => d.type === 'MISSING_PAYOUT');
+      expect(missingDiscrepancy).toBeDefined();
+      expect(missingDiscrepancy?.severity).toBe('error');
+      expect(missingDiscrepancy?.details.investorId).toBe('inv-2');
+      expect(missingDiscrepancy?.details.runId).toBe('run-1');
+    });
+
+    it('unexpected: a run with a payout for an unexpected investor yields an UNEXPECTED_PAYOUT error', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+      ];
+      // inv-unknown is not in expectedInvestorIds
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '200.00', status: 'processed' },
+        { id: 'p-2', distribution_id: 'run-1', investor_id: 'inv-unknown', amount: '100.00', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '300.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(false);
+      const unexpectedDiscrepancy = result.discrepancies.find((d) => d.type === 'UNEXPECTED_PAYOUT');
+      expect(unexpectedDiscrepancy).toBeDefined();
+      expect(unexpectedDiscrepancy?.severity).toBe('error');
+      expect(unexpectedDiscrepancy?.details.investorId).toBe('inv-unknown');
+      expect(unexpectedDiscrepancy?.details.amount).toBe('100.00');
+    });
+
+    it('sum-mismatch: sum mismatch is detected exactly using Decimal', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+      ];
+      // Payout is 299.99 instead of 300.00
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '299.99', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '300.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(false);
+      const sumMismatch = result.discrepancies.find((d) => d.type === 'PAYOUT_SUM_MISMATCH');
+      expect(sumMismatch).toBeDefined();
+      expect(sumMismatch?.severity).toBe('error');
+      expect(sumMismatch?.details.expectedAmount).toBe('300.00');
+      expect(sumMismatch?.details.actualAmount).toBe('299.99');
+      expect(sumMismatch?.details.difference).toBe('-0.01');
+    });
+
+    it('sum-mismatch: handles high precision decimal strings without floating-point inaccuracies', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '100.0000001', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+        { investor_id: 'inv-2', status: 'completed' },
+      ];
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '50.0000000', status: 'processed' },
+        { id: 'p-2', distribution_id: 'run-1', investor_id: 'inv-2', amount: '50.0000001', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '100.0000001', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      const sumMismatch = result.discrepancies.find((d) => d.type === 'PAYOUT_SUM_MISMATCH');
+      expect(sumMismatch).toBeUndefined();
+    });
+
+    it('failed-count: a run with 2 failed payouts reports failedPayouts: 2 in the result via repository count', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '200.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+        { investor_id: 'inv-2', status: 'completed' },
+      ];
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '100.00', status: 'failed' },
+        { id: 'p-2', distribution_id: 'run-1', investor_id: 'inv-2', amount: '100.00', status: 'failed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '200.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(2);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.summary.payoutsFailed).toBe(2);
+      expect(result.summary.failedPayouts).toBe(2);
+      expect(DistributionRepository.prototype.countPayoutsByStatus).toHaveBeenCalledWith('run-1', 'failed');
+    });
+
+    it('failed-count: fallback to loaded list counts failed payouts when countPayoutsByStatus returns undefined', async () => {
+      const mockRuns = [
+        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+        { investor_id: 'inv-2', status: 'completed' },
+        { investor_id: 'inv-3', status: 'completed' },
+      ];
+      const mockPayouts = [
+        { id: 'p-1', distribution_id: 'run-1', investor_id: 'inv-1', amount: '100.00', status: 'failed' },
+        { id: 'p-2', distribution_id: 'run-1', investor_id: 'inv-2', amount: '100.00', status: 'failed' },
+        { id: 'p-3', distribution_id: 'run-1', investor_id: 'inv-3', amount: '100.00', status: 'processed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        { amount: '300.00', period_start: periodStart, period_end: periodEnd },
+      ]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue(mockPayouts);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      expect(result.summary.payoutsFailed).toBe(2);
+      expect(result.summary.failedPayouts).toBe(2);
+    });
+
+    it('status guard: skips completeness checks for pending and failed runs', async () => {
+      const mockRuns = [
+        { id: 'run-pending', total_amount: '100.00', distribution_date: runDate, status: 'pending', offering_id: offeringId },
+        { id: 'run-failed', total_amount: '100.00', distribution_date: runDate, status: 'failed', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      // Neither run should emit MISSING_PAYOUT or PAYOUT_SUM_MISMATCH
+      expect(result.discrepancies.some((d) => d.type === 'MISSING_PAYOUT')).toBe(false);
+      expect(result.discrepancies.some((d) => d.type === 'PAYOUT_SUM_MISMATCH')).toBe(false);
+    });
+
+    it('status guard: runs completeness checks for processing runs', async () => {
+      const mockRuns = [
+        { id: 'run-proc', total_amount: '100.00', distribution_date: runDate, status: 'processing', offering_id: offeringId },
+      ];
+      const mockInvestments = [
+        { investor_id: 'inv-1', status: 'completed' },
+      ];
+
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRuns);
+      (InvestmentRepository.prototype.findByOffering as jest.Mock).mockResolvedValue(mockInvestments);
+      (DistributionRepository.prototype.getPayoutsForRun as jest.Mock).mockResolvedValue([]);
+      (DistributionRepository.prototype.countPayoutsByStatus as jest.Mock).mockResolvedValue(0);
+
+      const result = await service.reconcile(offeringId, periodStart, periodEnd);
+
+      // Processing run with missing payouts should emit MISSING_PAYOUT
+      expect(result.discrepancies.some((d) => d.type === 'MISSING_PAYOUT')).toBe(true);
     });
   });
 });

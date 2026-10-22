@@ -134,7 +134,7 @@ export class SocialAuthService {
       // Apple private-relay emails are transient and cannot be used for
       // account matching.  Skip the email-collision check entirely.
       if (!claims.isPrivateRelay) {
-        const emailUser = await this.userRepository.findByEmail(claims.email);
+        const emailUser = await this.userRepository.findByEmail(claims.email.trim().toLowerCase());
         if (emailUser) {
           throw new SocialAuthError(
             'EMAIL_ACCOUNT_REQUIRES_LINK',
@@ -213,8 +213,8 @@ export class SocialAuthService {
     }
 
     // Apple private-relay emails are transient — skip email-collision check.
-    if (!claims.isPrivateRelay && user.email !== claims.email) {
-      const emailUser = await this.userRepository.findByEmail(claims.email);
+    if (!claims.isPrivateRelay && user.email !== claims.email.trim().toLowerCase()) {
+      const emailUser = await this.userRepository.findByEmail(claims.email.trim().toLowerCase());
       if (emailUser && emailUser.id !== input.userId) {
         throw new SocialAuthError(
           'EMAIL_ACCOUNT_REQUIRES_LINK',

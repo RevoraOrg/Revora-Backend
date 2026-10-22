@@ -14,7 +14,9 @@ export interface OutboxRow {
   event_id: string;
   event_type: WebhookEventType;
   payload: unknown;
-  status: 'pending' | 'dispatched' | 'failed';
+  status: 'pending' | 'dispatching' | 'dispatched' | 'failed';
+  locked_until: Date | null;
+  lease_token: string | null;
   attempts: number;
   available_at: Date;
   created_at: Date;
@@ -37,8 +39,9 @@ export interface InsertOutboxInput {
  * passing the transactional PoolClient.  This guarantees the outbox row is
  * written atomically with the domain change that produced the event.
  *
- * `drainPending` uses SELECT … FOR UPDATE SKIP LOCKED so concurrent
- * dispatcher instances never process the same row twice.
+ * `drainPending` atomically persists a lease while holding SKIP LOCKED row
+ * locks. Only one worker owns an unexpired lease; expired claims may be retried
+ * with the same event_id. Delivery is still at least once.
  */
 export class OutboxRepository {
   constructor(private readonly db: Pool) {}
@@ -66,56 +69,74 @@ export class OutboxRepository {
   }
 
   /**
-   * Claim up to `limit` pending rows that are ready to dispatch.
-   * Uses SKIP LOCKED so concurrent workers never double-process a row.
+   * Claim ready pending rows or recover expired leases in one autocommit
+   * statement. The token fences completions from superseded workers.
+   * The lease must cover delivery of the entire claimed batch.
    */
-  async drainPending(limit = 50): Promise<OutboxRow[]> {
+  async drainPending(limit = 50, leaseMs = 60_000): Promise<OutboxRow[]> {
+    if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError('limit must be a non-negative safe integer');
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0) throw new RangeError('leaseMs must be a positive safe integer');
     const result: QueryResult<OutboxRow> = await this.db.query(
-      `SELECT * FROM webhook_outbox
-       WHERE status = 'pending' AND available_at <= NOW()
-       ORDER BY available_at ASC
-       LIMIT $1
-       FOR UPDATE SKIP LOCKED`,
-      [limit]
+      `UPDATE webhook_outbox
+       SET status = 'dispatching',
+           locked_until = NOW() + ($2::double precision * INTERVAL '1 millisecond'),
+           lease_token = $3::uuid
+       WHERE id IN (
+         SELECT id FROM webhook_outbox
+         WHERE (status = 'pending' AND available_at <= NOW())
+            OR (status = 'dispatching' AND locked_until <= NOW())
+         ORDER BY available_at ASC, id ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING *`,
+      [limit, leaseMs, randomUUID()]
     );
     return result.rows.map((r) => this.map(r));
   }
 
-  /** Mark a row as successfully dispatched. */
-  async markDispatched(id: string): Promise<void> {
+  /** Complete only the matching, unexpired claim; stale workers are a no-op. */
+  async markDispatched(id: string, leaseToken: string | null): Promise<void> {
     await this.db.query(
       `UPDATE webhook_outbox
-       SET status = 'dispatched', attempts = attempts + 1
-       WHERE id = $1`,
-      [id]
+       SET status = 'dispatched', attempts = attempts + 1,
+           locked_until = NULL, lease_token = NULL
+       WHERE id = $1 AND status = 'dispatching'
+         AND lease_token = $2::uuid AND locked_until > NOW()`,
+      [id, leaseToken]
     );
   }
 
   /**
    * Record a failed dispatch attempt.
-   * If `retryAfter` is provided the row stays pending and becomes available
+   * If `retryAfter` is provided the row returns to pending and becomes available
    * again at that time; otherwise it is marked failed.
    */
-  async markFailed(id: string, retryAfter?: Date): Promise<void> {
+  async markFailed(id: string, leaseToken: string | null, retryAfter?: Date): Promise<void> {
     if (retryAfter) {
       await this.db.query(
         `UPDATE webhook_outbox
-         SET attempts = attempts + 1, available_at = $2
-         WHERE id = $1`,
-        [id, retryAfter]
+         SET status = 'pending', attempts = attempts + 1, available_at = $3,
+             locked_until = NULL, lease_token = NULL
+         WHERE id = $1 AND status = 'dispatching'
+           AND lease_token = $2::uuid AND locked_until > NOW()`,
+        [id, leaseToken, retryAfter]
       );
     } else {
       await this.db.query(
         `UPDATE webhook_outbox
-         SET status = 'failed', attempts = attempts + 1
-         WHERE id = $1`,
-        [id]
+         SET status = 'failed', attempts = attempts + 1,
+             locked_until = NULL, lease_token = NULL
+         WHERE id = $1 AND status = 'dispatching'
+           AND lease_token = $2::uuid AND locked_until > NOW()`,
+        [id, leaseToken]
       );
     }
   }
 
   /**
-   * Fetch the oldest pending outbox row (by created_at).
+   * Fetch the oldest ready or expired outbox row (by created_at).
+   * Active leases and scheduled retries do not contribute to pending lag.
    * Used for measuring outbox lag without claiming the row.
    *
    * @returns The oldest pending row, or null if no pending records exist.
@@ -123,20 +144,23 @@ export class OutboxRepository {
   async getOldestPending(): Promise<OutboxRow | null> {
     const result: QueryResult<OutboxRow> = await this.db.query(
       `SELECT * FROM webhook_outbox
-       WHERE status = 'pending' AND available_at <= NOW()
+       WHERE (status = 'pending' AND available_at <= NOW())
+          OR (status = 'dispatching' AND locked_until <= NOW())
        ORDER BY created_at ASC
        LIMIT 1`
     );
     return result.rows.length > 0 ? this.map(result.rows[0]) : null;
   }
 
-  private map(row: any): OutboxRow {
+  private map(row: OutboxRow): OutboxRow {
     return {
       id: row.id,
       event_id: row.event_id,
       event_type: row.event_type as WebhookEventType,
       payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
       status: row.status,
+      locked_until: row.locked_until == null ? null : new Date(row.locked_until),
+      lease_token: row.lease_token ?? null,
       attempts: row.attempts,
       available_at: new Date(row.available_at),
       created_at: new Date(row.created_at),

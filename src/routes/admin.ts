@@ -10,6 +10,7 @@ import {
 import { Errors } from '../lib/errors';
 import { TenantSettingsRepository } from '../db/repositories/tenantSettingsRepository';
 import { SessionPolicyValidator } from '../services/sessionPolicyValidator';
+import { toCsvField } from '../lib/csv';
 
 export function createAdminRouter(
   auditLogRepo: AuditLogRepository,
@@ -35,32 +36,37 @@ export function createAdminRouter(
 
       // Build CSV content
       const headers = ['id', 'user_id', 'action', 'resource', 'details', 'ip_address', 'user_agent', 'created_at'];
-      const csvRows = [headers.join(',')];
+      const csvRows = [headers.map((h) => toCsvField(h)).join(',')];
 
       for (const log of logs) {
         const row = [
-          log.id,
-          log.user_id || '',
-          log.action,
-          log.resource || '',
-          log.details ? `"${log.details.replace(/"/g, '""')}"` : '',
-          log.ip_address || '',
-          log.user_agent ? `"${log.user_agent.replace(/"/g, '""')}"` : '',
-          log.created_at.toISOString()
+          toCsvField(log.id),
+          toCsvField(log.user_id || ''),
+          toCsvField(log.action),
+          toCsvField(log.resource || ''),
+          toCsvField(log.details ?? ''),
+          toCsvField(log.ip_address || ''),
+          toCsvField(log.user_agent ?? ''),
+          toCsvField(log.created_at.toISOString()),
         ];
         csvRows.push(row.join(','));
       }
 
       const csvContent = csvRows.join('\n');
 
-      // Create manifest header and sign with Ed25519
+      // Create manifest header and sign with Ed25519.
+      //
+      // The signature covers the escaped CSV bytes, so the signed artifact is
+      // authentic over the RFC 4180 + formula-guard escaped content
+      // ("escaping":"rfc4180+formula-guard" documented in the manifest).
       const keypair = Keypair.fromSecret(env.STELLAR_SERVER_SECRET!);
       
       const manifest = {
         rowCount: logs.length,
         limit,
         offset,
-        exportedAt: new Date().toISOString()
+        exportedAt: new Date().toISOString(),
+        escaping: 'rfc4180+formula-guard',
       };
       
       const manifestString = JSON.stringify(manifest);
