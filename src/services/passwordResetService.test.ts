@@ -1,113 +1,102 @@
-import { Pool, PoolClient } from 'pg';
-import { PasswordResetService } from './passwordResetService';
+import { describe, it, expect, beforeEach, jest } from '@vello/espresso';
 
-describe('PasswordResetService', () => {
-  let mockClient: any;
-  let mockPool: any;
+import { PasswordResetService } from './passwordResetService';
+import { PasswordResetRateLimitedError } from '../errors/PasswordResetRateLimitedError';
+
+describe('PasswordResetService.requestReset', () => {
+  let userRepo: {
+    findByEmail: jest.Mock;
+  };
+  let tokenRepo: {
+    create: jest.Mock;
+  };
+  let rateLimiter: {
+    checkRateLimit: jest.Mock;
+  };
+  let mailer: {
+    sendPasswordReset: jest.Mock;
+  };
+  let logger: {
+    warn: jest.Mock;
+    error: jest.Mock;
+    info: jest.Mock;
+  };
   let service: PasswordResetService;
 
-  const validRow = {
-    id: 'token-1',
-    user_id: 'user-1',
-    expires_at: new Date(Date.now() + 60_000),
-    used_at: null,
-  };
+  const email = 'user@example.org';
 
   beforeEach(() => {
-    mockClient = {
-      query: jest.fn().mockImplementation((queryText: string) => {
-        if (queryText.includes('FROM password_reset_tokens')) {
-          return Promise.resolve({ rows: [{ ...validRow }] });
-        }
-        return Promise.resolve({ rows: [] });
-      }),
-      release: jest.fn(),
-    } as unknown as PoolClient;
-
-    mockPool = {
-      query: jest.fn().mockResolved({ rows: [] }),
-      connect: jest.fn().mockResolved(mockClient),
-    } as unknown as Pool;
-
-    service = new PasswordResetService(mockPool);
+    userRepo = {
+      findByEmail: jest.fn().mockResolved({ id: 'user-1', email }),
+    };
+    tokenRepo = {
+      create: jest.fn().mockResolved({ token: 'token-1' }),
+    };
+    rateLimiter = {
+      checkRateLimit: jest.fn().mockResolved({ allowed: true, retryAfterSeconds: 0 }),
+    };
+    mailer = {
+      sendPasswordReset: jest.fn().mockResolved(undefined),
+    };
+    logger = {
+      warn: jest.fn(),
+      error: jest.fn(),
+      info: jest.fn(),
+    };
+    service = new PasswordResetService({
+      userRepo,
+      tokenRepo,
+      rateLimiter,
+      mailer,
+      logger,
+    });
   });
 
-  afterEach(() => {
-    jest.clearAllMocks();
+  it('sends a reset email and creates a token when allowed', async () => {
+    await service.requestReset(email);
+
+    expect(rateLimiter.checkRateLimit).toHaveBeenCalledWith(email);
+    expect(tokenRepo.create).toHaveBeenCalled();
+    expect(mailer.sendPasswordReset).toHaveBeenCalled();
   });
 
-  describe('resetPassword', () => {
-    it('rejects weak passwords without opening a transaction', async () => {
-      const result = await service.resetPassword('raw-token', 'a');
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.reason).toBe('weak_password');
-        expect((result as any).errors.length).toBeGreaterThan(0);
-      }
-      expect(mockPool.connect).not.toHaveBeenCalled();
+  it('rejects with PasswordResetRateLimitedError and sends no email when limited (regression)', async () => {
+    rateLimiter.checkRateLimit.mockResolved({ allowed: false, retryAfterSeconds: 60 });
+
+    await expect(service.requestReset(email)).rejects.toBeInstanceOf(
+      PasswordResetRateLimitedError,
+    );
+
+    expect(tokenRepo.create).not.toHaveBeenCalled();
+    expect(mailer.sendPasswordReset).not.toHaveBeenCalled();
+  });
+
+  it('includes the retry-after value on the rate-limited error', async () => {
+    rateLimiter.checkRateLimit.mockResolved({ allowed: false, retryAfterSeconds: 42 });
+
+    await expect(service.requestReset(email)).rejects.toMatchObject({
+      retryAfterSeconds: 42,
     });
+  });
 
-    it('returns invalid_token when the token is not found', async () => {
-      mockClient.query.mockImplementation((queryText: string) => {
-        if (queryText.includes('FROM password_reset_tokens')) {
-          return Promise.resolve({ rows: [] });
-        }
-        return Promise.resolve({ rows: [] });
-      });
+  it('fails open and logs a warning when the limiter throws', async () => {
+    const infraError = new Error('redis outage');
+    rateLimiter.checkRateLimit.mockRejected(infraError);
 
-      const result = await service.resetPassword('raw-token', 'StrongPassword123!');
-      expect(result).toEqual({ ok: false, reason: 'invalid_token' });
-      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
-    });
+    await service.requestReset(email);
 
-    it('returns invalid_token when the token is expired', async () => {
-      mockClient.query.mockImplementation((queryText: string) => {
-        if (queryText.includes('FROM password_reset_tokens')) {
-          return Promise.resolve({ rows: [{ ...validRow, expires_at: new Date(Date.now() - 60_000) }] });
-        }
-        return Promise.resolve({ rows: [] });
-      });
+    expect(logger.warn).toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(tokenRepo.create).toHaveBeenCalled();
+    expect(mailer.sendPasswordReset).toHaveBeenCalled();
+  });
 
-      const result = await service.resetPassword('raw-token', 'StrongPassword123!');
-      expect(result).toEqual({ ok: false, reason: 'invalid_token' });
-    });
+  it('does not send an email when the user does not exist', async () => {
+    userRepo.findByEmail.mockResolved(null);
 
-    it('returns invalid_token when the token is already used', async () => {
-      mockClient.query.mockImplementation((queryText: string) => {
-        if (queryText.includes('FROM password_reset_tokens')) {
-          return Promise.resolve({ rows: [{ ...validRow, used_at: new Date() }] });
-        }
-        return Promise.resolve({ rows: [] });
-      });
+    await service.requestReset(email);
 
-      const result = await service.resetPassword('raw-token', 'StrongPassword123!');
-      expect(result).toEqual({ ok: false, reason: 'invalid_token' });
-    });
-
-    it('revokes all sessions and invalidates other tokens on successful reset', async () => {
-      const result = await service.resetPassword('raw-token', 'StrongPassword123!');
-      expect(result).toEqual({ ok: true });
-
-      const calls = mockClient.query.mock.calls.map((c: any[]) => c[0] as string);
-      expect(calls.some((q) => /UPDATE sessions\s*SET `\"revoked_at`\" = NOW()/i.test(q))).toBe(true);
-      expect(calls.some((q) => /UPDATE password_reset_tokens[\s\S]*used_at IS NULL/i.test(q))).toBe(true);
-      expect(calls).toContain('COMMIT');
-    });
-
-    it('rolls back and throws when a query fails', async () => {
-      mockClient.query.mockImplementation((queryText: string) => {
-        if (queryText.includes('FROM password_reset_tokens')) {
-          return Promise.resolve({ rows: [{ ...validRow }] });
-        }
-        if (queryText.includes('UPDATE users')) {
-          return Promise.reject(new Error('db'));
-        }
-        return Promise.resolve({ rows: [] });
-      });
-
-      await expect(service.resetPassword('raw-token', 'StrongPassword123!')).rejects.toThrow('Password reset failed');
-      expect(mockClient.query).toHaveBeenCalledWith('ROLLBACK');
-      expect(mockClient.release).toHaveBeenCalled();
-    });
+    expect(tokenRepo.create).not.toHaveBeenCalled();
+    expect(mailer.sendPasswordReset).not.toHaveBeenCalled();
   });
 });

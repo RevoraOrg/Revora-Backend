@@ -1,7 +1,7 @@
 {
   "default_branch": "master",
   "branches": [
-    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "feat/autoscale-db-pool-signal",
     "master",
     "origin",
     "security/issue-1262-security-aml-investor-screening-falls-back-to",
@@ -9,7 +9,7 @@
     "security/issue-1293-security-password-reset-resetpassword-skips"
   ],
   "parent": {
-    "fix/issue-1303-fix-distributions-resuming-a-partial-run": "master",
+    "feat/autoscale-db-pool-signal": "master",
     "master": null,
     "origin": "master",
     "security/issue-1262-security-aml-investor-screening-falls-back-to": "master",
@@ -18,7 +18,7 @@
   },
   "order": [
     "master",
-    "fix/issue-1303-fix-distributions-resuming-a-partial-run",
+    "feat/autoscale-db-pool-signal",
     "origin",
     "security/issue-1262-security-aml-investor-screening-falls-back-to",
     "security/issue-1268-security-jwt-access-and-refresh-tokens-are",

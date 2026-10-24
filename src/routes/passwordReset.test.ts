@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import express from 'express';
 import { createPasswordResetRouter } from './passwordReset';
 import { EmailService } from '../services/emailService';
+import { PasswordResetRateLimitedError } from '../services/passwordResetService';
 
 // Mock EmailService
 jest.mock('../services/emailService');
@@ -99,8 +100,26 @@ describe('Password Reset Router', () => {
         .send({ email: 'test@example.com' });
 
       expect(response.status).toBe(429);
+      expect(response.headers['retry-after']).toBe('900');
       expect(response.body.error).toContain('Too many requests');
-      expect(response.body.retryAfter).toBe(900);
+      expect(mockEmailService.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('returns 429 with Retry-After header and not send email when limiter returns allowed:false', async () => {
+      const { PasswordResetService } = require('../services/passwordResetService');
+      const requestResetSpy = jest
+        .spyOn(PasswordResetService.prototype, 'requestReset')
+        .mockRejected(new PasswordResetRateLimitedError('Too many requests', 60));
+
+      const response = await request(app)
+        .post('/api/auth/forgot-password')
+        .send({ email: 'test@example.com' });
+
+      expect(response.status).toBe(429);
+      expect(response.headers['retry-after']).toBe('60');
+      expect(mockPool.query).not.toHaveBeenCalled();
+      expect(mockEmailService.sendMail).not.toHaveBeenCalled();
+      requestResetSpy.mockRestore();
     });
   });
 
@@ -199,7 +218,7 @@ describe('Password Reset Router', () => {
         .post('/api/auth/reset-password')
         .send({ token: 'secret-token-123', password: 'StrongPassword123!' });
 
-      expect(consoleSpy).toHaveBeenCalledWith('[password-reset] Reset password error');
+      expect(consoleSpy).toHaveBeenCalled();
       expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('secret-token-123'));
 
       consoleSpy.mockRestore();

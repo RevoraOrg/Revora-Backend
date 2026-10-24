@@ -13,5 +13,6 @@ pnpm-debug.log*
 Thumbs.db
 reports/mutation/
 .stryker-tmp/
+branch_structure.json
 .tools/
 .opencode

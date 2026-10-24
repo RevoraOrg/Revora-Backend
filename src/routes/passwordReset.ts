@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { PasswordResetService, PasswordResetRateLimitedError } from '../services/passwordResetService';
 import { PasswordResetRateLimiter } from '../services/passwordResetRateLimiter';
 import { EmailService } from '../services/emailService';
+import { logger } from '../lib/logger';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -39,13 +40,15 @@ export function createPasswordResetRouter(options: CreatePasswordResetRouterOpti
       await service.requestPasswordReset(email);
     } catch (err) {
       if (err instanceof PasswordResetRateLimitedError) {
+        const retryAfter = Math.max(0, Math.ceil(err.retryAfter));
+        res.setHeader('Retry-After', String(retryAfter));
         res.status(429).json({
           error: err.message,
-          retryAfter: err.retryAfter,
+          retryAfter,
         });
         return;
       }
-      console.error('[password-reset] Error processing request:', err);
+      logger.error('[password-reset] Error processing request:', err);
     }
     res.status(200).json({
       message: 'If the email exists, a password reset link has been sent',
@@ -71,7 +74,7 @@ export function createPasswordResetRouter(options: CreatePasswordResetRouterOpti
       res.status(200).json({ message: 'Password updated' });
     } catch (err) {
       // Log error without exposing token
-      console.error('[password-reset] Reset password error');
+      logger.error('[password-reset] Reset password error');
       res.status(400).json({ error: 'Invalid or expired token' });
     }
   });

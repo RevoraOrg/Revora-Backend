@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { randomBytes, createHash } from 'node:crypto';
 import { PasswordResetRateLimiter, RateLimitResult } from './passwordResetRateLimiter';
+import { logger } from '../utils/logger';
 import { validatePasswordStrength } from '../auth/register/validatePasswordStrength';
 
 export type EmailSender = (to: string, subject: string, body: string) => Promise<void>;
@@ -10,6 +11,12 @@ export interface PasswordResetServiceOptions {
   tokenTtlMinutes?: number;
   appUrl?: string;
   rateLimiter?: PasswordResetRateLimiter;
+  /**
+   * Policy for handling infrastructure errors from the rate limiter.
+   * - 'fail-open' (default): allow the request to proceed when the limiter throws.
+   * - 'fail-closed': reject the request when the limiter throws.
+   */
+  rateLimiterFailurePolicy?: 'fail-open' | 'fail-closed';
 }
 
 export type PasswordResetResult =
@@ -33,32 +40,45 @@ export class PasswordResetService {
   private tokenTtlMinutes: number;
   private appUrl: string;
   private rateLimiter?: PasswordResetRateLimiter;
+  private rateLimiterFailurePolicy: 'fail-open' | 'fail-closed';
 
   constructor(private readonly db: Pool, opts?: PasswordResetServiceOptions) {
     this.emailSender = opts?.emailSender ?? (async (_to, _subject, _body) => {});
     this.tokenTtlMinutes = opts?.tokenTtlMinutes ?? 60;
     this.appUrl = opts?.appUrl ?? process.env.APP_URL ?? 'http://localhost:3000';
     this.rateLimiter = opts?.rateLimiter;
+    this.rateLimiterFailurePolicy = opts?.rateLimiterFailurePolicy ?? 'fail-open';
   }
 
   async requestPasswordReset(emailRaw: string): Promise<void> {
     const email = emailRaw.trim().toLowerCase();
 
     if (this.rateLimiter) {
+      let rateLimitResult: RateLimitResult | undefined;
       try {
-        const rateLimitResult = await this.rateLimiter.checkRateLimit(email);
-        if (!rateLimitResult.allowed) {
+        rateLimitResult = await this.rateLimiter.checkRateLimit(email);
+      } catch (err) {
+        logger.warn('[password-reset] Rate limiter infrastructure error', {
+          error: err,
+          email,
+          policy: this.rateLimiterFailurePolicy,
+          metric: 'password_reset.rate_limiter_error',
+        });
+        if (this.rateLimiterFailurePolicy === 'fail-closed') {
           throw new PasswordResetRateLimitedError(
             'Too many password reset requests. Please try again later.',
-            rateLimitResult.retryAfter ?? this.rateLimiter['blockMinutes'] * 60,
-            rateLimitResult
+            60,
+            { allowed: false, retryAfter: 60 },
           );
         }
-      } catch (err) {
-        if (err instanceof PasswordResetRateLimitedError) {
-          throw err;
-        }
-        console.error('[password-reset] Rate limiter error, failing open:', err);
+      }
+
+      if (rateLimitResult && !rateLimitResult.allowed) {
+        throw new PasswordResetRateLimitedError(
+          'Too many password reset requests. Please try again later.',
+          rateLimitResult.retryAfter ?? this.rateLimiter['blockMinutes'] * 60,
+          rateLimitResult,
+        );
       }
     }
 
