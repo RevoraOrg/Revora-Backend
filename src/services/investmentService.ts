@@ -155,6 +155,15 @@ export class InvestmentService {
 
     // 3. OFAC / EU / UK sanctions screening (blocking, fail-closed) before persistence
     const screening = await this.screenInvestment(input);
+    if (screening && !screening.complete) {
+      // Missing legal name (or unavailable list) means screening cannot complete.
+      // Fail closed: never screen an identifier in place of a name.
+      await this.recordScreenBlocked(input, screening, false);
+      throw Errors.serviceUnavailable(
+        'Investment blocked: sanctions screening could not complete (missing investor name or list unavailable; fail-closed).',
+        this.screeningDetails(screening),
+      );
+    }
     if (screening && !screening.cleared) {
       // Failure to obtain a verified list, or a confirmed hit -> reject.
       const blocked = screening.matches.length > 0;
@@ -257,19 +266,35 @@ export class InvestmentService {
     if (!this.screeningService) return null;
 
     const name = await this.resolveInvestorName(input.investor_id);
-    const identityNames = [name, ...(input.beneficial_owners ?? [])]
+    const beneficialOwners = (input.beneficial_owners ?? [])
       .filter((n) => typeof n === 'string' && n.trim().length > 0);
+
+    // A missing legal name means the primary identity cannot be screened.
+    // Fail closed rather than screening an identifier (e.g. the UUID).
+    if (!name) {
+      return {
+        complete: false,
+        cleared: false,
+        matches: [],
+        versions: {},
+      };
+    }
+
+    const identityNames = [name, ...beneficialOwners];
 
     return this.screeningService.screen(identityNames);
   }
 
-  /** Resolve the investor's display name via the user repository (if available). */
-  private async resolveInvestorName(investorId: string): Promise<string> {
+  /**
+   * Resolve the investor's display name via the user repository (if available).
+   * Returns null when no legal name is on file — callers must fail closed.
+   */
+  private async resolveInvestorName(investorId: string): Promise<string | null> {
     if (this.userRepo) {
       const user = await this.userRepo.findById(investorId);
-      if (user?.name) return user.name;
+      if (user?.name && user.name.trim().length > 0) return user.name;
     }
-    return investorId;
+    return null;
   }
 
   /**

@@ -578,6 +578,77 @@ describe('InvestmentService sanctions screening', () => {
   });
 });
 
+describe('InvestmentService missing investor name (fail closed)', () => {
+  const baseInput: CreateInvestmentRequest = {
+    investor_id: 'investor-123',
+    offering_id: 'offering-abc',
+    amount: '1000.00',
+    asset: 'USDC',
+  };
+
+  function buildService(opts: {
+    user: User | null;
+    screenResult?: SanctionsScreenResult;
+  }) {
+    const pool = makeMockPool();
+    const invRepo = new InvestmentRepository(pool as unknown as Pool);
+    const offRepo = new OfferingRepository(pool as unknown as Pool);
+    const screening = {
+      screen: jest.fn().mockResolvedValue(
+        opts.screenResult ?? {
+          complete: true,
+          versions: { ofac: '2026-01-01' },
+          matches: [],
+          cleared: true,
+        },
+      ),
+    } as unknown as SanctionsScreeningService;
+    const auditLogFn = jest.fn().mockResolvedValue(undefined);
+    const audit = {
+      createAuditLog: auditLogFn,
+    } as unknown as AuditLogRepository;
+    const userRepo = {
+      findById: jest.fn().mockResolvedValue(opts.user),
+    } as unknown as UserRepository;
+    const svc = new InvestmentService(invRepo, offRepo, undefined, userRepo, screening, audit);
+    pool.query.mockResolvedValueOnce(mockQueryResult([makeOfferingRow({ status: 'active' })]));
+    return { svc, pool, screening, audit };
+  }
+
+  it('blocks an investor with no name and no beneficial owners (regression: UUID-only investor)', async () => {
+    const { svc, pool, screening, audit } = buildService({
+      user: makeUser({ name: undefined }),
+    });
+    await expect(svc.createInvestment(baseInput)).rejects.toThrow(/screening/i);
+    // Must not screen the UUID.
+    expect(screening.screen).not.toHaveBeenCalled();
+    // Must not insert.
+    const sqls = pool.query.mock.calls.map((c) => String(c[0]));
+    expect(sqls.some((s) => /INSERT\s+INTO\s+investments/i.test(s))).toBe(false);
+    // Must record the block.
+    expect(audit.createAuditLog).toHaveBeenCalledTimes(1);
+    const details = JSON.parse((audit.createAuditLog as jest.Mock).mock.calls[0][0].details as string);
+    expect(details.screening_status).toBe('blocked');
+    expect(details.reason).toBe('missing_investor_name');
+  });
+
+  it('blocks an investor with no name even when beneficial owners are present', async () => {
+    const { svc, pool, screening, audit } = buildService({
+      user: makeUser({ name: undefined }),
+    });
+    await expect(
+      svc.createInvestment({ ...baseInput, beneficial_owners: ['Eve'] }),
+    ).rejects.toThrow(/screening/i);
+    expect(screening.screen).not.toHaveBeenCalled();
+    const sqls = pool.query.mock.calls.map((c) => String(c[0]));
+    expect(sqls.some((s) => /INSERT\s+INTO\s+investments/i.test(s))).toBe(false);
+    expect(audit.createAuditLog).toHaveBeenCalledTimes(1);
+    const details = JSON.parse((audit.createAuditLog as jest.Mock).mock.calls[0][0].details as string);
+    expect(details.screening_status).toBe('blocked');
+    expect(details.reason).toBe('missing_investor_name');
+  });
+});
+
 describe('createInvestmentService', () => {
   it('creates an InvestmentService instance', () => {
     const mockPool = makeMockPool();
