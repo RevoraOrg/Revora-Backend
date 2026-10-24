@@ -22,10 +22,20 @@ The system fetches all milestones for a vault and sorts them by `created_at`. It
 ### Error Handling
 The implementation uses `lib/errors` factories for consistent error reporting. All errors are logged with structured context and mapped to appropriate HTTP status codes (400, 403, 404, 409, 500).
 
+### Concurrency Safety and Atomic Validation (Compare-And-Set)
+To prevent race conditions where concurrent verifiers validate the same milestone simultaneously (which previously led to duplicate validation events and duplicate domain event publication):
+1. **Conditional Update (CAS)**: `MilestoneRepository.markValidated` performs a conditional update:
+   `WHERE vault_id = $3 AND id = $4 AND status = 'pending'`.
+   If the milestone is already validated (or not pending), zero rows are updated and the repository returns `null`.
+2. **Conflict Mapping**: A `null` result from `markValidated` is immediately mapped to `409 Conflict`.
+3. **Execution Ordering & Unit of Work**: `markValidated` is executed first, followed by event creation in `MilestoneValidationEventRepository`. Both operations run within an optional `runInTransaction` unit of work. If `markValidated` fails or conflicts, no validation event is ever created.
+4. **Outbox-Style Event Publishing**: The domain event `vault.milestone.validated` is published only after the unit of work successfully commits.
+
 ## Test Coverage Summary
 
 *   **Unit Tests**: Comprehensive coverage of business rules, invariants, and middleware chain.
 *   **Property-based Tests**: Using `fast-check` to verify invariants across a wide range of generated inputs (vault statuses, milestone sequences, etc.).
+*   **Concurrency & Regression Tests**: Deterministic simulation of concurrent validation requests verifying that exactly one request succeeds (200 OK) while the other receives 409 Conflict, creating exactly one validation event and publishing exactly one domain event.
 *   **Coverage Metrics**:
     *   Statements: 100%
     *   Lines: 100%
@@ -34,10 +44,12 @@ The implementation uses `lib/errors` factories for consistent error reporting. A
 
 ### Verified Edge Cases
 *   Non-active vaults (closed, paused)
-*   Milestones already validated
+*   Milestones already validated (snapshot and CAS checks)
+*   Concurrent double-validation race attempts
 *   Out-of-order milestone validation
 *   Unauthorized role attempts
 *   Missing verifier assignments
 *   Rate limit exceeded
 *   Concurrent validation limits
+*   markValidated failure leaving no orphan validation events
 *   Unhandled database errors

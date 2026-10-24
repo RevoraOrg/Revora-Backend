@@ -18,6 +18,8 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     event_type: WebhookEventType.PAYOUT_COMPLETED,
     payload: { payout_id: 'payout-1' },
     status: 'pending',
+    locked_until: null,
+    lease_token: null,
     attempts: 0,
     available_at: timestamp,
     created_at: timestamp,
@@ -87,11 +89,12 @@ describe('OutboxRepository', () => {
   });
 
   it('drains ready pending rows and maps persisted JSON and dates', async () => {
-    const row = makeRow({ payload: { report_id: 'report-1' }, status: 'pending' });
+    const row = makeRow({ payload: { report_id: 'report-1' }, status: 'dispatching', locked_until: new Date('2026-09-28T00:00:00Z'), lease_token: 'lease-1' });
     const persistedRow = {
       ...asQueryRow(row),
       payload: JSON.stringify(row.payload),
       available_at: row.available_at.toISOString(),
+      locked_until: row.locked_until!.toISOString(),
       created_at: row.created_at.toISOString(),
       updated_at: row.updated_at.toISOString(),
     };
@@ -101,10 +104,16 @@ describe('OutboxRepository', () => {
     const result = await repository.drainPending(10);
 
     expect(query).toHaveBeenCalledWith(
-      expect.stringContaining("WHERE status = 'pending' AND available_at <= NOW()"),
-      [10],
+      expect.stringContaining("UPDATE webhook_outbox"),
+      [10, 60_000, expect.any(String)],
     );
-    expect(query.mock.calls[0][0]).toContain('FOR UPDATE SKIP LOCKED');
+    expect(query).toHaveBeenCalledTimes(1);
+    const sql = query.mock.calls[0][0] as string;
+    expect(sql).toContain("SET status = 'dispatching'");
+    expect(sql).toContain('FOR UPDATE SKIP LOCKED');
+    expect(sql).toContain("status = 'dispatching' AND locked_until <= NOW()");
+    expect(sql).toContain('RETURNING *');
+    expect(sql).not.toContain(';');
     expect(result).toEqual([row]);
     expect(result[0].available_at).toBeInstanceOf(Date);
   });
@@ -114,18 +123,18 @@ describe('OutboxRepository', () => {
     const repository = new OutboxRepository(makePool(query));
 
     await expect(repository.drainPending(0)).resolves.toEqual([]);
-    expect(query).toHaveBeenCalledWith(expect.any(String), [0]);
+    expect(query).toHaveBeenCalledWith(expect.any(String), [0, 60_000, expect.any(String)]);
   });
 
   it('marks a pending row as dispatched and increments attempts in the database', async () => {
     const query = jest.fn().mockResolvedValue({ rows: [] });
     const repository = new OutboxRepository(makePool(query));
 
-    await repository.markDispatched('row-1');
+    await repository.markDispatched('row-1', 'lease-1');
 
     expect(query).toHaveBeenCalledWith(
       expect.stringContaining("SET status = 'dispatched', attempts = attempts + 1"),
-      ['row-1'],
+      ['row-1', 'lease-1'],
     );
   });
 
@@ -134,11 +143,11 @@ describe('OutboxRepository', () => {
     const repository = new OutboxRepository(makePool(query));
     const retryAfter = new Date('2026-09-28T00:00:00.000Z');
 
-    await repository.markFailed('row-1', retryAfter);
+    await repository.markFailed('row-1', 'lease-1', retryAfter);
 
     expect(query).toHaveBeenCalledWith(
-      expect.stringContaining('SET attempts = attempts + 1, available_at = $2'),
-      ['row-1', retryAfter],
+      expect.stringContaining("SET status = 'pending', attempts = attempts + 1, available_at = $3"),
+      ['row-1', 'lease-1', retryAfter],
     );
     expect(query.mock.calls[0][0]).not.toContain("status = 'failed'");
   });
@@ -147,11 +156,11 @@ describe('OutboxRepository', () => {
     const query = jest.fn().mockResolvedValue({ rows: [] });
     const repository = new OutboxRepository(makePool(query));
 
-    await repository.markFailed('row-1');
+    await repository.markFailed('row-1', 'lease-1');
 
     expect(query).toHaveBeenCalledWith(
       expect.stringContaining("SET status = 'failed', attempts = attempts + 1"),
-      ['row-1'],
+      ['row-1', 'lease-1'],
     );
   });
 
@@ -165,6 +174,8 @@ describe('OutboxRepository', () => {
 
     await expect(repository.getOldestPending()).resolves.toEqual(row);
     await expect(repository.getOldestPending()).resolves.toBeNull();
+    expect(query.mock.calls[0][0]).toContain("status = 'pending' AND available_at <= NOW()");
+    expect(query.mock.calls[0][0]).toContain("status = 'dispatching' AND locked_until <= NOW()");
     expect(query.mock.calls[0][0]).toContain('ORDER BY created_at ASC');
     expect(query.mock.calls[0][0]).toContain('LIMIT 1');
   });
@@ -175,7 +186,7 @@ describe('OutboxRepository', () => {
     const repository = new OutboxRepository(makePool(query));
 
     await expect(repository.drainPending()).rejects.toBe(failure);
-    await expect(repository.markDispatched('row-1')).rejects.toBe(failure);
+    await expect(repository.markDispatched('row-1', 'lease-1')).rejects.toBe(failure);
   });
 
   it('surfaces malformed persisted JSON as a deterministic mapping failure', async () => {
@@ -185,5 +196,40 @@ describe('OutboxRepository', () => {
     const repository = new OutboxRepository(makePool(query));
 
     await expect(repository.drainPending()).rejects.toThrow(SyntaxError);
+  });
+});
+
+
+describe('claim validation and fencing', () => {
+  it.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid batch limit %s without a query', async limit => {
+    const query = jest.fn();
+    await expect(new OutboxRepository(makePool(query)).drainPending(limit)).rejects.toThrow(RangeError);
+    expect(query).not.toHaveBeenCalled();
+  });
+  it.each([0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid lease %s without a query', async leaseMs => {
+    const query = jest.fn();
+    await expect(new OutboxRepository(makePool(query)).drainPending(1, leaseMs)).rejects.toThrow(RangeError);
+    expect(query).not.toHaveBeenCalled();
+  });
+  it('uses a fresh token and the requested lease duration on each claim', async () => {
+    const query = jest.fn().mockResolvedValue({ rows: [] });
+    const repo = new OutboxRepository(makePool(query));
+    await repo.drainPending(2, 120_000);
+    await repo.drainPending(2, 120_000);
+    expect(query.mock.calls[0][1]).toEqual([2, 120_000, expect.any(String)]);
+    expect(query.mock.calls[0][1][2]).not.toBe(query.mock.calls[1][1][2]);
+  });
+  it('fences success, retry and terminal failure by status, token and database expiry', async () => {
+    const query = jest.fn().mockResolvedValue({ rows: [] });
+    const repo = new OutboxRepository(makePool(query));
+    await repo.markDispatched('row-1', 'lease-1');
+    await repo.markFailed('row-1', 'lease-1', new Date());
+    await repo.markFailed('row-1', 'lease-1');
+    for (const [sql, values] of query.mock.calls) {
+      expect(sql).toContain("WHERE id = $1 AND status = 'dispatching'");
+      expect(sql).toContain('lease_token = $2::uuid AND locked_until > NOW()');
+      expect(sql).toContain('locked_until = NULL, lease_token = NULL');
+      expect(values.slice(0, 2)).toEqual(['row-1', 'lease-1']);
+    }
   });
 });

@@ -21,12 +21,14 @@ import { DistributionRepository, DistributionRun, Payout } from '../db/repositor
 import { InvestmentRepository, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { logger, Logger, LogLevel } from '../lib/logger';
+import { Decimal } from '../lib/decimal';
 import { 
   classifyStellarRPCFailure, 
   StellarRPCFailureClass,
   StellarRPCFailureContext 
 } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
+import { Decimal } from '../lib/decimal';
 import { 
   StellarTransactionVerifier,
   TransactionVerificationResult 
@@ -56,6 +58,7 @@ export type DiscrepancyType =
   | 'INVESTOR_ALLOCATION_ERROR'
   | 'ROUNDING_LOSS_UNACCOUNTED'
   | 'MISSING_PAYOUT'
+  | 'UNEXPECTED_PAYOUT'
   | 'DUPLICATE_PAYOUT'
   | 'OVERPAYMENT'
   | 'UNDERPAMENT'
@@ -84,6 +87,7 @@ export interface ReconciliationSummary {
   investorCount: number;
   payoutsProcessed: number;
   payoutsFailed: number;
+  failedPayouts?: number;
   chainDrift?: {
     onChainAmount: string;
     localAmount: string;
@@ -135,7 +139,7 @@ export class RevenueReconciliationService {
     periodEnd: Date,
     options: ReconciliationOptions = {}
   ): Promise<ReconciliationResult> {
-    const tolerance = options.tolerance ?? DEFAULT_TOLERANCE;
+    const tolerance = String(options.tolerance ?? DEFAULT_TOLERANCE);
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
     this.logger.info(
@@ -195,7 +199,9 @@ export class RevenueReconciliationService {
           if (driftResult.hasDrift) {
             discrepancies.push({
               type: 'CHAIN_DRIFT_DETECTED',
-              severity: parseFloat(driftResult.drift) > tolerance * 10 ? 'critical' : 'error',
+              severity: new Decimal(driftResult.drift).compareTo(
+                new Decimal(tolerance).multiply(new Decimal('10')),
+              ) > 0 ? 'critical' : 'error',
               message: `On-chain drift detected for offering ${offeringId}: local ${driftResult.localAmount} vs chain ${driftResult.onChainAmount}`,
               details: driftResult,
               offeringId,
@@ -377,6 +383,7 @@ export class RevenueReconciliationService {
           investorCount: investorIds.size,
           payoutsProcessed: this.countProcessedPayouts(relevantRuns),
           payoutsFailed: totalFailedPayouts,
+          failedPayouts: totalFailedPayouts,
           chainDrift: discrepancies.find(d => d.type === 'CHAIN_DRIFT_DETECTED')?.details as any,
         },
         checkedAt: new Date(),
@@ -418,7 +425,11 @@ export class RevenueReconciliationService {
     const totalPayouts = this.sumDistributionAmounts(relevantRuns);
 
     return {
-      isBalanced: this.amountsEqual(totalRevenue, totalPayouts, DEFAULT_TOLERANCE),
+      isBalanced: this.amountsEqual(
+        totalRevenue,
+        totalPayouts,
+        String(DEFAULT_TOLERANCE),
+      ),
       difference: this.subtractAmounts(totalRevenue, totalPayouts),
     };
   }
@@ -508,45 +519,47 @@ export class RevenueReconciliationService {
     if (!offering || !offering.contract_address) {
       return {
         hasDrift: false,
-        onChainAmount: '0.00',
-        localAmount: '0.00',
-        drift: '0.00',
+        onChainAmount: '0.0000000000',
+        localAmount: '0.0000000000',
+        drift: '0.0000000000',
       };
     }
 
     const onChainState = await this.stellarClient.getRevenueState(offering.contract_address);
     const stats = await this.distributionRepo.getAggregateStats(offeringId);
 
-    const onChainAmount = parseFloat(onChainState.totalDistributed);
-    const localAmount = parseFloat(stats.totalDistributed);
-    const drift = Math.abs(onChainAmount - localAmount);
-
-    const hasDrift = drift > DEFAULT_TOLERANCE;
+    const onChainAmount = new Decimal(onChainState.totalDistributed);
+    const localAmount = new Decimal(stats.totalDistributed);
+    const driftDifference = onChainAmount.subtract(localAmount);
+    const drift = driftDifference.compareTo(new Decimal('0')) < 0
+      ? new Decimal('0').subtract(driftDifference)
+      : driftDifference;
+    const hasDrift = drift.compareTo(new Decimal(String(DEFAULT_TOLERANCE))) > 0;
 
     return {
       hasDrift,
-      onChainAmount: onChainAmount.toFixed(2),
-      localAmount: localAmount.toFixed(2),
-      drift: drift.toFixed(2),
+      onChainAmount: this.toNativeAmountScale(onChainAmount.toString()),
+      localAmount: this.toNativeAmountScale(localAmount.toString()),
+      drift: this.toNativeAmountScale(drift.toString()),
     };
   }
 
   private checkRevenueMismatch(
     totalRevenue: string,
     totalPayouts: string,
-    tolerance: number
+    tolerance: string
   ): ReconciliationDiscrepancy | null {
-    const diff = Math.abs(parseFloat(totalRevenue) - parseFloat(totalPayouts));
+    const diff = this.absoluteDifference(totalRevenue, totalPayouts);
 
-    if (diff > tolerance) {
+    if (diff.compareTo(new Decimal(tolerance)) > 0) {
       return {
         type: 'REVENUE_MISMATCH',
-        severity: diff > 1 ? 'critical' : 'error',
+        severity: diff.compareTo(new Decimal('1')) > 0 ? 'critical' : 'error',
         message: `Revenue mismatch detected: reported ${totalRevenue} vs payouts ${totalPayouts}`,
         details: {
           reported: totalRevenue,
           paid: totalPayouts,
-          difference: diff.toFixed(2),
+          difference: this.toNativeAmountScale(diff.toString()),
         },
         offeringId: '',
       };
@@ -557,7 +570,7 @@ export class RevenueReconciliationService {
 
   private async checkDistributionRunIntegrity(
     run: DistributionRun,
-    tolerance: number
+    tolerance: string
   ): Promise<ReconciliationDiscrepancy[]> {
     const discrepancies: ReconciliationDiscrepancy[] = [];
 
@@ -587,7 +600,7 @@ export class RevenueReconciliationService {
   private async checkInvestorAllocations(
     offeringId: string,
     runs: DistributionRun[],
-    tolerance: number
+    tolerance: string
   ): Promise<ReconciliationDiscrepancy[]> {
     const discrepancies: ReconciliationDiscrepancy[] = [];
     const investments = await this.investmentRepo.findByOffering(offeringId);
@@ -631,19 +644,26 @@ export class RevenueReconciliationService {
     for (const run of runs) {
       if (run.status !== 'completed') continue;
 
-      const totalAmount = parseFloat(run.total_amount);
-      const roundedAmount = Math.round(totalAmount * 100) / 100;
+      const totalAmount = new Decimal(run.total_amount);
+      const roundedAmount = Decimal.fromScaledBigInt(
+        totalAmount.toSorobanI128(2, 'round'),
+        2,
+      );
+      const loss = totalAmount.subtract(roundedAmount);
+      const absoluteLoss = loss.compareTo(new Decimal('0')) < 0
+        ? new Decimal('0').subtract(loss)
+        : loss;
 
-      if (Math.abs(totalAmount - roundedAmount) > 0.001) {
+      if (absoluteLoss.compareTo(new Decimal('0.001')) > 0) {
         discrepancies.push({
           type: 'ROUNDING_LOSS_UNACCOUNTED',
           severity: 'warning',
           message: `Potential rounding loss in run ${run.id}`,
           details: {
             runId: run.id,
-            originalAmount: totalAmount,
-            roundedAmount,
-            loss: (totalAmount - roundedAmount).toFixed(4),
+            originalAmount: totalAmount.toString(),
+            roundedAmount: roundedAmount.toString(),
+            loss: this.toNativeAmountScale(loss.toString()),
           },
           offeringId: run.offering_id,
         });
@@ -663,6 +683,65 @@ export class RevenueReconciliationService {
       return discrepancies;
     }
 
+    const payouts = (await this.distributionRepo.getPayoutsForRun(run.id)) || [];
+    const payoutInvestorIds = new Set(payouts.map((p) => p.investor_id));
+
+    // Check for missing payouts: expected investors with no payout
+    for (const investorId of expectedInvestorIds) {
+      if (!payoutInvestorIds.has(investorId)) {
+        discrepancies.push({
+          type: 'MISSING_PAYOUT',
+          severity: 'error',
+          message: `Missing payout for investor ${investorId} in run ${run.id}`,
+          details: {
+            runId: run.id,
+            investorId,
+          },
+          offeringId: run.offering_id,
+        });
+      }
+    }
+
+    // Check for unexpected payouts: payouts for investors not in expected set
+    for (const payout of payouts) {
+      if (!expectedInvestorIds.has(payout.investor_id)) {
+        discrepancies.push({
+          type: 'UNEXPECTED_PAYOUT',
+          severity: 'error',
+          message: `Unexpected payout for investor ${payout.investor_id} in run ${run.id}`,
+          details: {
+            runId: run.id,
+            payoutId: payout.id,
+            investorId: payout.investor_id,
+            amount: payout.amount,
+          },
+          offeringId: run.offering_id,
+        });
+      }
+    }
+
+    // Check sum(payout.amount) == run.total_amount using Decimal
+    let payoutSum = new Decimal('0');
+    for (const payout of payouts) {
+      payoutSum = payoutSum.add(new Decimal(payout.amount));
+    }
+
+    const runTotal = new Decimal(run.total_amount);
+    if (payoutSum.compareTo(runTotal) !== 0) {
+      discrepancies.push({
+        type: 'PAYOUT_SUM_MISMATCH',
+        severity: 'error',
+        message: `Payout sum mismatch in run ${run.id}: sum of payouts (${payoutSum.toString()}) does not match run total (${run.total_amount})`,
+        details: {
+          runId: run.id,
+          expectedAmount: run.total_amount,
+          actualAmount: payoutSum.toString(),
+          difference: payoutSum.subtract(runTotal).toString(),
+        },
+        offeringId: run.offering_id,
+      });
+    }
+
     return discrepancies;
   }
 
@@ -677,28 +756,48 @@ export class RevenueReconciliationService {
   }
 
   private sumRevenueAmounts(reports: RevenueReport[]): string {
-    return reports
-      .reduce((sum, r) => sum + parseFloat(r.amount ?? '0'), 0)
-      .toFixed(2);
+    const total = reports.reduce(
+      (sum, report) => sum.add(new Decimal(report.amount ?? '0')),
+      new Decimal('0'),
+    );
+    return this.toNativeAmountScale(total.toString());
   }
 
   private sumDistributionAmounts(runs: DistributionRun[]): string {
-    return runs
-      .filter((r) => r.status === 'completed')
-      .reduce((sum, r) => sum + parseFloat(r.total_amount), 0)
-      .toFixed(2);
+    const total = runs
+      .filter((run) => run.status === 'completed')
+      .reduce(
+        (sum, run) => sum.add(new Decimal(run.total_amount)),
+        new Decimal('0'),
+      );
+    return this.toNativeAmountScale(total.toString());
   }
 
-  private amountsEqual(a: string, b: string, tolerance: number): boolean {
-    return Math.abs(parseFloat(a) - parseFloat(b)) <= tolerance;
+  private amountsEqual(a: string, b: string, tolerance: string): boolean {
+    return this.absoluteDifference(a, b).compareTo(new Decimal(tolerance)) <= 0;
   }
 
   private subtractAmounts(a: string, b: string): string {
-    return (parseFloat(a) - parseFloat(b)).toFixed(2);
+    return this.toNativeAmountScale(new Decimal(a).subtract(new Decimal(b)).toString());
   }
 
   private calculateDiscrepancyAmount(revenue: string, payouts: string): string {
-    return Math.abs(parseFloat(revenue) - parseFloat(payouts)).toFixed(2);
+    return this.toNativeAmountScale(
+      this.absoluteDifference(revenue, payouts).toString(),
+    );
+  }
+
+  private absoluteDifference(a: string, b: string): Decimal {
+    const first = new Decimal(a);
+    const second = new Decimal(b);
+    const difference = first.subtract(second);
+    return difference.compareTo(new Decimal('0')) < 0
+      ? new Decimal('0').subtract(difference)
+      : difference;
+  }
+
+  private toNativeAmountScale(amount: string): string {
+    return new Decimal(amount).add(new Decimal('0.0000000000')).toString();
   }
 
   private isValidDistributionStatus(
@@ -728,6 +827,26 @@ export class RevenueReconciliationService {
         periodEnd,
       }
     );
+
+    // When no verifier is configured, chain validation is disabled.  Emit a
+    // single warning-severity discrepancy so operators are aware, but do NOT
+    // raise per-run STELLAR_TX_FAILED criticals that would fire permanent alarms.
+    if (!this.txVerifier) {
+      this.logger.warn(
+        'Chain validation disabled: no StellarTransactionVerifier configured',
+        { offeringId }
+      );
+      discrepancies.push({
+        type: 'CHAIN_EVENT_VALIDATION_FAILED',
+        severity: 'warning',
+        message: 'Chain validation disabled: StellarTransactionVerifier not configured',
+        details: { reason: 'verifier_not_configured', runsCount: runs.length },
+        offeringId,
+        periodStart,
+        periodEnd,
+      });
+      return discrepancies;
+    }
 
     for (const run of runs) {
       if (!run.stellar_transaction_hash) {
@@ -859,7 +978,14 @@ export class RevenueReconciliationService {
   }
 
   private async countFailedPayouts(runId: string): Promise<number> {
-    return 0;
+    if (typeof this.distributionRepo.countPayoutsByStatus === 'function') {
+      const count = await this.distributionRepo.countPayoutsByStatus(runId, 'failed');
+      if (typeof count === 'number') {
+        return count;
+      }
+    }
+    const payouts = (await this.distributionRepo.getPayoutsForRun(runId)) || [];
+    return payouts.filter((p) => p.status === 'failed').length;
   }
 
   private countProcessedPayouts(runs: DistributionRun[]): number {

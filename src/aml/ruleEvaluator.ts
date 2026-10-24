@@ -322,6 +322,12 @@ export class RuleEvaluator {
     const threshold = typeof tenantThreshold === 'number'
       ? tenantThreshold
       : (typeof config.jaro_winkler_threshold === 'number' ? config.jaro_winkler_threshold : 0.85);
+    const threshold_source: 'tenant' | 'rule' | 'default' =
+      typeof tenantThreshold === 'number'
+        ? 'tenant'
+        : typeof config.jaro_winkler_threshold === 'number'
+        ? 'rule'
+        : 'default';
 
     const normName = normalizeName(nameToScreen);
     let bestMatch: { candidate: string; score: number; matchType: 'exact' | 'fuzzy' } | null = null;
@@ -349,6 +355,7 @@ export class RuleEvaluator {
         details: {
           screened_name: nameToScreen,
           threshold,
+          threshold_source,
           matched: false,
         },
       };
@@ -367,6 +374,7 @@ export class RuleEvaluator {
         match_type: bestMatch.matchType,
         similarity_score: bestMatch.score,
         threshold,
+        threshold_source,
         action,
         auto_deny: autoDeny,
         review_status: isFuzzy ? 'pending_review' : 'confirmed_deny',
@@ -439,6 +447,12 @@ export class RuleEvaluator {
         : typeof config.jaro_winkler_threshold === 'number'
         ? config.jaro_winkler_threshold
         : 0.85;
+    const threshold_source: 'tenant' | 'rule' | 'default' =
+      typeof tenantThreshold === 'number'
+        ? 'tenant'
+        : typeof config.jaro_winkler_threshold === 'number'
+        ? 'rule'
+        : 'default';
 
     if (counterparties.length === 0 || sanctionsList.length === 0) {
       return {
@@ -519,6 +533,7 @@ export class RuleEvaluator {
           screened_count: counterparties.length,
           matched: false,
           threshold,
+          threshold_source,
         },
       };
     }
@@ -536,6 +551,7 @@ export class RuleEvaluator {
         match_count: matches.length,
         matches,
         threshold,
+        threshold_source,
         action: overallAction,
       },
     };

@@ -1,18 +1,21 @@
 import crypto from 'node:crypto';
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { withTransaction } from '../../db/transaction';
 import { Logger } from '../../lib/logger';
+import { isUserRole } from '../login/types';
 import {
     RefreshSuccessResponse,
     RefreshTokenRepository,
+    RefreshUserLookup,
     TokenService,
 } from './types';
 
 /**
  * @module auth/refresh/RefreshService
  * @description
- * Stateless-safe refresh token rotation with reuse detection and in-process
- * concurrent request deduplication.
+ * Stateless-safe refresh token rotation with reuse detection, in-process
+ * concurrent request deduplication, and authoritative re-authorisation on
+ * every rotation.
  *
  * Security assumptions:
  *  - Each refresh token is single-use; using it a second time (even before the
@@ -25,13 +28,24 @@ import {
  *  - The in-flight lock is always released via `finally`; a DB crash cannot
  *    leave a session permanently locked.
  *  - `revokeSessionAndDescendants` is idempotent and safe to call multiple times.
+ *  - **The role carried by the refresh token payload is advisory only.** The
+ *    authoritative role and account status are reloaded from the database on
+ *    every rotation (see {@link RefreshUserLookup}), so a demotion, suspension,
+ *    or deletion takes effect no later than the next refresh.
+ *  - **A token family has an absolute lifetime** (`family_expires_at`) fixed at
+ *    login and inherited by every rotated child. Rotating a refresh token never
+ *    extends this deadline, so a session cannot be kept alive indefinitely by
+ *    refreshing every 7 days.
  *
  * Abuse / failure paths:
- *  - Invalid / expired refresh token    -> null (no revocation)
- *  - Session not found                  -> null
- *  - Session already revoked            -> null + revokeSessionAndDescendants
- *  - Token already used after rotation  -> null + revokeSessionAndDescendants
- *  - Concurrent duplicate in-process    -> null (no revocation)
+ *  - Invalid / expired refresh token          -> null (no revocation)
+ *  - Session not found                        -> null
+ *  - Session already revoked                  -> null + revokeSessionAndDescendants
+ *  - Token already used after rotation        -> null + revokeSessionAndDescendants
+ *  - Concurrent duplicate in-process          -> null (no revocation)
+ *  - User deleted / disabled (inactive)       -> null + revokeSessionAndDescendants
+ *  - User role no longer recognised           -> null + revokeSessionAndDescendants
+ *  - Rotation past absolute family deadline   -> null + revokeSessionAndDescendants
  */
 export class RefreshService {
     /**
@@ -48,12 +62,17 @@ export class RefreshService {
         private readonly tokenService: TokenService,
         private readonly db: Pool,
         private readonly logger: Logger = new Logger(),
+        private readonly userLookup?: RefreshUserLookup,
     ) {}
 
     /**
      * Rotate a refresh token with concurrent refresh protection.
      * Uses database transactions to prevent race conditions where
      * multiple simultaneous refresh requests could bypass reuse detection.
+     *
+     * The returned access/refresh tokens always carry the user's **current**
+     * role loaded from the database, never the role embedded in the incoming
+     * refresh token.
      */
     async refresh(token: string): Promise<RefreshSuccessResponse | null> {
         // 1. Verify token (outside transaction - stateless)
@@ -111,6 +130,19 @@ export class RefreshService {
                 return null;
             }
 
+            // Bound the session's user to the identity claimed in the token. A
+            // mismatch means the token was forged or the session was re-purposed;
+            // fail closed and revoke the family.
+            if (session.user_id && session.user_id !== userId) {
+                this.logger.warn('Session user mismatch during refresh', {
+                    tokenUserId: userId,
+                    sessionUserId: session.user_id,
+                    sessionId,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
             if (session.expires_at && session.expires_at <= new Date()) {
                 this.logger.warn('Attempted refresh on expired session', {
                     userId,
@@ -142,6 +174,16 @@ export class RefreshService {
                 return null;
             }
 
+            // 2c.5 Reject deactivated users (#1300)
+            if (!(await this.repository.isUserActive(session.user_id, client))) {
+                this.logger.warn('Attempted refresh for inactive user', {
+                    userId,
+                    sessionId,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
             // 2d. Check for reuse detection: if this session already has a child
             const childSession = await this.repository.findSessionByParentId(sessionId, client);
             if (childSession) {
@@ -154,21 +196,74 @@ export class RefreshService {
                 return null;
             }
 
-            // 2d. Generate new session ID and tokens
+            // 2e. Enforce the absolute family lifetime. The deadline is fixed at
+            //     family creation and inherited unchanged by every child, so a
+            //     refresh never extends it. Once passed, the family is dead.
+            const familyExpiresAt = session.family_expires_at
+                ? new Date(session.family_expires_at)
+                : null;
+            if (familyExpiresAt && familyExpiresAt <= new Date()) {
+                this.logger.warn('Refresh refused: absolute family lifetime exceeded', {
+                    userId,
+                    sessionId,
+                    familyExpiresAt,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            // 2f. Reload authoritative user state. The role in the refresh token
+            //     payload is untrusted for authorisation purposes: an admin who is
+            //     demoted to investor, or a user suspended via SCIM, must not keep
+            //     receiving elevated access by rotating an old token.
+            const user = await this.loadUser(userId, client);
+            if (!user) {
+                this.logger.warn('Refresh refused: user no longer exists', {
+                    userId,
+                    sessionId,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            if (!user.active) {
+                this.logger.warn('Refresh refused: user is disabled', {
+                    userId,
+                    sessionId,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            if (!isUserRole(user.role)) {
+                this.logger.warn('Refresh refused: user role is not recognised', {
+                    userId,
+                    sessionId,
+                    role: user.role,
+                });
+                await this.repository.revokeSessionAndDescendants(sessionId, client);
+                return null;
+            }
+
+            const currentRole = user.role;
+
+            // 2g. Generate new session ID and tokens with the *current* DB role.
             const newSessionId = crypto.randomUUID();
             const tokens = this.tokenService.issueTokens({
                 userId,
                 sessionId: newSessionId,
-                role,
+                role: currentRole,
             });
 
-            // 2e. Mark the parent session's token as consumed to prevent reuse
+            // 2h. Mark the parent session's token as consumed to prevent reuse
             await this.repository.setSessionConsumed(sessionId, client);
 
-            // 2f. Create new session for the new refresh token
+            // 2i. Create new session for the new refresh token. The child inherits
+            //     the parent's absolute family deadline verbatim (when present) so
+            //     that rotation cannot extend the family lifetime.
             const newTokenHash = this.tokenService.hashToken(tokens.refreshToken);
             const expiresAt = new Date();
-            expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+            expiresAt.setDate(expiresAt.getDate() + 7); // 7 days sliding window
 
             await this.repository.createSession({
                 id: newSessionId,
@@ -176,13 +271,14 @@ export class RefreshService {
                 token_hash: newTokenHash,
                 expires_at: expiresAt,
                 parent_id: sessionId,
+                family_expires_at: familyExpiresAt,
             }, client);
 
             this.logger.info('Refresh token rotated successfully', {
                 userId,
                 oldSessionId: sessionId,
                 newSessionId,
-                role,
+                role: currentRole,
             });
 
             return tokens;
@@ -196,5 +292,20 @@ export class RefreshService {
         }).finally(() => {
             this.inFlightSessions.delete(sessionId);
         });
+    }
+
+    /**
+     * Load the authoritative user record, preferring the injected
+     * {@link RefreshUserLookup}.
+     *
+     * @dev When no lookup is configured the service fails closed: it cannot
+     *      prove the user is still active, so it treats the user as absent.
+     *      Production wiring always supplies a lookup (see `src/app.ts`).
+     */
+    private async loadUser(userId: string, client: PoolClient) {
+        if (!this.userLookup) {
+            return null;
+        }
+        return this.userLookup.findById(userId, client);
     }
 }

@@ -12,8 +12,8 @@ import { TenantSettingsRepository } from './tenantSettingsRepository';
  * re-serializes settings and writes the session policy as a bound parameter.
  */
 
-function mockResult(rows: unknown[]): QueryResult<any> {
-  return { rows, rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
+function mockResult(rows: unknown[]): QueryResult<Record<string, unknown>> {
+  return { rows: rows as Record<string, unknown>[], rowCount: rows.length, command: 'SELECT', oid: 0, fields: [] };
 }
 
 function row(overrides: Record<string, unknown> = {}) {
@@ -99,34 +99,33 @@ describe('TenantSettingsRepository', () => {
     });
   });
 
-  describe('upsertSettings', () => {
-    it('inserts with the default lax session policy and returns the stored row', async () => {
-      pool.query.mockResolvedValueOnce(mockResult([row({ session_policy: 'lax' })]));
+  describe('updateSettings', () => {
+    it('updates settings on conflict using EXCLUDED.settings and does not modify session_policy', async () => {
+      pool.query.mockResolvedValueOnce(mockResult([row({ session_policy: 'strict' })]));
 
-      const saved = await repo.upsertSettings('tenant-1', { theme: 'dark' });
+      const saved = await repo.updateSettings('tenant-1', { theme: 'dark' });
 
-      expect(saved.session_policy).toBe('lax');
+      expect(saved.session_policy).toBe('strict');
       const [sql, params] = pool.query.mock.calls[0];
       expect(sql).toContain('INSERT INTO tenant_settings');
       expect(sql).toContain('ON CONFLICT (tenant_id)');
-      expect(sql).toContain('DO UPDATE SET settings = $2, session_policy = $3, updated_at = NOW()');
+      expect(sql).toContain('DO UPDATE SET settings = EXCLUDED.settings');
       expect(sql).toContain('RETURNING tenant_id, settings, session_policy, created_at, updated_at');
-      expect(params).toEqual(['tenant-1', JSON.stringify({ theme: 'dark' }), 'lax']);
-    });
 
-    it('honours an explicit strict session policy', async () => {
-      pool.query.mockResolvedValueOnce(mockResult([row({ session_policy: 'strict' })]));
+      // Explicit security check: conflict-update clause must NOT reference session_policy
+      const doUpdateClause = sql.split(/DO UPDATE SET/i)[1]?.split(/RETURNING/i)[0];
+      expect(doUpdateClause).toBeDefined();
+      expect(doUpdateClause).toContain('settings = EXCLUDED.settings');
+      expect(doUpdateClause).not.toContain('session_policy');
 
-      await repo.upsertSettings('tenant-1', { theme: 'dark' }, 'strict');
-
-      expect(pool.query.mock.calls[0][1][2]).toBe('strict');
+      expect(params).toEqual(['tenant-1', JSON.stringify({ theme: 'dark' })]);
     });
 
     it('serializes nested settings instead of passing a raw object to pg', async () => {
       pool.query.mockResolvedValueOnce(mockResult([row()]));
       const settings = { limits: { seats: 25, tiers: ['a', 'b'] }, flags: { beta: true } };
 
-      await repo.upsertSettings('tenant-1', settings);
+      await repo.updateSettings('tenant-1', settings);
 
       const params = pool.query.mock.calls[0][1];
       expect(params[1]).toBe(JSON.stringify(settings));
@@ -136,23 +135,57 @@ describe('TenantSettingsRepository', () => {
     it('serializes an empty settings object as "{}"', async () => {
       pool.query.mockResolvedValueOnce(mockResult([row({ settings: {} })]));
 
-      await repo.upsertSettings('tenant-1', {});
+      await repo.updateSettings('tenant-1', {});
 
       expect(pool.query.mock.calls[0][1][1]).toBe('{}');
     });
 
-    it('propagates upsert failures', async () => {
+    it('propagates database failures', async () => {
       pool.query.mockRejectedValueOnce(new Error('deadlock detected'));
 
-      await expect(repo.upsertSettings('tenant-1', {})).rejects.toThrow('deadlock detected');
+      await expect(repo.updateSettings('tenant-1', {})).rejects.toThrow('deadlock detected');
     });
 
     it('maps a returned row with a null settings column to an empty object', async () => {
       pool.query.mockResolvedValueOnce(mockResult([row({ settings: null })]));
 
-      const saved = await repo.upsertSettings('tenant-1', { theme: 'dark' });
+      const saved = await repo.updateSettings('tenant-1', { theme: 'dark' });
 
       expect(saved.settings).toEqual({});
+    });
+  });
+
+  describe('setSessionPolicy', () => {
+    it.each(['strict' as const, 'lax' as const])(
+      'updates session_policy to %s on conflict and does not overwrite settings',
+      async (policy) => {
+        pool.query.mockResolvedValueOnce(mockResult([row({ session_policy: policy, settings: { theme: 'dark' } })]));
+
+        const saved = await repo.setSessionPolicy('tenant-1', policy);
+
+        expect(saved.session_policy).toBe(policy);
+        expect(saved.settings).toEqual({ theme: 'dark' });
+
+        const [sql, params] = pool.query.mock.calls[0];
+        expect(sql).toContain('INSERT INTO tenant_settings');
+        expect(sql).toContain('ON CONFLICT (tenant_id)');
+        expect(sql).toContain('session_policy = EXCLUDED.session_policy');
+        expect(sql).toContain('RETURNING tenant_id, settings, session_policy, created_at, updated_at');
+
+        // Explicit security check: conflict-update clause must NOT assign or reference settings
+        const doUpdateClause = sql.split(/DO UPDATE SET/i)[1]?.split(/RETURNING/i)[0];
+        expect(doUpdateClause).toBeDefined();
+        expect(doUpdateClause).toContain('session_policy = EXCLUDED.session_policy');
+        expect(doUpdateClause).not.toMatch(/settings\s*=/);
+
+        expect(params).toEqual(['tenant-1', policy]);
+      },
+    );
+
+    it('propagates database failures', async () => {
+      pool.query.mockRejectedValueOnce(new Error('connection reset'));
+
+      await expect(repo.setSessionPolicy('tenant-1', 'strict')).rejects.toThrow('connection reset');
     });
   });
 });

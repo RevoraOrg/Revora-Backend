@@ -140,6 +140,7 @@ function buildHarness(opts: {
     offeringRepo,
     undefined,
     userRepo,
+    undefined,
     screeningService,
     auditLogRepo,
   );
@@ -303,6 +304,7 @@ describe('InvestmentService screening fallback', () => {
     const service = new InvestmentService(
       investmentRepo,
       offeringRepo,
+      undefined,
       undefined,
       undefined,
       { screen } as unknown as SanctionsScreeningService,

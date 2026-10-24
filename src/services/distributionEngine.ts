@@ -15,7 +15,7 @@
  */
 import { Logger, globalLogger } from "../lib/logger";
 import { Errors, AppError } from "../lib/errors";
-import { Decimal } from "../lib/decimal";
+import { Decimal, parsePositiveDecimal } from "../lib/decimal";
 import { FxConversionEngine } from "./fxConversionEngine";
 import { Pool, PoolClient } from "pg";
 import {
@@ -33,7 +33,7 @@ import {
 
 export interface BalanceRow {
   investor_id: string;
-  balance: number;
+  balance: number | string;
 }
 
 export interface DistributionBatchResult {
@@ -135,6 +135,21 @@ export async function tryAcquireDistributionLock(
 }
 
 /**
+ * Canonical storage form for a validated revenue amount string.
+ *
+ * Preserves the historic `toFixed(2)` layout (integer part + at least two
+ * fractional digits) that idempotency lookups and `distributions.total_amount`
+ * were written against, while never rounding away precision: amounts with more
+ * than two fractional digits round-trip exactly as submitted, and values above
+ * `Number.MAX_SAFE_INTEGER` are never funneled through a JS number.
+ */
+function canonicalizeAmount(amountStr: string): string {
+  const [integerPart, fractionalPart = ''] = amountStr.split('.');
+  if (fractionalPart.length >= 2) return amountStr;
+  return `${integerPart}.${fractionalPart.padEnd(2, '0')}`;
+}
+
+/**
  * Core distribution calculation logic: prorate revenue across investors.
  *
  * This is the SHARED pure calculation function used by both real distribution runs
@@ -145,12 +160,13 @@ export async function tryAcquireDistributionLock(
  * It is purely functional — same inputs always yield same outputs.
  *
  * @param balances Array of investor balances
- * @param revenueAmount Total revenue to distribute
+ * @param revenueAmount Total revenue to distribute, as a validated plain
+ *        decimal string (never a JS number — precision must survive intact)
  * @returns Calculation result with per-investor rounded amounts
  */
 function calculateDistributionPayouts(
   balances: BalanceRow[],
-  revenueAmount: number,
+  revenueAmount: string,
 ): DistributionCalculation {
   if (!balances || balances.length === 0) {
     throw Errors.badRequest("No investors or balances found for offering");
@@ -158,10 +174,14 @@ function calculateDistributionPayouts(
 
   // 1. Sum balances and compute shares using Decimal for precision
   const balanceDecimals = balances.map((b) => {
-    const rawStr = b.balance.toFixed(18);
-    const rawDecimal = new Decimal(rawStr);
-    const scaled = rawDecimal.toSorobanI128(2, "round");
-    return Decimal.fromScaledBigInt(scaled, 2);
+    if (typeof b.balance === "string") {
+      return new Decimal(b.balance.trim());
+    }
+    const str = b.balance.toString();
+    if (str.includes("e") || str.includes("E")) {
+      return new Decimal(b.balance.toFixed(18));
+    }
+    return new Decimal(str);
   });
 
   const totalBalanceDecimal = balanceDecimals.reduce(
@@ -173,7 +193,7 @@ function calculateDistributionPayouts(
     throw Errors.badRequest("Total balance must be > 0 to distribute revenue");
   }
 
-  const revenueRawStr = revenueAmount.toFixed(18);
+  const revenueRawStr = parsePositiveDecimal(revenueAmount, "revenueAmount");
   const revenueRawDecimal = new Decimal(revenueRawStr);
   const revenueScaled = revenueRawDecimal.toSorobanI128(2, "round");
   const revenueDecimal = Decimal.fromScaledBigInt(revenueScaled, 2);
@@ -281,7 +301,7 @@ class DistributionEngine {
   async distribute(
     offeringId: string,
     period: { id: string; start: Date; end: Date },
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<
     DistributionBatchResult & {
       payouts: Array<{ investor_id: string; amount: string }>;
@@ -339,11 +359,22 @@ class DistributionEngine {
       }
     }
 
-    if (batchResult.failedPayouts.length > 0) {
+    if (
+      batchResult.failedPayouts.length > 0 ||
+      batchResult.distributionRun?.status === "failed"
+    ) {
       const firstFailure = batchResult.failedPayouts[0];
-      throw new Error(
-        `Distribution failed: ${firstFailure.errorClass ?? "UNKNOWN"}`,
-      );
+      const failureClass = firstFailure?.errorClass ?? "UNKNOWN";
+      const failedCount = batchResult.failedPayouts.length;
+      const message = `Distribution failed: ${failureClass} (${failedCount} investor(s) not paid)`;
+      if (
+        failureClass === StellarRPCFailureClass.RETRYABLE ||
+        failureClass === StellarRPCFailureClass.TIMEOUT ||
+        failureClass === StellarRPCFailureClass.RATE_LIMITED
+      ) {
+        throw Errors.serviceUnavailable(message);
+      }
+      throw Errors.internal(message);
     }
 
     return { ...batchResult, payouts: batchResult.successfulPayouts };
@@ -354,24 +385,27 @@ class DistributionEngine {
    *
    * @param offeringId  The offering to distribute revenue for
    * @param period      Distribution period (must include an `id` field)
-   * @param revenueAmount The total amount of revenue to be distributed
+   * @param revenueAmount The total amount of revenue to be distributed,
+   *   as a plain positive decimal string (validated with the shared
+   *   parsePositiveDecimal grammar, never a JS number)
    * @returns Batch result with successful and failed payouts
    */
   async distributeWithBatch(
     offeringId: string,
     period: { id?: string; start: Date; end: Date } & Record<string, any>,
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<DistributionBatchResult> {
     const startTime = Date.now();
 
-    // 1. Validation
+    // 1. Validation — revenue must be a plain, positive decimal string so the
+    //    exact value flows into the idempotency key and total_amount without
+    //    ever passing through a lossy JS number.
     if (!offeringId) throw Errors.badRequest("offeringId is required");
-    if (revenueAmount <= 0)
-      throw Errors.badRequest("revenueAmount must be > 0");
+    const amtStr = canonicalizeAmount(
+      parsePositiveDecimal(revenueAmount, "revenueAmount"),
+    );
     if (!period || !period.id || !period.end)
       throw Errors.badRequest("Valid distribution period with ID is required");
-
-    const amtStr = revenueAmount.toFixed(2);
 
     // 2. Idempotency Check: Look for an existing run
     let run = await this.distributionRepo.findRunByParams(
@@ -380,7 +414,14 @@ class DistributionEngine {
       amtStr,
     );
 
+    let persistedPlan: Array<{ investor_id: string; amount: string }> | null = null;
     if (run) {
+      if (Number(run.total_amount) !== Number(amtStr)) {
+        throw Errors.conflict(
+          `Distribution for offering ${offeringId} / period ${period.id} already exists with a different amount (${run.total_amount})`,
+        );
+      }
+
       if (run.status === "completed") {
         this.logger.info(
           "Distribution already completed, returning cached results",
@@ -409,36 +450,75 @@ class DistributionEngine {
         runId: run.id,
         currentStatus: run.status,
       });
+
+      // On resume, load the persisted allocation plan instead of recomputing
+      // from fresh balances. Recomputing would mix proration bases and could
+      // pay a newly-arrived holder for a period they did not hold.
+      if (typeof this.distributionRepo.getAllocationsForRun === "function") {
+        const allocations = await this.distributionRepo.getAllocationsForRun(
+          run.id,
+        );
+        if (allocations && allocations.length > 0) {
+          persistedPlan = allocations.map((a: any) => ({
+            investor_id: a.investor_id,
+            amount: a.amount,
+          }));
+        }
+      }
+      if (!persistedPlan) {
+        this.logger.error(
+          "Resume requested but persisted allocation plan is missing",
+          {
+            offeringId,
+            periodId: period.id,
+            runId: run.id,
+          },
+        );
+        throw Errors.conflict(
+          `Distribution run ${run.id} cannot be resumed: persisted allocation plan is missing`,
+        );
+      }
     }
 
     // 3. Acquire balances with retry and classification
     let balances: BalanceRow[] = [];
-    try {
-      balances = await this.withRetry(() =>
-        this.fetchBalances(offeringId, period),
-      );
-    } catch (err) {
-      const failure = classifyStellarRPCFailure(err, {
-        operation: "fetchBalances",
-        offeringId,
-        periodId: period.id,
-      });
-      this.logger.error("Failed to acquire balances", {
-        offeringId,
-        periodId: period.id,
-        error: err instanceof Error ? err.message : String(err),
-        failureClass: failure.class,
-      });
-      throw Errors.serviceUnavailable(
-        `Failed to acquire balances: ${failure.class}`,
-      );
-    }
+    let rounded: Array<{ investor_id: string; amount: Decimal; rawShare: Decimal }>;
+    if (persistedPlan) {
+      // Resume path: use the persisted plan verbatim. Do NOT refetch balances
+      // or recompute shares — that would change the proration base.
+      rounded = persistedPlan.map((p) => ({
+        investor_id: p.investor_id,
+        amount: new Decimal(p.amount),
+        rawShare: new Decimal(p.amount),
+      }));
+    } else {
+      try {
+        balances = await this.withRetry(() =>
+          this.fetchBalances(offeringId, period),
+        );
+      } catch (err) {
+        const failure = classifyStellarRPCFailure(err, {
+          operation: "fetchBalances",
+          offeringId,
+          periodId: period.id,
+        });
+        this.logger.error("Failed to acquire balances", {
+          offeringId,
+          periodId: period.id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class,
+        });
+        throw Errors.serviceUnavailable(
+          `Failed to acquire balances: ${failure.class}`,
+        );
+      }
 
-    // 4. Run the SHARED pure calculation logic
-    // Both real distribution and previews use this exact same function,
-    // guaranteeing that preview totals equal actual-run totals when inputs are unchanged.
-    const calculation = calculateDistributionPayouts(balances, revenueAmount);
-    const { rounded } = calculation;
+      // 4. Run the SHARED pure calculation logic
+      // Both real distribution and previews use this exact same function,
+      // guaranteeing that preview totals equal actual-run totals when inputs are unchanged.
+      const calculation = calculateDistributionPayouts(balances, revenueAmount);
+      rounded = calculation.rounded;
+    }
 
     // 5. Ensure distribution run exists and is in 'processing' state
     let frozenFxRateId: string | undefined =
@@ -514,21 +594,116 @@ class DistributionEngine {
           periodId: period.id,
           runId: run.id,
         });
-      } catch (err) {
-        const failure = classifyStellarRPCFailure(err, {
-          operation: "createDistributionRun",
-          offeringId,
-          periodId: period.id,
-        });
-        this.logger.error("Failed to create distribution run", {
-          offeringId,
-          periodId: period.id,
-          error: err instanceof Error ? err.message : String(err),
-          failureClass: failure.class,
-        });
-        throw Errors.internal(
-          `Failed to initialize distribution run: ${failure.class}`,
-        );
+      } catch (err: any) {
+        const isUniqueViolation =
+          err?.code === "23505" ||
+          err?.cause?.code === "23505" ||
+          (typeof err?.message === "string" &&
+            err.message.includes("23505"));
+
+        if (isUniqueViolation) {
+          this.logger.info(
+            "Distribution run creation hit unique constraint (23505), re-reading existing run",
+            {
+              offeringId,
+              periodId: period.id,
+            },
+          );
+
+          const existingRun = this.distributionRepo.findRunByOfferingAndPeriod
+            ? await this.distributionRepo.findRunByOfferingAndPeriod(
+                offeringId,
+                period.id,
+              )
+            : await this.distributionRepo.findRunByParams(
+                offeringId,
+                period.id,
+              );
+
+          if (!existingRun) {
+            throw Errors.conflict(
+              `Distribution for offering ${offeringId} / period ${period.id} is already in progress`,
+            );
+          }
+
+          run = existingRun;
+
+          if (Number(run.total_amount) !== Number(amtStr)) {
+            throw Errors.conflict(
+              `Distribution for offering ${offeringId} / period ${period.id} already exists with a different amount (${run.total_amount})`,
+            );
+          }
+
+          if (run.status === "completed") {
+            this.logger.info(
+              "Distribution already completed, returning cached results",
+              {
+                offeringId,
+                periodId: period.id,
+                runId: run.id,
+              },
+            );
+            const existingPayouts =
+              await this.distributionRepo.getPayoutsForRun(run.id);
+            return {
+              distributionRun: run,
+              successfulPayouts: existingPayouts.map((p: any) => ({
+                investor_id: p.investor_id,
+                amount: p.amount,
+              })),
+              failedPayouts: [],
+              totalPayouts: existingPayouts.length,
+            };
+          }
+        } else {
+          const failure = classifyStellarRPCFailure(err, {
+            operation: "createDistributionRun",
+            offeringId,
+            periodId: period.id,
+          });
+          this.logger.error("Failed to create distribution run", {
+            offeringId,
+            periodId: period.id,
+            error: err instanceof Error ? err.message : String(err),
+            failureClass: failure.class,
+          });
+          throw Errors.internal(
+            `Failed to initialize distribution run: ${failure.class}`,
+          );
+        }
+      }
+
+      // Persist the computed allocation plan so a resume executes the same
+      // plan rather than recomputing from fresh balances.
+      if (
+        typeof this.distributionRepo.createAllocations === "function"
+      ) {
+        try {
+          await this.withRetry(() =>
+            this.distributionRepo.createAllocations(
+              run.id,
+              rounded.map((r) => ({
+                investor_id: r.investor_id,
+                amount: r.amount.toString(),
+              })),
+            ),
+          );
+        } catch (err) {
+          const failure = classifyStellarRPCFailure(err, {
+            operation: "createAllocations",
+            offeringId,
+            periodId: period.id,
+          });
+          this.logger.error("Failed to persist distribution allocations", {
+            offeringId,
+            runId: run.id,
+            error: err instanceof Error ? err.message : String(err),
+            failureClass: failure.class,
+          });
+          throw Errors.internal(
+            `Failed to persist distribution allocations: ${failure.class}`,
+          );
+        }
       }
     } else if (run.status !== "processing") {
       try {
@@ -687,6 +862,8 @@ class DistributionEngine {
           rawError: err instanceof Error ? err.message : String(err),
         });
 
+        // Always record the rolled-back batch's investors as failures so
+        // callers can observe a partial run, regardless of transactional mode.
         if (!this.pool) {
           for (const r of batch) {
             if (!r) continue; // guard against poisoned/null batch items
@@ -703,7 +880,63 @@ class DistributionEngine {
               });
             }
           }
+        } else {
+          for (const r of batch) {
+            if (!r) continue; // guard against poisoned/null batch items
+            if (
+              !existingInvestorIds.has(r.investor_id) &&
+              !successfulPayouts.some((p) => p.investor_id === r.investor_id)
+            ) {
+              const amtStr = r.amount.toString();
+              failedPayouts.push({
+                investor_id: r.investor_id,
+                amount: amtStr,
+                error: `Batch processing failed: ${failure.class}`,
+                errorClass: failure.class,
+              });
+            }
+          }
         }
+      }
+    }
+
+    // 7. Post-completion invariant: sum(payouts) must equal run.total_amount.
+    // If it does not, mark the run failed and log the discrepancy.
+    if (failedPayouts.length === 0 && !hasBatchFailure) {
+      try {
+        const finalPayouts = await this.distributionRepo.getPayoutsForRun(
+          run.id,
+        );
+        const payoutSum = finalPayouts.reduce(
+          (sum: Decimal, p: any) => sum.add(new Decimal(p.amount)),
+          new Decimal("0"),
+        );
+        const expected = new Decimal(amtStr);
+        if (!payoutSum.equals(expected)) {
+          const discrepancy = payoutSum.subtract(expected);
+          this.logger.error(
+            "Distribution payout sum does not match run total_amount",
+            {
+              offeringId,
+              runId: run.id,
+              periodId: period.id,
+              expected: expected.toString(),
+              actual: payoutSum.toString(),
+              discrepancy: discrepancy.toString(),
+            },
+          );
+          hasBatchFailure = true;
+        }
+      } catch (err) {
+        this.logger.error(
+          "Failed to verify distribution payout sum invariant",
+          {
+            offeringId,
+            runId: run.id,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        hasBatchFailure = true;
       }
     }
 
@@ -779,21 +1012,24 @@ class DistributionEngine {
    *
    * @param offeringId  The offering to preview distribution for
    * @param period      Distribution period (must include an `id` field)
-   * @param revenueAmount The total amount of revenue to preview distributing
+   * @param revenueAmount The total amount of revenue to preview distributing,
+   *        as a plain positive decimal string (never a JS number)
    * @returns Preview result with per-investor projected amounts and preview metadata
    */
   async previewRun(
     offeringId: string,
     period: { id?: string; start: Date; end: Date } & Record<string, any>,
-    revenueAmount: number,
+    revenueAmount: string,
   ): Promise<DistributionPreviewResult> {
     const startTime = Date.now();
     const previewId = this.generatePreviewId();
 
-    // 1. Validation
+    // 1. Validation — same strict decimal-string grammar as real runs so a
+    //    preview can never display an amount the real run would reject.
     if (!offeringId) throw Errors.badRequest("offeringId is required");
-    if (revenueAmount <= 0)
-      throw Errors.badRequest("revenueAmount must be > 0");
+    const amtStr = canonicalizeAmount(
+      parsePositiveDecimal(revenueAmount, "revenueAmount"),
+    );
     if (!period || !period.id)
       throw Errors.badRequest("Valid distribution period with ID is required");
 
@@ -853,7 +1089,7 @@ class DistributionEngine {
       preview_id: previewId,
       offering_id: offeringId,
       period_id: period.id,
-      revenue_amount: revenueAmount.toFixed(2),
+      revenue_amount: amtStr,
       computed_at: new Date().toISOString(),
       investor_count: balances.length,
       projections,
@@ -912,8 +1148,15 @@ class DistributionEngine {
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         return await fn();
-      } catch (err) {
+      } catch (err: any) {
         lastError = err;
+        if (
+          err?.code === "23505" ||
+          err?.cause?.code === "23505" ||
+          (typeof err?.message === "string" && err.message.includes("23505"))
+        ) {
+          throw err;
+        }
         if (attempt < this.maxRetries) {
           const delay =
             this.initialDelayMs * Math.pow(this.backoffFactor, attempt - 1);

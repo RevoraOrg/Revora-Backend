@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { timingSafeEqual } from "crypto";
+import { Pool } from "pg";
 import express, {
   NextFunction,
   Request,
@@ -13,6 +14,7 @@ import { errorHandler } from "./middleware/errorHandler";
 import { requestIdMiddleware } from "./middleware/requestId";
 import { Errors } from "./lib/errors";
 import { globalSampler } from "./lib/sampler";
+import { globalLogger } from "./lib/logger";
 import {
   classifyStellarRPCFailure,
   StellarRPCFailureClass,
@@ -50,6 +52,17 @@ import { createAdminLedgerExportRouter } from "./routes/adminLedgerExport";
 import { createAdminWebhookRouter } from "./routes/adminWebhooks";
 import { AccountingLedgerService } from "./services/accountingLedgerService";
 import { DistributionRepository } from "./db/repositories/distributionRepository";
+import { BalanceSnapshotRepository } from "./db/repositories/balanceSnapshotRepository";
+import { OfferingRepository } from "./db/repositories/offeringRepository";
+import { ScheduledDistributionRepository } from "./db/repositories/scheduledDistributionRepository";
+import { BalanceRow } from "./services/distributionEngine";
+import DistributionEngine from "./services/distributionEngine";
+import { DistributionStateManager } from "./services/distributionScheduler";
+import createDistributionsRouter, {
+  DistributionAccountRepo,
+  OfferingRepo,
+} from "./routes/distributions";
+import createPayoutsRouter, { PayoutRepo } from "./routes/payouts";
 import { createAdminKycRiskTierRouter } from "./routes/adminKycRiskTier";
 import { AuditLogRepository } from "./db/repositories/auditLogRepository";
 import { TenantSettingsRepository } from "./db/repositories/tenantSettingsRepository";
@@ -63,13 +76,18 @@ import { RetentionLabelService } from "./services/retentionLabelService";
 import { PayoutDriftRepository } from "./db/repositories/payoutDriftRepository";
 import { PayoutDriftDetector } from "./services/payoutDriftDetector";
 import { MetricsCollector } from "./lib/metrics";
+import {
+  createStellarTransactionVerifier,
+  StellarTransactionVerifier,
+} from "./lib/stellarTransactionVerifier";
 import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
 import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
-import { LedgerExportService, InMemoryLedgerRepository } from "./services/ledgerExportService";
+import { LedgerExportService } from "./services/ledgerExportService";
+import { PgLedgerEntryRepository } from "./db/repositories/ledgerEntryRepository";
 import { createAMLService } from "./aml/amlService";
-import { InMemorySecurityAuditRepository } from "./security/audit";
+import { InMemorySecurityAuditRepository, AuditLogSecurityAuditRepository } from "./security/audit";
 import { createMobileCompanionRouter } from "./routes/mobileCompanion";
 import { InMemoryDeviceKeyStore } from "./middleware/deviceSignature";
 import { Keypair } from '@stellar/stellar-sdk';
@@ -84,6 +102,29 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
+// \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+import { createLoginRouter } from './auth/login/loginRoute';
+import { createRefreshRouter } from './auth/refresh/refreshRoute';
+import { createLogoutRouter } from './auth/logout/logoutRoute';
+import { createChangePasswordRouter } from './auth/changePassword/changePasswordRoute';
+import { createSocialAuthRouter } from './auth/social/socialAuthRoute';
+// \u2500\u2500 Auth services / adapters \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+import { LoginService } from './auth/login/loginService';
+import { RefreshService } from './auth/refresh/refreshService';
+import { RefreshTokenRepositoryAdapter } from './auth/refresh/repositoryAdapter';
+import { JwtTokenServiceAdapter } from './auth/refresh/tokenServiceAdapter';
+import { SocialAuthService } from './auth/social/socialAuthService';
+import { SocialUserRepositoryAdapter } from './auth/social/socialUserRepositoryAdapter';
+import { createDefaultSocialTokenVerifierFromEnv } from './auth/social/providerVerifiers';
+import { SocialIdentityRepository } from './db/repositories/socialIdentityRepository';
+import {
+  JwtIssuer,
+  UserRole,
+  UserRepository as IUserRepository,
+  SessionRepository as ISessionRepository,
+} from './auth/login/types';
+import { issueToken } from './lib/jwt';
+import { Logger as AppLogger } from './lib/logger';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
@@ -131,6 +172,22 @@ interface AuthenticatedRequest extends Request {
 interface AppDependencies {
   healthQuery?: typeof dbQuery;
   healthStatus?: typeof dbHealth;
+  sessionRepository?: Pick<SessionRepository, "findById">;
+  distributionEngine?: Pick<DistributionEngine, "distribute" | "previewRun">;
+  distributionOfferingRepo?: OfferingRepo;
+  distributionRepo?: DistributionAccountRepo &
+    Pick<DistributionRepository, "listPayoutsByInvestor">;
+  payoutRepo?: PayoutRepo;
+  balanceSnapshotRepo?: Pick<
+    BalanceSnapshotRepository,
+    "findByOfferingAndPeriod"
+  >;
+  scheduledDistributionRepo?: Pick<
+    ScheduledDistributionRepository,
+    "create" | "findByOffering" | "findAll" | "markCancelled"
+  >;
+  distributionStateManager?: Pick<DistributionStateManager, "pause" | "resume">;
+  accountingLedger?: AccountingLedgerService;
 }
 
 /**
@@ -743,12 +800,14 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
   // Initialize repositories for admin and audit routes
   const auditLogRepo = new AuditLogRepository(pool);
-  const amlAuditRepo = new InMemorySecurityAuditRepository();
+  const amlAuditRepo = new AuditLogSecurityAuditRepository(auditLogRepo);
   const retentionLabelService = new RetentionLabelService(
     new RetentionLabelRepository(pool),
     auditLogRepo,
   );
   const tenantSettingsRepo = new TenantSettingsRepository(pool);
+  const accountingLedger =
+    dependencies.accountingLedger ?? new AccountingLedgerService();
   const contractUpgradeService = env.STELLAR_SERVER_SECRET
     ? new ContractUpgradeOrchestratorService(
         pool,
@@ -771,7 +830,7 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     "/admin/ledger",
     createAdminLedgerExportRouter({
       distributionAccountRepo: new DistributionRepository(pool),
-      accountingLedger: new AccountingLedgerService(),
+      accountingLedger,
       auditLogRepo,
     }),
   );
@@ -792,11 +851,11 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   const sanctionsListDiffService = new SanctionsListDiffService(sanctionsVersionsRepo);
   apiRouter.use("/compliance", createComplianceRouter(sanctionsVersionsRepo, sanctionsListDiffService));
 
-  // Initialize ledger export with in-memory repository
-  // TODO: Replace with PgLedgerEntryRepository when ledger_entries table exists
-  const ledgerRepo = new InMemoryLedgerRepository();
+  // Ledger export: backed by Postgres, access restricted to compliance/admin roles.
+  // Migration 061_create_ledger_entries.sql must be applied before this runs.
+  const ledgerRepo = new PgLedgerEntryRepository(pool);
   const ledgerExportService = new LedgerExportService(ledgerRepo);
-  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService));
+  apiRouter.use("/ledger", createLedgerExportRouter(ledgerExportService, requireCompliance));
 
   // Investor statements (Issue #874): the fetch endpoint re-verifies the
   // persisted sha256 before serving. Storage defaults to in-memory — replace
@@ -805,7 +864,82 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
   // 404 (no artifacts exist), which is fail-safe.
   const statementStorage = new InMemoryStatementPdfStorage();
   const pdfRenderJobRepo = new PdfRenderJobRepository(pool);
-  const sessionRepo = new SessionRepository(pool);
+  const sessionRepo = dependencies.sessionRepository ?? new SessionRepository(pool);
+
+  const offeringRepo =
+    dependencies.distributionOfferingRepo ?? new OfferingRepository(pool);
+  const distributionRepo =
+    dependencies.distributionRepo ?? new DistributionRepository(pool);
+  const payoutRepo: PayoutRepo =
+    dependencies.payoutRepo ?? {
+      async listPayoutsByInvestor(investorId) {
+        const payouts = await distributionRepo.listPayoutsByInvestor(investorId);
+        return payouts.map((payout) => ({
+          id: payout.id,
+          distribution_run_id: payout.distribution_id,
+          investor_id: payout.investor_id,
+          amount: payout.amount,
+          status: payout.status,
+          transaction_hash: payout.tx_hash ?? undefined,
+          created_at: payout.created_at,
+          updated_at: payout.updated_at,
+        }));
+      },
+    };
+  const balanceSnapshotRepo =
+    dependencies.balanceSnapshotRepo ?? new BalanceSnapshotRepository(pool);
+  /**
+   * @dev Distribution calculations read persisted snapshots keyed by period;
+   * this app composition deliberately does not start the separate scheduler.
+   */
+  const balanceProvider = {
+    async getBalances(
+      offeringId: string,
+      period: { id: string },
+    ): Promise<BalanceRow[]> {
+      const snapshots = await balanceSnapshotRepo.findByOfferingAndPeriod(
+        offeringId,
+        period.id,
+      );
+      return snapshots.map((snapshot) => ({
+        investor_id: snapshot.holder_address_or_id,
+        balance: Number(snapshot.balance),
+      }));
+    },
+  };
+  const distributionEngine =
+    dependencies.distributionEngine ??
+    new DistributionEngine(
+      offeringRepo,
+      distributionRepo,
+      balanceProvider,
+      {},
+      pool,
+    );
+  const scheduledDistributionRepo =
+    dependencies.scheduledDistributionRepo ??
+    new ScheduledDistributionRepository(pool);
+  const distributionStateManager =
+    dependencies.distributionStateManager ?? new DistributionStateManager();
+
+  apiRouter.use(
+    createDistributionsRouter({
+      distributionEngine,
+      offeringRepo,
+      verifyJWT: createRequireAuth(sessionRepo),
+      distributionStateManager,
+      distributionAccountRepo: distributionRepo,
+      accountingLedger,
+      scheduledDistributionRepo,
+    }),
+  );
+  apiRouter.use(
+    createPayoutsRouter({
+      payoutRepo,
+      verifyJWT: createRequireAuth(sessionRepo),
+      routePath: "/investments/payouts",
+    }),
+  );
   apiRouter.use(
     "/statements",
     createStatementsRouter({
@@ -826,6 +960,78 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     createReconciliationMetricsHandler(globalMetrics),
   );
 
+  // ── Auth routes (login, refresh, logout, social, change-password) ────────
+  //
+  // Security assumptions:
+  //  - JwtIssuerImpl signs tokens with the same issueToken helper used
+  //    everywhere else; key rotation is controlled via env (JWT_SECRET).
+  //  - authSessionRepo is a fresh SessionRepository instance. Both
+  //    createRequireAuth and the auth services share the same underlying
+  //    pool, so sessions created at login are immediately honoured.
+  //  - Adapters translate concrete DB repositories to the narrow port
+  //    interfaces expected by each auth service without duplicating logic.
+  //  - Social-login endpoints are rate-limited per provider+sub via the
+  //    anti-enumeration middleware inside createSocialAuthRouter.
+  // ────────────────────────────────────────────────────────────────────────
+
+  // Local adapter classes — scoped inside createApp so they share closure.
+  class IndexUserRepositoryAdapter implements IUserRepository {
+    constructor(private readonly repo: UserRepository) {}
+    async findByEmail(email: string) {
+      const user = await this.repo.findByEmail(email);
+      if (!user) return null;
+      return { id: user.id, email: user.email, role: user.role as UserRole, passwordHash: user.password_hash };
+    }
+  }
+
+  class IndexSessionRepositoryAdapter implements ISessionRepository {
+    constructor(private readonly repo: SessionRepository) {}
+    async createSession(input: { id: string; userId: string; tokenHash: string; expiresAt: Date }) {
+      await this.repo.createSession({ id: input.id, user_id: input.userId, token_hash: input.tokenHash, expires_at: input.expiresAt });
+    }
+  }
+
+  class IndexJwtIssuer implements JwtIssuer {
+    sign(payload: { userId: string; sessionId: string; role: UserRole }) {
+      const accessToken = issueToken({ subject: payload.userId, additionalPayload: { sid: payload.sessionId, role: payload.role }, expiresIn: '1h' });
+      const refreshToken = issueToken({ subject: payload.userId, additionalPayload: { sid: payload.sessionId, role: payload.role, type: 'refresh' }, expiresIn: '7d' });
+      return { accessToken, refreshToken };
+    }
+  }
+
+  const authUserRepo = new UserRepository(pool);
+  const authSessionRepo = new SessionRepository(pool);
+  const requireAuthForLogin = createRequireAuth(authSessionRepo);
+  const jwtIssuer = new IndexJwtIssuer();
+
+  const loginService = new LoginService(
+    new IndexUserRepositoryAdapter(authUserRepo),
+    new IndexSessionRepositoryAdapter(authSessionRepo),
+    jwtIssuer,
+  );
+
+  const socialAuthService = new SocialAuthService(
+    new SocialUserRepositoryAdapter(authUserRepo),
+    new SocialIdentityRepository(pool),
+    new IndexSessionRepositoryAdapter(authSessionRepo),
+    jwtIssuer,
+    createDefaultSocialTokenVerifierFromEnv(),
+  );
+
+  const refreshTokenRepo = new RefreshTokenRepositoryAdapter(authSessionRepo);
+  const tokenService = new JwtTokenServiceAdapter();
+  const authLogger = new AppLogger({ serviceName: 'auth-refresh' });
+  const refreshService = new RefreshService(refreshTokenRepo, tokenService, pool, authLogger);
+
+  // Mount auth routes at app level (not under apiRouter) so absolute paths
+  // such as /api/auth/login are served without the API_VERSION_PREFIX.
+  app.use(createLoginRouter({ loginService }));
+  app.use(createRefreshRouter({ refreshService }));
+  app.use(createLogoutRouter({ requireAuth: requireAuthForLogin, sessionRepository: authSessionRepo }));
+  app.use(createSocialAuthRouter({ socialAuthService, requireAuth: requireAuthForLogin }));
+  // Change-password routes are relative paths (/me/change-password, /me/password)
+  // so mount them under the versioned /users prefix.
+  app.use(API_VERSION_PREFIX + '/users', createChangePasswordRouter({ db: pool, requireAuth: requireAuthForLogin }));
   app.use(API_VERSION_PREFIX, apiRouter);
   app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
   app.use(errorHandler);
@@ -1179,6 +1385,36 @@ export class WebhookQueue {
   }
 }
 
+/**
+ * Build a PayoutDriftDetector, injecting a StellarTransactionVerifier when
+ * STELLAR_HORIZON_URL is configured. Logs a startup warning and sets the
+ * payout_drift_verifier_enabled gauge to 0 when it is not configured.
+ */
+export function createPayoutDriftDetector(
+  pool: Pool,
+  driftRepo: PayoutDriftRepository,
+  metrics: MetricsCollector,
+): PayoutDriftDetector {
+  const configured = Boolean(process.env.STELLAR_HORIZON_URL);
+  const txVerifier: StellarTransactionVerifier | undefined = configured
+    ? createStellarTransactionVerifier()
+    : undefined;
+
+  if (!configured) {
+    globalLogger.warn('PayoutDriftDetector: no STELLAR_HORIZON_URL configured; under/overfunded drift will not be detected');
+    globalMetrics.setGauge(
+      'payout_drift_verifier_enabled',
+      0,
+      {},
+      '1 when a StellarTransactionVerifier is configured for payout drift detection'
+    );
+  } else {
+    globalMetrics.setGauge('payout_drift_verifier_enabled', 1, {});
+  }
+
+  return new PayoutDriftDetector(pool, driftRepo, metrics, txVerifier);
+}
+
 /* istanbul ignore next -- bootstrapping is integration-environment specific */
 if (require.main === module && env.NODE_ENV !== "test") {
   process.on("SIGTERM", () => {
@@ -1198,14 +1434,12 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   const metricsCollector = new MetricsCollector();
 
-  const payoutDriftRepo = new PayoutDriftRepository(pool);
-  const payoutDriftDetector = new PayoutDriftDetector(
+  const unconditionalPayoutDriftDetector = createPayoutDriftDetector(
     pool,
-    payoutDriftRepo,
+    new PayoutDriftRepository(pool),
     metricsCollector
   );
-  
-  payoutDriftDetector.start(); // Start nightly payout drift detection
+  unconditionalPayoutDriftDetector.start(); // Start nightly payout drift detection
   globalSampler.start(); // Start event loop lag monitoring
 
   if (roleConfig.auditPurge) {
@@ -1226,10 +1460,10 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   if (roleConfig.payoutDrift) {
     const payoutDriftRepo = new PayoutDriftRepository(pool);
-    const payoutDriftDetector = new PayoutDriftDetector(
+    const payoutDriftDetector = createPayoutDriftDetector(
       pool,
       payoutDriftRepo,
-      metricsCollector,
+      metricsCollector
     );
     payoutDriftDetector.start();
     backgroundStopFns.push(() => payoutDriftDetector.stop());
@@ -1237,10 +1471,19 @@ if (require.main === module && env.NODE_ENV !== "test") {
   }
 
   if (roleConfig.reconciliation) {
+    // Build a StellarTransactionVerifier from the configured Horizon URL so that
+    // chain consistency checks can validate distribution transactions on-chain.
+    // When STELLAR_HORIZON_URL is absent the verifier falls back to the testnet
+    // endpoint; chain validation is still skipped with a single warning discrepancy
+    // if the verifier cannot be constructed.
+    const txVerifier = new StellarTransactionVerifierImpl({
+      horizonUrl: env.STELLAR_HORIZON_URL,
+    });
     const reconciliationScheduler = createReconciliationSchedulerRuntime({
       db: pool,
       metrics: globalMetrics,
       logger: undefined,
+      txVerifier,
     });
     reconciliationScheduler.start();
     backgroundStopFns.push(() => reconciliationScheduler.stop());

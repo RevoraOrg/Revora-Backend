@@ -14,6 +14,8 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     event_type: WebhookEventType.PAYOUT_COMPLETED,
     payload: {},
     status: 'pending',
+    locked_until: null,
+    lease_token: null,
     attempts: 0,
     available_at: new Date(),
     created_at: new Date(),

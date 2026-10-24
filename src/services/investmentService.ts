@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { InvestmentRepository, CreateInvestmentInput, Investment } from '../db/repositories/investmentRepository';
 import { OfferingRepository } from '../db/repositories/offeringRepository';
 import { UserRepository } from '../db/repositories/userRepository';
@@ -8,6 +8,10 @@ import { AMLService } from '../aml/amlService';
 import { TransactionContext } from '../aml/types';
 import { SanctionsScreeningService, SanctionsScreenResult } from './sanctionsScreeningService';
 import { sanitizeReviewLink } from '../lib/reviewLink';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
+import { Decimal } from '../lib/decimal';
+import { globalLogger } from '../lib/logger';
+import { globalMetrics } from '../lib/metrics';
 
 /** Relative path to the OFAC dual-control review queue for compliance staff. */
 const OFAC_REVIEWS_ROUTE = '/api/v1/aml/ofac-reviews';
@@ -16,6 +20,7 @@ import {
   evaluateInvestmentAgainstCap,
   parseKycRiskTier,
   resolveEffectiveCap,
+  KycRiskTier,
 } from '../lib/kycRiskTierCaps';
 
 /**
@@ -40,6 +45,7 @@ export class InvestmentService {
     private offeringRepo: OfferingRepository,
     private amlService?: AMLService,
     private userRepo?: UserRepository,
+    private db?: Pool,
     private screeningService?: SanctionsScreeningService,
     private auditLogRepo?: AuditLogRepository,
   ) {}
@@ -48,49 +54,106 @@ export class InvestmentService {
    * Create a new investment
    * @param input Investment data
    * @returns Created investment
-   * @throws Error if offering not found, invalid, or KYC-tier cap exceeded
+   * @throws Error if offering not found, invalid, sanctions-blocked or KYC-tier cap exceeded
    */
   async createInvestment(input: CreateInvestmentRequest): Promise<Investment> {
-    // 1. Validate offering exists
-    const offering = await this.offeringRepo.findById(input.offering_id);
+    // Reject coercion-abuse inputs before database access or persistence.
+    if (typeof input.amount !== 'string' || !isPositiveDecimalAmount(input.amount)) {
+      throw Errors.validationError('Invalid amount: must be a positive decimal string');
+    }
+    const amount = new Decimal(input.amount);
+
+    if (!input.asset || input.asset.trim() === '') {
+      throw Errors.validationError('Asset is required');
+    }
+
+    // Without a pool (lightweight / legacy wiring) run the same checks without
+    // the serialising transaction.
+    if (!this.db) {
+      const investment = await this.validateAndPersist(input, amount);
+      await this.runAmlMonitoring(investment);
+      return investment;
+    }
+
+    // Run the cap check + insert in a single transaction guarded by an advisory
+    // lock so concurrent submissions cannot jointly exceed the cap.
+    const client = await this.db.connect();
+    let investment: Investment;
+    try {
+      await client.query('BEGIN');
+      await this.investmentRepo.acquireInvestorOfferingLock(client, input.investor_id, input.offering_id);
+      investment = await this.validateAndPersist(input, amount, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        // Ignore rollback errors
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    // Run AML transaction monitoring outside the transaction.
+    await this.runAmlMonitoring(investment);
+    return investment;
+  }
+
+  /**
+   * Validate the offering, enforce the KYC-tier cap, run sanctions screening and
+   * persist the investment (using `client` when inside a transaction).
+   */
+  private async validateAndPersist(
+    input: CreateInvestmentRequest,
+    amount: Decimal,
+    client?: PoolClient,
+  ): Promise<Investment> {
+    // 1. Validate offering exists and is active
+    const offering = await this.offeringRepo.findById(input.offering_id, client);
     if (!offering) {
       throw Errors.notFound(`Offering ${input.offering_id} not found`);
     }
 
-    // 2. Validate offering is active
     const activeStatuses = ['active', 'open'];
     if (!offering.status || !activeStatuses.includes(offering.status)) {
       throw Errors.validationError(`Offering is not active. Current status: ${offering.status}`);
     }
 
-    // 3. Validate amount
-    const amountNum = parseFloat(input.amount);
-    if (isNaN(amountNum) || amountNum <= 0) {
-      throw Errors.validationError('Invalid amount: must be a positive number');
+    // 2. KYC risk-tier dynamic cap
+    const tier = await this.resolveInvestorTier(input.investor_id, client);
+    const offeringCapBps = this.parseOfferingCapBps(offering);
+    const resolution = resolveEffectiveCap(offeringCapBps, tier);
+
+    if (resolution.effectiveCapBps != null) {
+      const totalOfferingAmount = this.parseTotalOfferingAmount(offering);
+      const existingTotalStr = await this.investmentRepo.sumInvestorCommitment(
+        input.investor_id,
+        input.offering_id,
+        client,
+      );
+      const existingTotal = new Decimal(existingTotalStr);
+
+      const check = evaluateInvestmentAgainstCap({
+        existingTotal,
+        newAmount: amount,
+        totalOfferingAmount,
+        resolution,
+      });
+
+      if (!check.allowed) {
+        throw new AppError(ErrorCode.FORBIDDEN, 403, check.reason, {
+          kyc_risk_tier: resolution.tier,
+          effective_cap_bps: resolution.effectiveCapBps,
+          offering_cap_bps: resolution.offeringCapBps,
+          existing_total: check.existingTotal.toString(),
+          attempted_amount: check.newAmount.toString(),
+          cap_amount: check.capAmount.toString(),
+        });
+      }
     }
 
-    // 4. Validate asset
-    if (!input.asset || input.asset.trim() === '') {
-      throw Errors.validationError('Asset is required');
-    }
-
-    // 5. KYC risk-tier dynamic cap (new intents only — never touches existing rows)
-    await this.assertKycTierCap({
-      investorId: input.investor_id,
-      offeringId: input.offering_id,
-      newAmount: amountNum,
-      offeringCapBps:
-        typeof offering.max_investor_share_bps === 'number'
-          ? offering.max_investor_share_bps
-          : offering.max_investor_share_bps == null
-            ? null
-            : Number(offering.max_investor_share_bps),
-      totalOfferingAmount: parseFloat(
-        String(offering.target_amount ?? offering.total_raised ?? '0'),
-      ),
-    });
-
-    // 6. OFAC / EU / UK sanctions screening (blocking, fail-closed) before persistence
+    // 3. OFAC / EU / UK sanctions screening (blocking, fail-closed) before persistence
     const screening = await this.screenInvestment(input);
     if (screening && !screening.complete) {
       // Missing legal name (or unavailable list) means screening cannot complete.
@@ -102,7 +165,7 @@ export class InvestmentService {
       );
     }
     if (screening && !screening.cleared) {
-      // Failure to obtain a verified list, or a confirmed hit → reject.
+      // Failure to obtain a verified list, or a confirmed hit -> reject.
       const blocked = screening.matches.length > 0;
       await this.recordScreenBlocked(input, screening, blocked);
       if (blocked) {
@@ -119,7 +182,7 @@ export class InvestmentService {
       );
     }
 
-    // 7. Create investment record
+    // 4. Create investment record
     const investmentInput: CreateInvestmentInput = {
       investor_id: input.investor_id,
       offering_id: input.offering_id,
@@ -141,32 +204,56 @@ export class InvestmentService {
       };
     }
 
-    const investment = await this.investmentRepo.create(investmentInput);
+    return this.investmentRepo.create(investmentInput, client);
+  }
 
-    // 7. Run AML transaction monitoring if service is available
-    if (this.amlService) {
-      try {
-        const context: TransactionContext = {
-          investment_id: investment.id,
-          investor_id: investment.investor_id,
-          offering_id: investment.offering_id,
-          amount: investment.amount,
-          asset: investment.asset,
-          timestamp: investment.created_at,
-        };
+  /**
+   * Fire-and-forget AML evaluation: a rules-engine hiccup never fails the
+   * investor's submission. Failures are surfaced via structured logging and the
+   * aml_evaluation_failures_total counter.
+   */
+  private async runAmlMonitoring(investment: Investment): Promise<void> {
+    const amlService = this.amlService;
+    if (!amlService) return;
 
-        // Run AML evaluation asynchronously (non-blocking)
-        this.amlService.evaluateTransaction(context).catch(error => {
-          // Log error but don't fail the investment creation
-          console.error('AML evaluation failed:', error);
-        });
-      } catch (error) {
-        // Log error but don't fail the investment creation
-        console.error('AML evaluation setup failed:', error);
-      }
+    const recordFailure = (error: unknown): void => {
+      globalLogger.error('AML evaluation failed', {
+        investment_id: investment.id,
+        investor_id: investment.investor_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      globalMetrics.incrementCounter(
+        'aml_evaluation_failures_total',
+        { reason: 'evaluation_error' },
+        1,
+        'Total number of AML evaluation failures on investment creation',
+      );
+    };
+
+    // Resolve the investor's display name so name-based rules (sanctions_screening,
+    // geo_mismatch) receive a real name rather than a UUID.
+    let investorName = investment.investor_id;
+    try {
+      investorName = await this.resolveInvestorName(investment.investor_id);
+    } catch {
+      // Fall back to the investor id; monitoring must never block the submission.
     }
 
-    return investment;
+    const context: TransactionContext = {
+      investment_id: investment.id,
+      investor_id: investment.investor_id,
+      offering_id: investment.offering_id,
+      amount: investment.amount,
+      asset: investment.asset,
+      timestamp: investment.created_at,
+      investor_name: investorName,
+    };
+
+    try {
+      amlService.evaluateTransaction(context).catch(recordFailure);
+    } catch (error) {
+      recordFailure(error);
+    }
   }
 
   /**
@@ -220,9 +307,6 @@ export class InvestmentService {
     blocked: boolean,
   ): Promise<void> {
     if (!this.auditLogRepo) return;
-    const reason = blocked
-      ? 'sanctions_hit'
-      : 'sanctions_list_unavailable';
     const reviewerLink = sanitizeReviewLink(OFAC_REVIEWS_ROUTE);
     const details: Record<string, unknown> = {
       investor_id: input.investor_id,
@@ -254,61 +338,35 @@ export class InvestmentService {
   }
 
   /**
-   * Resolve the investor's KYC tier and reject the intent when it would exceed
-   * the tier-adjusted concentration cap. Existing commitments are never modified.
+   * Resolve the investor's KYC tier
    */
-  private async assertKycTierCap(args: {
-    investorId: string;
-    offeringId: string;
-    newAmount: number;
-    offeringCapBps: number | null;
-    totalOfferingAmount: number;
-  }): Promise<void> {
-    let tier = DEFAULT_KYC_RISK_TIER;
+  private async resolveInvestorTier(investorId: string, client?: PoolClient): Promise<KycRiskTier> {
+    let tier: KycRiskTier = DEFAULT_KYC_RISK_TIER;
     if (this.userRepo) {
-      const user = await this.userRepo.findById(args.investorId);
+      const user = await this.userRepo.findById(investorId, client);
       if (user) {
         tier = parseKycRiskTier(user.kyc_risk_tier);
       }
     }
+    return tier;
+  }
 
-    const offeringCapBps =
-      args.offeringCapBps != null && Number.isFinite(args.offeringCapBps)
-        ? args.offeringCapBps
-        : null;
+  /**
+   * Parse offering cap basis points
+   */
+  private parseOfferingCapBps(offering: { max_investor_share_bps?: number | string | null }): number | null {
+    const cap = offering.max_investor_share_bps;
+    if (cap == null) return null;
+    const num = typeof cap === 'number' ? cap : Number(cap);
+    return Number.isFinite(num) ? num : null;
+  }
 
-    const resolution = resolveEffectiveCap(offeringCapBps, tier);
-
-    // Unlimited after tier resolution — nothing to enforce.
-    if (resolution.effectiveCapBps == null) {
-      return;
-    }
-
-    const totalOfferingAmount = Number.isFinite(args.totalOfferingAmount)
-      ? Math.max(0, args.totalOfferingAmount)
-      : 0;
-
-    const existingTotal = parseFloat(
-      await this.investmentRepo.sumInvestorCommitment(args.investorId, args.offeringId),
-    );
-
-    const check = evaluateInvestmentAgainstCap({
-      existingTotal: Number.isFinite(existingTotal) ? existingTotal : 0,
-      newAmount: args.newAmount,
-      totalOfferingAmount,
-      resolution,
-    });
-
-    if (!check.allowed) {
-      throw new AppError(ErrorCode.FORBIDDEN, 403, check.reason, {
-        kyc_risk_tier: resolution.tier,
-        effective_cap_bps: resolution.effectiveCapBps,
-        offering_cap_bps: resolution.offeringCapBps,
-        existing_total: check.existingTotal,
-        attempted_amount: check.newAmount,
-        cap_amount: check.capAmount,
-      });
-    }
+  /**
+   * Parse total offering amount as Decimal
+   */
+  private parseTotalOfferingAmount(offering: { target_amount?: string | number; total_raised?: string | number }): Decimal {
+    const raw = offering.target_amount ?? offering.total_raised ?? '0';
+    return new Decimal(String(raw));
   }
 }
 
@@ -326,6 +384,7 @@ export function createInvestmentService(
     new OfferingRepository(db),
     amlService,
     new UserRepository(db),
+    db,
     screeningService,
     auditLogRepo,
   );
