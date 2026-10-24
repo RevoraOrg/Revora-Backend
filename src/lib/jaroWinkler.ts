@@ -1,4 +1,4 @@
-/**
+/*
  * Jaro-Winkler Distance and String Normalization Utility
  * 
  * Provides string matching algorithms with Cyrillic-to-Latin transliteration
@@ -12,7 +12,7 @@ const CYRILLIC_TO_LATIN_MAP: Record<string, string> = {
   'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
   'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
   'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
-  'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
+  'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Б': 'Yo',
   'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
   'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
   'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Shch',
@@ -35,7 +35,7 @@ export function transliterateCyrillic(str: string): string {
 
 /**
  * Normalizes a name string by converting to lowercase, transliterating Cyrillic,
- * stripping diacritics, and collapsing whitespace.
+ * stripping diacritics and punctuation, and collapsing whitespace.
  * @param str Input name
  * @returns Clean, normalized name string
  */
@@ -55,6 +55,18 @@ export function normalizeName(str: string): string {
     .trim();
 
   return normalized;
+}
+
+/**
+ * Normalizes a name and sorts its tokens alphabetically, so that word order
+ * differences (e.g. "Doe, John" vs "John Doe") do not affect comparison.
+ * @param str Input name
+ * @returns Normalized name string with tokens sorted
+ */
+export function normalizeAndSortTokens(str: string): string {
+  const normalized = normalizeName(str);
+  if (!normalized) return '';
+  return normalized.split(' ').sort().join(' ');
 }
 
 /**
