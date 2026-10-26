@@ -80,7 +80,7 @@ describe('RevenueReconciliationService', () => {
         {
           id: 'run-1',
           total_amount: '0',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -135,7 +135,7 @@ describe('RevenueReconciliationService', () => {
     it('should return balanced result when there is no discrepancy or drift', async () => {
       const mockRevenueReports = [{ amount: '1000.00', period_start: periodStart, period_end: periodEnd }];
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '1000.00', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '1000.00', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRevenueReports);
@@ -159,7 +159,7 @@ describe('RevenueReconciliationService', () => {
     it('should detect revenue mismatch when reported != paid', async () => {
       const mockRevenueReports = [{ amount: '1000.00', period_start: periodStart, period_end: periodEnd }];
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '900.00', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '900.00', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRevenueReports);
@@ -178,7 +178,7 @@ describe('RevenueReconciliationService', () => {
     it('should detect on-chain drift when DB != Chain', async () => {
       const mockRevenueReports = [{ amount: '1000.00', period_start: periodStart, period_end: periodEnd }];
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '1000.00', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '1000.00', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRevenueReports);
@@ -199,7 +199,7 @@ describe('RevenueReconciliationService', () => {
     it('should handle RPC errors gracefully with a warning', async () => {
       const mockRevenueReports = [{ amount: '1000.00', period_start: periodStart, period_end: periodEnd }];
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '1000.00', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '1000.00', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue(mockRevenueReports);
@@ -216,7 +216,7 @@ describe('RevenueReconciliationService', () => {
     it('should run investor allocation and rounding checks when options are set', async () => {
       const mockRevenueReports = [];
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '1000.123', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '1000.123', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [{ investor_id: 'i1', status: 'completed' }];
 
@@ -237,7 +237,7 @@ describe('RevenueReconciliationService', () => {
 
     it('should detect investor allocation error when expected payouts are invalid', async () => {
       const mockDistributionRuns = [
-        { id: 'run-1', total_amount: '1000.00', distribution_date: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '1000.00', run_at: new Date('2023-01-15'), status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [{ investor_id: 'i1', status: 'completed' }];
 
@@ -262,9 +262,9 @@ describe('RevenueReconciliationService', () => {
 
     it('should detect distribution status discrepancies', async () => {
       const mockRuns = [
-        { id: 'run-failed', status: 'failed', total_amount: '100.00', distribution_date: new Date(), offering_id: offeringId },
-        { id: 'run-processing', status: 'processing', total_amount: '100.00', distribution_date: new Date(), offering_id: offeringId },
-        { id: 'run-pending', status: 'pending', total_amount: '100.00', distribution_date: new Date(), offering_id: offeringId },
+        { id: 'run-failed', status: 'failed', total_amount: '100.00', run_at: new Date(), offering_id: offeringId },
+        { id: 'run-processing', status: 'processing', total_amount: '100.00', run_at: new Date(), offering_id: offeringId },
+        { id: 'run-pending', status: 'pending', total_amount: '100.00', run_at: new Date(), offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
@@ -279,7 +279,7 @@ describe('RevenueReconciliationService', () => {
 
     it('should handle offering with no investments or invalid allocation', async () => {
       const mockRuns = [
-        { id: 'run-1', status: 'completed', total_amount: '1000.00', distribution_date: new Date(), offering_id: offeringId },
+        { id: 'run-1', status: 'completed', total_amount: '1000.00', run_at: new Date(), offering_id: offeringId },
       ];
 
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([]);
@@ -310,11 +310,59 @@ describe('RevenueReconciliationService', () => {
   describe('quickBalanceCheck', () => {
     it('should return balanced status and difference', async () => {
       (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([{ amount: '100.00', period_start: periodStart, period_end: periodEnd }]);
-      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([{ total_amount: '100.00', distribution_date: new Date('2023-01-15'), status: 'completed' }]);
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([{ total_amount: '100.00', run_at: new Date('2023-01-15'), status: 'completed' }]);
 
       const result = await service.quickBalanceCheck(offeringId, periodStart, periodEnd);
       expect(result.isBalanced).toBe(true);
       expect(result.difference).toBe('0.00');
+    });
+  });
+
+  describe('distribution run period filtering (run_at)', () => {
+    const report = { amount: '100.00', period_start: periodStart, period_end: periodEnd };
+    const run = (runAt: Date) => ({
+      id: 'run-1',
+      offering_id: offeringId,
+      total_amount: '100.00',
+      run_at: runAt,
+      status: 'completed',
+    });
+    const isZero = (value: string) => new Decimal(value).compareTo(new Decimal('0')) === 0;
+
+    beforeEach(() => {
+      (RevenueReportRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([report]);
+    });
+
+    it('balances a matching report and run (regression: runs were never selected)', async () => {
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        run(new Date('2023-01-15')),
+      ]);
+
+      const result = await service.quickBalanceCheck(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(true);
+      expect(isZero(result.difference)).toBe(true);
+    });
+
+    it('counts a run whose run_at equals periodEnd', async () => {
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        run(new Date(periodEnd)),
+      ]);
+
+      const result = await service.quickBalanceCheck(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(true);
+    });
+
+    it('does not count a run outside the period', async () => {
+      (DistributionRepository.prototype.listByOffering as jest.Mock).mockResolvedValue([
+        run(new Date('2023-02-15')),
+      ]);
+
+      const result = await service.quickBalanceCheck(offeringId, periodStart, periodEnd);
+
+      expect(result.isBalanced).toBe(false);
+      expect(new Decimal(result.difference).compareTo(new Decimal('100'))).toBe(0);
     });
   });
 
@@ -391,9 +439,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -415,15 +463,16 @@ describe('RevenueReconciliationService', () => {
 
       expect(mockTxVerifier.verifyTransaction).toHaveBeenCalledWith('tx-hash-1', '1000.00');
       expect(result.discrepancies.filter(d => d.type === 'STELLAR_TX_FAILED')).toHaveLength(0);
+      expect(result.discrepancies.filter(d => d.type === 'STELLAR_TX_NOT_FOUND')).toHaveLength(0);
     });
 
     it('should detect transaction not found on chain', async () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-missing',
+          tx_batch_id: 'tx-hash-missing',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -452,9 +501,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -484,9 +533,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -517,9 +566,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -549,9 +598,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -579,9 +628,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: null,
+          tx_batch_id: null,
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -607,9 +656,9 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -635,17 +684,17 @@ describe('RevenueReconciliationService', () => {
       const mockRuns = [
         {
           id: 'run-1',
-          stellar_transaction_hash: 'tx-hash-1',
+          tx_batch_id: 'tx-hash-1',
           total_amount: '1000.00',
-          distribution_date: new Date('2023-01-15'),
+          run_at: new Date('2023-01-15'),
           status: 'completed',
           offering_id: offeringId,
         },
         {
           id: 'run-2',
-          stellar_transaction_hash: 'tx-hash-2',
+          tx_batch_id: 'tx-hash-2',
           total_amount: '2000.00',
-          distribution_date: new Date('2023-01-20'),
+          run_at: new Date('2023-01-20'),
           status: 'completed',
           offering_id: offeringId,
         },
@@ -683,7 +732,7 @@ describe('RevenueReconciliationService', () => {
 
     it('complete: should report balanced when all expected investors have matching payouts and sum matches', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '300.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -713,7 +762,7 @@ describe('RevenueReconciliationService', () => {
 
     it('missing: a completed run missing one investor payout yields a MISSING_PAYOUT error', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '300.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -744,7 +793,7 @@ describe('RevenueReconciliationService', () => {
 
     it('unexpected: a run with a payout for an unexpected investor yields an UNEXPECTED_PAYOUT error', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '300.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -775,7 +824,7 @@ describe('RevenueReconciliationService', () => {
 
     it('sum-mismatch: sum mismatch is detected exactly using Decimal', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '300.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -806,7 +855,7 @@ describe('RevenueReconciliationService', () => {
 
     it('sum-mismatch: handles high precision decimal strings without floating-point inaccuracies', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '100.0000001', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '100.0000001', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -833,7 +882,7 @@ describe('RevenueReconciliationService', () => {
 
     it('failed-count: a run with 2 failed payouts reports failedPayouts: 2 in the result via repository count', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '200.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '200.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -861,7 +910,7 @@ describe('RevenueReconciliationService', () => {
 
     it('failed-count: fallback to loaded list counts failed payouts when countPayoutsByStatus returns undefined', async () => {
       const mockRuns = [
-        { id: 'run-1', total_amount: '300.00', distribution_date: runDate, status: 'completed', offering_id: offeringId },
+        { id: 'run-1', total_amount: '300.00', run_at: runDate, status: 'completed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -890,8 +939,8 @@ describe('RevenueReconciliationService', () => {
 
     it('status guard: skips completeness checks for pending and failed runs', async () => {
       const mockRuns = [
-        { id: 'run-pending', total_amount: '100.00', distribution_date: runDate, status: 'pending', offering_id: offeringId },
-        { id: 'run-failed', total_amount: '100.00', distribution_date: runDate, status: 'failed', offering_id: offeringId },
+        { id: 'run-pending', total_amount: '100.00', run_at: runDate, status: 'pending', offering_id: offeringId },
+        { id: 'run-failed', total_amount: '100.00', run_at: runDate, status: 'failed', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },
@@ -912,7 +961,7 @@ describe('RevenueReconciliationService', () => {
 
     it('status guard: runs completeness checks for processing runs', async () => {
       const mockRuns = [
-        { id: 'run-proc', total_amount: '100.00', distribution_date: runDate, status: 'processing', offering_id: offeringId },
+        { id: 'run-proc', total_amount: '100.00', run_at: runDate, status: 'processing', offering_id: offeringId },
       ];
       const mockInvestments = [
         { investor_id: 'inv-1', status: 'completed' },

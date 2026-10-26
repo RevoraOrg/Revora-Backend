@@ -28,7 +28,6 @@ import {
   StellarRPCFailureContext 
 } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
-import { Decimal } from '../lib/decimal';
 import { 
   StellarTransactionVerifier,
   TransactionVerificationResult 
@@ -163,7 +162,7 @@ export class RevenueReconciliationService {
       const distributionRuns = await this.distributionRepo.listByOffering(offeringId);
       const relevantRuns = distributionRuns.filter(
         (r) =>
-          r.distribution_date >= periodStart && r.distribution_date <= periodEnd
+          r.run_at >= periodStart && r.run_at <= periodEnd
       );
 
       this.logger.debug(
@@ -418,7 +417,7 @@ export class RevenueReconciliationService {
     const distributionRuns = await this.distributionRepo.listByOffering(offeringId);
     const relevantRuns = distributionRuns.filter(
       (r) =>
-        r.distribution_date >= periodStart && r.distribution_date <= periodEnd
+        r.run_at >= periodStart && r.run_at <= periodEnd
     );
 
     const totalRevenue = this.sumRevenueAmounts(relevantReports);
@@ -849,11 +848,11 @@ export class RevenueReconciliationService {
     }
 
     for (const run of runs) {
-      if (!run.stellar_transaction_hash) {
+      if (!run.tx_batch_id) {
         discrepancies.push({
           type: 'STELLAR_TX_NOT_FOUND',
           severity: 'error',
-          message: `Distribution run ${run.id} missing Stellar transaction hash`,
+          message: `Distribution run ${run.id} missing Stellar transaction reference (tx_batch_id)`,
           details: {
             runId: run.id,
             status: run.status,
@@ -869,7 +868,7 @@ export class RevenueReconciliationService {
         // This would integrate with Stellar RPC to validate transaction
         // For now, we'll simulate the validation logic
         const txValidation = await this.validateStellarTransaction(
-          run.stellar_transaction_hash,
+          run.tx_batch_id,
           run.total_amount
         );
 
@@ -877,10 +876,10 @@ export class RevenueReconciliationService {
           discrepancies.push({
             type: 'STELLAR_TX_FAILED',
             severity: 'critical',
-            message: `Stellar transaction ${run.stellar_transaction_hash} validation failed`,
+            message: `Stellar transaction ${run.tx_batch_id} validation failed`,
             details: {
               runId: run.id,
-              txHash: run.stellar_transaction_hash,
+              txHash: run.tx_batch_id,
               expectedAmount: run.total_amount,
               actualAmount: txValidation.actualAmount,
               errors: txValidation.errors,
@@ -901,7 +900,7 @@ export class RevenueReconciliationService {
               message: `Stellar transaction timestamp outside reconciliation period`,
               details: {
                 runId: run.id,
-                txHash: run.stellar_transaction_hash,
+                txHash: run.tx_batch_id,
                 txTimestamp: txValidation.timestamp,
                 periodStart,
                 periodEnd,
@@ -919,7 +918,7 @@ export class RevenueReconciliationService {
           {
             offeringId,
             runId: run.id,
-            txHash: run.stellar_transaction_hash,
+            txHash: run.tx_batch_id,
             failureClass: failure.class,
             error: error instanceof Error ? error.message : 'Unknown error',
           }
@@ -932,7 +931,7 @@ export class RevenueReconciliationService {
             message: `Chain event validation failed due to ${failure.class}`,
             details: {
               runId: run.id,
-              txHash: run.stellar_transaction_hash,
+              txHash: run.tx_batch_id,
               failureClass: failure.class,
               error: error instanceof Error ? error.message : 'Unknown error',
             },
