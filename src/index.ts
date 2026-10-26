@@ -82,6 +82,10 @@ import {
 } from "./lib/stellarTransactionVerifier";
 import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
 import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
+import { createDistributionSchedulerRuntime } from "./services/distributionScheduler";
+import { startBackgroundServices, stopBackgroundServices } from "./services/backgroundServices";
+import { RevenueReportRepository } from "./db/repositories/revenueReportRepository";
+import { StellarTransactionVerifierImpl } from "./lib/stellarTransactionVerifier";
 import { createAMLRoutes } from "./routes/amlRoutes";
 import { createLedgerExportRouter } from "./routes/ledgerExport";
 import { LedgerExportService } from "./services/ledgerExportService";
@@ -686,6 +690,30 @@ function createOfferingValidationHandler(
 
 let inFlightRequests = 0;
 
+/**
+ * Balance provider for the DistributionEngine: reads the persisted balance
+ * snapshots for an offering's period.
+ */
+export function createSnapshotBalanceProvider(
+  balanceSnapshotRepo: Pick<BalanceSnapshotRepository, "findByOfferingAndPeriod">,
+) {
+  return {
+    async getBalances(
+      offeringId: string,
+      period: { id: string },
+    ): Promise<BalanceRow[]> {
+      const snapshots = await balanceSnapshotRepo.findByOfferingAndPeriod(
+        offeringId,
+        period.id,
+      );
+      return snapshots.map((snapshot) => ({
+        investor_id: snapshot.holder_address_or_id,
+        balance: Number(snapshot.balance),
+      }));
+    },
+  };
+}
+
 export function createApp(dependencies: AppDependencies = {}): express.Express {
   const app = express();
   
@@ -890,23 +918,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
     dependencies.balanceSnapshotRepo ?? new BalanceSnapshotRepository(pool);
   /**
    * @dev Distribution calculations read persisted snapshots keyed by period;
-   * this app composition deliberately does not start the separate scheduler.
+   * this app composition deliberately does not start the separate scheduler
+   * (batch/all workers run it — see startBackgroundServices).
    */
-  const balanceProvider = {
-    async getBalances(
-      offeringId: string,
-      period: { id: string },
-    ): Promise<BalanceRow[]> {
-      const snapshots = await balanceSnapshotRepo.findByOfferingAndPeriod(
-        offeringId,
-        period.id,
-      );
-      return snapshots.map((snapshot) => ({
-        investor_id: snapshot.holder_address_or_id,
-        balance: Number(snapshot.balance),
-      }));
-    },
-  };
+  const balanceProvider = createSnapshotBalanceProvider(balanceSnapshotRepo);
   const distributionEngine =
     dependencies.distributionEngine ??
     new DistributionEngine(
@@ -1061,6 +1076,8 @@ export { classifyStellarRPCFailure, StellarRPCFailureClass };
 export const app = createApp();
 
 let isShuttingDown = false;
+/** Set at boot; stops role-gated background services and awaits in-flight work. */
+let stopBackgroundWork: (() => Promise<void>) | undefined;
 
 /* istanbul ignore next -- exercised only in real process shutdown */
 async function shutdown(signal: string): Promise<void> {
@@ -1106,6 +1123,10 @@ async function shutdown(signal: string): Promise<void> {
         console.warn('[server] Listener close timeout or error. Proceeding to close pool.');
       }
     }
+  }
+
+  if (stopBackgroundWork) {
+    await stopBackgroundWork();
   }
 
   await closePool();
@@ -1434,61 +1455,45 @@ if (require.main === module && env.NODE_ENV !== "test") {
 
   const metricsCollector = new MetricsCollector();
 
-  const unconditionalPayoutDriftDetector = createPayoutDriftDetector(
-    pool,
-    new PayoutDriftRepository(pool),
-    metricsCollector
-  );
-  unconditionalPayoutDriftDetector.start(); // Start nightly payout drift detection
   globalSampler.start(); // Start event loop lag monitoring
 
-  if (roleConfig.auditPurge) {
-    const auditLogRepo = new AuditLogRepository(pool);
-    const auditPurgeService = new AuditPurgeService(auditLogRepo, metricsCollector);
-    auditPurgeService.start();
-    backgroundStopFns.push(() => auditPurgeService.stop());
-    console.log("[server] AuditPurgeService started");
-  }
-
-  if (roleConfig.auditPurge) { // Reusing auditPurge role for general cleanup tasks
-    const sessionRepo = new SessionRepository(pool);
-    const sessionCompactionService = new SessionCompactionService(sessionRepo, metricsCollector);
-    sessionCompactionService.start();
-    backgroundStopFns.push(() => sessionCompactionService.stop());
-    console.log("[server] SessionCompactionService started");
-  }
-
-  if (roleConfig.payoutDrift) {
-    const payoutDriftRepo = new PayoutDriftRepository(pool);
-    const payoutDriftDetector = createPayoutDriftDetector(
-      pool,
-      payoutDriftRepo,
-      metricsCollector
-    );
-    payoutDriftDetector.start();
-    backgroundStopFns.push(() => payoutDriftDetector.stop());
-    console.log("[server] PayoutDriftDetector started");
-  }
-
-  if (roleConfig.reconciliation) {
-    // Build a StellarTransactionVerifier from the configured Horizon URL so that
-    // chain consistency checks can validate distribution transactions on-chain.
-    // When STELLAR_HORIZON_URL is absent the verifier falls back to the testnet
-    // endpoint; chain validation is still skipped with a single warning discrepancy
-    // if the verifier cannot be constructed.
-    const txVerifier = new StellarTransactionVerifierImpl({
-      horizonUrl: env.STELLAR_HORIZON_URL,
-    });
-    const reconciliationScheduler = createReconciliationSchedulerRuntime({
-      db: pool,
-      metrics: globalMetrics,
-      logger: undefined,
-      txVerifier,
-    });
-    reconciliationScheduler.start();
-    backgroundStopFns.push(() => reconciliationScheduler.stop());
-    console.log("[server] ReconciliationScheduler started");
-  }
+  // Batch work: each service starts at most once, only under its role flag.
+  const batchStopFns = startBackgroundServices(roleConfig, {
+    auditPurge: () => new AuditPurgeService(new AuditLogRepository(pool), metricsCollector),
+    sessionCompaction: () =>
+      new SessionCompactionService(new SessionRepository(pool), metricsCollector),
+    payoutDrift: () =>
+      createPayoutDriftDetector(pool, new PayoutDriftRepository(pool), metricsCollector),
+    reconciliation: () =>
+      // The StellarTransactionVerifier lets chain consistency checks validate
+      // distribution transactions; without STELLAR_HORIZON_URL it falls back to
+      // the testnet endpoint, and chain validation is skipped with a single
+      // warning discrepancy if the verifier cannot be constructed.
+      createReconciliationSchedulerRuntime({
+        db: pool,
+        metrics: globalMetrics,
+        logger: undefined,
+        txVerifier: new StellarTransactionVerifierImpl({
+          horizonUrl: env.STELLAR_HORIZON_URL,
+        }),
+      }),
+    distributionScheduler: () =>
+      createDistributionSchedulerRuntime({
+        engine: new DistributionEngine(
+          new OfferingRepository(pool),
+          new DistributionRepository(pool),
+          createSnapshotBalanceProvider(new BalanceSnapshotRepository(pool)),
+          {},
+          pool,
+        ),
+        revenueReportRepo: new RevenueReportRepository(pool),
+        scheduledDistributionRepo: new ScheduledDistributionRepository(pool),
+        metrics: metricsCollector,
+      }),
+  });
+  backgroundStopFns.push(...batchStopFns.map((stop) => () => void stop()));
+  // shutdown() awaits these so an in-flight distribution tick finishes first.
+  stopBackgroundWork = () => stopBackgroundServices(batchStopFns);
 
   // --- Hot-path services (only for "api" and "all" roles) ---
 

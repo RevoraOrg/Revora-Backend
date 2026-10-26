@@ -1,5 +1,6 @@
 import {
   DistributionScheduler,
+  createDistributionSchedulerRuntime,
   CronWindowValidator,
   validateCronSyntax,
   normalizeScheduleTimezone,
@@ -1940,5 +1941,155 @@ describe('DistributionScheduler – decimal-string amounts in processScheduledDi
 
     expect(engine.distribute).not.toHaveBeenCalled();
     expect(repo.markFailed).toHaveBeenCalledWith('sched-1', expect.any(String));
+  });
+});
+
+// ─── createDistributionSchedulerRuntime ───────────────────────────────────────
+
+describe('createDistributionSchedulerRuntime', () => {
+  const quietLogger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } as any;
+
+  function fakeScheduler(overrides: Partial<Record<string, jest.Mock>> = {}) {
+    return {
+      catchUpMissedWindows: jest.fn().mockResolvedValue({}),
+      processPendingDistributions: jest.fn().mockResolvedValue({}),
+      processScheduledDistributions: jest.fn().mockResolvedValue({}),
+      ...overrides,
+    };
+  }
+
+  function runtimeWith(scheduler: ReturnType<typeof fakeScheduler>, intervalMs = 1_000) {
+    return createDistributionSchedulerRuntime({
+      engine: {} as any,
+      revenueReportRepo: {} as any,
+      scheduledDistributionRepo: {} as any,
+      intervalMs,
+      logger: quietLogger,
+      scheduler: scheduler as any,
+    });
+  }
+
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it('catches up once at boot, then processes on every tick', async () => {
+    const scheduler = fakeScheduler();
+    const runtime = runtimeWith(scheduler);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scheduler.catchUpMissedWindows).toHaveBeenCalledTimes(1);
+    expect(scheduler.processScheduledDistributions).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(scheduler.catchUpMissedWindows).toHaveBeenCalledTimes(1);
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(2);
+    expect(scheduler.processScheduledDistributions).toHaveBeenCalledTimes(2);
+
+    await runtime.stop();
+  });
+
+  it('executes a due scheduled distribution within one interval', async () => {
+    const executed: string[] = [];
+    const due = ['sched-1'];
+    const scheduler = fakeScheduler({
+      // Nothing is due at boot; the row becomes due just after.
+      processScheduledDistributions: jest
+        .fn()
+        .mockResolvedValueOnce({ processed: 0 })
+        .mockImplementation(async () => {
+          executed.push(...due.splice(0));
+          return { processed: executed.length };
+        }),
+    });
+    const runtime = runtimeWith(scheduler, 5_000);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(executed).toEqual([]);
+
+    await jest.advanceTimersByTimeAsync(5_000);
+    expect(executed).toEqual(['sched-1']);
+    await runtime.stop();
+  });
+
+  it('never overlaps ticks: a slow tick delays the next one', async () => {
+    let release!: () => void;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const scheduler = fakeScheduler({
+      processPendingDistributions: jest.fn(async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise<void>((resolve) => (release = resolve));
+        concurrent--;
+      }),
+    });
+    const runtime = runtimeWith(scheduler, 1_000);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(10_000); // first tick still blocked
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(1);
+
+    release();
+    await jest.advanceTimersByTimeAsync(0);
+    await jest.advanceTimersByTimeAsync(999);
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(2);
+    expect(maxConcurrent).toBe(1);
+
+    release();
+    await runtime.stop();
+  });
+
+  it('stop() cancels the pending timer', async () => {
+    const scheduler = fakeScheduler();
+    const runtime = runtimeWith(scheduler);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(0);
+    await runtime.stop();
+    await jest.advanceTimersByTimeAsync(10_000);
+
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(1);
+    expect(runtime.isRunning()).toBe(false);
+  });
+
+  it('stop() resolves only after the in-flight tick finishes', async () => {
+    let release!: () => void;
+    let tickDone = false;
+    const scheduler = fakeScheduler({
+      processScheduledDistributions: jest.fn(async () => {
+        await new Promise<void>((resolve) => (release = resolve));
+        tickDone = true;
+      }),
+    });
+    const runtime = runtimeWith(scheduler);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(0);
+    let stopped = false;
+    const stopping = runtime.stop().then(() => (stopped = true));
+    await jest.advanceTimersByTimeAsync(0);
+    expect(stopped).toBe(false);
+
+    release();
+    await stopping;
+    expect(tickDone).toBe(true);
+    expect(scheduler.processScheduledDistributions).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps running after a tick throws', async () => {
+    const scheduler = fakeScheduler({
+      processPendingDistributions: jest.fn().mockRejectedValueOnce(new Error('db down')).mockResolvedValue({}),
+    });
+    const runtime = runtimeWith(scheduler);
+
+    runtime.start();
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(scheduler.processPendingDistributions).toHaveBeenCalledTimes(2);
+    expect(quietLogger.error).toHaveBeenCalled();
+    await runtime.stop();
   });
 });

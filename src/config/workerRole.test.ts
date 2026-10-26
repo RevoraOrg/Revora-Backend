@@ -129,6 +129,12 @@ describe('getRoleConfig', () => {
     expect(config.payoutDrift).toBe(true);
   });
 
+  it('runs the distribution scheduler and session compaction only in batch and all', () => {
+    expect(getRoleConfig('api')).toMatchObject({ distributionScheduler: false, sessionCompaction: false });
+    expect(getRoleConfig('batch')).toMatchObject({ distributionScheduler: true, sessionCompaction: true });
+    expect(getRoleConfig('all')).toMatchObject({ distributionScheduler: true, sessionCompaction: true });
+  });
+
   it('returns a copy (not a reference to the matrix)', () => {
     const config1 = getRoleConfig('api');
     const config2 = getRoleConfig('api');

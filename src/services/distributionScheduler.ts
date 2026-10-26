@@ -1285,3 +1285,112 @@ export class DistributionStateManager {
     return record?.state === "paused";
   }
 }
+
+// ─── DistributionScheduler runtime ────────────────────────────────────────────
+
+/** Default tick interval when neither the option nor the env var is set. */
+export const DEFAULT_DISTRIBUTION_SCHEDULER_INTERVAL_MS = 60_000;
+
+export interface CreateDistributionSchedulerRuntimeOptions {
+  engine: DistributionEngine;
+  revenueReportRepo: RevenueReportRepository;
+  scheduledDistributionRepo: ScheduledDistributionRepository;
+  /** Delay between the end of one tick and the start of the next. */
+  intervalMs?: number;
+  metrics?: MetricsCollector;
+  logger?: Logger;
+  /** Pre-built scheduler, for tests. */
+  scheduler?: Pick<
+    DistributionScheduler,
+    'catchUpMissedWindows' | 'processPendingDistributions' | 'processScheduledDistributions'
+  >;
+}
+
+export interface DistributionSchedulerRuntime {
+  start(): void;
+  /** Cancels the pending tick and resolves once any in-flight tick finishes. */
+  stop(): Promise<void>;
+  isRunning(): boolean;
+}
+
+function resolveDistributionInterval(intervalMs: number | undefined): number {
+  if (intervalMs !== undefined) return intervalMs;
+  const parsed = Number.parseInt(process.env.DISTRIBUTION_SCHEDULER_INTERVAL_MS ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_DISTRIBUTION_SCHEDULER_INTERVAL_MS;
+}
+
+/**
+ * Runs the DistributionScheduler on a cadence: `catchUpMissedWindows` once at
+ * boot, then `processPendingDistributions` and `processScheduledDistributions`
+ * every tick. Ticks are chained with `setTimeout` (the next one is scheduled
+ * only after the previous one finishes), so a slow tick delays the next rather
+ * than overlapping it.
+ */
+export function createDistributionSchedulerRuntime(
+  options: CreateDistributionSchedulerRuntimeOptions,
+): DistributionSchedulerRuntime {
+  const logger = options.logger ?? globalLogger;
+  const scheduler =
+    options.scheduler ??
+    new DistributionScheduler(options.engine, options.revenueReportRepo, {
+      logger,
+      metrics: options.metrics,
+      scheduledDistributionRepo: options.scheduledDistributionRepo,
+    });
+  const intervalMs = resolveDistributionInterval(options.intervalMs);
+
+  let started = false;
+  let stopped = false;
+  let caughtUp = false;
+  let timer: NodeJS.Timeout | null = null;
+  let inFlight: Promise<void> | null = null;
+
+  const runTick = async (): Promise<void> => {
+    try {
+      if (!caughtUp) {
+        caughtUp = true;
+        await scheduler.catchUpMissedWindows();
+      }
+      await scheduler.processPendingDistributions();
+      await scheduler.processScheduledDistributions();
+    } catch (err) {
+      logger.error('DistributionScheduler: unhandled tick error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const loop = (): void => {
+    timer = null;
+    if (stopped) return;
+    inFlight = runTick().finally(() => {
+      inFlight = null;
+      if (stopped) return;
+      timer = setTimeout(loop, intervalMs);
+      timer.unref?.();
+    });
+  };
+
+  return {
+    start(): void {
+      if (started) return;
+      started = true;
+      loop();
+      logger.info('DistributionScheduler: started', { intervalMs });
+    },
+    async stop(): Promise<void> {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (inFlight) await inFlight;
+      logger.info('DistributionScheduler: stopped');
+    },
+    isRunning(): boolean {
+      return started && !stopped;
+    },
+  };
+}

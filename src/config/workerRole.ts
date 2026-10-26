@@ -44,6 +44,10 @@ export interface RoleConfig {
   payoutDrift: boolean;
   /** Run scheduled RevenueReconciliationService reconciliation ticks. */
   reconciliation: boolean;
+  /** Run the DistributionScheduler (approved reports and scheduled_distributions). */
+  distributionScheduler: boolean;
+  /** Run periodic session compaction. */
+  sessionCompaction: boolean;
 }
 
 /**
@@ -56,6 +60,8 @@ export const ROLE_MATRIX: Record<WorkerRole, RoleConfig> = {
     auditPurge: false,
     payoutDrift: false,
     reconciliation: false,
+    distributionScheduler: false,
+    sessionCompaction: false,
   },
   batch: {
     httpServer: false,
@@ -63,6 +69,8 @@ export const ROLE_MATRIX: Record<WorkerRole, RoleConfig> = {
     auditPurge: true,
     payoutDrift: true,
     reconciliation: true,
+    distributionScheduler: true,
+    sessionCompaction: true,
   },
   all: {
     httpServer: true,
@@ -70,6 +78,8 @@ export const ROLE_MATRIX: Record<WorkerRole, RoleConfig> = {
     auditPurge: true,
     payoutDrift: true,
     reconciliation: true,
+    distributionScheduler: true,
+    sessionCompaction: true,
   },
 };
 
