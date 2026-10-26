@@ -6,6 +6,7 @@ import {
 } from '../db/repositories/revenueReportRepository';
 import { LedgerPeriodLockRepository } from '../db/repositories/ledgerPeriodLockRepository';
 import { AppError, Errors } from '../lib/errors';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
 import { Logger } from '../lib/logger';
 import { LogLevel } from '../lib/logger';
 import { Pool } from 'pg';
@@ -15,6 +16,8 @@ import { TransactionError, withTransaction } from '../db/transaction';
 export interface SubmitRevenueReportInput {
     offeringId: string;
     issuerId: string;
+    /** Authenticated user submitting the report; defaults to `issuerId`. */
+    reportedBy?: string;
     amount: string;
     periodStart: Date;
     periodEnd: Date;
@@ -128,6 +131,8 @@ export class RevenueService {
         // 4. Build the insert payload before opening a transaction.
         const reportData: CreateRevenueReportInput = {
             offering_id: input.offeringId,
+            issuer_id: input.issuerId,
+            reported_by: input.reportedBy ?? input.issuerId,
             amount: input.amount,
             period_start: input.periodStart,
             period_end: input.periodEnd,
