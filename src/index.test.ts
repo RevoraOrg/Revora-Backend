@@ -1,4 +1,4 @@
-import { parseMoneyString } from "./index";
+import { parseMoneyString } from "./routes/offeringValidation";
 import supertest from "supertest";
 import { createApp } from "./index";
 import { issueToken } from "./lib/jwt";
