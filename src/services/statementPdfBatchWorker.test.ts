@@ -32,6 +32,7 @@ import {
   makeStatementRenderFn,
   renderStatementPdfBytes,
 } from './statementPdfService';
+import { InMemoryStatementDataProvider } from './statementDataProvider';
 
 function makeBatch(overrides: Partial<PdfRenderBatchRow> = {}): PdfRenderBatchRow {
   return {
@@ -132,6 +133,34 @@ describe('statementPdfService', () => {
     expect(buildStatementStorageKey('2026-06', 'inv-1')).toBe(
       'statements/2026-06/inv-1.pdf',
     );
+  });
+
+  it('makeStatementRenderFn fetches StatementContent from dataProvider and emits PDF/UA tags', async () => {
+    const storage = new InMemoryStatementPdfStorage();
+    const provider = new InMemoryStatementDataProvider();
+    const job = makeJob();
+    const content = {
+      investorId: job.investor_id,
+      investorName: 'Ada Lovelace',
+      periodId: job.period_id,
+      periodLabel: 'Q2 2026',
+      generatedAt: new Date('2026-06-30T00:00:00.000Z'),
+      holdings: [{ offeringName: 'Solar Bond', offeringSymbol: 'SLR', balance: '500.00' }],
+      transactions: [],
+      distributionSummary: { totalDistributed: '25.00', fees: '2.50', distributions: [] },
+      revenueSummary: null,
+      taxClassifications: [],
+    };
+    provider.setContent(job.investor_id, job.period_id, content);
+
+    const render = makeStatementRenderFn(storage, provider);
+    const result = await render(job);
+    const pdfText = result.bytes.toString('utf8');
+
+    expect(pdfText).toContain('/MarkInfo << /Marked true >>');
+    expect(pdfText).toContain('<pdfuaid:part>1</pdfuaid:part>');
+    expect(pdfText).toContain('Solar Bond | SLR | 500.00');
+    expect(result.bytes.equals(renderStatementPdfBytes(job, content))).toBe(true);
   });
 });
 
