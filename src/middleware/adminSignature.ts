@@ -3,11 +3,6 @@ import crypto from 'crypto';
 import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
 
-/** Express request augmented with the verified admin key id for audit logging. */
-interface AdminSignedRequest extends Request {
-  adminKid?: string;
-}
-
 /**
  * @dev Ed25519 signatures are always 64 raw bytes. Enforcing the decoded length
  * before calling `crypto.verify` keeps attacker-controlled header input from
@@ -165,7 +160,7 @@ export function verifyAdminSignature(): (req: Request, res: Response, next: Next
       nonceStore.add(nonce);
       req.app.set('adminNonceStore', nonceStore);
       // Attach verified kid for audit logging
-      (req as AdminSignedRequest).adminKid = kid;
+      req.adminKid = kid;
       next();
     } catch (err) {
       // Defence in depth: no unexpected error (e.g. a throwing req.app) should
