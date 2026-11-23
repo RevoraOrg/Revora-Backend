@@ -16,3 +16,4 @@ reports/mutation/
 branch_structure.json
 .tools/
 .opencode
+*.bak
