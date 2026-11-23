@@ -12,6 +12,7 @@ import {
 import { JwksCacheService } from './jwksCache';
 import { digestDiscoveryDocument } from './discoveryDigest';
 import { globalMetrics } from '../../lib/metrics';
+import { globalLogger } from '../../lib/logger';
 
 const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
@@ -94,10 +95,11 @@ export class OidcAdapterService {
         1,
         'OIDC discovery document digest changed for issuer; admin should validate endpoint updates',
       );
-      console.warn(
-        `[OidcAdapter] oidc.discovery.changed issuer=${issuerUrl} ` +
-          `previous=${previous.slice(0, 12)}… current=${digest.slice(0, 12)}…`,
-      );
+      globalLogger.warn('oidc.discovery.changed', {
+        issuer: issuerUrl,
+        previousDigest: previous,
+        currentDigest: digest,
+      });
     }
 
     this.discoveryDigests.set(issuerUrl, digest);

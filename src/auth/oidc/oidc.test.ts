@@ -1,6 +1,7 @@
 import { createSign, generateKeyPairSync } from 'crypto';
 import express from 'express';
 import request from 'supertest';
+import { globalLogger } from '../../lib/logger';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
 import { createOidcRouter } from './oidcRoute';
@@ -161,7 +162,7 @@ describe('OidcAdapterService', () => {
     it('stores a per-issuer digest and alerts on fixture rotation', async () => {
       const metrics = { incrementCounter: jest.fn() };
       let now = 1_000_000;
-      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const warn = jest.spyOn(globalLogger, 'warn').mockImplementation(() => undefined);
       service = new OidcAdapterService(jwksCache, {
         metrics,
         discoveryTtlMs: 60_000,
@@ -193,7 +194,11 @@ describe('OidcAdapterService', () => {
         1,
         expect.any(String),
       );
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('oidc.discovery.changed'));
+      expect(warn).toHaveBeenCalledWith('oidc.discovery.changed', {
+        issuer: 'https://idp.example.com',
+        previousDigest: firstDigest,
+        currentDigest: service.getDiscoveryDigest('https://idp.example.com'),
+      });
       warn.mockRestore();
     });
 
