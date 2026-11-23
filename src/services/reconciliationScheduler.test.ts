@@ -25,9 +25,41 @@ import {
   InMemoryReconciliationRunStore,
   ReconciliationRunSummary,
   SchedulerOffering,
+  createReconciliationSchedulerRuntime,
 } from './reconciliationScheduler';
 import { MetricsCollector } from '../lib/metrics';
 import { ReconciliationResult } from './revenueReconciliationService';
+import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
+
+// ─── Spy on RevenueReconciliationService constructor ─────────────────────────
+// Jest hoists jest.mock() before variable declarations, so we use jest.fn()
+// inline and then retrieve the spy via the module import.
+jest.mock('./revenueReconciliationService', () => ({
+  ...jest.requireActual('./revenueReconciliationService'),
+  RevenueReconciliationService: jest.fn().mockImplementation(
+    (_db: unknown, _stellarClient: unknown, _txVerifier: unknown) => ({
+      reconcile: jest.fn().mockResolvedValue({
+        offeringId: 'off-1',
+        periodStart: new Date(),
+        periodEnd: new Date(),
+        isBalanced: true,
+        discrepancies: [],
+        summary: {
+          totalRevenueReported: '0',
+          totalPayouts: '0',
+          discrepancyAmount: '0',
+          investorCount: 0,
+          payoutsProcessed: 0,
+          payoutsFailed: 0,
+        },
+        checkedAt: new Date(),
+      }),
+    })
+  ),
+}));
+
+// Retrieve the mocked constructor after jest.mock() has run.
+import { RevenueReconciliationService as MockRevenueReconciliationServiceCtor } from './revenueReconciliationService';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -731,5 +763,107 @@ describe('ReconciliationScheduler', () => {
       const [, , , opts] = service.reconcile.mock.calls[0];
       expect((opts as any).tolerance).toBe(customTolerance);
     });
+  });
+});
+
+// ─── createReconciliationSchedulerRuntime – verifier pass-through ────────────
+
+describe('createReconciliationSchedulerRuntime – verifier pass-through', () => {
+  let metrics: MetricsCollector;
+
+  function makeMockPool() {
+    return { query: jest.fn() } as any;
+  }
+
+  beforeEach(() => {
+    metrics = new MetricsCollector({ enabled: true, enablePIIDetection: false });
+    (MockRevenueReconciliationServiceCtor as jest.Mock).mockClear();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('passes txVerifier to RevenueReconciliationService when provided', () => {
+    const mockVerifier: StellarTransactionVerifier = { verifyTransaction: jest.fn() };
+
+    createReconciliationSchedulerRuntime({
+      db: makeMockPool(),
+      metrics,
+      txVerifier: mockVerifier,
+    });
+
+    // RevenueReconciliationService constructor: new (db, stellarClient?, txVerifier?)
+    expect(MockRevenueReconciliationServiceCtor).toHaveBeenCalledWith(
+      expect.anything(),  // db
+      undefined,          // stellarClient not supplied
+      mockVerifier,       // txVerifier forwarded
+    );
+  });
+
+  it('passes stellarClient to RevenueReconciliationService when provided', () => {
+    const mockStellarClient = { getRevenueState: jest.fn() };
+
+    createReconciliationSchedulerRuntime({
+      db: makeMockPool(),
+      metrics,
+      stellarClient: mockStellarClient as any,
+    });
+
+    expect(MockRevenueReconciliationServiceCtor).toHaveBeenCalledWith(
+      expect.anything(),
+      mockStellarClient,
+      undefined,           // txVerifier not supplied
+    );
+  });
+
+  it('passes both txVerifier and stellarClient when both provided', () => {
+    const mockVerifier: StellarTransactionVerifier = { verifyTransaction: jest.fn() };
+    const mockStellarClient = { getRevenueState: jest.fn() };
+
+    createReconciliationSchedulerRuntime({
+      db: makeMockPool(),
+      metrics,
+      txVerifier: mockVerifier,
+      stellarClient: mockStellarClient as any,
+    });
+
+    expect(MockRevenueReconciliationServiceCtor).toHaveBeenCalledWith(
+      expect.anything(),
+      mockStellarClient,
+      mockVerifier,
+    );
+  });
+
+  it('constructs RevenueReconciliationService with undefined deps when neither provided', () => {
+    createReconciliationSchedulerRuntime({
+      db: makeMockPool(),
+      metrics,
+    });
+
+    expect(MockRevenueReconciliationServiceCtor).toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      undefined,
+    );
+  });
+
+  it('does NOT call RevenueReconciliationService constructor when a pre-built scheduler is supplied', () => {
+    (MockRevenueReconciliationServiceCtor as jest.Mock).mockClear();
+
+    const mockVerifier: StellarTransactionVerifier = { verifyTransaction: jest.fn() };
+    const preBuiltScheduler = {
+      runScheduledReconciliation: jest.fn().mockResolvedValue({}),
+    } as any;
+
+    createReconciliationSchedulerRuntime({
+      db: makeMockPool(),
+      metrics,
+      txVerifier: mockVerifier,
+      scheduler: preBuiltScheduler,
+    });
+
+    // When a pre-built scheduler is provided, no new service is constructed
+    expect(MockRevenueReconciliationServiceCtor).not.toHaveBeenCalled();
   });
 });

@@ -71,14 +71,16 @@ export const HOT_ROUTE_BUDGETS: LatencyBudgetConfig[] = [
  * Get latency budget for a specific route
  * @param method HTTP method (GET, POST, etc.)
  * @param path Route path
- * @returns Latency budget config or undefined if not found
+ * @returns A defensive copy of the latency budget config, or undefined if not found.
+ *          Mutating the returned object does not affect the canonical catalogue.
  */
 export function getLatencyBudget(method: string, path: string): LatencyBudgetConfig | undefined {
-  return HOT_ROUTE_BUDGETS.find(
+  const found = HOT_ROUTE_BUDGETS.find(
     (budget) =>
       budget.method.toUpperCase() === method.toUpperCase() &&
       normalizePath(budget.path) === normalizePath(path)
   );
+  return found ? { ...found } : undefined;
 }
 
 /**
@@ -93,8 +95,9 @@ function normalizePath(path: string): string {
 
 /**
  * Get all budgeted routes for test execution
- * @returns Array of budgeted routes
+ * @returns A new array of defensive copies of the budgeted route configs.
+ *          Mutating elements of the returned array does not affect the catalogue.
  */
 export function getAllBudgetedRoutes(): LatencyBudgetConfig[] {
-  return [...HOT_ROUTE_BUDGETS];
+  return HOT_ROUTE_BUDGETS.map((budget) => ({ ...budget }));
 }

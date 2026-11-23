@@ -9,6 +9,8 @@ export const ErrorCode = {
   SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
   INTERNAL_ERROR: "INTERNAL_ERROR",
   TOO_MANY_REQUESTS: "TOO_MANY_REQUESTS",
+  INVALID_JSON: "INVALID_JSON",
+  PAYLOAD_TOO_LARGE: "PAYLOAD_TOO_LARGE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -24,7 +26,7 @@ export interface ErrorResponse {
 /**
  * Creates a structured error object.
  */
-function createError(
+export function createError(
   code: ErrorCode,
   message: string,
   statusCode: number,
@@ -141,6 +143,20 @@ export function throwError(
   throw createError(code, message, statusCode, details, options);
 }
 
+/**
+ * Forwards an AppError into the express error-handling chain.
+ * @dev Express treats a 4-argument middleware as an error handler; calling
+ *      next(err) routes the error to that handler (or the default one), which
+ *      formats it into a standard ErrorResponse. This helper exists to make the
+ *      forwarding intent explicit and unit-testable.
+ */
+export function sendAppError(
+  next: (err?: unknown) => void,
+  err: AppError | Error,
+): void {
+  next(err);
+}
+
 export class BadRequestError extends AppError {
   constructor(message: string = 'Bad Request') {
     super(ErrorCode.BAD_REQUEST, 400, message);
@@ -148,10 +164,50 @@ export class BadRequestError extends AppError {
   }
 }
 
+/**
+ * Thrown when an optimistic-concurrency update detects that the row was
+ * modified by another writer since it was read (i.e. the supplied version no
+ * longer matches the stored one).
+ *
+ * Security assumptions:
+ * - The message is deliberately generic and never echoes raw database rows or
+ *   stack traces, so it is safe to return to untrusted clients.
+ * - Callers map this to HTTP 409 via {@link ConcurrencyError.statusCode}.
+ */
+export class ConcurrencyError extends Error {
+  public readonly statusCode: number = 409;
+  public readonly errorCode: string = 'CONCURRENCY_CONFLICT';
+
+  constructor(
+    message: string = 'The resource has been modified by another process. Please refresh and try again.',
+  ) {
+    super(message);
+    this.name = 'ConcurrencyError';
+    Object.setPrototypeOf(this, new.target.prototype);
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  /**
+   * Formats the error for client-facing JSON responses.
+   * Ensures no raw stack traces or DB strings are leaked.
+   */
+  public toJSON(): { error: string; message: string; code: string } {
+    return {
+      error: 'Conflict',
+      message: this.message,
+      code: this.errorCode,
+    };
+  }
+}
+
 export class UniqueConstraintError extends Error {
   public readonly field: string;
 
   constructor(field: string) {
+    // Canonical message form per Requirements 3.1–3.3 (see
+    // src/lib/__tests__/errors.property.test.ts Property 5):
+    // `Unique constraint violation on <field>`. Consumers (register roundtrip
+    // Req 3.3, startup-auth 409 mapping) assert this exact string.
     super(`Unique constraint violation on ${field}`);
     Object.setPrototypeOf(this, new.target.prototype);
     this.name = 'UniqueConstraintError';

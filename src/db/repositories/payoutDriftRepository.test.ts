@@ -115,13 +115,15 @@ describe('PayoutDriftRepository', () => {
   });
 
   describe('getLatestReport', () => {
-    it('returns null when no reports exist', async () => {
+    it('returns null when no reports exist (empty result path)', async () => {
       mockPool.query.mockResolvedValue({ rows: [] });
       const result = await repo.getLatestReport('offering-001');
       expect(result).toBeNull();
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+      expect(mockPool.query).toHaveBeenCalledWith(expect.any(String), ['offering-001']);
     });
 
-    it('returns the most recent report', async () => {
+    it('returns the most recent report (success path)', async () => {
       const fakeRow = {
         id: 'report-001',
         run_at: new Date(),
@@ -146,6 +148,24 @@ describe('PayoutDriftRepository', () => {
       const result = await repo.getLatestReport('offering-001');
       expect(result).not.toBeNull();
       expect(result!.offering_id).toBe('offering-001');
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+      expect(mockPool.query).toHaveBeenCalledWith(expect.any(String), ['offering-001']);
+    });
+
+    it('propagates database errors deterministically (failure path)', async () => {
+      const dbError = new Error('Database connection failed');
+      mockPool.query.mockRejectedValue(dbError);
+
+      await expect(repo.getLatestReport('offering-001')).rejects.toThrow('Database connection failed');
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('handles empty string offeringId safely (boundary input)', async () => {
+      mockPool.query.mockResolvedValue({ rows: [] });
+      const result = await repo.getLatestReport('');
+      expect(result).toBeNull();
+      expect(mockPool.query).toHaveBeenCalledTimes(1);
+      expect(mockPool.query).toHaveBeenCalledWith(expect.any(String), ['']);
     });
   });
 

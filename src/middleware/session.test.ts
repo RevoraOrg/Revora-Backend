@@ -19,6 +19,7 @@ import express, { Request, Response } from "express";
 import request                         from "supertest";
 import { SessionStore }                from "../lib/sessionStore";
 import { createSessionAuth, createSessionRouter } from "../middleware/session";
+import { AuthenticatedRequest }        from "./auth";
 
 
 /** Advance Date.now by `ms` milliseconds for the duration of `fn`. */
@@ -45,7 +46,7 @@ function makeApp(store: SessionStore) {
   app.get(
     "/protected",
     createSessionAuth(store),
-    (req: Request, res: Response) => {
+    (req: AuthenticatedRequest, res: Response) => {
       res.json({ userId: req.user!.id, role: req.user!.role });
     }
   );
@@ -141,6 +142,19 @@ describe("SessionStore", () => {
     it("is idempotent — deleting a non-existent token does not throw", async () => {
       const store = new SessionStore({ sweepIntervalMs: 0 });
       await expect(store.delete("ghost-token")).resolves.toBeUndefined();
+    });
+
+    it("deleteAllForUser removes all sessions for the given user", async () => {
+      const store = new SessionStore({ sweepIntervalMs: 0 });
+      const s1 = await store.create("user-1", "admin");
+      const s2 = await store.create("user-1", "investor");
+      const s3 = await store.create("user-2", "admin");
+
+      await store.deleteAllForUser("user-1");
+
+      expect(await store.get(s1.token)).toBeNull();
+      expect(await store.get(s2.token)).toBeNull();
+      expect(await store.get(s3.token)).not.toBeNull();
     });
   });
 
@@ -313,6 +327,47 @@ describe("Session middleware and routes", () => {
         .post("/session/login")
         .set("x-user-id", "user-1");
 
+      expect(res.status).toBe(401);
+    });
+
+    it("respects tenant policy callback when provided", async () => {
+      const getPolicy = jest.fn().mockResolvedValue('Lax' as const);
+      const customApp = express();
+      customApp.use(express.json());
+      customApp.use(createSessionRouter(store, getPolicy));
+
+      const res = await request(customApp)
+        .post("/session/login")
+        .set("x-user-id", "u-1")
+        .set("x-user-role", "admin")
+        .set("x-tenant-id", "tenant-123");
+
+      expect(res.status).toBe(201);
+      expect(getPolicy).toHaveBeenCalledWith("tenant-123");
+      const cookieHeader = res.headers["set-cookie"]?.[0] || "";
+      expect(cookieHeader).toContain("SameSite=Lax");
+    });
+  });
+
+  describe("GET /session/me", () => {
+    it("returns user id and role when authenticated", async () => {
+      const login = await request(app)
+        .post("/session/login")
+        .set("x-user-id", "user-me-1")
+        .set("x-user-role", "admin");
+
+      const { token } = login.body;
+
+      const res = await request(app)
+        .get("/session/me")
+        .set("Authorization", `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ userId: "user-me-1", role: "admin" });
+    });
+
+    it("returns 401 when unauthenticated", async () => {
+      const res = await request(app).get("/session/me");
       expect(res.status).toBe(401);
     });
   });

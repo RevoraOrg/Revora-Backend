@@ -125,7 +125,9 @@ describe('deviceSignature', () => {
       const kp = generateEd25519Keypair();
       expect(kp.publicKey).toContain('-----BEGIN PUBLIC KEY-----');
       expect(kp.privateKey).toContain('-----BEGIN PRIVATE KEY-----');
-      expect(kp.publicKey).toContain('Ed25519');
+      // PEM SPKI output does not embed the literal string "Ed25519"; verify the
+      // curve by decoding the key object instead.
+      expect(crypto.createPublicKey(kp.publicKey).asymmetricKeyType).toBe('ed25519');
     });
   });
 
@@ -278,11 +280,15 @@ describe('deviceSignature', () => {
         });
 
       const errors1: any[] = [];
-      await mw(makeGoodReq(), makeRes(), (err: any) => errors1.push(err));
+      await mw(makeGoodReq(), makeRes(), (err: any) => {
+        if (err) errors1.push(err);
+      });
       expect(errors1.length).toBe(0);
 
       const errors2: any[] = [];
-      await mw(makeGoodReq(), makeRes(), (err: any) => errors2.push(err));
+      await mw(makeGoodReq(), makeRes(), (err: any) => {
+        if (err) errors2.push(err);
+      });
       expect(errors2.length).toBe(1);
       expect(errors2[0].message).toContain('Replay');
     });

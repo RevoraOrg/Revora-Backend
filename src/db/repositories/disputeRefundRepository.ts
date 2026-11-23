@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 
 export interface DisputeRefund {
   id: string;
@@ -27,14 +27,14 @@ export class DisputeRefundRepository {
     return result.rows[0];
   }
 
-  async sumRefundsForDispute(disputeId: string): Promise<number> {
+  async sumRefundsForDispute(disputeId: string, client?: PoolClient): Promise<string> {
     const query = `
       SELECT COALESCE(SUM(amount), 0) as total
       FROM dispute_refunds
       WHERE dispute_id = $1
     `;
-    const result = await this.db.query(query, [disputeId]);
-    return parseFloat(result.rows[0].total);
+    const result = await (client || this.db).query(query, [disputeId]);
+    return String(result.rows[0]?.total ?? '0');
   }
 
   async listByDispute(disputeId: string): Promise<DisputeRefund[]> {

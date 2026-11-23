@@ -6,7 +6,7 @@
  * @see ../docs/revenue-report-ingestion-validation.md
  * @see ../docs/revenue-route-schema-validation.md
  */
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 
 export type DistributionStatus = 'in_progress' | 'completed' | 'failed';
 
@@ -51,7 +51,7 @@ export class RevenueReportRepository {
   /**
    * Create a new revenue report.
    */
-  async create(input: CreateRevenueReportInput): Promise<RevenueReport> {
+  async create(input: CreateRevenueReportInput, client?: PoolClient): Promise<RevenueReport> {
     const entries = Object.entries(input).filter(([, value]) => value !== undefined);
 
     if (entries.length === 0) {
@@ -68,7 +68,7 @@ export class RevenueReportRepository {
       RETURNING *
     `;
 
-    const result: QueryResult<RevenueReportRow> = await this.db.query(query, values);
+    const result: QueryResult<RevenueReportRow> = await (client ?? this.db).query(query, values);
 
     if (result.rows.length === 0) {
       throw new Error('Failed to create revenue report');
@@ -142,7 +142,8 @@ export class RevenueReportRepository {
   async findOverlappingReport(
     offeringId: string,
     periodStart: Date,
-    periodEnd: Date
+    periodEnd: Date,
+    client?: PoolClient
   ): Promise<RevenueReport | null> {
     const query = `
       SELECT *
@@ -154,7 +155,7 @@ export class RevenueReportRepository {
       LIMIT 1
     `;
 
-    const result: QueryResult<RevenueReportRow> = await this.db.query(query, [
+    const result: QueryResult<RevenueReportRow> = await (client ?? this.db).query(query, [
       offeringId,
       periodStart,
       periodEnd,

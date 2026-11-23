@@ -95,6 +95,14 @@ class FakeSessionRepository {
     }
     return count;
   }
+
+  async deleteAllSessionsByUserId(userId: string): Promise<void> {
+    for (const [hash, row] of this.rows) {
+      if (row.user_id === userId) {
+        this.rows.delete(hash);
+      }
+    }
+  }
 }
 
 function makeStore(repo: FakeSessionRepository, now: () => number, ttlMs = 60_000) {
@@ -282,6 +290,39 @@ describe("PostgresSessionStore", () => {
       expect(found).not.toBeNull();
       expect(found!.userId).toBe("user-1");
       expect(found!.role).toBe("admin");
+    });
+  });
+
+  describe("deleteAllForUser()", () => {
+    it("deletes all sessions for a user", async () => {
+      const repo = new FakeSessionRepository();
+      const store = makeStore(repo, () => 0);
+
+      const s1 = await store.create("user-1", "admin");
+      const s2 = await store.create("user-1", "client");
+      const s3 = await store.create("user-2", "admin");
+
+      await store.deleteAllForUser("user-1");
+
+      expect(await store.get(s1.token)).toBeNull();
+      expect(await store.get(s2.token)).toBeNull();
+      expect(await store.get(s3.token)).not.toBeNull();
+    });
+  });
+
+  describe("startCleanup() and stop()", () => {
+    it("starts periodic cleanup and stops cleanly", () => {
+      const repo = new FakeSessionRepository();
+      const store = new PostgresSessionStore(repo as unknown as SessionRepository, {
+        cleanupIntervalMs: 50,
+      });
+
+      store.startCleanup();
+      // Calling a second time is a no-op
+      store.startCleanup();
+      store.stop();
+      // Calling a second time is a no-op
+      store.stop();
     });
   });
 

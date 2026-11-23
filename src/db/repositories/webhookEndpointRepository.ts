@@ -164,6 +164,17 @@ export class WebhookEndpointRepository {
     return result.rows[0] ? result.rows[0].cnt : 0;
   }
 
+  async findCompletedDeliveryByEventId(endpointId: string, eventId: string): Promise<WebhookDelivery | null> {
+    const result: QueryResult<WebhookDelivery> = await this.db.query(
+      `SELECT * FROM webhook_deliveries
+       WHERE endpoint_id = $1 AND status = 'completed' AND payload->>'id' = $2
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [endpointId, eventId]
+    );
+    return result.rows[0] ? this.mapDelivery(result.rows[0]) : null;
+  }
+
   private map(row: WebhookEndpoint): WebhookEndpoint {
     return {
       id: row.id,

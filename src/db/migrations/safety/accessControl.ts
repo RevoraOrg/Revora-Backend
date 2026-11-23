@@ -520,8 +520,12 @@ export class MigrationAccessControl {
     }
 
     // Check for existing approval
-    const pendingRequests = await this.approvalRepository.getPendingRequests(securityContext.environment);
-    const approvedRequest = pendingRequests.find(r => r.migrationId === migrationId && r.status === 'approved');
+    const allRequests = typeof (this.approvalRepository as any).getAllRequests === 'function'
+      ? await (this.approvalRepository as any).getAllRequests()
+      : await this.approvalRepository.getPendingRequests(securityContext.environment);
+    const approvedRequest = allRequests.find(
+      (r: MigrationApprovalRequest) => r.migrationId === migrationId && r.status === 'approved' && r.environment === securityContext.environment
+    );
 
     if (approvedRequest) {
       // Check if approval is still valid (not expired)

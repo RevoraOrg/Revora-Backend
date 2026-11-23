@@ -22,7 +22,7 @@ The five logical subsystems and their primary files:
 | **Offerings (catalog)** | `src/services/offeringSyncService.ts`, `src/db/repositories/offeringRepository.ts` | `docs/offering-validation-matrix.md`, `docs/offering-status-transition-guardrails.md` |
 | **Revenue reports** | `src/services/revenueService.ts`, `src/db/repositories/revenueReportRepository.ts` | `docs/revenue-report-ingestion-validation.md` |
 | **Distribution engine** | `src/services/distributionEngine.ts`, `src/services/distributionScheduler.ts`, `src/routes/distributions.ts`, `src/db/repositories/distributionRepository.ts` | `docs/distribution-engine-retry-strategy.md`, `docs/distribution-advisory-lock.md`, `docs/distribution-engine-atomic-transactions.md`, `docs/distribution-scheduler-idempotency.md`, `docs/distribution-engine-safety.md` |
-| **Reconciliation** | `src/services/revenueReconciliationService.ts`, `src/services/reconciliationScheduler.ts`, `src/routes/reconciliationRoutes.ts` | `docs/revenue-reconciliation.md`, `docs/revenue-reconciliation-checks.md`, `docs/stellar-rpc-failure-behavior.md` |
+| **Reconciliation** | `src/services/revenueReconciliationService.ts`, `src/services/reconciliationScheduler.ts`, `src/routes/reconciliationRoutes.ts` | `docs/revenue-reconciliation.md`, `docs/revenue-reconciliation-checks.md`, `docs/stellar-rpc-failure-behavior.md`, `docs/runbooks/payout-reconciliation.md` |
 | **Transactional webhook outbox**| `src/services/outboxDispatcher.ts`, `src/services/webhookService.ts`, `src/db/repositories/outboxRepository.ts` | `docs/transactional-outbox.md`, `docs/webhooks-implementation.md`, `docs/webhook-queue-backpressure.md` |
 
 ```mermaid
@@ -223,6 +223,18 @@ if any scheduled run is imbalanced **or errors**. A subsequent balanced run
 clears the alarm. Overflow offerings (beyond `cardinalityLimit`, default 50)
 share a single `offering_id="overflow"` label to keep Prometheus cardinality
 bounded.
+
+### Payout Drift Alarm (nightly)
+
+On its nightly tick, `ReconciliationScheduler` also emits a **payout drift**
+report that compares the `payouts` table against indexed on-chain Stellar
+payments and publishes the per-offering drift counts (missing, duplicated,
+under-funded) to `MetricsCollector` as `reconciliation_payout_drift_total`. A
+**pager alarm** fires when a non-zero drift count persists for older than 24
+hours, signalling an unreconciled payout that needs operator triage. The
+triage steps, severity rubric, owner, and replay procedure for clearing this
+alarm are documented in the
+[payout reconciliation runbook](../runbooks/payout-reconciliation.md).
 
 ---
 

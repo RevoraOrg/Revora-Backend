@@ -103,6 +103,13 @@ function generatePlaceholder(
 // ── Core redaction engine ────────────────────────────────────────────────────
 
 const BUILTIN_RULES: RedactionRule[] = [
+  // Already-redacted values are left untouched (idempotency).
+  (_key, value) => {
+    if (typeof value === 'string' && /^(?:__.*__|\[REDACTED_.*\])$/.test(value)) {
+      return value;
+    }
+    return undefined;
+  },
   // Email
   (_key, value) => {
     if (typeof value === 'string' && EMAIL_RE.test(value)) {
@@ -110,21 +117,15 @@ const BUILTIN_RULES: RedactionRule[] = [
     }
     return undefined;
   },
-  // Phone
-  (_key, value) => {
-    if (typeof value === 'string' && PHONE_RE.test(value)) {
-      return '__PHONE__';
-    }
-    return undefined;
-  },
-  // SSN
+  // SSN (9 digits, dashes optional) — must precede the generic phone rule,
+  // which also matches digit strings.
   (_key, value) => {
     if (typeof value === 'string' && SSN_RE.test(value)) {
       return '__SSN__';
     }
     return undefined;
   },
-  // SSN last-4
+  // SSN last-4 (key-specific)
   (key, value) => {
     if (typeof value === 'string' && SSN4_RE.test(value) && /ssn|last.?4/i.test(key)) {
       return '__SSN4__';
@@ -135,6 +136,13 @@ const BUILTIN_RULES: RedactionRule[] = [
   (_key, value) => {
     if (typeof value === 'string' && EIN_RE.test(value)) {
       return '__EIN__';
+    }
+    return undefined;
+  },
+  // Phone
+  (_key, value) => {
+    if (typeof value === 'string' && PHONE_RE.test(value)) {
+      return '__PHONE__';
     }
     return undefined;
   },

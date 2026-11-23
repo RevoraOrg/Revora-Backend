@@ -119,7 +119,7 @@ describe('RegisterHandler – weak password → 400 (Property 8)', () => {
   it('returns 400 for passwords that fail service-side strength validation', async () => {
     // In our new design, the handler doesn't check password length; the service does.
     // If the service throws a validation error, the handler forwards it to next().
-    const svc = makeThrowingService(new AppError(ErrorCode.VALIDATION_ERROR, 'Weak password', 400));
+    const svc = makeThrowingService(new AppError(ErrorCode.VALIDATION_ERROR, 400, 'Weak password'));
     const handler = createRegisterHandler(svc);
     const res = makeRes();
     let capturedErr: any = null;

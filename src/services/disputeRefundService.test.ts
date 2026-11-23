@@ -1,23 +1,38 @@
 import { Pool } from 'pg';
 import { DisputeRefundService } from './disputeRefundService';
-import { Errors } from '../lib/errors';
 import { closePool } from '../db/client';
+import { Decimal } from '../lib/decimal';
 
 describe('DisputeRefundService', () => {
   let db: Pool;
+  let client: { query: jest.Mock; release: jest.Mock };
   let service: DisputeRefundService;
-  let mockClient: any;
+  const payouts = [
+    { investor_id: 'investor-1', amount: '1.0000000000' },
+    { investor_id: 'investor-2', amount: '1.0000000000' },
+    { investor_id: 'investor-3', amount: '1.0000000000' },
+  ];
 
-  beforeAll(async () => {
-    mockClient = {
-      query: jest.fn(),
+  beforeEach(() => {
+    client = {
+      query: jest.fn(async (query: string) => {
+        if (query.includes('SELECT total_amount')) return { rows: [{ total_amount: '3.0000000000' }] };
+        if (query.includes('SELECT COALESCE(SUM(amount)')) return { rows: [{ total: '0.0000' }] };
+        if (query.includes('FROM distribution_payouts')) return { rows: payouts };
+        if (query.includes('INSERT INTO dispute_refunds')) {
+          return { rows: [{ id: 'refund-1', dispute_id: 'dispute-1', amount: '1.0000' }] };
+        }
+        if (query.includes('INSERT INTO dispute_ledger_events')) {
+          return { rows: [{ id: 'event-1' }, { id: 'event-2' }, { id: 'event-3' }] };
+        }
+        return { rows: [] };
+      }),
       release: jest.fn(),
     };
     db = {
       query: jest.fn(),
-      connect: jest.fn().mockResolvedValue(mockClient),
+      connect: jest.fn().mockResolvedValue(client),
     } as unknown as Pool;
-    
     service = new DisputeRefundService(db);
   });
 
@@ -29,56 +44,68 @@ describe('DisputeRefundService', () => {
     await closePool();
   });
 
-  it('rejects refund if amount is not positive', async () => {
-    await expect(service.processPartialRefund({
-      disputeId: 'dispute-1',
-      amount: '-50.00',
-      originalDisbursement: '100.00'
-    })).rejects.toThrow('Refund amount must be a positive number');
+  const params = {
+    disputeId: 'dispute-1',
+    distributionId: 'distribution-1',
+    amount: '1.0000',
+  };
+
+  it('rejects non-positive and over-precision refund amounts', async () => {
+    await expect(service.processPartialRefund({ ...params, amount: '0' }))
+      .rejects.toThrow('Refund amount must be a positive number');
+    await expect(service.processPartialRefund({ ...params, amount: '0.00001' }))
+      .rejects.toThrow('Refund amount must not exceed 4 decimal places');
+    expect(db.connect).not.toHaveBeenCalled();
   });
 
-  it('enforces the sum invariant and rejects if refund exceeds original disbursement', async () => {
-    // Mock sumRefundsForDispute to return 60
-    (db.query as jest.Mock).mockResolvedValueOnce({ rows: [{ total: '60.00' }] });
-
-    const promise = service.processPartialRefund({
-      disputeId: 'dispute-1',
-      amount: '50.00', // 60 + 50 = 110 > 100
-      originalDisbursement: '100.00'
+  it('rejects refunds exceeding the server-side distribution total', async () => {
+    client.query.mockImplementation(async (query: string) => {
+      if (query.includes('SELECT total_amount')) return { rows: [{ total_amount: '100.0000000000' }] };
+      if (query.includes('SELECT COALESCE(SUM(amount)')) return { rows: [{ total: '90.0000' }] };
+      return { rows: [] };
     });
 
-    await expect(promise).rejects.toThrow(/Sum of partial refunds \\(110\\) cannot exceed original disbursement \\(100\\)/);
+    await expect(service.processPartialRefund({ ...params, amount: '10.0001' }))
+      .rejects.toThrow(/cannot exceed original disbursement/);
+
+    expect(client.query).toHaveBeenCalledWith('SELECT pg_advisory_xact_lock(hashtext($1))', ['dispute-1']);
+    expect(client.query.mock.calls.some(([query]) => String(query).includes('INSERT INTO dispute_refunds'))).toBe(false);
+    expect(client.query).toHaveBeenCalledWith('ROLLBACK');
   });
 
-  it('processes the refund and performs proportional ledger reversal', async () => {
-    (db.query as jest.Mock)
-      .mockResolvedValueOnce({ rows: [{ total: '40.00' }] }) // sumRefundsForDispute
-      .mockResolvedValueOnce({ rows: [ // distributionRepo.getPayoutsForRun
-        { investor_id: 'inv-1', amount: '50.00' },
-        { investor_id: 'inv-2', amount: '50.00' }
-      ]});
-      
-    // Mock for transaction start
-    mockClient.query
-      .mockResolvedValueOnce({}) // BEGIN
-      .mockResolvedValueOnce({ rows: [{ id: 'refund-1', amount: '60.00' }] }) // INSERT refund
-      .mockResolvedValueOnce({ rows: [{ id: 'reversal-1' }, { id: 'reversal-2' }] }) // INSERT ledger events
-      .mockResolvedValueOnce({}); // COMMIT
-
-    const refund = await service.processPartialRefund({
-      disputeId: 'dispute-1',
-      amount: '60.00',
-      originalDisbursement: '100.00',
-      distributionId: 'dist-1'
-    });
+  it('serializes cap reads inside the transaction and allocates exact reversals with largest remainders', async () => {
+    const refund = await service.processPartialRefund({ ...params, amount: '1.0000' });
 
     expect(refund.id).toBe('refund-1');
-    expect(mockClient.query).toHaveBeenCalledTimes(4); // BEGIN, INSERT refund, INSERT events, COMMIT
-    
-    // Check the batch insert values
-    const insertEventsCall = mockClient.query.mock.calls[2];
-    expect(insertEventsCall[0]).toContain('INSERT INTO dispute_ledger_events');
-    // Inv-1 originally got 50 out of 100 (50%). Refund is 60. So reversal should be -30.
-    expect(insertEventsCall[1]).toContain('-30');
+    const lockIndex = client.query.mock.calls.findIndex(([query]) =>
+      String(query).includes('pg_advisory_xact_lock'));
+    const totalIndex = client.query.mock.calls.findIndex(([query]) =>
+      String(query).includes('SELECT total_amount'));
+    const sumIndex = client.query.mock.calls.findIndex(([query]) =>
+      String(query).includes('SELECT COALESCE(SUM(amount)'));
+    expect(lockIndex).toBeGreaterThan(0);
+    expect(totalIndex).toBeGreaterThan(lockIndex);
+    expect(sumIndex).toBeGreaterThan(totalIndex);
+
+    const eventInsert = client.query.mock.calls.find(([query]) =>
+      String(query).includes('INSERT INTO dispute_ledger_events'));
+    const eventValues = eventInsert[1] as string[];
+    const reversals = eventValues.filter((_, index) => index % 4 === 2);
+    expect(reversals.filter((value) => value === '-0.3334')).toHaveLength(1);
+    expect(reversals.filter((value) => value === '-0.3333')).toHaveLength(2);
+    const exactTotal = reversals.reduce((sum, amount) => sum.add(new Decimal(amount)), new Decimal('0'));
+    expect(exactTotal.toString()).toBe('-1.0000');
+  });
+
+  it('rolls back when there are no payouts to reverse', async () => {
+    client.query.mockImplementation(async (query: string) => {
+      if (query.includes('SELECT total_amount')) return { rows: [{ total_amount: '3.0000000000' }] };
+      if (query.includes('SELECT COALESCE(SUM(amount)')) return { rows: [{ total: '0' }] };
+      if (query.includes('FROM distribution_payouts')) return { rows: [] };
+      return { rows: [] };
+    });
+
+    await expect(service.processPartialRefund(params)).rejects.toThrow('Distribution has no payouts to reverse');
+    expect(client.query).toHaveBeenCalledWith('ROLLBACK');
   });
 });

@@ -1,5 +1,5 @@
 import cors from "cors";
-import { env } from "../config/env";
+import { env, readEnvBoolean } from "../config/env";
 import { globalLogger } from "../lib/logger";
 
 /**
@@ -20,11 +20,14 @@ import { globalLogger } from "../lib/logger";
  *
  * ENV:
  * ALLOWED_ORIGINS = "https://app.example.com,https://admin.example.com"
- * CORS_ALLOW_NO_ORIGIN = "true" (optional, defaults to false)
+ * CORS_ALLOW_NO_ORIGIN = "true" (optional, defaults to false; accepts
+ *   true/false/1/0/yes/no/on/off — anything else throws at startup)
  */
 export function createCorsMiddleware() {
   const allowedOrigins: string[] = env.ALLOWED_ORIGINS_ARRAY;
-  const allowNoOrigin = process.env.CORS_ALLOW_NO_ORIGIN === "true";
+  // Parsed via the shared envBoolean value set (issue #1305): a bare
+  // `=== "true"` check silently treated "1"/"yes"/"on" as disabled.
+  const allowNoOrigin = readEnvBoolean("CORS_ALLOW_NO_ORIGIN", false);
 
   // Security validation: require explicit origins in production
   if (process.env.NODE_ENV === "production") {

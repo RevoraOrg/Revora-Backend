@@ -408,4 +408,190 @@ describe('PayoutDriftDetector', () => {
       detector.stop();
     });
   });
+
+  describe('decimal math and tolerance (issue #1302)', () => {
+    it('reports a sub-cent underfunded payout as underfunded', async () => {
+      // 0.005 below expected, tolerance 0.0000001 (one stroop) → underfunded.
+      // On master this used float + 0.01 threshold and missed it.
+      const payout = makePayout({
+        id: 'payout-001',
+        investor_id: 'inv-001',
+        amount: '100.005',
+        tx_hash: 'real-hash',
+      });
+
+      mockVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        actualAmount: '100.000',
+        timestamp: new Date().toISOString(),
+        errors: ['Transaction amount mismatch'],
+      });
+
+      mockRepo.getPayoutsByOffering.mockResolvedValue([
+        { offering_id: 'offering-001', payouts: [payout] },
+      ]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 1,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+
+      const result = await detector.runDriftDetection();
+
+      expect(result.totalUnderfunded).toBe(1);
+      expect(result.totalOverfunded).toBe(0);
+      const detail = mockRepo.saveReport.mock.calls[0][0].details[0];
+      expect(detail.drift_type).toBe('underfunded');
+      expect(detail.discrepancy).toBe('0.005');
+    });
+
+    it('reports discrepancy at full precision for sub-cent drift', async () => {
+      const payout = makePayout({
+        id: 'payout-001',
+        investor_id: 'inv-001',
+        amount: '100.0012345678',
+        tx_hash: 'real-hash',
+      });
+
+      mockVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        actualAmount: '100.0012345670',
+        timestamp: new Date().toISOString(),
+        errors: ['Transaction amount mismatch'],
+      });
+
+      mockRepo.getPayoutsByOffering.mockResolvedValue([
+        { offering_id: 'offering-001', payouts: [payout] },
+      ]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 0,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+
+      await detector.runDriftDetection();
+
+      const detail = mockRepo.saveReport.mock.calls[0][0].details[0];
+      expect(detail.discrepancy).toBe('0.0000000008');
+    });
+
+    it('sums totalDriftAmount exactly for 10-decimal inputs', async () => {
+      const payouts = [
+        makePayout({ id: 'p1', investor_id: 'inv-1', amount: '0.0000000001', tx_hash: 'h1' }),
+        makePayout({ id: 'p2', investor_id: 'inv-2', amount: '0.0000000002', tx_hash: 'h2' }),
+        makePayout({ id: 'p3', investor_id: 'inv-3', amount: '0.0000000003', tx_hash: 'h3' }),
+      ];
+
+      payouts.forEach(() => {
+        mockVerifier.verifyTransaction.mockResolvedValueOnce({
+          isValid: false,
+          actualAmount: '0',
+          timestamp: new Date().toISOString(),
+          errors: ['mismatch'],
+        });
+      });
+
+      mockRepo.getPayoutsByOffering.mockResolvedValue([
+        { offering_id: 'offering-001', payouts },
+      ]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 3,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+
+      const result = await detector.runDriftDetection();
+
+      expect(result.totalUnderfunded).toBe(3);
+      // 0.0000000001 + 0.0000000002 + 0.0000000003 = 0.0000000006 exactly
+      expect(result.totalDriftAmount).toBe('0.0000000006');
+    });
+
+    it('does not classify drift within tolerance as under/overfunded', async () => {
+      const payout = makePayout({
+        id: 'payout-001',
+        investor_id: 'inv-001',
+        amount: '100.00000005',
+        tx_hash: 'real-hash',
+      });
+
+      // diff 0.00000005 < tolerance 0.0000001 → within tolerance, ignored
+      mockVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        actualAmount: '100.00000000',
+        timestamp: new Date().toISOString(),
+        errors: ['Transaction amount mismatch'],
+      });
+
+      mockRepo.getPayoutsByOffering.mockResolvedValue([
+        { offering_id: 'offering-001', payouts: [payout] },
+      ]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 0,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+
+      const result = await detector.runDriftDetection();
+
+      expect(result.totalUnderfunded).toBe(0);
+      expect(result.totalOverfunded).toBe(0);
+      expect(mockRepo.saveReport).not.toHaveBeenCalled();
+    });
+
+    it('uses a custom tolerance when provided', async () => {
+      const detectorWithTolerance = new PayoutDriftDetector(
+        {} as any,
+        mockRepo,
+        metrics,
+        mockVerifier,
+        { intervalMs: 999999, driftThresholdHours: 24, toleranceAmount: '1.0' }
+      );
+
+      const payout = makePayout({
+        id: 'payout-001',
+        investor_id: 'inv-001',
+        amount: '100.00',
+        tx_hash: 'real-hash',
+      });
+
+      // diff 0.5 < custom tolerance 1.0 → ignored
+      mockVerifier.verifyTransaction.mockResolvedValue({
+        isValid: false,
+        actualAmount: '99.5',
+        timestamp: new Date().toISOString(),
+        errors: ['Transaction amount mismatch'],
+      });
+
+      mockRepo.getPayoutsByOffering.mockResolvedValue([
+        { offering_id: 'offering-001', payouts: [payout] },
+      ]);
+      mockRepo.getAggregatedDriftSummary.mockResolvedValue({
+        total_missing: 0,
+        total_underfunded: 0,
+        total_overfunded: 0,
+        total_duplicate_tx: 0,
+        total_drift_amount: '0',
+        oldest_drift_hours: 0,
+      });
+
+      const result = await detectorWithTolerance.runDriftDetection();
+      detectorWithTolerance.stop();
+
+      expect(result.totalUnderfunded).toBe(0);
+      expect(result.totalOverfunded).toBe(0);
+    });
+  });
 });

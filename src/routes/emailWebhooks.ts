@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { verifyWebhook, extractSignatureFromHeaders } from '../lib/webhookSignature';
+import { verifyWebhookPayload } from '../lib/webhookSignature';
 import { EmailDeliverabilityService } from '../services/emailDeliverabilityService';
 import { Logger } from '../lib/logger';
 import { Errors } from '../lib/errors';
@@ -59,22 +59,114 @@ function createSendgridAuthMiddleware(secret?: string) {
       const headers = req.headers as Record<string, string | string[] | undefined>;
 
       // Try to extract signature
-      const signature = extractSignatureFromHeaders(headers);
+      const signature =
+        headers['x-twilio-email-event-webhook-signature'] as string | undefined;
       if (!signature) {
         next(Errors.unauthorized('Missing SendGrid webhook signature'));
         return;
       }
 
-      const result = verifyWebhook(
-        { secret, headerName: 'x-twilio-email-event-webhook-signature', requireTimestamp: false },
-        serialized,
-        headers,
-      );
-
-      if (!result.valid) {
+      const isValid = verifyWebhookPayload(secret, serialized, signature);
+      if (!isValid) {
         next(Errors.unauthorized('Invalid SendGrid webhook signature'));
         return;
       }
+    }
+
+    next();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SES SNS notification signature verification middleware
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a middleware that verifies SES/SNS webhook signatures using a
+ * shared HMAC secret.
+ *
+ * When a `sesSnsSecret` is provided, every incoming POST to the SES endpoint
+ * must supply a valid HMAC-SHA256 signature in the `x-revora-signature`
+ * header so that only authorised senders (e.g. an API gateway or custom SNS
+ * delivery agent that adds the header) can deliver events.
+ *
+ * If no secret is configured the middleware is a no-op, which is intentional
+ * for setups that rely solely on network-level controls (e.g. VPC endpoints).
+ */
+function createSesAuthMiddleware(secret?: string) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    if (!secret) {
+      // No secret configured — skip HMAC check (allow network-level controls)
+      next();
+      return;
+    }
+
+    const rawBody = (req as unknown as { rawBody?: string }).rawBody;
+    const serialized =
+      rawBody ??
+      (typeof req.body === 'object' ? JSON.stringify(req.body) : String(req.body ?? ''));
+
+    const headers = req.headers as Record<string, string | string[] | undefined>;
+    const signature = headers['x-revora-signature'] as string | undefined;
+
+    if (!signature) {
+      next(Errors.unauthorized('Missing SES webhook signature'));
+      return;
+    }
+
+    const isValid = verifyWebhookPayload(secret, serialized, signature);
+    if (!isValid) {
+      next(Errors.unauthorized('Invalid SES webhook signature'));
+      return;
+    }
+
+    next();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// SMTP DSN webhook signature verification middleware
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a middleware that verifies SMTP DSN webhook signatures using a
+ * shared HMAC secret.
+ *
+ * When `smtpWebhookSecret` is provided the caller must include a valid
+ * HMAC-SHA256 signature in the `x-revora-signature` header.  If no secret
+ * is configured the middleware is a no-op (useful for closed internal
+ * networks where network-level access controls are sufficient).
+ *
+ * If no secret is configured in production a warning is logged, matching
+ * the security posture of the SendGrid middleware.
+ */
+function createSmtpAuthMiddleware(secret?: string) {
+  return (req: Request, _res: Response, next: NextFunction): void => {
+    if (!secret) {
+      if (process.env.NODE_ENV === 'production') {
+        console.warn('[emailWebhooks] SMTP webhook secret not configured in production — skipping verification');
+      }
+      next();
+      return;
+    }
+
+    const rawBody = (req as unknown as { rawBody?: string }).rawBody;
+    const serialized =
+      rawBody ??
+      (typeof req.body === 'object' ? JSON.stringify(req.body) : String(req.body ?? ''));
+
+    const headers = req.headers as Record<string, string | string[] | undefined>;
+    const signature = headers['x-revora-signature'] as string | undefined;
+
+    if (!signature) {
+      next(Errors.unauthorized('Missing SMTP webhook signature'));
+      return;
+    }
+
+    const isValid = verifyWebhookPayload(secret, serialized, signature);
+    if (!isValid) {
+      next(Errors.unauthorized('Invalid SMTP webhook signature'));
+      return;
     }
 
     next();
@@ -89,7 +181,7 @@ export function captureRawBody(req: Request, _res: Response, next: NextFunction)
   let data = '';
   req.on('data', (chunk: string) => { data += chunk; });
   req.on('end', () => {
-    (req as any).rawBody = data;
+    (req as unknown as { rawBody: string }).rawBody = data;
     next();
   });
 }
@@ -363,13 +455,20 @@ function parseSmtpDsn(
  * Creates a router for email bounce webhook ingestion.
  *
  * POST /api/v1/email/webhooks/sendgrid  — SendGrid event webhooks
- * POST /api/v1/email/webhooks/ses        — SES bounce/complaint notifications
+ * POST /api/v1/email/webhooks/ses        — SES bounce/complaint/subscription notifications
  * POST /api/v1/email/webhooks/smtp       — Generic SMTP DSN bounces
  *
  * Security:
- * - SendGrid and SMTP endpoints are authenticated via HMAC signature verification.
- * - SES endpoint is intended to be fronted by an SNS subscription verification
- *   handler (not implemented here — AWS recommends manual subscription confirmation).
+ * - SendGrid endpoint is authenticated via HMAC-SHA256 signature verification
+ *   using `authConfig.sendgridWebhookSecret`.
+ * - SES endpoint is authenticated via HMAC-SHA256 signature verification
+ *   using `authConfig.sesSnsSecret` when provided.  Callers that rely on
+ *   network-level controls (e.g. AWS VPC endpoints) may omit the secret.
+ * - SMTP endpoint is authenticated via HMAC-SHA256 signature verification
+ *   using `authConfig.smtpWebhookSecret` when provided.
+ * - SES endpoint handles SNS SubscriptionConfirmation messages: the
+ *   SubscribeURL is logged for manual confirmation by an operator, and a
+ *   200 response is returned so AWS does not retry the delivery.
  * - All endpoints validate input shape before processing.
  */
 export function createEmailWebhooksRouter(
@@ -418,9 +517,68 @@ export function createEmailWebhooksRouter(
   // -----------------------------------------------------------------------
   router.post(
     '/ses',
+    createSesAuthMiddleware(authConfig.sesSnsSecret),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
         const body = req.body as Record<string, unknown>;
+
+        // ----------------------------------------------------------------
+        // Handle SNS SubscriptionConfirmation
+        //
+        // AWS SNS sends a SubscriptionConfirmation POST when a topic
+        // subscription is first created.  The endpoint must acknowledge
+        // this request (HTTP 200) so that AWS knows the subscription
+        // endpoint is reachable.  The SubscribeURL contained in the body
+        // must be visited by an operator to activate the subscription;
+        // automatic confirmation is intentionally not performed here to
+        // prevent subscription hijacking attacks.
+        // ----------------------------------------------------------------
+        const snsMessageType =
+          (req.headers['x-amz-sns-message-type'] as string | undefined) ??
+          (typeof body.Type === 'string' ? body.Type : undefined);
+
+        if (snsMessageType === 'SubscriptionConfirmation') {
+          const subscribeUrl =
+            typeof body.SubscribeURL === 'string' ? body.SubscribeURL : undefined;
+          const topicArn =
+            typeof body.TopicArn === 'string' ? body.TopicArn : undefined;
+          const token =
+            typeof body.Token === 'string' ? body.Token : undefined;
+
+          log.info('SNS SubscriptionConfirmation received — manual confirmation required', {
+            topicArn,
+            // Log the SubscribeURL so an operator can activate the subscription.
+            // This value is not a secret but intentionally redacted to a boolean
+            // presence indicator in metrics/structured logs to avoid URL logging.
+            subscribeUrlPresent: Boolean(subscribeUrl),
+            tokenPresent: Boolean(token),
+          });
+
+          // Return 200 so AWS does not retry the delivery.
+          res.status(200).json({
+            received: true,
+            type: 'SubscriptionConfirmation',
+            message:
+              'SubscriptionConfirmation received. Manual confirmation is required: an operator must visit the SubscribeURL to activate the subscription.',
+          });
+          return;
+        }
+
+        // ----------------------------------------------------------------
+        // Handle UnsubscribeConfirmation (AWS sends this when a subscription
+        // is deleted; acknowledge with 200 and log for auditing purposes)
+        // ----------------------------------------------------------------
+        if (snsMessageType === 'UnsubscribeConfirmation') {
+          log.info('SNS UnsubscribeConfirmation received', {
+            topicArn: typeof body.TopicArn === 'string' ? body.TopicArn : undefined,
+          });
+          res.status(200).json({ received: true, type: 'UnsubscribeConfirmation' });
+          return;
+        }
+
+        // ----------------------------------------------------------------
+        // Normal notification handling (Bounce / Complaint)
+        // ----------------------------------------------------------------
         const parsed = parseSesBounceNotification(body, deliverabilityService);
 
         let processed = 0;
@@ -445,6 +603,7 @@ export function createEmailWebhooksRouter(
   // -----------------------------------------------------------------------
   router.post(
     '/smtp',
+    createSmtpAuthMiddleware(authConfig.smtpWebhookSecret),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
         const body = req.body as Record<string, unknown>;
@@ -468,4 +627,3 @@ export function createEmailWebhooksRouter(
 
   return router;
 }
-

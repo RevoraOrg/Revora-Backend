@@ -1,3 +1,4 @@
+import { AppError, ErrorCode } from '../../lib/errors';
 import { createRegisterHandler } from './registerHandler';
 import { RegisterService, DuplicateEmailError } from './registerService';
 import { RegisteredUser } from './types';
@@ -52,16 +53,24 @@ describe('RegisterHandler', () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ password: 'password1' }), res, (e: any) => { throw e; });
-    expect(res._get().statusCode).toBe(400);
+    let captured: any = null;
+    await handler(makeReq({ password: 'password1' }), res, (e: any) => { captured = e; });
+    // Validation errors are forwarded to next(err) and translated into HTTP
+    // responses by the errorHandler middleware.
+    expect(captured).toBeInstanceOf(AppError);
+    expect(captured.statusCode).toBe(400);
+    expect(captured.code).toBe(ErrorCode.BAD_REQUEST);
   });
 
   it('rejects invalid email format with 400', async () => {
     const svc = new MockRegisterService();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'notanemail', password: 'password1' }), res, (e: any) => { throw e; });
-    expect(res._get().statusCode).toBe(400);
+    let captured: any = null;
+    await handler(makeReq({ email: 'notanemail', password: 'password1' }), res, (e: any) => { captured = e; });
+    expect(captured).toBeInstanceOf(AppError);
+    expect(captured.statusCode).toBe(400);
+    expect(captured.code).toBe(ErrorCode.BAD_REQUEST);
   });
 
   it('returns 409 when email is already taken', async () => {
@@ -69,8 +78,11 @@ describe('RegisterHandler', () => {
     svc.shouldThrow = new DuplicateEmailError();
     const handler = createRegisterHandler(svc as unknown as RegisterService);
     const res = makeRes();
-    await handler(makeReq({ email: 'taken@example.com', password: 'password1' }), res, (e: any) => { throw e; });
-    expect(res._get().statusCode).toBe(409);
+    let captured: any = null;
+    await handler(makeReq({ email: 'taken@example.com', password: 'password1' }), res, (e: any) => { captured = e; });
+    expect(captured).toBeInstanceOf(AppError);
+    expect(captured.statusCode).toBe(409);
+    expect(captured.code).toBe(ErrorCode.CONFLICT);
   });
 
   it('forwards unexpected errors to next()', async () => {

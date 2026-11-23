@@ -8,10 +8,63 @@
 import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
+import { parsePositiveDecimal } from '../lib/decimal';
 import { globalLogger as logger } from '../lib/logger';
 import { globalMetrics } from '../lib/metrics';
 import { DistributionStateManager } from '../services/distributionScheduler';
+import { ScheduledDistributionRepository } from '../db/repositories/scheduledDistributionRepository';
+import { AccountingLedgerService, DistributionRunLedger } from '../services/accountingLedgerService';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
+
+/**
+ * Convenience factory for HTTP 422 Unprocessable Entity.
+ * Used when the request is well-formed but semantically invalid (e.g. no
+ * matching revenue report exists for the provided period).
+ */
+const unprocessableEntity = (message: string) =>
+  createError(ErrorCode.VALIDATION_ERROR, message, 422);
+
+/**
+ * UUID v4 regex (RFC 4122).
+ * Used to validate period.id before passing it to the distribution engine,
+ * since distributions.period_id is a UUID NOT NULL column.
+ */
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Returns true iff the string is a well-formed RFC 4122 UUID. */
+export function isUUID(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/**
+ * Minimal repository surface the distributions router depends on for
+ * period/revenue-report resolution. Defined locally so the router stays
+ * decoupled from the full repository class and test fakes remain simple.
+ */
+export interface RevenueReportRepo {
+  /**
+   * Find any revenue report that covers [periodStart, periodEnd) for the
+   * given offering. Used to resolve a missing period.id from the caller.
+   */
+  findOverlappingReport(
+    offeringId: string,
+    periodStart: Date,
+    periodEnd: Date,
+  ): Promise<{ id: string } | null>;
+}
+
+/**
+ * Minimal repository surface the distributions router depends on for the
+ * double-entry accounting export. Defined locally to keep the router
+ * decoupled from the full repository class and preserve test compatibility.
+ */
+export interface DistributionAccountRepo {
+  listForAccountingExport(
+    offeringId: string,
+    periodId?: string,
+  ): Promise<DistributionRunLedger[]>;
+}
 
 export interface OfferingRepo {
   getById: (id: string) => Promise<Offering | null>;
@@ -28,13 +81,39 @@ export interface ScheduleConfig {
   timezone: string;
 }
 
+type ScheduledDistributionRepo = Pick<
+  ScheduledDistributionRepository,
+  'create' | 'findByOffering' | 'findAll' | 'markCancelled'
+>;
+type DistributionState = Pick<DistributionStateManager, 'pause' | 'resume'>;
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Parse an amount field from the request body as a plain positive decimal
+ * string. Rejects exponent ("1e3"), hex ("0x10"), signed ("-5"), whitespace
+ * (" 12 "), non-string and non-positive forms with HTTP 400 — `Number()`
+ * would have silently coerced all of them and dropped precision above ~15
+ * significant digits.
+ */
+function parseAmountField(raw: unknown, field: string): string {
+  try {
+    return parsePositiveDecimal(raw, field);
+  } catch (err) {
+    throw Errors.badRequest(
+      err instanceof Error && err.message ? err.message : `Invalid ${field}`,
+    );
+  }
+}
 
 export function createDistributionHandlers(
   distributionEngine: any,
   offeringRepo?: OfferingRepo,
-  distributionStateManager?: DistributionStateManager,
+  distributionStateManager?: DistributionState,
   auditRepository?: SecurityAuditRepository,
+  distributionAccountRepo?: DistributionAccountRepo,
+  accountingLedger?: AccountingLedgerService,
+  scheduledDistributionRepo?: ScheduledDistributionRepo,
 ) {
   async function triggerDistribution(req: Request, res: Response, next: NextFunction) {
     const requestId = (req as any).id;
@@ -57,10 +136,7 @@ export function createDistributionHandlers(
       });
 
       const revenueRaw = req.body?.revenue_amount ?? req.body?.revenueAmount;
-      const revenueAmount = revenueRaw !== undefined ? Number(revenueRaw) : NaN;
-      if (Number.isNaN(revenueAmount) || revenueAmount <= 0) {
-        throw Errors.badRequest('Invalid revenue amount');
-      }
+      const revenueAmount = parseAmountField(revenueRaw, 'revenue_amount');
 
       const startRaw = req.body?.period?.start ?? req.body?.start;
       const endRaw = req.body?.period?.end ?? req.body?.end;
@@ -79,7 +155,43 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      const period = { start: startDate, end: endDate };
+      // period.id must be a valid UUID to satisfy the distributions.period_id UUID NOT NULL column.
+      //
+      // - If the caller provides a period.id, validate it is a UUID; reject with 400 if not.
+      // - If the caller omits period.id, resolve it from the revenue report that covers the
+      //   given [start, end) window.  Reject with 422 if no matching report is found.
+      //   A synthetic timestamp-derived key is NOT accepted because it would fail the DB
+      //   UUID constraint (see #1259).
+      const periodIdRaw = req.body?.period?.id ?? req.body?.periodId;
+      let periodId: string;
+
+      if (periodIdRaw !== undefined && periodIdRaw !== null && String(periodIdRaw).trim().length > 0) {
+        const candidate = String(periodIdRaw).trim();
+        if (!isUUID(candidate)) {
+          throw Errors.badRequest('period.id must be a valid UUID');
+        }
+        periodId = candidate;
+      } else {
+        // No period.id provided — look up the matching revenue report.
+        if (!revenueReportRepo) {
+          throw unprocessableEntity(
+            'period.id is required (no revenue report repository configured)',
+          );
+        }
+        const report = await revenueReportRepo.findOverlappingReport(
+          offeringId,
+          startDate,
+          endDate,
+        );
+        if (!report) {
+          throw unprocessableEntity(
+            'No revenue report found for the given offering and period; provide an explicit period.id',
+          );
+        }
+        periodId = report.id;
+      }
+
+      const period = { id: periodId, start: startDate, end: endDate };
 
       if (user.role !== 'admin') {
         if (user.role !== 'startup') {
@@ -142,10 +254,7 @@ export function createDistributionHandlers(
       });
 
       const revenueRaw = req.body?.revenue_amount ?? req.body?.revenueAmount;
-      const revenueAmount = revenueRaw !== undefined ? Number(revenueRaw) : NaN;
-      if (Number.isNaN(revenueAmount) || revenueAmount <= 0) {
-        throw Errors.badRequest('Invalid revenue amount');
-      }
+      const revenueAmount = parseAmountField(revenueRaw, 'revenue_amount');
 
       const startRaw = req.body?.period?.start ?? req.body?.start;
       const endRaw = req.body?.period?.end ?? req.body?.end;
@@ -164,8 +273,41 @@ export function createDistributionHandlers(
         throw Errors.badRequest('End date must be after start date');
       }
       
-      // Include period.id if provided in request, generate a synthetic one for preview if not
-      const periodId = req.body?.period?.id ?? `${startRaw}:${endRaw}`;
+      // period.id must be a valid UUID (same constraint as trigger):
+      // the engine passes it through to previewRun which surfaces it in the
+      // response — and if the same period is later actually distributed the
+      // UUID must match the DB row.
+      //
+      // - Caller-provided id: validate as UUID, reject 400 if not.
+      // - Omitted id: resolve via revenue report repo, reject 422 if not found.
+      const periodIdRawPreview = req.body?.period?.id ?? req.body?.periodId;
+      let periodId: string;
+
+      if (periodIdRawPreview !== undefined && periodIdRawPreview !== null && String(periodIdRawPreview).trim().length > 0) {
+        const candidate = String(periodIdRawPreview).trim();
+        if (!isUUID(candidate)) {
+          throw Errors.badRequest('period.id must be a valid UUID');
+        }
+        periodId = candidate;
+      } else {
+        // No period.id provided — resolve from revenue report.
+        if (!revenueReportRepo) {
+          throw unprocessableEntity(
+            'period.id is required (no revenue report repository configured)',
+          );
+        }
+        const report = await revenueReportRepo.findOverlappingReport(
+          offeringId,
+          startDate,
+          endDate,
+        );
+        if (!report) {
+          throw unprocessableEntity(
+            'No revenue report found for the given offering and period; provide an explicit period.id',
+          );
+        }
+        periodId = report.id;
+      }
       const period = { id: periodId, start: startDate, end: endDate };
 
       // Authorization: same level as real distribution (admin or startup issuer of offering)
@@ -392,15 +534,319 @@ export function createDistributionHandlers(
     }
   }
 
-  return { triggerDistribution, previewDistribution, pauseDistribution, resumeDistribution };
+  /**
+   * GET /offerings/:id/ledger/export
+   *
+   * Returns a stable, deterministic double-entry ledger of distributions and
+   * payouts for the offering, together with a trailing checksum and export-id
+   * for downstream accounting (e.g. NetSuite) and replay detection.
+   *
+   * Authorization is identical to distribution execution: an admin may export
+   * any offering; a startup may only export an offering they issued.
+   *
+   * @dev Backed by DistributionAccountRepo.listForAccountingExport via the
+   *      AccountingLedgerService. When the feature is not wired (no repo or
+   *      ledger service provided) the handler returns 404 to preserve
+   *      backward compatibility for existing deployers.
+   */
+  async function exportDistributionLedger(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      if (!user || !user.id) {
+        throw Errors.unauthorized();
+      }
+
+      const offeringId = String(req.params.id || '');
+      if (!offeringId) {
+        throw Errors.badRequest('Missing offering id');
+      }
+
+      if (!distributionAccountRepo || !accountingLedger) {
+        throw Errors.notFound('Accounting export is not available');
+      }
+
+      const periodId = req.query.period_id ? String(req.query.period_id) : undefined;
+      if (periodId !== undefined && periodId.trim().length === 0) {
+        throw Errors.badRequest('period_id cannot be empty');
+      }
+
+      logger.info('Requesting distribution ledger export', {
+        offeringId,
+        userId: user.id,
+        role: user.role,
+        periodId,
+        requestId,
+      });
+
+      // Authorization: same level as real distribution.
+      if (user.role !== 'admin') {
+        if (user.role !== 'startup') {
+          throw Errors.forbidden('Forbidden: startup role required');
+        }
+        if (!offeringRepo || typeof offeringRepo.getById !== 'function') {
+          throw Errors.forbidden('Forbidden: cannot verify issuer');
+        }
+        const offering = await offeringRepo.getById(offeringId);
+        if (!offering) {
+          throw Errors.notFound('Offering not found');
+        }
+        if (offering.issuer_id !== user.id) {
+          throw Errors.forbidden();
+        }
+      }
+
+      const runs = await distributionAccountRepo.listForAccountingExport(
+        offeringId,
+        periodId,
+      );
+      const ledger = accountingLedger.buildExport(
+        accountingLedger.buildDistributionLedgerLines(runs),
+      );
+
+      logger.info('Distribution ledger export completed', {
+        offeringId,
+        exportId: ledger.export_id,
+        lineCount: ledger.totals.line_count,
+        requestId,
+      });
+
+      return res.status(200).json(ledger);
+    } catch (err) {
+      logger.error('Distribution ledger export failed', {
+        offeringId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  // ─── Deferred distribution scheduling ────────────────────────────────────────
+
+  function requireScheduleRepo(): ScheduledDistributionRepo {
+    if (!scheduledDistributionRepo) {
+      throw Errors.internal('Scheduled distribution repository not available');
+    }
+    return scheduledDistributionRepo;
+  }
+
+  function requireScheduleAdmin(user: { id?: string; role?: string }): void {
+    if (!user || !user.id) {
+      throw Errors.unauthorized();
+    }
+    if (user.role !== 'admin') {
+      throw Errors.forbidden('Forbidden: admin role required');
+    }
+  }
+
+  /**
+   * POST /distributions/schedule
+   * Enqueues a deferred distribution run for a future settlement window.
+   * Admin-only. Duplicate (offering_id, period_id) enqueue returns 409.
+   */
+  async function scheduleDistribution(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      requireScheduleAdmin(user);
+      const repo = requireScheduleRepo();
+
+      const offeringId = String(req.body?.offering_id ?? '');
+      const periodId = String(req.body?.period_id ?? '');
+      if (!offeringId) {
+        throw Errors.badRequest('offering_id is required');
+      }
+      if (!periodId) {
+        throw Errors.badRequest('period_id is required');
+      }
+
+      const runAtRaw = req.body?.run_at;
+      const runAt = new Date(runAtRaw);
+      if (!runAtRaw || isNaN(runAt.getTime())) {
+        throw Errors.badRequest('run_at must be a valid date');
+      }
+
+      const totalRaw = req.body?.total_amount;
+      const totalAmount = parseAmountField(totalRaw, 'total_amount');
+
+      let periodStart: Date | undefined;
+      let periodEnd: Date | undefined;
+      if (
+        req.body?.period_start !== undefined ||
+        req.body?.period_end !== undefined
+      ) {
+        periodStart = new Date(req.body.period_start);
+        periodEnd = new Date(req.body.period_end);
+        if (isNaN(periodStart.getTime()) || isNaN(periodEnd.getTime())) {
+          throw Errors.badRequest('period_start / period_end must be valid dates');
+        }
+        if (periodEnd <= periodStart) {
+          throw Errors.badRequest('period_end must be after period_start');
+        }
+      }
+
+      if (offeringRepo && typeof offeringRepo.getById === 'function') {
+        const offering = await offeringRepo.getById(offeringId);
+        if (!offering) {
+          throw Errors.notFound('Offering not found');
+        }
+      }
+
+      const scheduled = await repo.create({
+        offering_id: offeringId,
+        period_id: periodId,
+        period_start: periodStart,
+        period_end: periodEnd,
+        total_amount: totalAmount,
+        run_at: runAt,
+        created_by: user.id,
+      });
+
+      logger.info('Scheduled distribution enqueued', {
+        scheduledId: scheduled.id,
+        offeringId,
+        runAt: scheduled.run_at.toISOString(),
+        userId: user.id,
+        requestId,
+      });
+
+      return res.status(201).json({
+        id: scheduled.id,
+        offering_id: scheduled.offering_id,
+        period_id: scheduled.period_id,
+        total_amount: scheduled.total_amount,
+        run_at: scheduled.run_at.toISOString(),
+        status: scheduled.status,
+        created_by: scheduled.created_by,
+      });
+    } catch (err) {
+      logger.error('Schedule distribution failed', {
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  /**
+   * GET /distributions/schedule
+   * Lists deferred distribution runs (optionally filtered by offering_id).
+   * Admin-only.
+   */
+  async function listScheduledDistributions(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      requireScheduleAdmin(user);
+      const repo = requireScheduleRepo();
+
+      const offeringId = req.query.offering_id
+        ? String(req.query.offering_id)
+        : undefined;
+      if (offeringId !== undefined && offeringId.trim().length === 0) {
+        throw Errors.badRequest('offering_id cannot be empty');
+      }
+
+      const requestedLimit = Number(req.query.limit ?? 100);
+      const requestedOffset = Number(req.query.offset ?? 0);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(requestedLimit, 500) : 100;
+      const offset = Number.isFinite(requestedOffset) ? Math.max(requestedOffset, 0) : 0;
+
+      const rows = offeringId
+        ? await repo.findByOffering(offeringId)
+        : await repo.findAll(limit, offset);
+
+      return res.status(200).json({
+        scheduled_distributions: rows.map((row) => ({
+          id: row.id,
+          offering_id: row.offering_id,
+          period_id: row.period_id,
+          total_amount: row.total_amount,
+          run_at: row.run_at.toISOString(),
+          status: row.status,
+          attempts: row.attempts,
+          error_message: row.error_message ?? null,
+          executed_at: row.executed_at ? row.executed_at.toISOString() : null,
+          created_by: row.created_by ?? null,
+        })),
+      });
+    } catch (err) {
+      logger.error('List scheduled distributions failed', {
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  /**
+   * DELETE /distributions/schedule/:id
+   * Cancels a pending deferred distribution run. Admin-only. Only rows still
+   * in `scheduled` status can be cancelled; anything else returns 404.
+   */
+  async function cancelScheduledDistribution(req: Request, res: Response, next: NextFunction) {
+    const requestId = (req as any).id;
+    try {
+      const user = (req as any).user;
+      requireScheduleAdmin(user);
+      const repo = requireScheduleRepo();
+
+      const scheduledId = String(req.params.id || '');
+      if (!scheduledId) {
+        throw Errors.badRequest('Missing scheduled distribution id');
+      }
+
+      const cancelled = await repo.markCancelled(scheduledId);
+      if (!cancelled) {
+        throw Errors.notFound(
+          'Scheduled distribution not found or no longer cancellable',
+        );
+      }
+
+      logger.info('Scheduled distribution cancelled', {
+        scheduledId,
+        userId: user.id,
+        requestId,
+      });
+
+      return res.status(200).json({
+        id: cancelled.id,
+        offering_id: cancelled.offering_id,
+        period_id: cancelled.period_id,
+        status: cancelled.status,
+      });
+    } catch (err) {
+      logger.error('Cancel scheduled distribution failed', {
+        scheduledId: req.params.id,
+        error: err instanceof Error ? err.message : String(err),
+        requestId,
+      });
+      return next(err);
+    }
+  }
+
+  return {
+    triggerDistribution,
+    previewDistribution,
+    pauseDistribution,
+    resumeDistribution,
+    exportDistributionLedger,
+    scheduleDistribution,
+    listScheduledDistributions,
+    cancelScheduledDistribution,
+  };
 }
 
 export default function createDistributionsRouter(opts: {
   distributionEngine: any;
   offeringRepo?: OfferingRepo;
   verifyJWT: express.RequestHandler;
-  distributionStateManager?: DistributionStateManager;
+  distributionStateManager?: DistributionState;
   auditRepository?: SecurityAuditRepository;
+  distributionAccountRepo?: DistributionAccountRepo;
+  accountingLedger?: AccountingLedgerService;
+  scheduledDistributionRepo?: ScheduledDistributionRepo;
 }) {
   const router = express.Router();
   const handlers = createDistributionHandlers(
@@ -408,12 +854,20 @@ export default function createDistributionsRouter(opts: {
     opts.offeringRepo,
     opts.distributionStateManager,
     opts.auditRepository,
+    opts.distributionAccountRepo,
+    opts.accountingLedger,
+    opts.scheduledDistributionRepo,
+    opts.revenueReportRepo,
   );
 
   router.post('/offerings/:id/distribute', opts.verifyJWT, handlers.triggerDistribution);
   router.post('/offerings/:id/distribute/preview', opts.verifyJWT, handlers.previewDistribution);
+  router.get('/offerings/:id/ledger/export', opts.verifyJWT, handlers.exportDistributionLedger);
   router.post('/distributions/:id/pause', opts.verifyJWT, handlers.pauseDistribution);
   router.post('/distributions/:id/resume', opts.verifyJWT, handlers.resumeDistribution);
+  router.post('/distributions/schedule', opts.verifyJWT, handlers.scheduleDistribution);
+  router.get('/distributions/schedule', opts.verifyJWT, handlers.listScheduledDistributions);
+  router.delete('/distributions/schedule/:id', opts.verifyJWT, handlers.cancelScheduledDistribution);
 
   return router;
 }

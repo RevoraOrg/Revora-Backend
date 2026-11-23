@@ -296,10 +296,25 @@ export class RuleEvaluator {
   private evaluateSanctionsRule(context: TransactionContext, rule: AMLRule): { triggered: boolean; details: Record<string, unknown> } {
     const config = rule.config as unknown as SanctionsRuleConfig;
     const sanctionsList = config.sanctions_list || [];
-    const nameToScreen = context.investor_name || context.investor_id;
 
-    if (!nameToScreen || sanctionsList.length === 0) {
-      return { triggered: false, details: { reason: 'Missing investor name or sanctions list' } };
+    // Fail closed: a missing legal name means screening cannot complete.
+    // Never fall back to investor_id — an identifier can never match a
+    // sanctions list and would silently clear the check (false negative).
+    const nameToScreen = context.investor_name;
+    if (!nameToScreen || nameToScreen.trim() === '') {
+      return {
+        triggered: true,
+        details: {
+          reason: 'missing_investor_name',
+          action: 'pending_review',
+          review_status: 'pending_review',
+          matched: false,
+        },
+      };
+    }
+
+    if (sanctionsList.length === 0) {
+      return { triggered: false, details: { reason: 'Missing sanctions list' } };
     }
 
     // Per-tenant threshold > rule config threshold > default 0.85
@@ -307,6 +322,12 @@ export class RuleEvaluator {
     const threshold = typeof tenantThreshold === 'number'
       ? tenantThreshold
       : (typeof config.jaro_winkler_threshold === 'number' ? config.jaro_winkler_threshold : 0.85);
+    const threshold_source: 'tenant' | 'rule' | 'default' =
+      typeof tenantThreshold === 'number'
+        ? 'tenant'
+        : typeof config.jaro_winkler_threshold === 'number'
+        ? 'rule'
+        : 'default';
 
     const normName = normalizeName(nameToScreen);
     let bestMatch: { candidate: string; score: number; matchType: 'exact' | 'fuzzy' } | null = null;
@@ -334,6 +355,7 @@ export class RuleEvaluator {
         details: {
           screened_name: nameToScreen,
           threshold,
+          threshold_source,
           matched: false,
         },
       };
@@ -352,6 +374,7 @@ export class RuleEvaluator {
         match_type: bestMatch.matchType,
         similarity_score: bestMatch.score,
         threshold,
+        threshold_source,
         action,
         auto_deny: autoDeny,
         review_status: isFuzzy ? 'pending_review' : 'confirmed_deny',
@@ -424,6 +447,12 @@ export class RuleEvaluator {
         : typeof config.jaro_winkler_threshold === 'number'
         ? config.jaro_winkler_threshold
         : 0.85;
+    const threshold_source: 'tenant' | 'rule' | 'default' =
+      typeof tenantThreshold === 'number'
+        ? 'tenant'
+        : typeof config.jaro_winkler_threshold === 'number'
+        ? 'rule'
+        : 'default';
 
     if (counterparties.length === 0 || sanctionsList.length === 0) {
       return {
@@ -504,6 +533,7 @@ export class RuleEvaluator {
           screened_count: counterparties.length,
           matched: false,
           threshold,
+          threshold_source,
         },
       };
     }
@@ -521,6 +551,7 @@ export class RuleEvaluator {
         match_count: matches.length,
         matches,
         threshold,
+        threshold_source,
         action: overallAction,
       },
     };

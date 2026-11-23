@@ -4,6 +4,7 @@ import { Pool } from 'pg';
 import { createReconciliationRouter, createReconciliationMetricsHandler } from './reconciliationRoutes';
 import { errorHandler } from '../middleware/errorHandler';
 import { MetricsCollector } from '../lib/metrics';
+import { StellarTransactionVerifier } from '../lib/stellarTransactionVerifier';
 
 // Mock dependencies
 const mockReconcile = jest.fn();
@@ -11,6 +12,8 @@ const mockQuickBalanceCheck = jest.fn();
 const mockVerifyDistributionRun = jest.fn();
 const mockValidateRevenueReport = jest.fn();
 
+// Jest hoists jest.mock() before variable declarations, so the factory must use
+// jest.fn() directly.  We retrieve the constructor spy after the mock is set up.
 jest.mock('../services/revenueReconciliationService', () => {
   return {
     RevenueReconciliationService: jest.fn().mockImplementation(() => {
@@ -20,9 +23,12 @@ jest.mock('../services/revenueReconciliationService', () => {
         verifyDistributionRun: mockVerifyDistributionRun,
         validateRevenueReport: mockValidateRevenueReport,
       };
-    })
+    }),
   };
 });
+
+// Retrieve the mocked constructor after jest.mock() has run.
+import { RevenueReconciliationService as MockRevenueReconciliationService } from '../services/revenueReconciliationService';
 
 describe('Reconciliation Routes', () => {
   let app: express.Application;
@@ -367,6 +373,88 @@ describe('Reconciliation Routes', () => {
 
       expect(res.status).toBe(403);
     });
+  });
+});
+
+// ─── Verifier pass-through ───────────────────────────────────────────────────
+
+describe('createReconciliationRouter – verifier pass-through', () => {
+  let mockPool: jest.Mocked<Pool>;
+
+  const requireAuthAdmin = (req: any, _res: any, next: any) => {
+    req.user = { id: 'admin-1', role: 'admin' };
+    next();
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockPool = {} as any;
+  });
+
+  it('passes txVerifier to RevenueReconciliationService when provided', () => {
+    const mockVerifier: StellarTransactionVerifier = {
+      verifyTransaction: jest.fn(),
+    };
+
+    createReconciliationRouter({
+      db: mockPool,
+      requireAuth: requireAuthAdmin,
+      txVerifier: mockVerifier,
+    });
+
+    // RevenueReconciliationService constructor: (db, stellarClient?, txVerifier?)
+    expect(MockRevenueReconciliationService).toHaveBeenCalledWith(
+      mockPool,
+      undefined,          // stellarClient not supplied
+      mockVerifier,       // txVerifier forwarded
+    );
+  });
+
+  it('passes stellarClient to RevenueReconciliationService when provided', () => {
+    const mockStellarClient = { getRevenueState: jest.fn() };
+
+    createReconciliationRouter({
+      db: mockPool,
+      requireAuth: requireAuthAdmin,
+      stellarClient: mockStellarClient as any,
+    });
+
+    expect(MockRevenueReconciliationService).toHaveBeenCalledWith(
+      mockPool,
+      mockStellarClient,
+      undefined,           // txVerifier not supplied
+    );
+  });
+
+  it('passes both txVerifier and stellarClient when both provided', () => {
+    const mockVerifier: StellarTransactionVerifier = { verifyTransaction: jest.fn() };
+    const mockStellarClient = { getRevenueState: jest.fn() };
+
+    createReconciliationRouter({
+      db: mockPool,
+      requireAuth: requireAuthAdmin,
+      txVerifier: mockVerifier,
+      stellarClient: mockStellarClient as any,
+    });
+
+    expect(MockRevenueReconciliationService).toHaveBeenCalledWith(
+      mockPool,
+      mockStellarClient,
+      mockVerifier,
+    );
+  });
+
+  it('omits both when neither is provided (original behaviour)', () => {
+    createReconciliationRouter({
+      db: mockPool,
+      requireAuth: requireAuthAdmin,
+    });
+
+    expect(MockRevenueReconciliationService).toHaveBeenCalledWith(
+      mockPool,
+      undefined,
+      undefined,
+    );
   });
 });
 

@@ -1,11 +1,12 @@
 /**
  * Security audit repository with comprehensive logging capabilities
- * 
+ *
  * Provides persistent storage and retrieval of security events
  * with efficient querying for compliance and monitoring.
  */
 
 import { AuditEvent, SecurityAuditRepository } from './types';
+import { AuditLogRepository, CreateAuditLogInput } from '../db/repositories/auditLogRepository';
 
 /**
  * In-memory implementation for development and testing
@@ -17,7 +18,7 @@ export class InMemorySecurityAuditRepository implements SecurityAuditRepository 
 
   async record(event: AuditEvent): Promise<void> {
     this.events.push(event);
-    
+
     // Prevent memory leaks by limiting stored events
     if (this.events.length > this.maxEvents) {
       this.events = this.events.slice(-this.maxEvents * 0.8); // Keep 80% of max
@@ -40,8 +41,8 @@ export class InMemorySecurityAuditRepository implements SecurityAuditRepository 
 
   async findSecurityViolations(since: Date, limit = 100): Promise<AuditEvent[]> {
     return this.events
-      .filter(event => 
-        event.type === 'SECURITY_VIOLATION' && 
+      .filter(event =>
+        event.type === 'SECURITY_VIOLATION' &&
         event.timestamp >= since
       )
       .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
@@ -59,6 +60,109 @@ export class InMemorySecurityAuditRepository implements SecurityAuditRepository 
 
   getEventCount(): number {
     return this.events.length;
+  }
+}
+
+/**
+ * Persistent implementation backed by AuditLogRepository (audit_logs table).
+ * Maps SecurityAuditRepository interface to the existing audit_logs schema.
+ *
+ * Security assumptions:
+ * - Audit logs survive service restarts (PostgreSQL persistence).
+ * - The audit_logs table has hash-chain integrity verification (auditHashChain).
+ * - Mapping is lossy: details JSONB is serialized; nested securityContext
+ *   is flattened into user_agent for storage limitations.
+ */
+export class AuditLogSecurityAuditRepository implements SecurityAuditRepository {
+  constructor(private auditLogRepo: AuditLogRepository) {}
+
+  async record(event: AuditEvent): Promise<void> {
+    const input: CreateAuditLogInput = {
+      user_id: event.userId || null,
+      action: event.action,
+      resource: event.resource,
+      details: JSON.stringify(event.details),
+      ip_address: event.securityContext.ipAddress,
+      user_agent: JSON.stringify({
+        requestId: event.securityContext.requestId,
+        userAgent: event.securityContext.userAgent,
+        timestamp: event.securityContext.timestamp,
+      }),
+    };
+
+    await this.auditLogRepo.createAuditLog(input);
+  }
+
+  async findByUserId(userId: string, limit = 100): Promise<AuditEvent[]> {
+    const logs = await this.auditLogRepo.getAuditLogsByUser(userId, limit);
+    return logs.map(log => this.mapToAuditEvent(log));
+  }
+
+  async findBySessionId(sessionId: string, limit = 100): Promise<AuditEvent[]> {
+    // AuditLogRepository does not have sessionId filtering; return empty array
+    // as sessionId is not persisted in audit_logs table
+    return [];
+  }
+
+  async findSecurityViolations(since: Date, limit = 100): Promise<AuditEvent[]> {
+    // Use action filtering as a proxy for type, since audit_logs does not have a type field
+    // AML security violations use action prefixes like 'aml_alert_created'
+    const logs = await this.auditLogRepo.getAuditLogsByAction('aml_', limit);
+    return logs
+      .filter(log => log.created_at >= since)
+      .map(log => this.mapToAuditEvent(log));
+  }
+
+  private mapToAuditEvent(log: any): AuditEvent {
+    let securityContextData: any = { ipAddress: log.ip_address, userAgent: 'unknown', requestId: 'unknown', timestamp: log.created_at };
+    try {
+      if (log.user_agent) {
+        const parsed = JSON.parse(log.user_agent);
+        securityContextData = {
+          ipAddress: log.ip_address,
+          requestId: parsed.requestId || 'unknown',
+          userAgent: parsed.userAgent || 'unknown',
+          timestamp: parsed.timestamp || log.created_at,
+        };
+      }
+    } catch {
+      // If parsing fails, use defaults
+    }
+
+    let details: Record<string, unknown> = {};
+    try {
+      if (log.details) {
+        details = typeof log.details === 'string' ? JSON.parse(log.details) : log.details;
+      }
+    } catch {
+      // If parsing fails, use empty object
+    }
+
+    return {
+      id: log.id,
+      type: this.inferTypeFromAction(log.action),
+      userId: log.user_id || undefined,
+      sessionId: undefined, // Not stored in audit_logs
+      action: log.action,
+      resource: log.resource || '',
+      outcome: 'SUCCESS', // audit_logs does not have outcome field; assume SUCCESS for recorded events
+      details,
+      securityContext: securityContextData,
+      timestamp: log.created_at,
+    };
+  }
+
+  private inferTypeFromAction(action: string): AuditEvent['type'] {
+    if (action.startsWith('aml_')) {
+      return 'VALIDATION';
+    }
+    if (action.includes('auth')) {
+      return 'AUTHENTICATION';
+    }
+    if (action.includes('violation')) {
+      return 'SECURITY_VIOLATION';
+    }
+    return 'VALIDATION'; // Default fallback
   }
 }
 

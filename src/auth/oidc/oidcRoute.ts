@@ -133,7 +133,7 @@ export function createOidcRouter(deps: OidcRouterDependencies): Router {
       }
 
       if (claims.email && userRepo && auditLogRepo) {
-        const user = await userRepo.findByEmail(claims.email);
+        const user = await userRepo.findByEmail(claims.email.trim().toLowerCase());
         if (user) {
           let groupsChanged = false;
           const lastGroups = user.last_oidc_groups || [];

@@ -4,18 +4,43 @@ import { StellarRPCFailureClass } from '../lib/stellarRpcFailure';
 import { Errors } from '../lib/errors';
 
 // Mock logger
-jest.mock('../lib/logger', () => ({
-  globalLogger: {
+jest.mock('../lib/logger', () => {
+  const logger = {
+    info: jest.fn(),
     warn: jest.fn(),
-  },
-}));
+    error: jest.fn(),
+    debug: jest.fn(),
+    child: jest.fn(() => logger),
+  };
+  return { globalLogger: logger };
+});
 
-// Mock environment
+// Mock environment. The secret is read live from process.env so tests can toggle
+// it: the "missing secret" test deletes it, the remaining tests set it in setup.
 jest.mock('../config/env', () => ({
   env: {
     STELLAR_NETWORK: 'testnet',
     STELLAR_NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+    STELLAR_HORIZON_URL: 'https://horizon-testnet.stellar.org',
+    STELLAR_TIMEOUT: 30000,
+    STELLAR_MAX_FEE: 100000,
+    get STELLAR_SERVER_SECRET() {
+      return process.env.STELLAR_SERVER_SECRET;
+    },
   },
+}));
+
+// The real @stellar/stellar-sdk exposes `rpc.Server` as a non-configurable
+// getter, so it cannot be reassigned. Mock the whole module so beforeEach can
+// rewire the jest fns it needs.
+jest.mock('@stellar/stellar-sdk', () => ({
+  rpc: { Server: jest.fn() },
+  Keypair: { fromSecret: jest.fn() },
+  Asset: { native: jest.fn() },
+  TransactionBuilder: jest.fn(),
+  Operation: { payment: jest.fn(), invokeContractFunction: jest.fn() },
+  BASE_FEE: '100',
+  Networks: { TESTNET: 'Test SDF Network ; September 2015' },
 }));
 
 describe('StellarSubmissionService - Simple Tests', () => {
@@ -31,30 +56,31 @@ describe('StellarSubmissionService - Simple Tests', () => {
       getAccount: jest.fn(),
       sendTransaction: jest.fn(),
     };
-    
-    StellarSdk.rpc.Server = jest.fn(() => mockServer);
-    StellarSdk.Keypair.fromSecret = jest.fn(() => ({
+
+    // Use the module-mocked jest fns (the real SDK exposes read-only getters,
+    // so these must be configured via mock implementations, not assignment).
+    (StellarSdk.rpc.Server as jest.Mock).mockReturnValue(mockServer);
+    (StellarSdk.Keypair.fromSecret as jest.Mock).mockReturnValue({
       publicKey: () => 'G-MOCK-PUBLIC-KEY',
       sign: jest.fn(),
-    }));
-    
-    StellarSdk.Asset.native = jest.fn(() => ({ code: 'XLM', issuer: undefined }));
-    
+    });
+    (StellarSdk.Asset.native as jest.Mock).mockReturnValue({
+      isNative: () => true,
+      code: 'XLM',
+      issuer: undefined,
+    });
+
     const mockTransaction = {
       hash: () => 'mock-transaction-hash',
       sign: jest.fn(),
     };
-    
-    StellarSdk.TransactionBuilder = jest.fn(() => ({
+
+    (StellarSdk.TransactionBuilder as jest.Mock).mockReturnValue({
       addOperation: jest.fn().mockReturnThis(),
       setTimeout: jest.fn().mockReturnThis(),
       build: jest.fn().mockReturnValue(mockTransaction),
-    }));
-    
-    StellarSdk.Operation.payment = jest.fn();
-    StellarSdk.Operation.invokeContractFunction = jest.fn();
-    StellarSdk.BASE_FEE = '100';
-    
+    });
+
     service = new StellarSubmissionService();
   });
 
@@ -214,7 +240,10 @@ describe('StellarSubmissionService - Simple Tests', () => {
 
   it('should throw error if secret is invalid', () => {
     process.env.STELLAR_SERVER_SECRET = 'invalid-secret';
-    
+    (StellarSdk.Keypair.fromSecret as jest.Mock).mockImplementationOnce(() => {
+      throw new Error('invalid secret');
+    });
+
     expect(() => new StellarSubmissionService()).toThrow(
       'Invalid STELLAR_SERVER_SECRET provided',
     );

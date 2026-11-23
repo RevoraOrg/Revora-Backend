@@ -98,6 +98,37 @@ describe('DistributionRepository', () => {
     });
   });
 
+  describe('findRunByOfferingAndPeriod', () => {
+    it('should return a run by offering_id and period_id regardless of amount', async () => {
+      const mockRun = {
+        id: 'run-123',
+        offering_id: 'offering-123',
+        period_id: 'period-456',
+        total_amount: '1000.00',
+        status: 'completed',
+        run_at: new Date(),
+      };
+
+      mockPool.query.mockResolvedValueOnce({ rows: [mockRun] });
+
+      const result = await repository.findRunByOfferingAndPeriod('offering-123', 'period-456');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions\s+WHERE\s+offering_id\s+=\s+\$1\s+AND\s+period_id\s+=\s+\$2/i),
+        ['offering-123', 'period-456']
+      );
+      expect(result?.id).toBe('run-123');
+    });
+
+    it('should return null when no run matches offering_id and period_id', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+
+      const result = await repository.findRunByOfferingAndPeriod('offering-none', 'period-none');
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('findRunByParams', () => {
     it('should return a run if parameters match', async () => {
       const mockRun = {
@@ -119,6 +150,27 @@ describe('DistributionRepository', () => {
       );
       expect(result?.id).toBe('run-123');
     });
+
+    it('should delegate to findRunByOfferingAndPeriod when totalAmount is omitted', async () => {
+      const mockRun = {
+        id: 'run-123',
+        offering_id: 'offering-123',
+        period_id: 'period-456',
+        total_amount: '1000.00',
+        status: 'completed',
+        run_at: new Date(),
+      };
+
+      mockPool.query.mockResolvedValueOnce({ rows: [mockRun] });
+
+      const result = await repository.findRunByParams('offering-123', 'period-456');
+
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+\*\s+FROM\s+distributions\s+WHERE\s+offering_id\s+=\s+\$1\s+AND\s+period_id\s+=\s+\$2/i),
+        ['offering-123', 'period-456']
+      );
+      expect(result?.id).toBe('run-123');
+    });
   });
 
   describe('getPayoutsForRun', () => {
@@ -131,6 +183,24 @@ describe('DistributionRepository', () => {
         ['run-1']
       );
       expect(result).toHaveLength(1);
+    });
+  });
+
+  describe('countPayoutsByStatus', () => {
+    it('should query and return count of payouts by status', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [{ count: 3 }] });
+      const count = await repository.countPayoutsByStatus('run-1', 'failed');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/SELECT\s+COUNT\(\*\)::int\s+AS\s+count\s+FROM\s+distribution_payouts\s+WHERE\s+distribution_id\s+=\s+\$1\s+AND\s+status\s+=\s+\$2/i),
+        ['run-1', 'failed']
+      );
+      expect(count).toBe(3);
+    });
+
+    it('should return 0 when no rows or count is 0', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+      const count = await repository.countPayoutsByStatus('run-1', 'failed');
+      expect(count).toBe(0);
     });
   });
 
@@ -174,6 +244,73 @@ describe('DistributionRepository', () => {
         expect.stringMatching(/UPDATE\s+distributions\s+SET\s+status\s+=\s+\$1/i),
         ['completed', 'run-1']
       );
+    });
+  });
+
+  describe('listByPeriod', () => {
+    it('lists distribution runs for a period ordered by run_at ascending', async () => {
+      const runs = [
+        {
+          id: 'run-1',
+          offering_id: 'off-1',
+          period_id: '2026-07',
+          total_amount: '500.00',
+          status: 'completed',
+          run_at: new Date('2026-07-14T00:00:00.000Z'),
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ];
+      mockPool.query.mockResolvedValueOnce({ rows: runs });
+      const result = await repository.listByPeriod('2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/FROM\s+distributions\s+WHERE\s+period_id\s+=\s+\$1/i),
+        ['2026-07']
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].total_amount).toBe('500.00');
+    });
+
+    it('returns empty array when no runs exist for the period', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [] });
+      expect(await repository.listByPeriod('1999-01')).toEqual([]);
+    });
+  });
+
+  describe('listPayoutsByInvestorForPeriod', () => {
+    it('joins payouts to distributions on period_id', async () => {
+      const payouts = [
+        {
+          id: 'p1',
+          distribution_id: 'run-1',
+          investor_id: 'inv-1',
+          amount: '120.00',
+          status: 'processed',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ];
+      mockPool.query.mockResolvedValueOnce({ rows: payouts });
+      const result = await repository.listPayoutsByInvestorForPeriod('inv-1', '2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/INNER\s+JOIN\s+distributions\s+d\s+ON\s+d\.id\s+=\s+p\.distribution_id/i),
+        ['inv-1', '2026-07']
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('120.00');
+    });
+  });
+
+  describe('listPayoutsByPeriod', () => {
+    it('lists all payouts for a period', async () => {
+      const payouts = [{ id: 'p1', amount: '10.00' }, { id: 'p2', amount: '20.00' }];
+      mockPool.query.mockResolvedValueOnce({ rows: payouts });
+      const result = await repository.listPayoutsByPeriod('2026-07');
+      expect(mockPool.query).toHaveBeenCalledWith(
+        expect.stringMatching(/WHERE\s+d\.period_id\s+=\s+\$1/i),
+        ['2026-07']
+      );
+      expect(result).toHaveLength(2);
     });
   });
 });

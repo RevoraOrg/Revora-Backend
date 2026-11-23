@@ -29,6 +29,10 @@ import { globalMetrics } from './metrics';
 export interface StellarRpcClient {
   /** Retrieves the latest ledger sequence number from the Stellar network */
   getLatestLedger(): Promise<{ sequence: number }>;
+  /** Retrieves events from the Stellar network */
+  getEvents(request: StellarSdk.rpc.GetEventsRequest): Promise<StellarSdk.rpc.GetEventsResponse>;
+  /** Returns the current state of circuit breakers for endpoints */
+  getBreakerStates(): Record<string, 'closed' | 'open' | 'half-open'>;
 }
 
 /** Configuration options for the Stellar RPC client */
@@ -47,6 +51,7 @@ export interface StellarRpcClientConfig {
 class CircuitBreaker {
   private failureCount = 0;
   private openUntil: number | null = null;
+  private halfOpenActive = false;
 
   constructor(
     private readonly threshold: number,
@@ -55,24 +60,39 @@ class CircuitBreaker {
 
   public recordFailure(): void {
     this.failureCount++;
-    if (this.failureCount >= this.threshold) {
+    if (this.halfOpenActive || this.failureCount >= this.threshold) {
       this.openUntil = Date.now() + this.cooldownMs;
+      this.halfOpenActive = false;
     }
   }
 
   public recordSuccess(): void {
     this.failureCount = 0;
     this.openUntil = null;
+    this.halfOpenActive = false;
   }
 
-  public isClosed(): boolean {
-    if (this.openUntil === null) return true;
-    if (Date.now() >= this.openUntil) {
-      this.failureCount = 0;
-      this.openUntil = null;
+  public isAllowed(): boolean {
+    if (this.openUntil === null) {
+      if (this.halfOpenActive) {
+        return false; // Probe is already active
+      }
       return true;
     }
+    
+    if (Date.now() >= this.openUntil) {
+      this.openUntil = null;
+      this.halfOpenActive = true;
+      return true; // allow one probe
+    }
+    
     return false;
+  }
+
+  public getState(): 'closed' | 'open' | 'half-open' {
+    if (this.halfOpenActive) return 'half-open';
+    if (this.openUntil !== null && Date.now() < this.openUntil) return 'open';
+    return 'closed';
   }
 }
 
@@ -89,19 +109,12 @@ export class StellarRpcClientImpl implements StellarRpcClient {
     this.failureThreshold = config.failureThreshold ?? 5;
     this.cooldownMs = config.cooldownMs ?? 30000;
 
-    // FIX 2: Use env.STELLAR_HORIZON_URL instead of non-existent named exports.
+    // Use configured URLs or default array from env
     const provided = config.serverUrls;
     if (provided && provided.length > 0) {
       this.endpoints = provided;
-    } else if (env.STELLAR_HORIZON_URL) {
-      this.endpoints = [env.STELLAR_HORIZON_URL];
     } else {
-      // Fall back to network-appropriate default
-      this.endpoints = [
-        env.STELLAR_NETWORK === 'public'
-          ? 'https://horizon.stellar.org'
-          : 'https://horizon-testnet.stellar.org',
-      ];
+      this.endpoints = env.STELLAR_HORIZON_URLS_ARRAY;
     }
 
     this.breakers = new Map();
@@ -115,12 +128,20 @@ export class StellarRpcClientImpl implements StellarRpcClient {
     return new StellarSdk.rpc.Server(url, { allowHttp: url.startsWith('http://') });
   }
 
+  public getBreakerStates(): Record<string, 'closed' | 'open' | 'half-open'> {
+    const states: Record<string, 'closed' | 'open' | 'half-open'> = {};
+    for (const [url, breaker] of this.breakers.entries()) {
+      states[url] = breaker.getState();
+    }
+    return states;
+  }
+
   async getLatestLedger(): Promise<{ sequence: number }> {
     for (let i = 0; i < this.endpoints.length; i++) {
       const endpoint = this.endpoints[i];
       const breaker = this.breakers.get(endpoint)!;
 
-      if (!breaker.isClosed()) {
+      if (!breaker.isAllowed()) {
         continue;
       }
 
@@ -155,6 +176,46 @@ export class StellarRpcClientImpl implements StellarRpcClient {
         breaker.recordFailure();
         if (!failure.shouldRetry) {
           continue;
+        }
+        continue;
+      }
+    }
+
+    throw new Error('All Horizon endpoints are unavailable or circuit broken');
+  }
+
+  async getEvents(request: StellarSdk.rpc.GetEventsRequest): Promise<StellarSdk.rpc.GetEventsResponse> {
+    for (let i = 0; i < this.endpoints.length; i++) {
+      const endpoint = this.endpoints[i];
+      const breaker = this.breakers.get(endpoint)!;
+
+      if (!breaker.isAllowed()) {
+        continue;
+      }
+
+      const server = this.createServer(endpoint);
+
+      try {
+        const response = await Promise.race([
+          server.getEvents(request),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`RPC request timeout after ${this.timeout}ms`)),
+              this.timeout,
+            ),
+          ),
+        ]);
+
+        breaker.recordSuccess();
+        return response;
+      } catch (rawError) {
+        const failure = classifyStellarRPCFailure(rawError, {
+          operation: 'getEvents',
+          attemptCount: i + 1,
+        });
+        breaker.recordFailure();
+        if (!failure.shouldRetry) {
+          throw rawError;
         }
         continue;
       }

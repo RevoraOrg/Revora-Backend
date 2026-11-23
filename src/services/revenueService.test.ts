@@ -1,30 +1,8 @@
-/**
- * revenueService.test.ts — corrected
- *
- * Fixes applied (all 12 ts errors from the screenshot):
- *
- * ts(2724) Line 1  — `RevenueReportInput` is not exported from revenueService.
- *                    Correct export is `SubmitRevenueReportInput`.
- *
- * ts(2339) Line 49 — `ingestRevenueReport` does not exist on RevenueService.
- *                    Actual method name is `submitReport`.
- *
- * ts(2554) Line 34 — RevenueService constructor takes exactly 2 arguments
- *                    (offeringRepo, revenueReportRepo). The test was passing 3
- *                    (stellarService, revenueRepo, logger). Logger is built internally.
- *
- * ts(2740) Line 7  — Mock Logger shape did not satisfy the Logger interface.
- *                    Removed — the service constructs its own logger; no injection needed.
- *
- * ts(1005) Line 64 — Unclosed object literal on `stellarError` (missing `}`).
- *                    Fixed below by aligning mocks to real repo interfaces.
- *
- * Additionally: mock shapes updated to match OfferingRepository.findById and
- * RevenueReportRepository.create / findOverlappingReport signatures.
- */
+/** Revenue submission validation and transaction-bound persistence behavior. */
 
 import { RevenueService, SubmitRevenueReportInput } from './revenueService';
 import { ErrorCode } from '../lib/errors';
+import { Pool, PoolClient } from 'pg';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -65,6 +43,19 @@ const mockRevenueReportRepo = {
   findByOfferingId: jest.fn(),
 };
 
+const mockTransactionClient = {
+  query: jest.fn().mockResolvedValue({ rows: [] }),
+  release: jest.fn(),
+} as unknown as PoolClient;
+
+const mockPool = {
+  connect: jest.fn().mockResolvedValue(mockTransactionClient),
+} as unknown as Pool;
+
+const mockLedgerLockRepo = {
+  isPeriodLocked: jest.fn(),
+};
+
 // ── Shared valid input ────────────────────────────────────────────────────────
 
 const validInput: SubmitRevenueReportInput = {
@@ -82,8 +73,14 @@ describe('RevenueService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    // FIX: constructor takes exactly (offeringRepo, revenueReportRepo) — 2 args
-    service = new RevenueService(mockOfferingRepo as any, mockRevenueReportRepo as any);
+    (mockPool.connect as jest.Mock).mockResolvedValue(mockTransactionClient);
+    (mockTransactionClient.query as jest.Mock).mockResolvedValue({ rows: [] });
+    service = new RevenueService(
+      mockOfferingRepo as any,
+      mockRevenueReportRepo as any,
+      mockLedgerLockRepo as any,
+      mockPool
+    );
   });
 
   // ── Happy path ────────────────────────────────────────────────────────────
@@ -92,6 +89,7 @@ describe('RevenueService', () => {
     it('creates and returns a revenue report for valid input', async () => {
       mockOfferingRepo.findById.mockResolvedValue(mockOffering);
       mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockLedgerLockRepo.isPeriodLocked.mockResolvedValue(false);
       mockRevenueReportRepo.create.mockResolvedValue(mockReport);
 
       const result = await service.submitReport(validInput);
@@ -99,7 +97,25 @@ describe('RevenueService', () => {
       expect(result).toBeDefined();
       expect(result.id).toBe('report-1');
       expect(mockOfferingRepo.findById).toHaveBeenCalledWith('offering-123');
-      expect(mockRevenueReportRepo.create).toHaveBeenCalled();
+      expect(mockTransactionClient.query).toHaveBeenCalledWith(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        ['offering-123']
+      );
+      expect(mockRevenueReportRepo.findOverlappingReport).toHaveBeenCalledWith(
+        'offering-123',
+        validInput.periodStart,
+        validInput.periodEnd,
+        mockTransactionClient
+      );
+      expect(mockLedgerLockRepo.isPeriodLocked).toHaveBeenCalledWith(
+        'offering-123',
+        '2023-01-01',
+        mockTransactionClient
+      );
+      expect(mockRevenueReportRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ offering_id: 'offering-123' }),
+        mockTransactionClient
+      );
     });
 
     // ── Offering not found ──────────────────────────────────────────────────
@@ -198,22 +214,53 @@ describe('RevenueService', () => {
 
     it('throws CONFLICT when period overlaps an existing report', async () => {
       mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockLedgerLockRepo.isPeriodLocked.mockResolvedValue(false);
       mockRevenueReportRepo.findOverlappingReport.mockResolvedValue({ id: 'existing' });
 
       await expect(service.submitReport(validInput)).rejects.toMatchObject({
         code: ErrorCode.CONFLICT,
       });
       expect(mockRevenueReportRepo.create).not.toHaveBeenCalled();
+      expect(mockRevenueReportRepo.findOverlappingReport).toHaveBeenCalledWith(
+        'offering-123',
+        validInput.periodStart,
+        validInput.periodEnd,
+        mockTransactionClient
+      );
     });
 
     // ── Repository failure ─────────────────────────────────────────────────
 
     it('propagates errors thrown by create()', async () => {
       mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockLedgerLockRepo.isPeriodLocked.mockResolvedValue(false);
       mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
       mockRevenueReportRepo.create.mockRejectedValue(new Error('DB connection lost'));
 
       await expect(service.submitReport(validInput)).rejects.toThrow('DB connection lost');
+    });
+
+    it('throws CONFLICT when the period lock is visible in the transaction', async () => {
+      mockOfferingRepo.findById.mockResolvedValue(mockOffering);
+      mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockLedgerLockRepo.isPeriodLocked.mockResolvedValue(true);
+
+      await expect(service.submitReport(validInput)).rejects.toMatchObject({
+        code: ErrorCode.CONFLICT,
+      });
+
+      expect(mockRevenueReportRepo.findOverlappingReport).toHaveBeenCalledWith(
+        'offering-123',
+        validInput.periodStart,
+        validInput.periodEnd,
+        mockTransactionClient
+      );
+      expect(mockLedgerLockRepo.isPeriodLocked).toHaveBeenCalledWith(
+        'offering-123',
+        '2023-01-01',
+        mockTransactionClient
+      );
+      expect(mockRevenueReportRepo.create).not.toHaveBeenCalled();
     });
 
     // ── Optional requestId ─────────────────────────────────────────────────
@@ -221,6 +268,7 @@ describe('RevenueService', () => {
     it('succeeds with an optional requestId provided', async () => {
       mockOfferingRepo.findById.mockResolvedValue(mockOffering);
       mockRevenueReportRepo.findOverlappingReport.mockResolvedValue(null);
+      mockLedgerLockRepo.isPeriodLocked.mockResolvedValue(false);
       mockRevenueReportRepo.create.mockResolvedValue(mockReport);
 
       await expect(

@@ -61,6 +61,10 @@
  * @module services/fxQuorumEvaluator
  */
 
+// Regression coverage for METRIC_QUORUM_EVALUATED failure handling lives in
+// `src/services/__tests__/fxQuorumEvaluator.test.ts`. The constructor guards
+// below are part of the public contract and are asserted there.
+
 import { Decimal } from '../lib/decimal';
 import { AppError, ErrorCode } from '../lib/errors';
 import { Logger } from '../lib/logger';
@@ -236,6 +240,8 @@ export class FxQuorumEvaluator {
     } = {},
   ) {
     if (!Number.isInteger(config.k) || config.k < 1) {
+      // Contract: k must be an integer >= 1. Thrown before any state is set so
+      // a misconfigured evaluator can never be constructed.
       throw new Error('FxQuorumEvaluator: k must be an integer >= 1');
     }
     if (
@@ -243,6 +249,8 @@ export class FxQuorumEvaluator {
       !Number.isFinite(config.tolerance) ||
       config.tolerance < 0
     ) {
+      // Contract: tolerance must be a finite number >= 0. NaN/Infinity and
+      // negative values are rejected deterministically.
       throw new Error('FxQuorumEvaluator: tolerance must be a finite number >= 0');
     }
     if (
@@ -250,12 +258,17 @@ export class FxQuorumEvaluator {
       config.reference !== 'median' &&
       config.reference !== 'mean'
     ) {
+      // Contract: reference must be 'median' or 'mean' when provided. Any other
+      // value (including null/undefined-like strings) is rejected.
       throw new Error("FxQuorumEvaluator: reference must be 'median' or 'mean'");
     }
 
     this.k = config.k;
     this.tolerance = config.tolerance;
     this.reference = config.reference ?? 'median';
+    // minValidProviders defaults to k; allowReducedQuorum defaults to true.
+    // Both are surfaced via getConfig() so tests can assert the resolved
+    // defaults without reaching into private state.
     this.minValidProviders = config.minValidProviders ?? config.k;
     this.allowReducedQuorum = config.allowReducedQuorum ?? true;
   }
@@ -374,6 +387,9 @@ export class FxQuorumEvaluator {
     const result = this.assess(pair, inputs);
     const { metrics, logger, pager } = this.options;
 
+    // METRIC_QUORUM_EVALUATED is emitted exactly once per evaluate() call,
+    // before either the success or failure branch, so the counter is
+    // observable and deterministic regardless of outcome.
     metrics?.incrementCounter(METRIC_QUORUM_EVALUATED, { pair: sanitizePair(pair) });
 
     if (result.agreed && result.consensusRate) {
@@ -384,6 +400,9 @@ export class FxQuorumEvaluator {
       return result.consensusRate;
     }
 
+    // ── Failure path: emit, log, page, then block the run. ──
+    // The failure branch must always increment METRIC_QUORUM_FAILED, set the
+    // in-consensus and divergence gauges, log, page (best-effort), and throw.
     // ── Failure path: emit, log, page, then block the run. ──
     metrics?.incrementCounter(METRIC_QUORUM_FAILED, { pair: result.pair });
     metrics?.setGauge(METRIC_QUORUM_IN_CONSENSUS, result.inConsensus, {
@@ -406,6 +425,8 @@ export class FxQuorumEvaluator {
       divergent: result.divergent,
     });
 
+    // Pager is best-effort: a throwing or rejecting pager must never mask the
+    // FxQuorumFailedError that the pipeline relies on to block the run.
     if (pager) {
       try {
         const paged = pager(result);
@@ -420,12 +441,16 @@ export class FxQuorumEvaluator {
       }
     }
 
+    // Always throw the operational 503 after emitting metrics/logs/pages so
+    // callers observe a deterministic error contract.
     throw new FxQuorumFailedError(result);
   }
 
   /** Exposed for tests / review: the parsed, validated config. */
   getConfig(): Readonly<FxQuorumConfig> {
     return {
+      // Return the resolved values (defaults applied) so tests can assert the
+      // effective configuration rather than the raw input.
       k: this.k,
       tolerance: this.tolerance,
       reference: this.reference,

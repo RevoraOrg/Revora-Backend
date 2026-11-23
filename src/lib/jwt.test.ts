@@ -1,6 +1,8 @@
 // Set up test JWT_SECRET before importing jwt module
 process.env.JWT_SECRET = "test-secret-key-that-is-at-least-32-characters-long!";
 
+import jwt from "jsonwebtoken";
+
 import {
   issueToken,
   verifyToken,
@@ -14,6 +16,7 @@ import {
   TOKEN_EXPIRY,
   REFRESH_TOKEN_EXPIRY,
   JwtPayload,
+
   TokenOptions,
   ClaimValidationOptions,
   getCurrentKeyId,
@@ -633,6 +636,82 @@ describe("jwt utilities", () => {
 
           expect(() => verifyToken(token)).toThrow("unknown key ID");
         });
+      });
+    });
+
+    // ── TOKEN_EXPIRY and Claims Failure Handling ──────────────────────────────
+
+    describe("TOKEN_EXPIRY and claims failure handling", () => {
+      it("should throw when token is missing sub claim", () => {
+        // sub is undefined
+        const token = jwt.sign(
+          { exp: Math.floor(Date.now() / 1000) + 3600 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        expect(() => verifyToken(token)).toThrow(
+          "Token is missing required subject (sub) claim"
+        );
+      });
+
+      it("should throw when token has expired", () => {
+        // exp is in the past beyond tolerance
+        const token = jwt.sign(
+          { sub: "user-1", exp: Math.floor(Date.now() / 1000) - 120 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        expect(() => verifyToken(token, { clockToleranceSeconds: 30 })).toThrow(
+          "Token has expired"
+        );
+      });
+
+      it("should throw when token iat claim is in the future", () => {
+        // iat is in the future beyond tolerance
+        const token = jwt.sign(
+          { sub: "user-1", iat: Math.floor(Date.now() / 1000) + 120 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        expect(() => verifyToken(token, { clockToleranceSeconds: 30 })).toThrow(
+          "Token iat claim is in the future"
+        );
+      });
+
+      it("should accept token with valid claims (normal path)", () => {
+        const now = Math.floor(Date.now() / 1000);
+        const token = jwt.sign(
+          { sub: "user-1", iat: now, exp: now + 3600 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        const payload = verifyToken(token, { clockToleranceSeconds: 30 });
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should accept token exactly at the boundary of expiry tolerance", () => {
+        const now = Math.floor(Date.now() / 1000);
+        // Expiry is exactly at the boundary (-30s with 30s tolerance)
+        const token = jwt.sign(
+          { sub: "user-1", exp: now - 30 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        const payload = verifyToken(token, { clockToleranceSeconds: 30 });
+        expect(payload.sub).toBe("user-1");
+      });
+
+      it("should throw when token is just outside the boundary of expiry tolerance", () => {
+        const now = Math.floor(Date.now() / 1000);
+        // Expiry is 1 second beyond the boundary (-31s with 30s tolerance)
+        const token = jwt.sign(
+          { sub: "user-1", exp: now - 31 },
+          DEFAULT_JWT_SECRET,
+          { header: { kid: "current" } }
+        );
+        expect(() => verifyToken(token, { clockToleranceSeconds: 30 })).toThrow(
+          "Token has expired"
+        );
       });
     });
 

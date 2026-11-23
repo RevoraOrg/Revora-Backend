@@ -22,7 +22,7 @@ export const DEFAULT_RISK_WEIGHTS: RiskScoreWeights = {
     'low': 5,
     'medium': 15,
     'high': 30,
-    'critical': 50
+    'critical': 50 
   },
   baseScore: 0
 };

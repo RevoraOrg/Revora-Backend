@@ -168,11 +168,20 @@ Validate revenue report before submission.
 | `PAYOUT_SUM_MISMATCH` | error | Individual payout sum doesn't match run total |
 | `INVESTOR_ALLOCATION_ERROR` | error | Invalid investor allocation detected |
 | `ROUNDING_LOSS_UNACCOUNTED` | warning | Rounding loss not properly handled |
-| `MISSING_PAYOUT` | error | Expected payout not found |
+| `MISSING_PAYOUT` | error | Expected investor has no recorded payout in distribution run |
+| `UNEXPECTED_PAYOUT` | error | Payout recorded for investor not in expected investor set |
 | `DUPLICATE_PAYOUT` | error | Duplicate payout detected |
 | `OVERPAYMENT` | critical | Payout exceeds expected amount |
 | `UNDERPAMENT` | error | Payout below expected amount |
 | `DISTRIBUTION_STATUS_INVALID` | warning/error | Distribution run in invalid state |
+
+### Payout Completeness and Verification
+
+`checkPayoutCompleteness` inspects completed and processing distribution runs:
+- **Missing Payouts (`MISSING_PAYOUT`)**: Verifies every investor associated with the offering has a corresponding payout record. Emits an error discrepancy for each missing investor.
+- **Unexpected Payouts (`UNEXPECTED_PAYOUT`)**: Verifies all payout recipients are valid investors for the offering. Emits an error discrepancy for each unauthorized or unexpected payout.
+- **Payout Sum Mismatch (`PAYOUT_SUM_MISMATCH`)**: Accurately sums individual payout amounts using the `Decimal` arbitrary-precision utility and compares against the distribution run's `total_amount`. Any difference triggers an error discrepancy with exact differences.
+- **Failed Payout Counting**: `countFailedPayouts` counts payouts with `status = 'failed'` using `DistributionRepository.countPayoutsByStatus` (or loaded payouts list), populating `payoutsFailed` and `failedPayouts` in `ReconciliationResult.summary`.
 
 ## Tolerance Configuration
 

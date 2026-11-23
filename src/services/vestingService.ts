@@ -3,22 +3,20 @@
  *
  * Handles partial claims for vesting schedules to ensure schedule math integrity
  * and prevent balance inconsistencies.
+ *
+ * Security assumptions:
+ * - All operations validate ownership via the repository
+ * - Claims are persisted to the database, not in-memory
+ * - Ownership is enforced at the database level (user_id foreign key)
  */
 
-export interface VestingSchedule {
-  id: string;
-  totalAmount: number;
-  claimedAmount: number;
-  lastClaimIndex: number;
-  schedule: VestingEvent[];
-}
-
-export interface VestingEvent {
-  index: number;
-  amount: number;
-  timestamp: number;
-  claimed: boolean;
-}
+import { Pool } from 'pg';
+import { 
+  VestingScheduleRepository, 
+  VestingSchedule, 
+  VestingEvent,
+  CreateVestingScheduleInput 
+} from '../db/repositories/vestingScheduleRepository';
 
 export interface PartialClaimRequest {
   scheduleId: string;
@@ -34,9 +32,34 @@ export interface PartialClaimResult {
 }
 
 export class VestingService {
+  private repository: VestingScheduleRepository;
+
+  constructor(pool?: Pool) {
+    // If pool is provided, use it; otherwise this is a test scenario
+    // where the repository will be mocked
+    if (pool) {
+      this.repository = new VestingScheduleRepository(pool);
+    } else {
+      // Placeholder for testing - will be replaced by mocks
+      this.repository = null as any;
+    }
+  }
+
+  /**
+   * Set the repository (primarily for testing)
+   */
+  setRepository(repository: VestingScheduleRepository): void {
+    this.repository = repository;
+  }
+
   /**
    * Process a partial claim for a vesting schedule
-   * Ensures no double-claiming and maintains cursor integrity
+   * 
+   * Security: Validates ownership via repository before processing.
+   * Persists claim state to database to prevent double-claiming.
+   * 
+   * @param request - The partial claim request
+   * @returns The claim result with success status and amounts
    */
   async processPartialClaim(request: PartialClaimRequest): Promise<PartialClaimResult> {
     // Validate input
@@ -44,12 +67,18 @@ export class VestingService {
       return { success: false, claimedAmount: 0, remainingAmount: 0, error: 'Claim amount cannot be negative' };
     }
 
-    const schedule = await this.getVestingSchedule(request.scheduleId);
-    if (!schedule) {
-      return { success: false, claimedAmount: 0, remainingAmount: 0, error: 'Schedule not found' };
+    // Validate userId is provided
+    if (!request.userId) {
+      return { success: false, claimedAmount: 0, remainingAmount: 0, error: 'User authentication required' };
     }
 
-    // Validate claim amount
+    // Fetch schedule with ownership validation
+    const schedule = await this.repository.findByIdAndUserId(request.scheduleId, request.userId);
+    if (!schedule) {
+      return { success: false, claimedAmount: 0, remainingAmount: 0, error: 'Schedule not found or access denied' };
+    }
+
+    // Validate claim amount against available vested amount
     const availableAmount = this.calculateAvailableAmount(schedule);
     if (request.claimAmount > availableAmount) {
       return {
@@ -60,20 +89,47 @@ export class VestingService {
       };
     }
 
-    // Update schedule with partial claim
-    schedule.claimedAmount += request.claimAmount;
-    schedule.lastClaimIndex = this.updateClaimIndex(schedule, request.claimAmount);
+    // Calculate new claim state
+    const newClaimedAmount = schedule.claimedAmount + request.claimAmount;
+    const newLastClaimIndex = this.updateClaimIndex(schedule, request.claimAmount);
 
-    // Persist changes (mock)
-    await this.saveVestingSchedule(schedule);
+    // Persist changes to database with ownership validation
+    const updateSuccess = await this.repository.updateClaim({
+      scheduleId: request.scheduleId,
+      userId: request.userId,
+      claimedAmount: newClaimedAmount,
+      lastClaimIndex: newLastClaimIndex
+    });
+
+    if (!updateSuccess) {
+      // This should not happen if we successfully fetched the schedule,
+      // but it handles race conditions where the schedule was deleted
+      return { success: false, claimedAmount: 0, remainingAmount: 0, error: 'Failed to persist claim' };
+    }
 
     return {
       success: true,
       claimedAmount: request.claimAmount,
-      remainingAmount: schedule.totalAmount - schedule.claimedAmount
+      remainingAmount: schedule.totalAmount - newClaimedAmount
     };
   }
 
+  /**
+   * Create a new vesting schedule
+   * 
+   * @param input - The schedule creation input
+   * @returns The created schedule
+   */
+  async createSchedule(input: CreateVestingScheduleInput): Promise<VestingSchedule> {
+    return this.repository.create(input);
+  }
+
+  /**
+   * Calculate the currently available vested amount
+   * 
+   * @param schedule - The vesting schedule
+   * @returns The available amount that can be claimed
+   */
   private calculateAvailableAmount(schedule: VestingSchedule): number {
     const now = Date.now();
     let available = 0;
@@ -87,8 +143,15 @@ export class VestingService {
     return Math.max(0, available - schedule.claimedAmount);
   }
 
+  /**
+   * Update the claim index based on the claim amount
+   * Marks events as claimed until the claim amount is covered
+   * 
+   * @param schedule - The vesting schedule
+   * @param claimAmount - The amount being claimed
+   * @returns The new last claim index
+   */
   private updateClaimIndex(schedule: VestingSchedule, claimAmount: number): number {
-    // Simple implementation: mark events as claimed until claimAmount is covered
     let remainingClaim = claimAmount;
     let lastIndex = schedule.lastClaimIndex;
 
@@ -106,25 +169,5 @@ export class VestingService {
     }
 
     return lastIndex;
-  }
-
-  private async getVestingSchedule(id: string): Promise<VestingSchedule | null> {
-    // Mock implementation
-    return {
-      id,
-      totalAmount: 1000,
-      claimedAmount: 0,
-      lastClaimIndex: -1,
-      schedule: [
-        { index: 0, amount: 200, timestamp: Date.now() - 1000, claimed: false },
-        { index: 1, amount: 300, timestamp: Date.now() + 1000, claimed: false },
-        { index: 2, amount: 500, timestamp: Date.now() + 2000, claimed: false }
-      ]
-    };
-  }
-
-  private async saveVestingSchedule(schedule: VestingSchedule): Promise<void> {
-    // Mock persistence
-    console.log('Saved vesting schedule:', schedule.id);
   }
 }

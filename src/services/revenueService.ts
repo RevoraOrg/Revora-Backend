@@ -5,10 +5,12 @@ import {
     RevenueReport,
 } from '../db/repositories/revenueReportRepository';
 import { LedgerPeriodLockRepository } from '../db/repositories/ledgerPeriodLockRepository';
-import { Errors } from '../lib/errors';
+import { AppError, Errors } from '../lib/errors';
 import { Logger } from '../lib/logger';
 import { LogLevel } from '../lib/logger';
-import { PoolClient } from 'pg';
+import { Pool } from 'pg';
+import { pool } from '../db/client';
+import { TransactionError, withTransaction } from '../db/transaction';
 
 export interface SubmitRevenueReportInput {
     offeringId: string;
@@ -57,7 +59,8 @@ export class RevenueService {
     constructor(
         private offeringRepo: OfferingRepository,
         private revenueReportRepo: RevenueReportRepository,
-        private ledgerLockRepo?: LedgerPeriodLockRepository
+        private ledgerLockRepo?: LedgerPeriodLockRepository,
+        private dbPool: Pool = pool
     ) {
         this.logger = new Logger({ level: LogLevel.INFO });
     }
@@ -76,11 +79,10 @@ export class RevenueService {
      * - This ensures locked periods cannot be modified after close.
      * 
      * @param input - The revenue report data containing offering, amount, and period.
-     * @param client - Optional transaction client for race-safe locking checks
      * @returns The persisted RevenueReport object.
      * @throws AppError if validation fails, unauthorized access, or period is locked.
      */
-    async submitReport(input: SubmitRevenueReportInput, client?: PoolClient): Promise<RevenueReport> {
+    async submitReport(input: SubmitRevenueReportInput): Promise<RevenueReport> {
         // 1. Validate offering existence and ownership
         const offering = await this.offeringRepo.findById(input.offeringId);
         if (!offering) {
@@ -93,8 +95,7 @@ export class RevenueService {
 
         // 2. Validate amount format and value
         const amountStr = input.amount;
-        const amountRegex = /^\d+(\.\d+)?$/;
-        if (!amountRegex.test(amountStr)) {
+        if (!isPositiveDecimalAmount(amountStr)) {
             throw Errors.validationError('Invalid revenue amount format: must be a positive decimal string');
         }
 
@@ -109,9 +110,6 @@ export class RevenueService {
         }
 
         const numValue = parseFloat(amountStr);
-        if (!Number.isFinite(numValue) || numValue <= 0) {
-            throw Errors.validationError('Amount must be a positive number greater than zero');
-        }
 
         const maxNum = parseFloat(DECIMAL_LIMITS.MAX_AMOUNT);
         if (numValue > maxNum) {
@@ -127,36 +125,7 @@ export class RevenueService {
             throw Errors.validationError('Invalid period: end date must be strictly after start date');
         }
 
-        // 4. Enforce non-overlapping periods per offering
-        const overlapping = await this.revenueReportRepo.findOverlappingReport(
-            input.offeringId,
-            input.periodStart,
-            input.periodEnd
-        );
-
-        if (overlapping) {
-            throw Errors.conflict(
-                `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
-            );
-        }
-
-        // 5. Check if period is locked (prevent writes to closed periods)
-        // This is the critical race-safety check: must use same transaction isolation as close operation
-        if (this.ledgerLockRepo) {
-            const isPeriodLocked = await this.ledgerLockRepo.isPeriodLocked(
-                input.offeringId,
-                input.periodStart.toISOString().split('T')[0], // ISO date as period identifier
-                client
-            );
-
-            if (isPeriodLocked) {
-                throw Errors.conflict(
-                    `Period starting ${input.periodStart.toISOString()} is locked and cannot accept new journal entries`
-                );
-            }
-        }
-
-        // 6. Save the report
+        // 4. Build the insert payload before opening a transaction.
         const reportData: CreateRevenueReportInput = {
             offering_id: input.offeringId,
             amount: input.amount,
@@ -164,7 +133,51 @@ export class RevenueService {
             period_end: input.periodEnd,
         };
 
-        const report = await this.revenueReportRepo.create(reportData);
+        // Serialize submissions for this offering so the overlap check sees any prior
+        // transaction's insert before deciding whether this report can be created.
+        let report: RevenueReport;
+        try {
+            report = await withTransaction(this.dbPool, async (client) => {
+                await client.query(
+                    'SELECT pg_advisory_xact_lock(hashtext($1))',
+                    [input.offeringId]
+                );
+
+                const overlapping = await this.revenueReportRepo.findOverlappingReport(
+                    input.offeringId,
+                    input.periodStart,
+                    input.periodEnd,
+                    client
+                );
+
+                if (overlapping) {
+                    throw Errors.conflict(
+                        `A revenue report already exists that overlaps with the specified period (${input.periodStart.toISOString()} - ${input.periodEnd.toISOString()})`
+                    );
+                }
+
+                if (this.ledgerLockRepo) {
+                    const isPeriodLocked = await this.ledgerLockRepo.isPeriodLocked(
+                        input.offeringId,
+                        input.periodStart.toISOString().split('T')[0],
+                        client
+                    );
+
+                    if (isPeriodLocked) {
+                        throw Errors.conflict(
+                            `Period starting ${input.periodStart.toISOString()} is locked and cannot accept new journal entries`
+                        );
+                    }
+                }
+
+                return this.revenueReportRepo.create(reportData, client);
+            });
+        } catch (error) {
+            if (error instanceof TransactionError && error.cause instanceof AppError) {
+                throw error.cause;
+            }
+            throw error;
+        }
 
         this.emitDistributionEvent(report, input.requestId || '');
 

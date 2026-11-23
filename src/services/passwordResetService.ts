@@ -1,6 +1,8 @@
 import { Pool, PoolClient } from 'pg';
 import { randomBytes, createHash } from 'node:crypto';
 import { PasswordResetRateLimiter, RateLimitResult } from './passwordResetRateLimiter';
+import { logger } from '../utils/logger';
+import { validatePasswordStrength } from '../auth/register/validatePasswordStrength';
 
 export type EmailSender = (to: string, subject: string, body: string) => Promise<void>;
 
@@ -9,7 +11,18 @@ export interface PasswordResetServiceOptions {
   tokenTtlMinutes?: number;
   appUrl?: string;
   rateLimiter?: PasswordResetRateLimiter;
+  /**
+   * Policy for handling infrastructure errors from the rate limiter.
+   * - 'fail-open' (default): allow the request to proceed when the limiter throws.
+   * - 'fail-closed': reject the request when the limiter throws.
+   */
+  rateLimiterFailurePolicy?: 'fail-open' | 'fail-closed';
 }
+
+export type PasswordResetResult =
+  | { ok: true }
+  | { ok: false; reason: 'invalid_token' }
+  | { ok: false; reason: 'weak_password'; errors: string[] };
 
 export class PasswordResetRateLimitedError extends Error {
   constructor(
@@ -27,29 +40,45 @@ export class PasswordResetService {
   private tokenTtlMinutes: number;
   private appUrl: string;
   private rateLimiter?: PasswordResetRateLimiter;
+  private rateLimiterFailurePolicy: 'fail-open' | 'fail-closed';
 
   constructor(private readonly db: Pool, opts?: PasswordResetServiceOptions) {
     this.emailSender = opts?.emailSender ?? (async (_to, _subject, _body) => {});
     this.tokenTtlMinutes = opts?.tokenTtlMinutes ?? 60;
     this.appUrl = opts?.appUrl ?? process.env.APP_URL ?? 'http://localhost:3000';
     this.rateLimiter = opts?.rateLimiter;
+    this.rateLimiterFailurePolicy = opts?.rateLimiterFailurePolicy ?? 'fail-open';
   }
 
   async requestPasswordReset(emailRaw: string): Promise<void> {
     const email = emailRaw.trim().toLowerCase();
 
     if (this.rateLimiter) {
+      let rateLimitResult: RateLimitResult | undefined;
       try {
-        const rateLimitResult = await this.rateLimiter.checkRateLimit(email);
-        if (!rateLimitResult.allowed) {
+        rateLimitResult = await this.rateLimiter.checkRateLimit(email);
+      } catch (err) {
+        logger.warn('[password-reset] Rate limiter infrastructure error', {
+          error: err,
+          email,
+          policy: this.rateLimiterFailurePolicy,
+          metric: 'password_reset.rate_limiter_error',
+        });
+        if (this.rateLimiterFailurePolicy === 'fail-closed') {
           throw new PasswordResetRateLimitedError(
             'Too many password reset requests. Please try again later.',
-            rateLimitResult.retryAfter ?? this.rateLimiter['blockMinutes'] * 60,
-            rateLimitResult
+            60,
+            { allowed: false, retryAfter: 60 },
           );
         }
-      } catch (err) {
-        console.error('[password-reset] Rate limiter error, failing open:', err);
+      }
+
+      if (rateLimitResult && !rateLimitResult.allowed) {
+        throw new PasswordResetRateLimitedError(
+          'Too many password reset requests. Please try again later.',
+          rateLimitResult.retryAfter ?? this.rateLimiter['blockMinutes'] * 60,
+          rateLimitResult,
+        );
       }
     }
 
@@ -75,7 +104,17 @@ export class PasswordResetService {
     );
   }
 
-  async resetPassword(tokenRaw: string, newPassword: string): Promise<boolean> {
+  async resetPassword(tokenRaw: string, newPassword: string): Promise<PasswordResetResult> {
+    const strengthResult = validatePasswordStrength(newPassword);
+    if (!strengthResult.valid) {
+      return { ok: false, reason: 'weak_password', errors: strengthResult.errors };
+    }
+
+    const tokenResult = await this.applyReset(tokenRaw, newPassword);
+    return tokenResult;
+  }
+
+  private async applyReset(tokenRaw: string, newPassword: string): Promise<PasswordResetResult> {
     const tokenHash = this.hashToken(tokenRaw);
     let client: PoolClient | null = null;
     try {
@@ -85,20 +124,20 @@ export class PasswordResetService {
       const { rows } = await client.query(
         `SELECT id, user_id, expires_at, used_at
          FROM password_reset_tokens
-         WHERE token_hash = $1
+         WHERE TOKEN_HASH = $1
          FOR UPDATE`,
         [tokenHash],
       );
 
       if (rows.length === 0) {
         await client.query('ROLLBACK');
-        return false;
+        return { ok: false, reason: 'invalid_token' };
       }
 
       const row = rows[0] as { id: string; user_id: string; expires_at: Date; used_at: Date | null };
       if (row.used_at || new Date(row.expires_at) < new Date()) {
         await client.query('ROLLBACK');
-        return false;
+        return { ok: false, reason: 'invalid_token' };
       }
 
       const passwordHash = this.hashPassword(newPassword);
@@ -109,12 +148,19 @@ export class PasswordResetService {
       );
 
       await client.query(
-        `UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`,
-        [row.id],
+        `UPDATE sessions SET reoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+        [row.user_id],
+      );
+
+      await client.query(
+        `UPDATE password_reset_tokens
+         SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL `,
+        [row.user_id],
       );
 
       await client.query('COMMIT');
-      return true;
+      return { ok: true };
     } catch {
       if (client) {
         try {
@@ -143,9 +189,4 @@ export class PasswordResetService {
   private hashToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
   }
-
-  private hashPassword(plaintext: string): string {
-    return createHash('sha256').update(plaintext).digest('hex');
-  }
 }
-

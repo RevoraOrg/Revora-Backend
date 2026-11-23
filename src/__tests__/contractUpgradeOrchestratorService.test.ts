@@ -1,3 +1,4 @@
+import * as StellarSdk from '@stellar/stellar-sdk';
 import { ContractUpgradeOrchestratorService } from '../services/contractUpgradeOrchestratorService';
 
 const mockPool = {
@@ -269,6 +270,104 @@ const holdPeriodRow = {
     failed_tx_count: 0,
   },
 };
+
+describe('ContractUpgradeOrchestratorService — applyUpgrade', () => {
+  let service: ContractUpgradeOrchestratorService;
+  let rpcServer: { getAccount: jest.Mock; sendTransaction: jest.Mock };
+  let keypair: StellarSdk.Keypair;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    keypair = StellarSdk.Keypair.random();
+    service = new ContractUpgradeOrchestratorService(
+      mockPool, mockAuditLogRepo, mockTenantSettingsRepo, keypair,
+    );
+    rpcServer = {
+      getAccount: jest.fn().mockResolvedValue(new StellarSdk.Account(keypair.publicKey(), '1')),
+      sendTransaction: jest.fn(),
+    };
+    Object.defineProperty(service, 'server', { value: rpcServer });
+  });
+
+  it('applies an upgrade when the RPC transaction status is PENDING', async () => {
+    const contractId = StellarSdk.StrKey.encodeContract(Buffer.alloc(32, 1));
+    const approvedUpgrade = { ...approvedRow, contract_id: contractId };
+    const appliedUpgrade = {
+      ...approvedUpgrade,
+      status: 'applied',
+      transaction_hash: 'transaction-hash-1',
+      applied_at: new Date().toISOString(),
+    };
+    mockPool.query
+      .mockResolvedValueOnce({ rows: [approvedUpgrade] })
+      .mockResolvedValueOnce({ rows: [appliedUpgrade] });
+    rpcServer.sendTransaction.mockResolvedValue({ status: 'PENDING', hash: 'transaction-hash-1' });
+
+    const result = await service.applyUpgrade(approvedUpgrade.id, 'operator-1');
+
+    expect(result.status).toBe('applied');
+    expect(result.transaction_hash).toBe('transaction-hash-1');
+    expect(mockPool.query).toHaveBeenCalledTimes(2);
+    expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'CONTRACT_UPGRADE_APPLIED' }),
+    );
+  });
+
+  it.each(['DUPLICATE', 'TRY_AGAIN_LATER', 'ERROR'] as const)(
+    'records and exposes RPC status %s as a failed upgrade',
+    async (status) => {
+      const contractId = StellarSdk.StrKey.encodeContract(Buffer.alloc(32, 1));
+      const approvedUpgrade = { ...approvedRow, contract_id: contractId };
+      const rejection = `Transaction rejected with status: ${status}`;
+      mockPool.query
+        .mockResolvedValueOnce({ rows: [approvedUpgrade] })
+        .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+      rpcServer.sendTransaction.mockResolvedValue({ status });
+
+      await expect(service.applyUpgrade(approvedUpgrade.id, 'operator-1'))
+        .rejects.toMatchObject({
+          statusCode: 503,
+          message: 'Failed to submit contract upgrade transaction',
+          details: { upgrade_id: approvedUpgrade.id, error: rejection },
+        });
+
+      expect(mockPool.query).toHaveBeenLastCalledWith(
+        expect.stringContaining("SET status = 'failed'"),
+        [`Apply failed: ${rejection}`, approvedUpgrade.id],
+      );
+      expect(mockAuditLogRepo.createAuditLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'CONTRACT_UPGRADE_FAILED',
+          details: expect.stringContaining(rejection),
+        }),
+      );
+    },
+  );
+
+  it('does not submit an upgrade outside the approved status boundary', async () => {
+    const pendingUpgrade = { ...approvedRow, status: 'pending' };
+    mockPool.query.mockResolvedValueOnce({ rows: [pendingUpgrade] });
+
+    await expect(service.applyUpgrade(pendingUpgrade.id, 'operator-1'))
+      .rejects.toThrow(/must be 'approved'/);
+
+    expect(rpcServer.getAccount).not.toHaveBeenCalled();
+    expect(rpcServer.sendTransaction).not.toHaveBeenCalled();
+    expect(mockPool.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not submit when the dry-run result is missing', async () => {
+    const untestedUpgrade = { ...approvedRow, simulate_ok: null };
+    mockPool.query.mockResolvedValueOnce({ rows: [untestedUpgrade] });
+
+    await expect(service.applyUpgrade(untestedUpgrade.id, 'operator-1'))
+      .rejects.toThrow(/successful dry-run simulation/);
+
+    expect(rpcServer.getAccount).not.toHaveBeenCalled();
+    expect(rpcServer.sendTransaction).not.toHaveBeenCalled();
+    expect(mockPool.query).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('ContractUpgradeOrchestratorService — startCanary', () => {
   let service: ContractUpgradeOrchestratorService;

@@ -598,9 +598,9 @@ export class MigrationManager {
     const appliedMigrations = await this.getAppliedMigrations();
     const appliedSet = new Set(appliedMigrations);
     
-    const files = fs.readdirSync(migrationsDir)
-      .filter((f: string) => f.endsWith('.sql'))
-      .sort();
+    const allFiles = fs.readdirSync(migrationsDir);
+    const { resolveMigrations } = require('../../migrate');
+    const files = resolveMigrations(allFiles);
     
     return files.filter((file: string) => !appliedSet.has(file));
   }

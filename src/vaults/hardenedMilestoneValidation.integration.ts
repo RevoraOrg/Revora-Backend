@@ -10,7 +10,12 @@ import { Pool } from 'pg';
 import {
   createHardenedMilestoneValidationRouter,
   createSecurityMonitoringRouter,
+  Milestone,
+  MilestoneRepository,
+  Vault,
+  VaultRepository,
 } from '../vaults/hardenedMilestoneValidation';
+import { withTransaction } from '../db/transaction';
 import {
   InMemorySecurityAuditRepository,
   DatabaseSecurityAuditRepository,
@@ -29,10 +34,10 @@ import {
 } from '../security/types';
 
 // Example database repositories (implement these based on your existing schema)
-class DatabaseMilestoneRepository {
+export class DatabaseMilestoneRepository implements MilestoneRepository {
   constructor(private pool: Pool) {}
 
-  async getByVaultAndId(vaultId: string, milestoneId: string) {
+  async getByVaultAndId(vaultId: string, milestoneId: string): Promise<Milestone | null> {
     const query = `
       SELECT id, vault_id, status, validated_at, validated_by 
       FROM milestones 
@@ -42,16 +47,27 @@ class DatabaseMilestoneRepository {
     return result.rows[0] || null;
   }
 
+  async listByVault(vaultId: string): Promise<Milestone[]> {
+    const query = `
+      SELECT id, vault_id, status, validated_at, validated_by, created_at
+      FROM milestones 
+      WHERE vault_id = $1
+      ORDER BY created_at ASC
+    `;
+    const result = await this.pool.query(query, [vaultId]);
+    return result.rows;
+  }
+
   async markValidated(input: {
     vaultId: string;
     milestoneId: string;
     verifierId: string;
     validatedAt: Date;
-  }) {
+  }): Promise<Milestone | null> {
     const query = `
       UPDATE milestones 
       SET status = 'validated', validated_at = $1, validated_by = $2, updated_at = NOW()
-      WHERE vault_id = $3 AND id = $4
+      WHERE vault_id = $3 AND id = $4 AND status = 'pending'
       RETURNING *
     `;
     const result = await this.pool.query(query, [
@@ -60,7 +76,64 @@ class DatabaseMilestoneRepository {
       input.vaultId,
       input.milestoneId,
     ]);
-    return result.rows[0];
+    return result.rows[0] || null;
+  }
+}
+
+export class InMemoryMilestoneRepository implements MilestoneRepository {
+  private milestones: Map<string, Milestone> = new Map();
+
+  constructor(initialMilestones: Milestone[] = []) {
+    for (const m of initialMilestones) {
+      this.milestones.set(`${m.vault_id}:${m.id}`, { ...m });
+    }
+  }
+
+  async getByVaultAndId(vaultId: string, milestoneId: string): Promise<Milestone | null> {
+    const m = this.milestones.get(`${vaultId}:${milestoneId}`);
+    return m ? { ...m } : null;
+  }
+
+  async listByVault(vaultId: string): Promise<Milestone[]> {
+    return Array.from(this.milestones.values())
+      .filter((m) => m.vault_id === vaultId)
+      .map((m) => ({ ...m }));
+  }
+
+  async markValidated(input: {
+    vaultId: string;
+    milestoneId: string;
+    verifierId: string;
+    validatedAt: Date;
+  }): Promise<Milestone | null> {
+    const key = `${input.vaultId}:${input.milestoneId}`;
+    const m = this.milestones.get(key);
+    // Conditional update: WHERE status = 'pending'
+    if (!m || m.status !== 'pending') {
+      return null;
+    }
+    const updated: Milestone = {
+      ...m,
+      status: 'validated',
+      validated_at: input.validatedAt,
+      validated_by: input.verifierId,
+    };
+    this.milestones.set(key, updated);
+    return { ...updated };
+  }
+}
+
+export class DatabaseVaultRepository implements VaultRepository {
+  constructor(private pool: Pool) {}
+
+  async getById(id: string): Promise<Vault | null> {
+    const query = `
+      SELECT id, status 
+      FROM vaults 
+      WHERE id = $1
+    `;
+    const result = await this.pool.query(query, [id]);
+    return result.rows[0] || null;
   }
 }
 
@@ -125,6 +198,7 @@ export const createHardenedMilestoneValidationDeps = (
 ) => {
   // Create repositories
   const milestoneRepository = new DatabaseMilestoneRepository(pool);
+  const vaultRepository = new DatabaseVaultRepository(pool);
   const verifierAssignmentRepository = new DatabaseVerifierAssignmentRepository(pool);
   const milestoneValidationEventRepository = new DatabaseMilestoneValidationEventRepository(pool);
   const domainEventPublisher = new DatabaseDomainEventPublisher(pool);
@@ -166,12 +240,14 @@ export const createHardenedMilestoneValidationDeps = (
 
   return {
     milestoneRepository,
+    vaultRepository,
     verifierAssignmentRepository,
     milestoneValidationEventRepository,
     domainEventPublisher,
     auditRepository,
     validationLimiter,
     securityConfig,
+    runInTransaction: <T>(fn: () => Promise<T>) => withTransaction(pool, async () => fn()),
   };
 };
 

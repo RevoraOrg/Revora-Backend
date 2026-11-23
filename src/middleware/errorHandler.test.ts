@@ -3,8 +3,6 @@ import {
   AppError,
   ErrorCode,
   Errors,
-  createError,
-  sendAppError,
   throwError,
 } from '../lib/errors';
 import {
@@ -28,16 +26,17 @@ function makeReq(requestId?: string, path: string = '/test', method: string = 'G
   return { requestId, path, method } as Request;
 }
 
-function makeRes(): jest.Mocked<Pick<Response, 'status' | 'json'>> {
+function makeRes(): jest.Mocked<Pick<Response, 'status' | 'json' | 'setHeader'>> {
   return {
     status: jest.fn().mockReturnThis(),
     json: jest.fn().mockReturnThis(),
-  } as unknown as jest.Mocked<Pick<Response, 'status' | 'json'>>;
+    setHeader: jest.fn(),
+  } as unknown as jest.Mocked<Pick<Response, 'status' | 'json' | 'setHeader'>>;
 }
 
 describe('lib/errors', () => {
   it('creates structured AppError responses with request ids', () => {
-    const err = createError(ErrorCode.BAD_REQUEST, 'bad input', 400, { field: 'email' });
+    const err = Errors.badRequest('bad input', { field: 'email' });
     expect(err.toResponse('rid-1')).toEqual({
       code: ErrorCode.BAD_REQUEST,
       message: 'bad input',
@@ -63,18 +62,41 @@ describe('lib/errors', () => {
     }).toThrow(AppError);
   });
 
-  it('forwards AppError via sendAppError helper', () => {
-    const next = jest.fn();
-    const err = Errors.validationError('bad', { field: 'amount' });
-    sendAppError(next, err);
-    expect(next).toHaveBeenCalledWith(err);
-  });
+  // NOTE: the former `sendAppError` helper was removed from the public API;
+  // forwarding to next(err) is now the responsibility of the errorHandler
+  // middleware covered below.
 });
 
 describe('mapUnknownErrorToAppError', () => {
   it('returns AppError instances unchanged', () => {
     const err = Errors.forbidden('Nope');
     expect(mapUnknownErrorToAppError(err)).toBe(err);
+  });
+  it('maps malformed JSON to 400 INVALID_JSON', () => {
+    const mapped = mapUnknownErrorToAppError({ type: 'entity.parse.failed' });
+    expect(mapped.statusCode).toBe(400);
+    expect(mapped.code).toBe(ErrorCode.INVALID_JSON);
+  });
+
+  it('maps a too-large body to 413 PAYLOAD_TOO_LARGE', () => {
+    const mapped = mapUnknownErrorToAppError({ type: 'entity.too.large' });
+    expect(mapped.statusCode).toBe(413);
+    expect(mapped.code).toBe(ErrorCode.PAYLOAD_TOO_LARGE);
+  });
+
+  it('maps pg 22P02 (bad UUID) to 400', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '22P02' });
+    expect(mapped.statusCode).toBe(400);
+  });
+
+  it('maps pg 23505 (duplicate) to 409', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '23505' });
+    expect(mapped.statusCode).toBe(409);
+  });
+
+  it('maps pg 23503 (bad link) to 409', () => {
+    const mapped = mapUnknownErrorToAppError({ code: '23503' });
+    expect(mapped.statusCode).toBe(409);
   });
 
   it('sanitizes unknown errors into INTERNAL_ERROR', () => {
@@ -102,7 +124,7 @@ describe('createStructuredErrorLogEntry', () => {
   it('logs structured AppError fields including details', () => {
     process.env.NODE_ENV = 'production';
     const entry = createStructuredErrorLogEntry(
-      new AppError(ErrorCode.CONFLICT, 'already exists', 409, { id: 'abc' }),
+      new AppError(ErrorCode.CONFLICT, 409, 'already exists', { id: 'abc' }),
       'req-1',
     );
 

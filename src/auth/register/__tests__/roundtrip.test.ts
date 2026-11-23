@@ -163,7 +163,7 @@ describe('instanceof UniqueConstraintError across module boundary (Req 3.3)', ()
     const err = new UniqueConstraintError('email');
     expect(err.name).toBe('UniqueConstraintError');
     expect(err.field).toBe('email');
-    expect(err.message).toBe('Duplicate value for field: email');
+    expect(err.message).toBe('Unique constraint violation on email');
   });
 });
 

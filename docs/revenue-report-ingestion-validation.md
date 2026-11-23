@@ -18,6 +18,8 @@ The Revenue Report Ingestion system allows startup issuers to submit periodic re
 ### 2. Period Validation
 - **Logic**: The `period_end` date must be strictly after the `period_start` date.
 - **Overlaps**: The system enforces a **strict non-overlap** policy. A new revenue report cannot be submitted if its time period (start to end) overlaps with any existing report for the same offering. This prevents double-counting of revenue.
+- **Concurrency**: Overlap validation and report insertion run in one transaction. The transaction first acquires a PostgreSQL transaction-scoped advisory lock keyed by offering ID, so concurrent submissions for the same offering serialize and the later submission observes the committed report.
+- **Ledger close**: The ledger close confirmation uses the same offering-scoped advisory lock. A report submission therefore either completes before the close or checks the committed period lock after the close; it cannot pass a stale lock check while the close commits concurrently.
 
 ## API Behavior and Error Codes
 

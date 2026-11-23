@@ -1,0 +1,91 @@
+{
+  "provider": "jumio",
+  "version": 1,
+  "recordedAt": "2026-01-15T12:00:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/net/api/v3/initiate",
+        "headers": {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "body": {
+          "customerId": "[REDACTED_CUSTOMERID_0000]",
+          "userReference": "[REDACTED_USERREFERENCE_0000]",
+          "email": "__EMAIL__",
+          "phone": "__PHONE__",
+          "firstName": "[REDACTED_FIRSTNAME_0000]",
+          "lastName": "[REDACTED_LASTNAME_0000]"
+        },
+        "timestamp": "2026-01-15T12:00:00.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "timestamp": "2026-01-15T12:00:00.300Z",
+          "transactionReference": "[REDACTED_TRANSACTIONREFERENCE_0000]"
+        },
+        "timestamp": "2026-01-15T12:00:00.300Z"
+      },
+      "label": "initiate"
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/net/api/v3/partners/verify/customer",
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "body": {
+          "customerId": "[REDACTED_CUSTOMERID_0000]",
+          "userReference": "[REDACTED_USERREFERENCE_0000]",
+          "scan": "passport_front"
+        },
+        "timestamp": "2026-01-15T12:00:20.000Z"
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "result": {
+            "idVerified": true,
+            "idScanStatus": "pass",
+            "isBlocked": false,
+            "sanctions": { "match": false }
+          },
+          "customerId": "[REDACTED_CUSTOMERID_0000]"
+        },
+        "timestamp": "2026-01-15T12:00:21.000Z"
+      },
+      "label": "verify_customer"
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/net/api/v3/transaction/{transactionReference}",
+        "headers": {
+          "Authorization": "[REDACTED_AUTHORIZATION_0000]"
+        },
+        "timestamp": "2026-01-15T12:00:30.000Z"
+      },
+      "response": {
+        "status": 404,
+        "headers": {},
+        "body": {
+          "code": "JUMIO_TRANSACTION_NOT_FOUND",
+          "message": "Transaction not found"
+        },
+        "timestamp": "2026-01-15T12:00:30.100Z"
+      },
+      "label": "transaction_not_found"
+    }
+  ],
+  "redaction": {
+    "totalRedactions": 4,
+    "placeholderCount": 14
+  }
+}

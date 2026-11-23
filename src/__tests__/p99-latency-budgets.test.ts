@@ -174,7 +174,7 @@ describe('P99 Latency Budgets for Hot Routes', () => {
    * npm test -- p99-latency-budgets.test.ts --testNamePattern="Hot routes|edge cases|Percentile|Budget|Configuration|Documentation|workflow"
    * ```
    */
-  describe.skip('Hot routes stay within p99 budgets', () => {
+  describe('Hot routes stay within p99 budgets', () => {
     it('enforces p99 budget for GET /api/v1/health', async () => {
       const app = buildTestApp();
       const budget = getLatencyBudget('GET', '/api/v1/health')!;
@@ -535,7 +535,7 @@ describe('P99 Latency Budgets for Hot Routes', () => {
    * NOTE: Requires full app initialization with complex dependencies.
    * Skip for now, can be run manually with full app setup.
    */
-  describe.skip('Full latency testing workflow', () => {
+  describe('Full latency testing workflow', () => {
     it('completes end-to-end p99 test with reporting', async () => {
       const app = buildTestApp();
       const results: Array<{

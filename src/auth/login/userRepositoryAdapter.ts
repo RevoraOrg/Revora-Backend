@@ -13,6 +13,7 @@ export class UserRepositoryAdapter implements UserRepository {
             email: user.email,
             role: user.role as any,
             passwordHash: user.password_hash,
+            isActive: user.is_active !== false,
         };
     }
 }

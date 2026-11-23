@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { hashPassword } from '../../utils/password';
 import { validatePasswordStrength } from '../../lib/passwordStrength';
 import { Errors } from '../../lib/errors';
 import { globalLogger } from '../../lib/logger';
@@ -66,7 +66,7 @@ export class RegisterService {
       throw new DuplicateEmailError();
     }
 
-    const password_hash = createHash('sha256').update(password).digest('hex');
+    const password_hash = await hashPassword(password);
 
     return this.userRepository.createUser({ email, password_hash, role: 'investor' });
   }

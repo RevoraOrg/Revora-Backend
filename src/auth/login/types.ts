@@ -8,13 +8,22 @@
 
 // ── User ────────────────────────────────────────────────────────────────
 
-export type UserRole = 'startup' | 'investor';
+export const USER_ROLES = ['startup', 'investor'] as const;
+
+export type UserRole = (typeof USER_ROLES)[number];
+
+/** Return whether an unknown value is a supported login role. */
+export function isUserRole(value: unknown): value is UserRole {
+  return typeof value === 'string' && (USER_ROLES as readonly string[]).includes(value);
+}
 
 export interface UserRecord {
   id: string;
   email: string;
   role: UserRole;
   passwordHash: string;
+  /** False once the account is deprovisioned (#1300). Missing means active. */
+  isActive?: boolean;
 }
 
 // ── Repositories ────────────────────────────────────────────────────────
@@ -31,6 +40,11 @@ export interface SessionRepository {
     userId: string;
     tokenHash: string;
     expiresAt: Date;
+    /**
+     * Absolute deadline for the refresh-token family this session roots.
+     * Set at login and inherited by every rotated child.
+     */
+    familyExpiresAt?: Date | null;
   }): Promise<void>;
 }
 

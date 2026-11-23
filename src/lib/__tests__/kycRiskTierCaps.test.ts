@@ -5,6 +5,7 @@
  * and the "tier upgrade unblocks only on next intent" evaluation semantics.
  */
 
+import { Decimal } from '../decimal';
 import {
   CapResolution,
   DEFAULT_KYC_RISK_TIER,
@@ -60,7 +61,7 @@ describe('kycRiskTierCaps', () => {
 
     it('exposes multiplier metadata for audits', () => {
       const r = resolveEffectiveCap(2_000, 'high');
-      expect(r.multiplier).toBe(TIER_CAP_MULTIPLIERS.high);
+      expect(r.multiplier.toString()).toBe(TIER_CAP_MULTIPLIERS.high);
       expect(r.offeringCapBps).toBe(2_000);
       expect(r.tier).toBe('high');
     });
@@ -70,32 +71,34 @@ describe('kycRiskTierCaps', () => {
     it('converts bps to absolute units', () => {
       const resolution: CapResolution = {
         tier: 'elevated',
-        multiplier: 0.5,
+        multiplier: new Decimal('0.5'),
         offeringCapBps: 1_000,
         effectiveCapBps: 500,
       };
-      expect(effectiveCapAmount(resolution, 1_000_000)).toBe(50_000);
+      const result = effectiveCapAmount(resolution, new Decimal('1000000'));
+      expect(result).not.toBeNull();
+      expect(result!.toString()).toMatch(/^50000(\.0+)?$/);
     });
 
     it('returns null when unlimited', () => {
       const resolution = resolveEffectiveCap(null, 'standard');
-      expect(effectiveCapAmount(resolution, 1_000_000)).toBeNull();
+      expect(effectiveCapAmount(resolution, new Decimal('1000000'))).toBeNull();
     });
 
-    it('rejects non-finite offering size', () => {
+    it('rejects negative offering size', () => {
       const resolution = resolveEffectiveCap(1_000, 'standard');
-      expect(() => effectiveCapAmount(resolution, Number.NaN)).toThrow(/non-negative finite/);
+      expect(() => effectiveCapAmount(resolution, new Decimal('-1'))).toThrow(/non-negative/);
     });
   });
 
   describe('evaluateInvestmentAgainstCap', () => {
-    const offeringSize = 1_000_000;
+    const offeringSize = new Decimal('1000000');
 
     it('allows any amount when offering has no static cap (unlimited)', () => {
       const resolution = resolveEffectiveCap(null, 'standard');
       const result = evaluateInvestmentAgainstCap({
-        existingTotal: 999_999,
-        newAmount: 999_999,
+        existingTotal: new Decimal('999999'),
+        newAmount: new Decimal('999999'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
@@ -108,8 +111,8 @@ describe('kycRiskTierCaps', () => {
     it('allows investment under the tier-adjusted cap', () => {
       const resolution = resolveEffectiveCap(1_000, 'high'); // 250 bps → 25_000
       const result = evaluateInvestmentAgainstCap({
-        existingTotal: 10_000,
-        newAmount: 15_000,
+        existingTotal: new Decimal('10000'),
+        newAmount: new Decimal('15000'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
@@ -119,23 +122,23 @@ describe('kycRiskTierCaps', () => {
     it('rejects when existing + new would exceed the adjusted cap', () => {
       const resolution = resolveEffectiveCap(1_000, 'high'); // 25_000
       const result = evaluateInvestmentAgainstCap({
-        existingTotal: 20_000,
-        newAmount: 6_000,
+        existingTotal: new Decimal('20000'),
+        newAmount: new Decimal('6000'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
       expect(result.allowed).toBe(false);
       if (!result.allowed) {
         expect(result.reason).toMatch(/KYC risk-tier adjusted cap/);
-        expect(result.capAmount).toBe(25_000);
+        expect(result.capAmount.toString()).toMatch(/^25000(\.0+)?$/);
       }
     });
 
     it('allows exact boundary', () => {
       const resolution = resolveEffectiveCap(1_000, 'elevated'); // 50_000
       const result = evaluateInvestmentAgainstCap({
-        existingTotal: 40_000,
-        newAmount: 10_000,
+        existingTotal: new Decimal('40000'),
+        newAmount: new Decimal('10000'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
@@ -145,8 +148,8 @@ describe('kycRiskTierCaps', () => {
     it('restricted blocks any positive new amount', () => {
       const resolution = resolveEffectiveCap(1_000, 'restricted');
       const result = evaluateInvestmentAgainstCap({
-        existingTotal: 0,
-        newAmount: 1,
+        existingTotal: new Decimal('0'),
+        newAmount: new Decimal('1'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
@@ -156,8 +159,8 @@ describe('kycRiskTierCaps', () => {
     it('tier upgrade unblocks prior above-cap attempt only on next evaluation', () => {
       const offeringCapBps = 1_000; // 100_000 absolute at standard
       const totalOfferingAmount = offeringSize;
-      const existingTotal = 0;
-      const attempted = 60_000;
+      const existingTotal = new Decimal('0');
+      const attempted = new Decimal('60000');
 
       const blocked = evaluateInvestmentAgainstCap({
         existingTotal,
@@ -184,14 +187,14 @@ describe('kycRiskTierCaps', () => {
       // claw back the 80k — evaluate only cares about existing+new vs cap.
       const resolution = resolveEffectiveCap(1_000, 'elevated'); // 50_000
       const addMore = evaluateInvestmentAgainstCap({
-        existingTotal: 80_000,
-        newAmount: 1,
+        existingTotal: new Decimal('80000'),
+        newAmount: new Decimal('1'),
         totalOfferingAmount: offeringSize,
         resolution,
       });
       expect(addMore.allowed).toBe(false);
       // No mutation API exists — existingTotal is an input, not rewritten.
-      expect(addMore.allowed === false && addMore.existingTotal).toBe(80_000);
+      expect(addMore.allowed === false && addMore.existingTotal.toString()).toBe('80000');
     });
   });
 

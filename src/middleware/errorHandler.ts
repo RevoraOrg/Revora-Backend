@@ -1,5 +1,5 @@
 import { ErrorRequestHandler, NextFunction, Request, Response } from 'express';
-import { AppError, ErrorCode, ErrorResponse, Errors } from '../lib/errors';
+import { AppError, ErrorCode, ErrorResponse, Errors,createError } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
 
 interface StructuredErrorLogEntry {
@@ -22,6 +22,23 @@ function getRequestId(req: Request): string | undefined {
 export function mapUnknownErrorToAppError(err: unknown): AppError {
   if (err instanceof AppError) {
     return err;
+  }
+  const e = err as { type?: string; code?: string } | null;
+
+  if (e && e.type === 'entity.parse.failed') {
+    return createError(ErrorCode.INVALID_JSON, 'Malformed JSON body', 400);
+  }
+  if (e && e.type === 'entity.too.large') {
+    return createError(ErrorCode.PAYLOAD_TOO_LARGE, 'Request body too large', 413);
+  }
+  if (e && e.code === '22P02') {
+    return createError(ErrorCode.BAD_REQUEST, 'Invalid input', 400);
+  }
+  if (e && e.code === '23505') {
+    return createError(ErrorCode.CONFLICT, 'Resource already exists', 409);
+  }
+  if (e && e.code === '23503') {
+    return createError(ErrorCode.CONFLICT, 'Related resource conflict', 409);
   }
   return Errors.internal();
 }

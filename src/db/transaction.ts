@@ -1,5 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { globalLogger } from '../lib/logger';
+import { WebhookEventType } from '../services/webhookService';
+import { OutboxRepository } from './repositories/outboxRepository';
 
 /**
  * Transaction options for controlling transaction behavior
@@ -9,14 +11,18 @@ export interface TransactionOptions<T = unknown> {
    * Isolation level for the transaction
    * @default 'READ COMMITTED'
    */
-  isolationLevel?: 'READ UNCOMMITTED' | 'READ COMMITTED' | 'REPEATABLE READ' | 'SERIALIZABLE';
-  
+  isolationLevel?:
+    | "READ UNCOMMITTED"
+    | "READ COMMITTED"
+    | "REPEATABLE READ"
+    | "SERIALIZABLE";
+
   /**
    * Whether this is a read-only transaction
    * @default false
    */
   readOnly?: boolean;
-  
+
   /**
    * Whether to use a savepoint for nested transactions
    * @default true
@@ -38,10 +44,10 @@ export class TransactionError extends Error {
   constructor(
     message: string,
     public readonly cause?: unknown,
-    public readonly rollbackSucceeded: boolean = true
+    public readonly rollbackSucceeded: boolean = true,
   ) {
     super(message);
-    this.name = 'TransactionError';
+    this.name = "TransactionError";
     Object.setPrototypeOf(this, TransactionError.prototype);
   }
 }
@@ -59,25 +65,25 @@ const transactionContexts = new WeakMap<PoolClient, TransactionContext>();
 
 /**
  * Execute a function within a database transaction.
- * 
+ *
  * Provides atomic operations with automatic commit/rollback:
  * - All changes commit together on success
  * - All changes rollback together on failure
  * - Connection is always released back to the pool
  * - Supports nested transactions via savepoints
- * 
+ *
  * Security guarantees:
  * - Prevents partial writes on failure
  * - No connection leaks (always releases)
  * - Sanitized error messages (no sensitive data)
  * - Input validation before transaction starts
- * 
+ *
  * @param pool - PostgreSQL connection pool
  * @param callback - Function to execute within transaction, receives PoolClient
  * @param options - Transaction configuration options
  * @returns Result of the callback function
  * @throws {TransactionError} If transaction fails or cannot be rolled back
- * 
+ *
  * @example
  * ```typescript
  * const result = await withTransaction(pool, async (client) => {
@@ -86,12 +92,12 @@ const transactionContexts = new WeakMap<PoolClient, TransactionContext>();
  *   return { success: true };
  * });
  * ```
- * 
+ *
  * @example Nested transactions
  * ```typescript
  * await withTransaction(pool, async (client) => {
  *   await client.query('INSERT INTO orders (id) VALUES ($1)', [orderId]);
- *   
+ *
  *   // Nested transaction uses savepoint
  *   await withTransaction(pool, async (nestedClient) => {
  *     await nestedClient.query('INSERT INTO order_items (order_id) VALUES ($1)', [orderId]);
@@ -99,23 +105,23 @@ const transactionContexts = new WeakMap<PoolClient, TransactionContext>();
  * });
  * ```
  */
-const logger = globalLogger.child({ service: 'db-transaction' });
+const logger = globalLogger.child({ service: "db-transaction" });
 
 export async function withTransaction<T>(
   pool: Pool,
   callback: (client: PoolClient) => Promise<T>,
-  options: TransactionOptions<T> = {}
+  options: TransactionOptions<T> = {},
 ): Promise<T> {
   // Validate inputs before acquiring connection
   if (!pool) {
-    throw new TransactionError('Pool is required');
+    throw new TransactionError("Pool is required");
   }
-  if (typeof callback !== 'function') {
-    throw new TransactionError('Callback must be a function');
+  if (typeof callback !== "function") {
+    throw new TransactionError("Callback must be a function");
   }
 
   const {
-    isolationLevel = 'READ COMMITTED',
+    isolationLevel = "READ COMMITTED",
     readOnly = false,
     useSavepoint = true,
     afterCommit,
@@ -127,22 +133,22 @@ export async function withTransaction<T>(
 
   try {
     client = await pool.connect();
-    
+
     transactionContexts.set(client, {
       client,
       depth: 0,
       savepointCounter: 0,
     });
 
-    let beginCommand = 'BEGIN';
-    if (isolationLevel !== 'READ COMMITTED') {
+    let beginCommand = "BEGIN";
+    if (isolationLevel !== "READ COMMITTED") {
       beginCommand += ` ISOLATION LEVEL ${isolationLevel}`;
     }
     if (readOnly) {
-      beginCommand += ' READ ONLY';
+      beginCommand += " READ ONLY";
     }
 
-    logger.info('Beginning transaction', {
+    logger.info("Beginning transaction", {
       isolationLevel,
       readOnly,
       useSavepoint,
@@ -152,19 +158,19 @@ export async function withTransaction<T>(
 
     const result = await callback(client);
 
-    await client.query('COMMIT');
+    await client.query("COMMIT");
     transactionContexts.delete(client);
-    logger.info('Transaction committed');
+    logger.info("Transaction committed");
 
     if (afterCommit) {
       try {
         await afterCommit(result);
       } catch (afterCommitError) {
         const sanitizedMessage = sanitizeError(afterCommitError);
-        logger.error('Post-commit action failed', { error: sanitizedMessage });
+        logger.error("Post-commit action failed", { error: sanitizedMessage });
         throw new TransactionError(
           `Transaction committed but post-commit action failed: ${sanitizedMessage}`,
-          afterCommitError
+          afterCommitError,
         );
       }
     }
@@ -172,25 +178,31 @@ export async function withTransaction<T>(
     return result;
   } catch (error) {
     let rollbackSucceeded = true;
-    
+
     if (client) {
       try {
-        await client.query('ROLLBACK');
+        await client.query("ROLLBACK");
         transactionContexts.delete(client);
-        logger.warn('Transaction rolled back successfully');
+        logger.warn("Transaction rolled back successfully");
       } catch (rollbackError) {
         rollbackSucceeded = false;
         // Log rollback failure but throw original error
-        console.error('[transaction] Rollback failed:', sanitizeError(rollbackError));
+        console.error(
+          "[transaction] Rollback failed:",
+          sanitizeError(rollbackError),
+        );
       }
     }
 
     const sanitizedMessage = sanitizeError(error);
-    logger.error('Transaction failed', { error: sanitizedMessage, rollbackSucceeded });
+    logger.error("Transaction failed", {
+      error: sanitizedMessage,
+      rollbackSucceeded,
+    });
     throw new TransactionError(
       `Transaction failed: ${sanitizedMessage}`,
       error,
-      rollbackSucceeded
+      rollbackSucceeded,
     );
   } finally {
     if (client && !isNestedTransaction) {
@@ -208,31 +220,37 @@ function sanitizeError(error: unknown): string {
   if (error instanceof Error) {
     // Remove sensitive patterns from error messages
     let message = error.message;
-    
+
     // Remove connection strings
-    message = message.replace(/postgresql:\/\/[^\s]+/gi, 'postgresql://[REDACTED]');
-    
+    message = message.replace(
+      /postgresql:\/\/[^\s]+/gi,
+      "postgresql://[REDACTED]",
+    );
+
     // Remove password patterns
-    message = message.replace(/password[=:]\s*['"]?[^'"\s]+['"]?/gi, 'password=[REDACTED]');
-    
+    message = message.replace(
+      /password[=:]\s*['"]?[^'"\s]+['"]?/gi,
+      "password=[REDACTED]",
+    );
+
     // Remove potential API keys or tokens
-    message = message.replace(/[a-z0-9]{32,}/gi, '[REDACTED]');
-    
+    message = message.replace(/[a-z0-9]{32,}/gi, "[REDACTED]");
+
     return message;
   }
-  
-  return 'Unknown error';
+
+  return "Unknown error";
 }
 
 /**
  * Execute multiple operations in a transaction with automatic rollback on any failure.
  * Convenience wrapper around withTransaction for common patterns.
- * 
+ *
  * @param pool - PostgreSQL connection pool
  * @param operations - Array of functions to execute in sequence
  * @param options - Transaction configuration options
  * @returns Array of results from each operation
- * 
+ *
  * @example
  * ```typescript
  * const [user, profile] = await transactional(pool, [
@@ -244,16 +262,243 @@ function sanitizeError(error: unknown): string {
 export async function transactional<T extends unknown[]>(
   pool: Pool,
   operations: Array<(client: PoolClient) => Promise<unknown>>,
-  options: TransactionOptions<T> = {}
+  options: TransactionOptions<T> = {},
 ): Promise<T> {
-  return withTransaction(pool, async (client) => {
-    const results: unknown[] = [];
-    
-    for (const operation of operations) {
-      const result = await operation(client);
-      results.push(result);
+  return withTransaction(
+    pool,
+    async (client) => {
+      const results: unknown[] = [];
+
+      for (const operation of operations) {
+        const result = await operation(client);
+        results.push(result);
+      }
+
+      return results as T;
+    },
+    options,
+  );
+}
+
+/**
+ * Result type for advisory-lock acquisition attempts.
+ */
+export interface AdvisoryLockAcquireResult {
+  /** True when the lock was granted, false if another session holds it. */
+  acquired: boolean;
+}
+
+/**
+ * Error thrown when a transaction-scoped advisory lock cannot be acquired.
+ *
+ * This distinct error type allows callers (scheduler, HTTP handlers) to
+ * differentiate "another process is already running this batch" from other
+ * transactional failures and respond with the appropriate status / retry
+ * behaviour instead of surfacing a generic 500.
+ */
+export class AdvisoryLockNotAvailableError extends Error {
+  constructor(
+    message: string,
+    public readonly classId: number,
+    public readonly objectId: number,
+  ) {
+    super(message);
+    this.name = "AdvisoryLockNotAvailableError";
+    Object.setPrototypeOf(this, AdvisoryLockNotAvailableError.prototype);
+  }
+}
+
+/**
+ * Derive a pair of int4 keys from arbitrary strings for use with Postgres
+ * two-argument advisory-lock functions (pg_try_advisory_xact_lock etc).
+ *
+ * Uses FNV-1a 32-bit split into two 16-bit halves sign-extended to int4 so
+ * Postgres accepts them as integer literals. Collision probability is
+ * negligible for the expected cardinality of (offering_id, period_id) pairs
+ * in a single deployment.
+ */
+export function advisoryLockKey2(
+  primary: string,
+  secondary: string,
+): [number, number] {
+  const input = `${primary}:${secondary}`;
+  let h = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193); // FNV prime
+  }
+  const hi = (h >>> 16) & 0xffff;
+  const lo = h & 0xffff;
+  return [hi | 0, lo | 0];
+}
+
+/**
+ * Attempt to acquire a transaction-scoped advisory lock keyed by two int4
+ * values. Returns true when the lock was granted, false otherwise.
+ *
+ * The lock is automatically released when the enclosing transaction commits
+ * or rolls back — no explicit release is required.
+ *
+ * Security assumptions:
+ * - Must only be called inside an active transaction (`withTransaction`) so
+ *   the lock scopes correctly to the work being serialised.
+ * - Uses `pg_try_advisory_xact_lock` (non-blocking) so a contended batch
+ *   fails fast rather than queueing an unbounded number of workers.
+ */
+export async function tryAcquireAdvisoryXactLock(
+  client: PoolClient,
+  classId: number,
+  objectId: number,
+): Promise<boolean> {
+  const result = await client.query<{ acquired: boolean }>(
+    "SELECT pg_try_advisory_xact_lock($1, $2) AS acquired",
+    [classId, objectId],
+  );
+  return result.rows[0].acquired;
+}
+
+/**
+ * Execute `callback` inside a transaction while holding a transaction-scoped
+ * advisory lock derived from `(primaryKey, secondaryKey)`.
+ *
+ * If the lock cannot be acquired (another session/process already holds it),
+ * throws `AdvisoryLockNotAvailableError` so callers can decide whether to
+ * retry, skip, or return a 409 CONFLICT response.
+ *
+ * This is the **canonical** entry point for serialising work that must not
+ * run concurrently across processes (e.g. a distribution batch for a given
+ * offering/period).
+ *
+ * @param pool          PostgreSQL connection pool.
+ * @param primaryKey    First lock dimension (e.g. `offeringId`).
+ * @param secondaryKey  Second lock dimension (e.g. `periodId`).
+ * @param callback      Work to execute while the lock is held. Receives the
+ *                      transactional `PoolClient` so the caller can participate
+ *                      in the same transaction as the lock.
+ * @param options       Standard transaction options (isolation level,
+ *                      readOnly, afterCommit hooks).
+ * @returns The callback's return value.
+ * @throws {AdvisoryLockNotAvailableError} If the lock is held by another session.
+ * @throws {TransactionError} If the underlying transaction fails.
+ */
+export async function withAdvisoryLock<T>(
+  pool: Pool,
+  primaryKey: string,
+  secondaryKey: string,
+  callback: (client: PoolClient) => Promise<T>,
+  options: TransactionOptions<T> = {},
+): Promise<T> {
+  if (!pool) throw new TransactionError("Pool is required");
+  if (!primaryKey || typeof primaryKey !== "string") {
+    throw new TransactionError("primaryKey is required");
+  }
+  if (!secondaryKey || typeof secondaryKey !== "string") {
+    throw new TransactionError("secondaryKey is required");
+  }
+  if (typeof callback !== "function") {
+    throw new TransactionError("Callback must be a function");
+  }
+
+  const [classId, objectId] = advisoryLockKey2(primaryKey, secondaryKey);
+
+  return withTransaction<T>(
+    pool,
+    async (client) => {
+      const acquired = await tryAcquireAdvisoryXactLock(
+        client,
+        classId,
+        objectId,
+      );
+      if (!acquired) {
+        throw new AdvisoryLockNotAvailableError(
+          `Advisory lock for ("${primaryKey}", "${secondaryKey}") is held by another session`,
+          classId,
+          objectId,
+        );
+      }
+      return await callback(client);
+    },
+    options,
+  );
+}
+
+/**
+ * A webhook event to be captured by the transactional outbox as part of the
+ * producing database transaction.
+ */
+export interface WebhookOutboxEvent {
+  /** Webhook event type (e.g. `distribution.completed`, `payout.failed`). */
+  event: WebhookEventType;
+  /** Arbitrary JSON-serialisable event payload. */
+  data: unknown;
+  /** Stable idempotency key; a UUID v4 is generated when omitted. */
+  eventId?: string;
+}
+
+/**
+ * Insert webhook events into the transactional outbox using the caller's
+ * transactional `client`.
+ *
+ * Because every row is written through the same `PoolClient` as the domain
+ * change that produced the event, the rows commit or roll back atomically with
+ * the surrounding `withTransaction` block:
+ *
+ * - **Commit**  → the rows become visible and are picked up by the
+ *   `OutboxDispatcher` drain worker.
+ * - **Rollback** → the rows are discarded with the transaction, so a failed
+ *   producer never emits a phantom webhook event.
+ *
+ * Each row carries a stable `event_id` (the caller-supplied idempotency key or
+ * a fresh UUID v4). The dispatcher forwards that id as the webhook payload `id`
+ * on every delivery attempt, so the receiver's `webhookEventOrdering`
+ * middleware can deduplicate retries — exactly-once delivery.
+ *
+ * @example
+ * ```typescript
+ * await withTransaction(pool, async (client) => {
+ *   await client.query('UPDATE payouts SET status = $1 ...', ['completed', payoutId]);
+ *   await enqueueWebhookOutboxEvents(client, outboxRepo, [{
+ *     event: WebhookEventType.PAYOUT_COMPLETED,
+ *     data: { payout_id: payoutId },
+ *   }]);
+ * });
+ * ```
+ *
+ * @param client    Transactional PoolClient from the producing transaction.
+ * @param outboxRepo OutboxRepository wrapping the `webhook_outbox` table.
+ * @param events    List of events to capture atomically.
+ * @returns         The stable `event_id` written for each event, in order.
+ * @throws {TransactionError} when `client`, `outboxRepo` or the events list
+ *         is invalid.
+ */
+export async function enqueueWebhookOutboxEvents(
+  client: PoolClient,
+  outboxRepo: OutboxRepository,
+  events: WebhookOutboxEvent[],
+): Promise<string[]> {
+  if (!client) {
+    throw new TransactionError('PoolClient is required to enqueue webhook outbox events');
+  }
+  if (!outboxRepo) {
+    throw new TransactionError('OutboxRepository is required to enqueue webhook outbox events');
+  }
+  if (!Array.isArray(events)) {
+    throw new TransactionError('Outbox events must be provided as an array');
+  }
+  if (events.length === 0) {
+    return [];
+  }
+
+  const eventIds: string[] = [];
+  for (const entry of events) {
+    if (!entry || typeof entry !== 'object' || !entry.event) {
+      throw new TransactionError('Each outbox event must include a valid event type');
     }
-    
-    return results as T;
-  }, options);
+    const row = await outboxRepo.insert(
+      { event_type: entry.event, payload: entry.data, event_id: entry.eventId },
+      client,
+    );
+    eventIds.push(row.event_id);
+  }
+  return eventIds;
 }

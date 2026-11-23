@@ -6,12 +6,13 @@ export class JwtIssuerAdapter implements JwtIssuer {
     accessToken: string;
     refreshToken: string;
   } {
-    const accessToken = issueToken({
+    const accessToken = issueToken( {
       subject: payload.userId,
       expiresIn: TOKEN_EXPIRY,
       additionalPayload: {
         sid: payload.sessionId,
         role: payload.role,
+        typ: 'access',
       },
     });
 
@@ -21,6 +22,7 @@ export class JwtIssuerAdapter implements JwtIssuer {
       additionalPayload: {
         sid: payload.sessionId,
         role: payload.role,
+        typ: 'refresh',
       },
     });
 

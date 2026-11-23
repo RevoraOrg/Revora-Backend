@@ -18,7 +18,17 @@ import {
   CreateCaseInput,
   UpdateCaseInput,
   SemVer,
+  TransactionContext,
 } from './types';
+import {
+  RECORDED_PROVIDERS,
+  assertNoPiiLeaks,
+  findPiiLeaks,
+  interactionByLabel,
+  replayInteractions,
+  replayProvider,
+} from './fixtures/replay';
+import { createRedactionContext, redactObject } from './fixtures/redaction';
 
 // Mock repositories
 class MockRuleRepository {
@@ -387,7 +397,7 @@ describe('AMLService', () => {
         config: { window_minutes: 60, max_amount: 10000, max_count: 10 },
       };
 
-      const rule = await service.createRule(input);
+      const rule = await service.createRule(input, 'user_u1');
 
       expect(rule.name).toBe(input.name);
       expect(rule.type).toBe(input.type);
@@ -397,6 +407,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_created');
+      expect(events[0].userId).toBe('user_u1');
     });
 
     it('should update a rule with version bump and audit logging', async () => {
@@ -413,7 +424,7 @@ describe('AMLService', () => {
         change_reason: 'Disabling for testing',
       };
 
-      const updated = await service.updateRule(rule.id, input);
+      const updated = await service.updateRule(rule.id, input, 'user_u2');
 
       expect(updated.enabled).toBe(false);
       expect(updated.version.minor).toBe(1);
@@ -422,6 +433,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_updated');
+      expect(events[0].userId).toBe('user_u2');
     });
 
     it('should rollback rule to previous version with audit logging', async () => {
@@ -435,7 +447,7 @@ describe('AMLService', () => {
 
       const targetVersion: SemVer = { major: 1, minor: 0, patch: 0 };
 
-      const rolledBack = await service.rollbackRule(rule.id, targetVersion);
+      const rolledBack = await service.rollbackRule(rule.id, targetVersion, 'user_u3');
 
       expect(rolledBack.version.patch).toBe(1);
 
@@ -443,6 +455,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_rule_rollback');
+      expect(events[0].userId).toBe('user_u3');
     });
 
     it('should get all rules', async () => {
@@ -485,7 +498,7 @@ describe('AMLService', () => {
         notes: 'Initial review',
       };
 
-      const amlCase = await service.createCase(input);
+      const amlCase = await service.createCase(input, 'user_u4');
 
       expect(amlCase.status).toBe('assigned');
       expect(amlCase.assigned_to).toBe('analyst1');
@@ -494,6 +507,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_created');
+      expect(events[0].userId).toBe('user_u4');
     });
 
     it('should update a case with audit logging', async () => {
@@ -518,7 +532,7 @@ describe('AMLService', () => {
         notes: 'Investigation complete',
       };
 
-      const updated = await service.updateCase(amlCase.id, input);
+      const updated = await service.updateCase(amlCase.id, input, 'user_u5');
 
       expect(updated.status).toBe('closed');
       expect(updated.disposition).toBe('false_positive');
@@ -528,6 +542,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_case_updated');
+      expect(events[0].userId).toBe('user_u5');
     });
 
     it('should get case by ID', async () => {
@@ -659,7 +674,7 @@ describe('AMLService', () => {
         status: 'pending',
       });
 
-      const dismissed = await service.dismissAlert(alert.id);
+      const dismissed = await service.dismissAlert(alert.id, 'user_u6');
 
       expect(dismissed.status).toBe('dismissed');
 
@@ -667,6 +682,7 @@ describe('AMLService', () => {
       const events = auditRepo.getEvents();
       expect(events).toHaveLength(1);
       expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u6');
     });
   });
 
@@ -727,5 +743,618 @@ describe('AMLService', () => {
       expect(queue[0].status).toBe('pending_first_approval');
       expect(queue[0].first_approver_id).toBeUndefined();
     });
+  });
+
+  describe('OFAC Review Failure Handling', () => {
+    const createReview = async (expires_at?: Date) => service.createOFACReview({
+      alert_id: 'alert_ofac_1',
+      investor_id: 'investor_1',
+      matched_name: 'John Smith',
+      list_entry_id: 'ofac_sdn_123',
+      rationale: 'Documented legal name collision with verified date of birth mismatch.',
+      expires_at,
+    }, 'case_creator');
+
+    it.each([
+      ['empty string', ''],
+      ['single space', ' '],
+      ['spaces only', '   '],
+      ['tab only', '\t'],
+      ['newline only', '\n'],
+      ['mixed whitespace', ' \t\r\n '],
+      ['non-breaking space', '\u00a0'],
+    ])('rejects a %s rationale without touching the repository or audit trail', async (_label, rationale) => {
+      const review = await createReview();
+      const before = auditRepo.getEvents();
+      const findByIdSpy = jest.spyOn(ofacReviewRepo, 'findById');
+      const approveSpy = jest.spyOn(ofacReviewRepo, 'approve');
+
+      await expect(
+        service.approveOFACReview(review.id, 'officer_1', rationale)
+      ).rejects.toThrow('OFAC clearance rationale is required');
+
+      // The guard must run before any repository read/write or audit write.
+      expect(findByIdSpy).not.toHaveBeenCalled();
+      expect(approveSpy).not.toHaveBeenCalled();
+      expect(auditRepo.getEvents()).toHaveLength(before.length);
+      expect(review.status).toBe('pending_first_approval');
+      expect(review.first_approver_id).toBeUndefined();
+    });
+
+    it('validates the rationale before resolving a missing OFAC repository', async () => {
+      const noRepoService = new AMLService(
+        ruleRepo as unknown as AMLRuleRepository,
+        alertRepo as unknown as AMLAlertRepository,
+        evaluator as unknown as RuleEvaluator,
+        auditRepo,
+        'test_user'
+      );
+
+      // A blank rationale is a caller error regardless of wiring; the rationale
+      // guard must win over the "repository is not configured" guard.
+      await expect(
+        noRepoService.approveOFACReview('ofac_any', 'officer_1', '   ')
+      ).rejects.toThrow('OFAC clearance rationale is required');
+    });
+
+    it('throws when the OFAC review repository is not configured', async () => {
+      const noRepoService = new AMLService(
+        ruleRepo as unknown as AMLRuleRepository,
+        alertRepo as unknown as AMLAlertRepository,
+        evaluator as unknown as RuleEvaluator,
+        auditRepo,
+        'test_user'
+      );
+
+      await expect(noRepoService.createOFACReview({
+        alert_id: 'alert_ofac_1',
+        investor_id: 'investor_1',
+        matched_name: 'John Smith',
+        rationale: 'Documented legal name collision with verified date of birth mismatch.',
+      })).rejects.toThrow('OFAC review repository is not configured');
+
+      await expect(noRepoService.getOFACReviewQueue()).rejects.toThrow(
+        'OFAC review repository is not configured'
+      );
+
+      await expect(
+        noRepoService.approveOFACReview('ofac_any', 'officer_1', 'Valid rationale that is not blank.')
+      ).rejects.toThrow('OFAC review repository is not configured');
+
+      // Wiring failures must not emit audit events claiming compliance activity.
+      expect(auditRepo.getEvents()).toHaveLength(0);
+    });
+
+    it('returns an empty queue when no reviews are pending and excludes cleared reviews', async () => {
+      // Empty-result branch: no reviews queued at all.
+      await expect(service.getOFACReviewQueue()).resolves.toEqual([]);
+
+      const review = await createReview();
+      expect(await service.getOFACReviewQueue()).toHaveLength(1);
+
+      await service.approveOFACReview(review.id, 'officer_1', 'First review rationale is complete.');
+      await service.approveOFACReview(review.id, 'officer_2', 'Second review confirms false positive.');
+
+      // Cleared reviews are no longer actionable and must drop out of the queue.
+      const queue = await service.getOFACReviewQueue();
+      expect(queue).toHaveLength(0);
+      expect(queue.find(entry => entry.id === review.id)).toBeUndefined();
+    });
+
+    it('accepts the shortest non-blank rationale and preserves it verbatim', async () => {
+      const review = await createReview();
+      const rationale = ' x '; // 1 non-whitespace char, padded -> valid and stored as-is
+
+      const first = await service.approveOFACReview(review.id, 'officer_1', rationale);
+
+      expect(first.status).toBe('pending_second_approval');
+      expect(first.first_approval_rationale).toBe(rationale);
+
+      const firstEvent = auditRepo.getEvents().find(
+        event => event.action === 'ofac_review_first_approved'
+      );
+      expect(firstEvent?.resource).toBe(`ofac_review/${review.id}`);
+      expect(firstEvent?.details).toMatchObject({
+        review_id: review.id,
+        alert_id: 'alert_ofac_1',
+        investor_id: 'investor_1',
+        status: 'pending_second_approval',
+        first_approver_id: 'officer_1',
+        rationale,
+      });
+
+      const cleared = await service.approveOFACReview(review.id, 'officer_2', 'Second review confirms.');
+      expect(cleared.status).toBe('cleared');
+
+      const clearedEvent = auditRepo.getEvents().find(
+        event => event.action === 'ofac_review_cleared'
+      );
+      expect(clearedEvent?.details).toMatchObject({
+        review_id: review.id,
+        status: 'cleared',
+        first_approver_id: 'officer_1',
+        second_approver_id: 'officer_2',
+        rationale: 'Second review confirms.',
+      });
+    });
+  });
+
+  describe('Regression Tests', () => {
+    it('should not record "system" as userId when explicit actorId is provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert with explicit actorId
+      await service.dismissAlert(alert.id, 'user_u1');
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('user_u1');
+      expect(events[0].userId).not.toBe('system');
+    });
+
+    it('should fall back to currentUserId when actorId is not provided', async () => {
+      const alert = await alertRepo.create({
+        investment_id: 'inv1',
+        investor_id: 'inv1',
+        rule_id: 'rule1',
+        rule_version: { major: 1, minor: 0, patch: 0 },
+        severity: 'high',
+        details: {},
+        status: 'pending',
+      });
+
+      // Dismiss alert without explicit actorId (falls back to currentUserId)
+      await service.dismissAlert(alert.id);
+
+      const events = auditRepo.getEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].action).toBe('aml_alert_dismissed');
+      expect(events[0].userId).toBe('test_user'); // currentUserId from service constructor
+    });
+  });
+});
+
+  /**
+   * Provider fixture replay (#755).
+   *
+   * The recorder/redaction harness landed in #594 but was only ever exercised
+   * by its own unit tests — `amlService.test.ts` never replayed a trace, so a
+   * fixture that leaked PII could still land green. These tests replay every
+   * checked-in provider fixture in CI and fail the build on any leak.
+   */
+  describe('Provider Fixture Replay', () => {
+    it('should ship a fixture for every recorded provider', async () => {
+      expect(RECORDED_PROVIDERS.length).toBeGreaterThan(0);
+
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        expect(fixture.provider).toBe(provider);
+      }
+    });
+
+    it('should leak no PII or credentials in any recorded fixture', async () => {
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        expect({ provider, leaks: findPiiLeaks(fixture) }).toEqual({
+          provider,
+          leaks: [],
+        });
+        expect(() => assertNoPiiLeaks(fixture)).not.toThrow();
+      }
+    });
+
+    it('should replay interactions in recorded order with a non-empty body', async () => {
+      for (const provider of RECORDED_PROVIDERS) {
+        const fixture = await replayProvider(provider);
+        const interactions = replayInteractions(fixture);
+
+        expect(interactions.length).toBeGreaterThan(0);
+        for (const interaction of interactions) {
+          expect(interaction.label).toBeTruthy();
+          expect(interaction.request.method).toMatch(/^(GET|POST|PUT|PATCH|DELETE)$/);
+          expect(interaction.request.path).toMatch(/^\//);
+          expect(interaction.response.status).toBeGreaterThanOrEqual(100);
+          expect(interaction.response.status).toBeLessThan(600);
+          expect(interaction.request.timestamp).toMatch(
+            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+          );
+        }
+      }
+    });
+
+    it('should replay deterministically across repeated loads', async () => {
+      const first = await replayProvider('sumsub');
+      const second = await replayProvider('sumsub');
+
+      expect(JSON.stringify(replayInteractions(first))).toBe(
+        JSON.stringify(replayInteractions(second)),
+      );
+    });
+
+    it('should allow per-label lookup for adapter assertions', async () => {
+      const sumsub = await replayProvider('sumsub');
+      const jumio = await replayProvider('jumio');
+
+      expect(interactionByLabel(sumsub, 'applicant_created')).toBeDefined();
+      expect(interactionByLabel(sumsub, 'check_complete')).toBeDefined();
+      expect(interactionByLabel(jumio, 'verify_customer')).toBeDefined();
+      expect(interactionByLabel(sumsub, 'does_not_exist')).toBeUndefined();
+    });
+
+    it('should keep provider error responses replayable for negative paths', async () => {
+      // Error traces must survive redaction too: an adapter's failure mapping is
+      // as much of a contract as its success mapping.
+      const jumio = await replayProvider('jumio');
+      const notFound = interactionByLabel(jumio, 'transaction_not_found');
+
+      expect(notFound).toBeDefined();
+      expect(notFound!.response.status).toBe(404);
+      expect(() => assertNoPiiLeaks(jumio)).not.toThrow();
+    });
+
+    it('should redact a raw PII payload through the engine with no leak', async () => {
+      // Round-trips a realistic un-redacted vendor payload through the
+      // redactor, then asserts the leak scanner catches nothing.
+      const ctx = createRedactionContext();
+      const raw = {
+        applicant: {
+          firstName: 'Jane',
+          lastName: 'Doe',
+          email: 'jane.doe@example.com',
+          phone: '+14155552671',
+          dateOfBirth: '1985-04-12',
+          address: '742 Evergreen Terrace, Springfield',
+        },
+        document: {
+          type: 'passport',
+          number: 'X1234567',
+        },
+        meta: {
+          ipAddress: '203.0.113.42',
+          apiKey: 'sk_live_9f8a7b6c5d4e3f2a',
+          sessionToken: 'eyJhbGciOiJIUzI1NiJ9.payload.sig',
+        },
+      };
+
+      const redacted = redactObject(raw, ctx);
+
+      const serialized = JSON.stringify(redacted);
+      expect(serialized).not.toContain('jane.doe@example.com');
+      expect(serialized).not.toContain('+14155552671');
+      expect(serialized).not.toContain('203.0.113.42');
+      expect(serialized).not.toContain('sk_live_9f8a7b6c5d4e3f2a');
+      expect(serialized).not.toContain('Evergreen Terrace');
+      expect(serialized).not.toContain('1985-04-12');
+
+      // Non-PII enums must survive redaction untouched.
+      const typed = redacted as typeof raw;
+      expect(typed.document.type).toBe('passport');
+    });
+
+    it('should detect a leak when raw PII is injected into a fixture', async () => {
+      // Negative control: proves the scanner actually fails, so the passing
+      // assertions above are not vacuous.
+      const fixture = await replayProvider('jumio');
+      const tampered = {
+        ...fixture,
+        interactions: fixture.interactions.map((interaction, i) =>
+          i === 0
+            ? {
+                ...interaction,
+                response: {
+                  ...interaction.response,
+                  body: { ...(interaction.response.body as object), email: 'leak@example.com' },
+                },
+              }
+            : interaction,
+        ),
+      };
+
+      const leaks = findPiiLeaks(tampered);
+      expect(leaks.length).toBeGreaterThan(0);
+      expect(leaks.join('\n')).toMatch(/email/);
+      expect(() => assertNoPiiLeaks(tampered)).toThrow(/leaks PII/);
+    });
+
+    it('should detect credential-shaped headers left un-redacted', async () => {
+      const fixture = await replayProvider('sumsub');
+      const tampered = {
+        ...fixture,
+        interactions: fixture.interactions.map((interaction, i) =>
+          i === 0
+            ? {
+                ...interaction,
+                request: {
+                  ...interaction.request,
+                  headers: { ...interaction.request.headers, Authorization: 'Bearer eyJhbGciOiJI' },
+                },
+              }
+            : interaction,
+        ),
+      };
+
+      expect(findPiiLeaks(tampered).length).toBeGreaterThan(0);
+    });
+
+    it('should not flag benign recorded values as leaks', () => {
+      // Guards the scanner against becoming so noisy that real leaks get
+      // dismissed as false positives.
+      const clean = {
+        provider: 'sumsub',
+        version: 1 as const,
+        recordedAt: '2026-01-15T12:00:00.000Z',
+        interactions: [],
+        redaction: { totalRedactions: 0, placeholderCount: 0 },
+      };
+
+      expect(findPiiLeaks(clean)).toEqual([]);
+    });
+  });
+
+// ─── Tenant Sanctions Threshold Wiring Tests (#1289) ─────────────────────────
+
+/**
+ * Minimal stub for TenantSettingsService.  Only getSanctionsThreshold is used
+ * by AMLService, so that is the only method we need.
+ */
+class MockTenantSettingsService {
+  constructor(private readonly thresholdByTenant: Record<string, number> = {}) {}
+
+  async getSanctionsThreshold(tenantId: string): Promise<number> {
+    return this.thresholdByTenant[tenantId] ?? 0.85;
+  }
+}
+
+/**
+ * A RuleEvaluator stub that captures the context it receives so tests can
+ * inspect whether tenant_settings was attached before evaluation.
+ */
+class CapturingEvaluator {
+  capturedContext: TransactionContext | null = null;
+
+  async evaluate(context: TransactionContext, _rules: any[]): Promise<any[]> {
+    this.capturedContext = context;
+    return [];
+  }
+}
+
+describe('AMLService – tenant threshold context enrichment (#1289)', () => {
+  let ruleRepo: MockRuleRepository;
+  let alertRepo: MockAlertRepository;
+  let auditRepo: MockAuditRepository;
+  let capturingEvaluator: CapturingEvaluator;
+
+  function makeService(tenantThresholds: Record<string, number> = {}) {
+    capturingEvaluator = new CapturingEvaluator();
+    const tenantSettingsService = new MockTenantSettingsService(tenantThresholds);
+    return new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      capturingEvaluator as any,
+      auditRepo,
+      'test_user',
+      undefined, // ofacReviewRepo not needed
+      tenantSettingsService as any,
+    );
+  }
+
+  beforeEach(() => {
+    ruleRepo = new MockRuleRepository();
+    alertRepo = new MockAlertRepository();
+    auditRepo = new MockAuditRepository();
+  });
+
+  it('regression: without TenantSettingsService, tenant_settings is never attached', async () => {
+    // Verify the pre-fix behaviour: service wired WITHOUT tenantSettingsService.
+    capturingEvaluator = new CapturingEvaluator();
+    const serviceWithoutTenant = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      capturingEvaluator as any,
+      auditRepo,
+      'test_user',
+    );
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      // tenant_settings deliberately absent — simulates the bug
+    };
+
+    await serviceWithoutTenant.evaluateTransaction(context);
+
+    // Without the fix the evaluator receives the context as-is, with no
+    // tenant_settings populated.
+    expect(capturingEvaluator.capturedContext?.tenant_settings).toBeUndefined();
+  });
+
+  it('with TenantSettingsService, tenant threshold is attached when tenant_id is set', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      // tenant_settings absent — service must populate it
+    };
+
+    await service.evaluateTransaction(context);
+
+    expect(capturingEvaluator.capturedContext?.tenant_settings?.sanctions_threshold).toBe(0.95);
+  });
+
+  it('does not overwrite an already-populated tenant_settings.sanctions_threshold', async () => {
+    // Callers that pre-populate context (e.g. tests, admin overrides) must not
+    // have their value silently replaced.
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.99 }, // caller already set it
+    };
+
+    await service.evaluateTransaction(context);
+
+    // Pre-existing value must be preserved
+    expect(capturingEvaluator.capturedContext?.tenant_settings?.sanctions_threshold).toBe(0.99);
+  });
+
+  it('does not load threshold when tenant_id is absent', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      // no tenant_id
+    };
+
+    await service.evaluateTransaction(context);
+
+    expect(capturingEvaluator.capturedContext?.tenant_settings).toBeUndefined();
+  });
+
+  it('original caller context is not mutated (shallow copy is used)', async () => {
+    const service = makeService({ tenant_abc: 0.95 });
+
+    const context: TransactionContext = {
+      investment_id: 'inv1',
+      investor_id: 'inv1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      tenant_id: 'tenant_abc',
+    };
+
+    await service.evaluateTransaction(context);
+
+    // The original context object must remain unchanged
+    expect(context.tenant_settings).toBeUndefined();
+  });
+
+  it('alert details include threshold_source tenant when tenant threshold is active', async () => {
+    // Use a real RuleEvaluator so the full path is exercised end-to-end.
+    const investmentRepo = { listByInvestor: async () => [] };
+    const realEvaluator = new RuleEvaluator(investmentRepo as any);
+
+    const tenantSettingsService = new MockTenantSettingsService({ tenant_abc: 0.95 });
+    const service = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      realEvaluator,
+      auditRepo,
+      'test_user',
+      undefined,
+      tenantSettingsService as any,
+    );
+
+    // Create a sanctions rule that would trigger at 0.85 but NOT at 0.95.
+    await ruleRepo.create(
+      {
+        name: 'Sanctions Rule',
+        description: 'Test sanctions rule',
+        type: 'sanctions_screening',
+        severity: 'critical',
+        config: {
+          sanctions_list: ['Specially Designated National'],
+          fuzzy_enabled: true,
+        },
+      },
+      'test_user',
+    );
+
+    // Investor name that scores above 0.85 but below 0.95 vs the list entry
+    const context: TransactionContext = {
+      investment_id: 'inv_sanctions_1',
+      investor_id: 'investor_sanctions_1',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      investor_name: 'Specially Designated Nationol',
+      tenant_id: 'tenant_abc',
+      previous_transactions: [],
+      // No tenant_settings — service must attach it
+    };
+
+    const alerts = await service.evaluateTransaction(context);
+
+    // With tenant threshold 0.95 the near-miss name must NOT trigger
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('with default 0.85 threshold the same near-miss name DOES trigger (proving threshold is used)', async () => {
+    // Same setup but without TenantSettingsService — falls back to 0.85.
+    const investmentRepo = { listByInvestor: async () => [] };
+    const realEvaluator = new RuleEvaluator(investmentRepo as any);
+
+    const serviceDefault = new AMLService(
+      ruleRepo as any,
+      alertRepo as any,
+      realEvaluator,
+      auditRepo,
+      'test_user',
+      // No tenantSettingsService
+    );
+
+    await ruleRepo.create(
+      {
+        name: 'Sanctions Rule',
+        description: 'Test sanctions rule',
+        type: 'sanctions_screening',
+        severity: 'critical',
+        config: {
+          sanctions_list: ['Specially Designated National'],
+          fuzzy_enabled: true,
+        },
+      },
+      'test_user',
+    );
+
+    const context: TransactionContext = {
+      investment_id: 'inv_sanctions_2',
+      investor_id: 'investor_sanctions_2',
+      offering_id: 'off1',
+      amount: '1000',
+      asset: 'USD',
+      timestamp: new Date(),
+      investor_name: 'Specially Designated Nationol',
+      previous_transactions: [],
+    };
+
+    const alerts = await service.evaluateTransaction(context);
+
+    // At 0.85 this near-miss SHOULD trigger, confirming the threshold matters
+    expect(alerts.length).toBeGreaterThan(0);
+    expect(alerts[0].details.threshold_source).toBe('default');
+    expect(alerts[0].details.threshold).toBe(0.85);
   });
 });

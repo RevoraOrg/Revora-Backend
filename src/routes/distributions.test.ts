@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import express from 'express';
+import request from 'supertest';
 import { Decimal } from '../lib/decimal';
 import { Errors } from '../lib/errors';
 import { BalanceRow, DistributionPreviewResult } from '../services/distributionEngine';
+import createDistributionsRouter, { OfferingRepo } from './distributions';
+import { errorHandler } from '../middleware/errorHandler';
 
 /**
  * Distribution Preview and Shared Calculation Tests
@@ -83,10 +87,10 @@ describe('Distribution Preview Feature', () => {
       };
 
       // Get preview
-      const preview = await mockDistributionEngine.previewRun(offeringId, period, revenueAmount);
+      const preview = await mockDistributionEngine.previewRun(offeringId, period, String(revenueAmount));
       
       // Get actual distribution
-      const actual = await mockDistributionEngine.distribute(offeringId, period, revenueAmount);
+      const actual = await mockDistributionEngine.distribute(offeringId, period, String(revenueAmount));
 
       // ASSERTION: Per-investor amounts must be numerically identical
       expect(preview.projections).toHaveLength(actual.payouts.length);
@@ -217,8 +221,8 @@ describe('Distribution Preview Feature', () => {
       };
 
       const period = { id: 'period-1', start: new Date(), end: new Date() };
-      const result1 = await mockEngine.previewRun('off-1', period, 100000);
-      const result2 = await mockEngine.previewRun('off-1', period, 100000);
+      const result1 = await mockEngine.previewRun('off-1', period, '100000');
+      const result2 = await mockEngine.previewRun('off-1', period, '100000');
 
       // Different preview-ids confirm no idempotency caching
       expect(result1.preview_id).not.toBe(result2.preview_id);
@@ -256,7 +260,7 @@ describe('Distribution Preview Feature', () => {
 
       // Call preview 5 times with identical inputs
       for (let i = 0; i < 5; i++) {
-        const result = await mockEngine.previewRun('off-1', period, 100000);
+        const result = await mockEngine.previewRun('off-1', period, '100000');
         previewIds.add(result.preview_id);
       }
 
@@ -583,6 +587,194 @@ describe('Distribution Preview Feature', () => {
       
       const sharedFunction = 'calculateDistributionPayouts';
       expect(sharedFunction).toBe('calculateDistributionPayouts');
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Route-level decimal-string validation (issue #1281)
+// ─────────────────────────────────────────────────────────────────────────
+describe('Route-level decimal-string validation', () => {
+  function makeTriggerApp(engineOverrides: Record<string, jest.Mock> = {}) {
+    const app = express();
+    app.use(express.json());
+
+    const verifyJWT: express.RequestHandler = (req, _res, next) => {
+      (req as any).user = { id: 'user-1', role: 'admin' };
+      next();
+    };
+
+    const distributionEngine = {
+      distribute: jest.fn().mockResolvedValue({
+        distributionRun: { id: 'run-1' },
+        payouts: [],
+        successfulPayouts: [],
+        failedPayouts: [],
+        totalPayouts: 0,
+      }),
+      previewRun: jest.fn().mockResolvedValue({
+        preview_id: 'prev-1',
+        offering_id: 'off-1',
+        period_id: 'period-1',
+        revenue_amount: '100000.00',
+        computed_at: new Date().toISOString(),
+        investor_count: 0,
+        projections: [],
+      }),
+      ...engineOverrides,
+    };
+
+    const offeringRepo: OfferingRepo = {
+      getById: jest.fn().mockResolvedValue({ id: 'off-1', issuer_id: 'user-1' }),
+    };
+
+    const router = createDistributionsRouter({ distributionEngine, offeringRepo, verifyJWT });
+    app.use('/api/v1', router);
+    app.use(errorHandler);
+    return { app, distributionEngine };
+  }
+
+  describe('POST /api/v1/offerings/:id/distribute', () => {
+    it('passes a large decimal revenue amount straight through to the engine', async () => {
+      const { app, distributionEngine } = makeTriggerApp();
+
+      const res = await request(app)
+        .post('/api/v1/offerings/off-1/distribute')
+        .send({
+          period: { start: '2026-01-01', end: '2026-01-31' },
+          revenue_amount: '12345678901234567.89',
+        })
+        .expect(200);
+
+      expect(res.body).toBeDefined();
+      expect(distributionEngine.distribute).toHaveBeenCalledWith(
+        'off-1',
+        expect.anything(),
+        '12345678901234567.89',
+      );
+    });
+
+    it.each(['1e3', '0x10', '-5', ' 12 ', 'abc', '', 1000])(
+      'rejects revenue amount %p with 400',
+      async (bad) => {
+        const { app } = makeTriggerApp();
+        const res = await request(app)
+          .post('/api/v1/offerings/off-1/distribute')
+          .send({
+            period: { start: '2026-01-01', end: '2026-01-31' },
+            revenue_amount: bad,
+          })
+          .expect(400);
+        expect(res.body.code).toBe('BAD_REQUEST');
+      },
+    );
+
+    it('rejects a missing revenue amount with 400', async () => {
+      const { app } = makeTriggerApp();
+      await request(app)
+        .post('/api/v1/offerings/off-1/distribute')
+        .send({ period: { start: '2026-01-01', end: '2026-01-31' } })
+        .expect(400);
+    });
+  });
+
+  describe('POST /api/v1/offerings/:id/distribute/preview', () => {
+    it('passes the exact decimal string straight through to previewRun', async () => {
+      const { app, distributionEngine } = makeTriggerApp();
+
+      await request(app)
+        .post('/api/v1/offerings/off-1/distribute/preview')
+        .send({
+          period: { start: '2026-01-01', end: '2026-01-31' },
+          revenue_amount: '12345678901234567.89',
+        })
+        .expect(200);
+
+      expect(distributionEngine.previewRun).toHaveBeenCalledWith(
+        'off-1',
+        expect.anything(),
+        '12345678901234567.89',
+      );
+    });
+
+    it.each(['1e3', '0x10', '-5', ' 12 ', 'abc', 1000])(
+      'rejects revenue amount %p with 400',
+      async (bad) => {
+        const { app } = makeTriggerApp();
+        await request(app)
+          .post('/api/v1/offerings/off-1/distribute/preview')
+          .send({
+            period: { start: '2026-01-01', end: '2026-01-31' },
+            revenue_amount: bad,
+          })
+          .expect(400);
+      },
+    );
+  });
+
+  describe('POST /api/v1/distributions/schedule', () => {
+    function makeScheduleApp() {
+      const app = express();
+      app.use(express.json());
+
+      const verifyJWT: express.RequestHandler = (req, _res, next) => {
+        (req as any).user = { id: 'user-1', role: 'admin' };
+        next();
+      };
+
+      const distributionEngine = {
+        distribute: jest.fn().mockResolvedValue({
+          distributionRun: { id: 'run-1' },
+          payouts: [],
+        }),
+      };
+
+      const scheduledDistributionRepo = {
+        create: jest.fn().mockResolvedValue({
+          id: 'sched-1',
+          status: 'scheduled',
+          total_amount: '1000',
+          run_at: new Date('2026-08-01T00:00:00Z'),
+        }),
+      };
+
+      const router = createDistributionsRouter({
+        distributionEngine,
+        verifyJWT,
+        scheduledDistributionRepo,
+      });
+      app.use('/api/v1', router);
+      app.use(errorHandler);
+      return { app, scheduledDistributionRepo, distributionEngine };
+    }
+
+    it('rejects total_amount "1e3" with 400', async () => {
+      const { app } = makeScheduleApp();
+      await request(app)
+        .post('/api/v1/distributions/schedule')
+        .send({
+          offering_id: 'off-1',
+          period_id: 'period-1',
+          run_at: '2026-08-01T00:00:00Z',
+          total_amount: '1e3',
+        })
+        .expect(400);
+    });
+
+    it('stores total_amount as the submitted decimal string', async () => {
+      const { app, scheduledDistributionRepo } = makeScheduleApp();
+      await request(app)
+        .post('/api/v1/distributions/schedule')
+        .send({
+          offering_id: 'off-1',
+          period_id: 'period-1',
+          run_at: '2026-08-01T00:00:00Z',
+          total_amount: '1000',
+        })
+        .expect(201);
+      expect(scheduledDistributionRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ total_amount: '1000' }),
+      );
     });
   });
 });

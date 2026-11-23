@@ -1492,3 +1492,216 @@ describe('Velocity Rule — Sliding Window Aggregation', () => {
     });
   });
 });
+
+// ─── Tenant Sanctions Threshold Tests (#1289) ────────────────────────────────
+
+describe('RuleEvaluator – sanctions_screening tenant threshold', () => {
+  let evaluator: RuleEvaluator;
+  let mockRepo: MockInvestmentRepository;
+
+  const sanctionsRule: AMLRule = {
+    id: 'sanctions_rule_1',
+    name: 'Sanctions Screening',
+    description: 'Screens against sanctions list',
+    type: 'sanctions_screening',
+    version: { major: 1, minor: 0, patch: 0 },
+    severity: 'critical',
+    enabled: true,
+    config: {
+      // Rule-level threshold intentionally absent so we can prove tenant wins
+      sanctions_list: ['Specially Designated National'],
+      fuzzy_enabled: true,
+    },
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  // Name whose Jaro-Winkler score against 'Specially Designated National'
+  // is between 0.85 (default) and 0.95 (tight tenant threshold).
+  // 'Specially Designated Natiional' (double-i typo) has a score just below 1.0
+  // but above 0.85.  We use a name that is clearly below 0.95 but above 0.85.
+  const contextBase: Omit<TransactionContext, 'investor_name'> = {
+    investment_id: 'inv_t1',
+    investor_id: 'investor_t1',
+    offering_id: 'off_t1',
+    amount: '1000',
+    asset: 'USD',
+    timestamp: new Date(),
+    previous_transactions: [],
+  };
+
+  beforeEach(() => {
+    mockRepo = new MockInvestmentRepository();
+    evaluator = new RuleEvaluator(mockRepo as any);
+  });
+
+  it('regression: without tenant_settings the evaluator uses the 0.85 default and triggers on a 0.9-score name', async () => {
+    // 'Specially Designated Nationol' is a deliberate near-miss; its JW score
+    // against 'Specially Designated National' is above 0.85.
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated Nationol',
+      // No tenant_settings — this is the pre-fix state on master
+    };
+
+    const results = await evaluator.evaluate(context, [sanctionsRule]);
+    expect(results).toHaveLength(1);
+    // Under the default 0.85 threshold a near-miss SHOULD trigger.
+    expect(results[0].triggered).toBe(true);
+    expect(results[0].details.threshold).toBe(0.85);
+    expect(results[0].details.threshold_source).toBe('default');
+  });
+
+  it('with tenant threshold 0.95 a name scoring ~0.9 does NOT trigger', async () => {
+    // Same name as above; its JW score is above 0.85 but below 0.95.
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated Nationol',
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.95 },
+    };
+
+    const results = await evaluator.evaluate(context, [sanctionsRule]);
+    expect(results).toHaveLength(1);
+    expect(results[0].triggered).toBe(false);
+    expect(results[0].details.threshold).toBe(0.95);
+    expect(results[0].details.threshold_source).toBe('tenant');
+  });
+
+  it('with tenant threshold 0.95 an exact-match still triggers', async () => {
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated National',
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.95 },
+    };
+
+    const results = await evaluator.evaluate(context, [sanctionsRule]);
+    expect(results).toHaveLength(1);
+    expect(results[0].triggered).toBe(true);
+    expect(results[0].details.threshold_source).toBe('tenant');
+  });
+
+  it('rule-level threshold takes precedence over default when no tenant_settings', async () => {
+    const ruleWithThreshold: AMLRule = {
+      ...sanctionsRule,
+      config: {
+        ...sanctionsRule.config,
+        jaro_winkler_threshold: 0.92,
+      },
+    };
+
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated Nationol',
+      // No tenant_settings
+    };
+
+    const results = await evaluator.evaluate(context, [ruleWithThreshold]);
+    expect(results).toHaveLength(1);
+    expect(results[0].details.threshold).toBe(0.92);
+    expect(results[0].details.threshold_source).toBe('rule');
+  });
+
+  it('tenant threshold overrides rule-level threshold', async () => {
+    const ruleWithThreshold: AMLRule = {
+      ...sanctionsRule,
+      config: {
+        ...sanctionsRule.config,
+        jaro_winkler_threshold: 0.88,
+      },
+    };
+
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated Nationol',
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.95 },
+    };
+
+    const results = await evaluator.evaluate(context, [ruleWithThreshold]);
+    expect(results).toHaveLength(1);
+    // Tenant wins over rule config
+    expect(results[0].details.threshold).toBe(0.95);
+    expect(results[0].details.threshold_source).toBe('tenant');
+  });
+
+  it('alert details include threshold_source on triggered result', async () => {
+    const context: TransactionContext = {
+      ...contextBase,
+      investor_name: 'Specially Designated National',
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.95 },
+    };
+
+    const results = await evaluator.evaluate(context, [sanctionsRule]);
+    expect(results[0].triggered).toBe(true);
+    expect(results[0].details).toMatchObject({
+      threshold_source: 'tenant',
+      threshold: 0.95,
+    });
+  });
+});
+
+describe('RuleEvaluator – ofac_counterparty_screening tenant threshold', () => {
+  let evaluator: RuleEvaluator;
+  let mockRepo: MockInvestmentRepository;
+
+  const ofacRule: AMLRule = {
+    id: 'ofac_rule_1',
+    name: 'OFAC Counterparty Screening',
+    description: 'Screens counterparties',
+    type: 'ofac_counterparty_screening',
+    version: { major: 1, minor: 0, patch: 0 },
+    severity: 'critical',
+    enabled: true,
+    config: {
+      sanctions_list: ['Sanctioned Vessel Inc'],
+      fuzzy_enabled: true,
+    },
+    created_at: new Date(),
+    updated_at: new Date(),
+  };
+
+  const contextBase: Omit<TransactionContext, 'counterparties'> = {
+    investment_id: 'inv_cp1',
+    investor_id: 'investor_cp1',
+    offering_id: 'off_cp1',
+    amount: '1000',
+    asset: 'USD',
+    timestamp: new Date(),
+    previous_transactions: [],
+  };
+
+  beforeEach(() => {
+    mockRepo = new MockInvestmentRepository();
+    evaluator = new RuleEvaluator(mockRepo as any);
+  });
+
+  it('threshold_source is "tenant" when tenant_settings is populated', async () => {
+    const context: TransactionContext = {
+      ...contextBase,
+      tenant_id: 'tenant_abc',
+      tenant_settings: { sanctions_threshold: 0.95 },
+      // Counterparty that clearly won't match at 0.95 but would at 0.85
+      counterparties: [{ name: 'Sanctioned Vessel Inx', type: 'organization' }],
+    };
+
+    const results = await evaluator.evaluate(context, [ofacRule]);
+    expect(results).toHaveLength(1);
+    expect(results[0].details.threshold_source).toBe('tenant');
+    expect(results[0].details.threshold).toBe(0.95);
+  });
+
+  it('threshold_source is "default" when no tenant_settings', async () => {
+    const context: TransactionContext = {
+      ...contextBase,
+      counterparties: [{ name: 'Completely Unrelated Name', type: 'organization' }],
+    };
+
+    const results = await evaluator.evaluate(context, [ofacRule]);
+    expect(results).toHaveLength(1);
+    expect(results[0].details.threshold_source).toBe('default');
+    expect(results[0].details.threshold).toBe(0.85);
+  });
+});

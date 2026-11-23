@@ -1,4 +1,6 @@
-import { buildConfig } from './env';
+import fs from 'fs';
+import path from 'path';
+import { buildConfig, envBoolean, envSchema, readEnvBoolean } from './env';
 
 describe('env config', () => {
   const originalEnv = process.env;
@@ -35,8 +37,8 @@ describe('env config', () => {
     try {
       buildConfig();
       fail('Expected buildConfig to throw');
-    } catch (e: any) {
-      expect(e.message).toBe('Process.exit called with 1');
+    } catch (e: unknown) {
+      expect((e as Error).message).toBe('Process.exit called with 1');
     }
     expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
     
@@ -56,8 +58,8 @@ describe('env config', () => {
     try {
       buildConfig();
       fail('Expected buildConfig to throw');
-    } catch (e: any) {
-      expect(e.message).toBe('Process.exit called with 1');
+    } catch (e: unknown) {
+      expect((e as Error).message).toBe('Process.exit called with 1');
     }
     expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
     
@@ -118,5 +120,222 @@ describe('env config', () => {
 
     mockExit.mockRestore();
     mockConsoleError.mockRestore();
+  });
+
+  /**
+   * Boolean environment flags — issue #1305.
+   *
+   * Regression context: `z.coerce.boolean()` applies `Boolean(value)`, so
+   * `"false"`, `"0"` and `"no"` all parsed as `true`. These tests fail on the
+   * pre-fix implementation for every "disabled" input below.
+   */
+  describe('envBoolean helper', () => {
+    const truthyValues = ['true', 'TRUE', '1', 'yes', 'YES', 'on', 'On', ' true ', '\tTRUE\n'];
+    const falsyValues = ['false', 'FALSE', '0', 'no', 'NO', 'off', 'OFF', ' false ', ' 0 '];
+
+    it.each(truthyValues)('parses %j as true', (value) => {
+      const result = envBoolean(false).safeParse(value);
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(true);
+    });
+
+    it.each(falsyValues)('parses %j as false', (value) => {
+      const result = envBoolean(true).safeParse(value);
+      expect(result.success).toBe(true);
+      expect(result.data).toBe(false);
+    });
+
+    it('returns the default when the variable is unset', () => {
+      expect(envBoolean(false).parse(undefined)).toBe(false);
+      expect(envBoolean(true).parse(undefined)).toBe(true);
+    });
+
+    it.each(['maybe', '2', 'y', 'n', 'enabled', 'null', '', '   ', 'falsey', 'offf'])(
+      'rejects %j with a clear validation message',
+      (value) => {
+        const result = envBoolean(false).safeParse(value);
+        expect(result.success).toBe(false);
+        expect(result.error?.issues[0]?.message).toBe(
+          'must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+        );
+      },
+    );
+  });
+
+  describe('boolean feature flags via buildConfig', () => {
+    it('parses OUTBOX_DISPATCHER_ENABLED=false as false (regression: coerce returned true)', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = 'false';
+
+      const cfg = buildConfig();
+      expect(cfg.OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses OUTBOX_DISPATCHER_ENABLED=0 as false', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '0';
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses OUTBOX_DISPATCHER_ENABLED=1 as true', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '1';
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(true);
+    });
+
+    it('defaults OUTBOX_DISPATCHER_ENABLED to false when unset', () => {
+      process.env.NODE_ENV = 'test';
+      delete process.env.OUTBOX_DISPATCHER_ENABLED;
+
+      expect(buildConfig().OUTBOX_DISPATCHER_ENABLED).toBe(false);
+    });
+
+    it('parses EMAIL_DELIVERABILITY_ENABLED=off as false (previously mounted webhooks anyway)', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'off';
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(false);
+    });
+
+    it('parses EMAIL_DELIVERABILITY_ENABLED=no as false', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'no';
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(false);
+    });
+
+    it('defaults EMAIL_DELIVERABILITY_ENABLED to true when unset (default unchanged)', () => {
+      process.env.NODE_ENV = 'test';
+      delete process.env.EMAIL_DELIVERABILITY_ENABLED;
+
+      expect(buildConfig().EMAIL_DELIVERABILITY_ENABLED).toBe(true);
+    });
+
+    it('fails validation with a clear message when a boolean flag is set to "maybe"', () => {
+      const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+        throw new Error(`Process.exit called with ${code}`);
+      });
+      const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      process.env.NODE_ENV = 'test';
+      process.env.EMAIL_DELIVERABILITY_ENABLED = 'maybe';
+
+      expect(() => buildConfig()).toThrow('Process.exit called with 1');
+      expect(mockConsoleError).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'EMAIL_DELIVERABILITY_ENABLED: must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+        ),
+      );
+
+      mockExit.mockRestore();
+      mockConsoleError.mockRestore();
+    });
+
+    it('fails validation when a boolean flag is set to an empty string', () => {
+      const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+        throw new Error(`Process.exit called with ${code}`);
+      });
+      const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      process.env.NODE_ENV = 'test';
+      process.env.OUTBOX_DISPATCHER_ENABLED = '';
+
+      expect(() => buildConfig()).toThrow('Process.exit called with 1');
+      expect(mockConsoleError).toHaveBeenCalledWith(
+        expect.stringContaining('OUTBOX_DISPATCHER_ENABLED: must be one of'),
+      );
+
+      mockExit.mockRestore();
+      mockConsoleError.mockRestore();
+    });
+  });
+
+  describe('readEnvBoolean (ad-hoc process.env reads)', () => {
+    afterEach(() => {
+      delete process.env.TEST_BOOL_FLAG;
+    });
+
+    it('reads the shared accepted value set at call time', () => {
+      process.env.TEST_BOOL_FLAG = 'yes';
+      expect(readEnvBoolean('TEST_BOOL_FLAG', false)).toBe(true);
+
+      process.env.TEST_BOOL_FLAG = '0';
+      expect(readEnvBoolean('TEST_BOOL_FLAG', true)).toBe(false);
+    });
+
+    it('returns the default when the variable is unset', () => {
+      delete process.env.TEST_BOOL_FLAG;
+      expect(readEnvBoolean('TEST_BOOL_FLAG', false)).toBe(false);
+      expect(readEnvBoolean('TEST_BOOL_FLAG', true)).toBe(true);
+    });
+
+    it('throws a clear error naming the variable for invalid values', () => {
+      process.env.TEST_BOOL_FLAG = 'maybe';
+      expect(() => readEnvBoolean('TEST_BOOL_FLAG', false)).toThrow(
+        'TEST_BOOL_FLAG must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
+      );
+    });
+  });
+
+  describe('.env.example documentation sync', () => {
+    it('documents every environment variable defined in envSchema in .env.example', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      expect(fs.existsSync(envExamplePath)).toBe(true);
+
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+      const declaredVars = new Set<string>();
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        // Matches assignments: VAR_NAME=... or # VAR_NAME=...
+        const match = trimmed.match(/^(?:#\s*)?([A-Z0-9_]+)=/);
+        if (match) {
+          declaredVars.add(match[1]);
+        }
+      }
+
+      const schemaKeys = Object.keys(envSchema.shape);
+      const missingKeys = schemaKeys.filter((key) => !declaredVars.has(key));
+
+      expect(missingKeys).toEqual([]);
+    });
+
+    it('documents key non-schema operational variables in .env.example', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+      const declaredVars = new Set<string>();
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        const match = trimmed.match(/^(?:#\s*)?([A-Z0-9_]+)=/);
+        if (match) {
+          declaredVars.add(match[1]);
+        }
+      }
+
+      // Check critical variables called out in issue #1407
+      expect(declaredVars.has('ADMIN_PUBKEYS')).toBe(true);
+      expect(declaredVars.has('LEDGER_CLOSE_SIGNING_KEY')).toBe(true);
+      expect(declaredVars.has('CORS_ALLOW_NO_ORIGIN')).toBe(true);
+      expect(declaredVars.has('RECORD_FIXTURES')).toBe(true);
+    });
+
+    it('contains only placeholder values and no live secrets', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+
+      // Ensure no live Stellar seeds (56 characters starting with S)
+      const stellarSecretMatch = content.match(/STELLAR_SERVER_SECRET=S[A-Z0-9]{55}/);
+      if (stellarSecretMatch) {
+        expect(stellarSecretMatch[0]).toContain('X');
+      }
+
+      // Check that secret variables contain placeholder indicators
+      expect(content).toContain('dev-jwt-secret-placeholder');
+      expect(content).toContain('dev-cursor-signing-secret-placeholder');
+      expect(content).toContain('dGVzdC1hdWRpdC1leHBvcnQ');
+    });
   });
 });

@@ -1,5 +1,6 @@
-import { Pool, QueryResult } from 'pg';
+import { Pool, PoolClient, QueryResult } from 'pg';
 import { UniqueConstraintError } from '../../lib/errors';
+import { withTransaction } from '../transaction';
 import {
   DEFAULT_KYC_RISK_TIER,
   KycRiskTier,
@@ -10,15 +11,42 @@ import {
  * Full user row — password_hash included for internal auth use only.
  * Never expose this type in API responses.
  */
+export type UserStatus = 'active' | 'suspended' | 'disabled' | 'deactivated';
+
+export const USER_STATUSES: readonly UserStatus[] = [
+  'active',
+  'suspended',
+  'disabled',
+  'deactivated',
+];
+
+export function isUserStatus(value: unknown): value is UserStatus {
+  return typeof value === 'string' && (USER_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * Normalise a raw DB status value. Unknown / missing values fall back to
+ * `'active'` so a schema that predates the status column does not lock out
+ * every account.
+ */
+export function parseUserStatus(value: unknown): UserStatus {
+  return isUserStatus(value) ? value : 'active';
+}
+
 export interface User {
   id: string;
   email: string;
   password_hash: string;
   name?: string;
   role: 'startup' | 'investor';
+  /** Account lifecycle status. Non-`active` users must not authenticate. */
+  status: UserStatus;
   /** KYC risk tier used to scale per-offering investment caps. */
   kyc_risk_tier: KycRiskTier;
   last_oidc_groups?: string[] | null;
+  /** False once the account is deprovisioned (SCIM, #1300). Missing means active. */
+  is_active?: boolean;
+  deactivated_at?: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -40,6 +68,7 @@ export interface UpdateUserInput {
   name?: string;
   password_hash?: string;
   role?: 'startup' | 'investor';
+  status?: UserStatus;
   kyc_risk_tier?: KycRiskTier;
   last_oidc_groups?: string[] | null;
 }
@@ -64,14 +93,15 @@ export class UserRepository {
   /**
    * Find a user by ID (includes password_hash for internal auth flows).
    */
-  async findById(id: string): Promise<User | null> {
+  async findById(id: string, client?: PoolClient): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, status, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE id = $1
       LIMIT 1
     `;
-    const result: QueryResult<User> = await this.db.query(query, [id]);
+    const executor = client ?? this.db;
+    const result: QueryResult<User> = await executor.query(query, [id]);
     return result.rows.length > 0 ? this.mapUser(result.rows[0]) : null;
   }
 
@@ -85,7 +115,7 @@ export class UserRepository {
    */
   async findByEmail(email: string): Promise<User | null> {
     const query = `
-      SELECT id, email, password_hash, name, role, kyc_risk_tier, last_oidc_groups, created_at, updated_at
+      SELECT id, email, password_hash, name, role, status, kyc_risk_tier, last_oidc_groups, created_at, updated_at
       FROM users
       WHERE email = $1
       LIMIT 1
@@ -168,6 +198,10 @@ export class UserRepository {
       sets.push(`role = $${idx++}`);
       values.push(input.role);
     }
+    if (input.status !== undefined) {
+      sets.push(`status = $${idx++}`);
+      values.push(input.status);
+    }
     if (input.kyc_risk_tier !== undefined) {
       sets.push(`kyc_risk_tier = $${idx++}`);
       values.push(input.kyc_risk_tier);
@@ -222,6 +256,41 @@ export class UserRepository {
     await this.db.query(query, [newPasswordHash, userId]);
   }
 
+  /**
+   * Activate or deactivate a user (#1300). Deactivation also revokes all of
+   * the user's live sessions in the same transaction.
+   *
+   * The sessions update is a separate statement on purpose: it runs after the
+   * users row is locked, so it also sees a session created by a refresh that
+   * was racing this call (refresh reads the row FOR SHARE).
+   *
+   * Returns null if the user does not exist.
+   */
+  async setActive(userId: string, active: boolean): Promise<User | null> {
+    return withTransaction(this.db, async (client) => {
+      const result: QueryResult<User> = await client.query(
+        `
+        UPDATE users
+        SET is_active = $2,
+            deactivated_at = CASE WHEN $2 THEN NULL ELSE COALESCE(deactivated_at, NOW()) END,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING *
+        `,
+        [userId, active],
+      );
+      if (result.rows.length === 0) return null;
+
+      if (!active) {
+        await client.query(
+          `UPDATE sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`,
+          [userId],
+        );
+      }
+      return this.mapUser(result.rows[0]);
+    });
+  }
+
   private mapUser(row: any): User {
     return {
       id: row.id,
@@ -229,8 +298,11 @@ export class UserRepository {
       password_hash: row.password_hash,
       name: row.name ?? undefined,
       role: row.role as 'startup' | 'investor',
+      status: parseUserStatus(row.status),
       kyc_risk_tier: parseKycRiskTier(row.kyc_risk_tier),
       last_oidc_groups: row.last_oidc_groups ?? null,
+      is_active: row.is_active !== false,
+      deactivated_at: row.deactivated_at ?? null,
       created_at: row.created_at,
       updated_at: row.updated_at,
     };

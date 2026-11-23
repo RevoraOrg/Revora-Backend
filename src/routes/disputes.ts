@@ -235,15 +235,32 @@ export function createDisputeSLAHandlers(
   async function processRefund(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const { disputeId } = req.params;
-      const { amount, originalDisbursement, reason, ledgerEventId, distributionId } = req.body || {};
+      const body = req.body || {};
+      const { amount, reason, ledgerEventId, distributionId } = body;
 
       if (!disputeId) {
         res.status(400).json({ error: 'disputeId path parameter is required' });
         return;
       }
 
-      if (!amount || !originalDisbursement) {
-        res.status(400).json({ error: 'amount and originalDisbursement are required in body' });
+      const authenticatedUser = (req as Request & { user?: { role?: string } }).user;
+      if (!authenticatedUser || !['admin', 'compliance'].includes(authenticatedUser.role || '')) {
+        res.status(403).json({ error: 'Admin or compliance role is required to process refunds' });
+        return;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, 'originalDisbursement')) {
+        res.status(400).json({ error: 'originalDisbursement must not be supplied; it is derived from distributionId' });
+        return;
+      }
+
+      if (amount === undefined || amount === null || amount === '') {
+        res.status(400).json({ error: 'amount is required in body' });
+        return;
+      }
+
+      if (typeof distributionId !== 'string' || distributionId.trim().length === 0) {
+        res.status(400).json({ error: 'distributionId is required in body' });
         return;
       }
 
@@ -255,7 +272,6 @@ export function createDisputeSLAHandlers(
       const refund = await disputeRefundService.processPartialRefund({
         disputeId,
         amount: String(amount),
-        originalDisbursement: String(originalDisbursement),
         reason,
         ledgerEventId,
         distributionId,
@@ -309,7 +325,7 @@ export function createDisputeSLARouter(deps: CreateDisputeSLARouterDeps): Router
   router.post('/disputes/:disputeId/sla/pause', deps.requireAuth, handlers.pauseSLA);
   router.post('/disputes/:disputeId/sla/resume', deps.requireAuth, handlers.resumeSLA);
   
-  // Partial refund endpoint
+  // Refunds require authenticated administrative/compliance identity; handler enforces the role boundary.
   router.post('/disputes/:disputeId/refund', deps.requireAuth, handlers.processRefund);
 
   // SLA burn report (auth required)

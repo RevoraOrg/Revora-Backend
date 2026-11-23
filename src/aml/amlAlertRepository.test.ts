@@ -148,7 +148,7 @@ class MockClient {
     // Handle UPDATE alert status
     if (text.includes('UPDATE aml_alerts')) {
       const alertId = values?.[2];
-      if (alertId === 'nonexistent') {
+      if (alertId === 'nonexistent' || alertId === '') {
         return { rows: [] }; // Simulate not found
       }
       return {
@@ -246,7 +246,7 @@ class MockClient {
     // Handle UPDATE case
     if (text.includes('UPDATE aml_cases')) {
       const caseId = values ? values[values.length - 1] : 'case_1';
-      if (caseId === 'nonexistent') {
+      if (caseId === 'nonexistent' || caseId === '') {
         return { rows: [] }; // Simulate not found
       }
       return {
@@ -384,6 +384,11 @@ describe('AMLAlertRepository', () => {
       await expect(repository.updateStatus('nonexistent', 'dismissed'))
         .rejects.toThrow('Alert nonexistent not found');
     });
+
+    it('should preserve the not-found error contract for an empty alert ID', async () => {
+      await expect(repository.updateStatus('', 'dismissed'))
+        .rejects.toThrow(new Error('Alert  not found'));
+    });
   });
 
   describe('createCase', () => {
@@ -488,6 +493,11 @@ describe('AMLAlertRepository', () => {
     it('should throw error for nonexistent case', async () => {
       await expect(repository.updateCase('nonexistent', {}))
         .rejects.toThrow('Case nonexistent not found');
+    });
+
+    it('should preserve the not-found error contract for an empty case ID', async () => {
+      await expect(repository.updateCase('', {}))
+        .rejects.toThrow(new Error('Case  not found'));
     });
   });
 

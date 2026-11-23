@@ -6,7 +6,11 @@ import {
   isPrivateIPv6,
   isPrivateIP,
   normalizeEncodedIP,
+  safeFetch,
 } from './ssrfProtection';
+import * as dnsPromises from 'dns/promises';
+import * as https from 'https';
+import nock from 'nock';
 
 // ─── IPv4 Private Range Tests ───────────────────────────────────────────────
 
@@ -61,6 +65,15 @@ describe('SSRF Protection - IPv4 Private Ranges', () => {
   it('should accept public IPv4 addresses', async () => {
     const result = await validateWebhookUrlSync('https://8.8.8.8/webhook');
     expect(result.valid).toBe(true);
+  });
+
+  it('should reject shared and benchmarking IPv4 ranges', () => {
+    expect(isPrivateIPv4('100.64.0.1')).toBe(true);
+    expect(isPrivateIPv4('100.127.255.254')).toBe(true);
+    expect(isPrivateIPv4('198.18.0.1')).toBe(true);
+    expect(isPrivateIPv4('198.19.255.254')).toBe(true);
+    expect(isPrivateIPv4('100.128.0.1')).toBe(false);
+    expect(isPrivateIPv4('198.20.0.1')).toBe(false);
   });
 
   it('should accept 1.1.1.1 (public DNS)', async () => {
@@ -320,12 +333,88 @@ describe('SSRF Protection - Helper Functions', () => {
     it('should detect private IPv6 addresses', () => {
       expect(isPrivateIP('::1')).toBe(true);
       expect(isPrivateIP('fc00::1')).toBe(true);
+      expect(isPrivateIP('::ffff:127.0.0.1')).toBe(true);
+      expect(isPrivateIP('::ffff:7f00:1')).toBe(true);
+      expect(isPrivateIP('64:ff9b::7f00:1')).toBe(true);
+      expect(isPrivateIP('2002:7f00:1::')).toBe(true);
+      expect(isPrivateIP('2001:db8::5efe:7f00:1')).toBe(true);
     });
 
     it('should detect public addresses', () => {
       expect(isPrivateIP('8.8.8.8')).toBe(false);
       expect(isPrivateIP('2001:4860:4860::8888')).toBe(false);
     });
+  });
+});
+
+describe('SSRF-safe fetch', () => {
+  afterEach(() => {
+    nock.cleanAll();
+    jest.restoreAllMocks();
+  });
+
+  it('does not follow a redirect to a private address', async () => {
+    const redirect = nock('https://8.8.8.8')
+      .post('/webhook')
+      .reply(302, '', { Location: 'https://169.254.169.254/latest/meta-data' });
+    const privateTarget = nock('https://169.254.169.254')
+      .get('/latest/meta-data')
+      .reply(200, 'should not be reached');
+
+    const response = await safeFetch('https://8.8.8.8/webhook', {
+      method: 'POST',
+      body: '{}',
+      redirect: 'manual',
+    });
+
+    expect(response.status).toBe(302);
+    expect(redirect.isDone()).toBe(true);
+    expect(privateTarget.isDone()).toBe(false);
+  });
+
+  it('rejects any private address in a DNS answer before making a request', async () => {
+    const lookup = jest.spyOn(dnsPromises, 'lookup').mockResolvedValueOnce([
+      { address: '93.184.216.34', family: 4 },
+      { address: '127.0.0.1', family: 4 },
+    ] as never);
+
+    await expect(safeFetch('https://mixed-answer.example/hook', { method: 'POST' }))
+      .rejects.toMatchObject({ code: 'RESOLVED_TO_PRIVATE' });
+
+    expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it('pins the socket lookup to the address validated before connecting', async () => {
+    const validatedAddress = '93.184.216.34';
+    const dnsLookup = jest.spyOn(dnsPromises, 'lookup').mockResolvedValueOnce([
+      { address: validatedAddress, family: 4 },
+    ] as never).mockResolvedValueOnce([
+      { address: '127.0.0.1', family: 4 },
+    ] as never);
+    let socketAddress: string | undefined;
+    const fakeResponse = { statusCode: 200, resume: jest.fn() } as unknown as https.IncomingMessage;
+    const fakeRequest = {
+      once: jest.fn(),
+      write: jest.fn(),
+      end: jest.fn(),
+    } as unknown as https.ClientRequest;
+    const request = jest.spyOn(https, 'request').mockImplementation(((_url, options, callback) => {
+      const agent = options?.agent as https.Agent;
+      const pinnedLookup = agent.options.lookup as (...args: unknown[]) => void;
+      pinnedLookup('rebind.example', {}, (error: Error | null, address: string) => {
+        expect(error).toBeNull();
+        socketAddress = address;
+      });
+      callback?.(fakeResponse);
+      return fakeRequest;
+    }) as typeof https.request);
+
+    const response = await safeFetch('https://rebind.example/hook', { method: 'POST' });
+
+    expect(response.status).toBe(200);
+    expect(socketAddress).toBe(validatedAddress);
+    expect(dnsLookup).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -12,6 +12,7 @@ import { OFACReviewRepository } from './ofacReviewRepository';
 import { RuleEvaluator } from './ruleEvaluator';
 import { InvestmentRepository } from '../db/repositories/investmentRepository';
 import { SecurityAuditRepository, AuditEvent } from '../security/types';
+import { TenantSettingsService } from '../services/tenantSettingsService';
 import {
   AMLRule,
   CreateRuleInput,
@@ -36,25 +37,65 @@ export class AMLService {
     private evaluator: RuleEvaluator,
     private auditRepo: SecurityAuditRepository,
     private currentUserId: string,
-    private ofacReviewRepo?: OFACReviewRepository
+    private ofacReviewRepo?: OFACReviewRepository,
+    /**
+     * Optional: when provided, the per-tenant dual-control-approved
+     * Jaro-Winkler sanctions threshold is loaded and attached to the
+     * transaction context before rule evaluation, so that the
+     * RuleEvaluator picks it up via context.tenant_settings.sanctions_threshold.
+     *
+     * Without this dependency the service falls back to the rule-config or
+     * hard-coded 0.85 default — exactly the behaviour described in #1289.
+     */
+    private tenantSettingsService?: TenantSettingsService
   ) {}
 
   /**
    * Evaluate a transaction against all enabled rules
+   *
+   * If the context carries a `tenant_id` and no `tenant_settings` have been
+   * pre-populated, the method fetches the dual-control-approved sanctions
+   * threshold from TenantSettingsService and attaches it to the context so
+   * that RuleEvaluator can apply it without being aware of the persistence
+   * layer.  The original context object is **not mutated**; a shallow copy
+   * is used instead to keep callers' state intact.
+   *
    * @param context Transaction context
    * @returns Array of triggered alerts
    */
   async evaluateTransaction(context: TransactionContext): Promise<AMLAlert[]> {
+    // Enrich context with tenant sanctions threshold when available.
+    // This is the fix for #1289: without this block, approved threshold
+    // changes were silently ignored and the evaluator always fell back to
+    // the rule config or the 0.85 hard-coded default.
+    let enrichedContext: TransactionContext = context;
+    if (
+      context.tenant_id &&
+      !context.tenant_settings?.sanctions_threshold &&
+      this.tenantSettingsService
+    ) {
+      const sanctions_threshold = await this.tenantSettingsService.getSanctionsThreshold(
+        context.tenant_id
+      );
+      enrichedContext = {
+        ...context,
+        tenant_settings: {
+          ...context.tenant_settings,
+          sanctions_threshold,
+        },
+      };
+    }
+
     const rules = await this.ruleRepo.findEnabled();
-    const results = await this.evaluator.evaluate(context, rules);
+    const results = await this.evaluator.evaluate(enrichedContext, rules);
 
     const alerts: AMLAlert[] = [];
 
     for (const result of results) {
       if (result.triggered) {
         const alert = await this.alertRepo.create({
-          investment_id: context.investment_id,
-          investor_id: context.investor_id,
+          investment_id: enrichedContext.investment_id,
+          investor_id: enrichedContext.investor_id,
           rule_id: result.rule_id,
           rule_version: result.rule_version,
           severity: result.severity,
@@ -68,7 +109,7 @@ export class AMLService {
         await this.auditRepo.record({
           id: this.generateAuditId(),
           type: 'SECURITY_VIOLATION',
-          userId: context.investor_id,
+          userId: enrichedContext.investor_id,
           action: 'aml_alert_created',
           resource: `aml_alert/${alert.id}`,
           outcome: 'SUCCESS',
@@ -76,7 +117,7 @@ export class AMLService {
             alert_id: alert.id,
             rule_id: result.rule_id,
             severity: result.severity,
-            investment_id: context.investment_id,
+            investment_id: enrichedContext.investment_id,
           },
           securityContext: {
             requestId: this.generateRequestId(),
@@ -95,16 +136,18 @@ export class AMLService {
   /**
    * Create a new AML rule
    * @param input Rule creation data
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Created rule
    */
-  async createRule(input: CreateRuleInput): Promise<AMLRule> {
-    const rule = await this.ruleRepo.create(input, this.currentUserId);
+  async createRule(input: CreateRuleInput, actorId?: string): Promise<AMLRule> {
+    const userId = actorId || this.currentUserId;
+    const rule = await this.ruleRepo.create(input, userId);
 
     // Audit log rule creation
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_rule_created',
       resource: `aml_rule/${rule.id}`,
       outcome: 'SUCCESS',
@@ -130,16 +173,18 @@ export class AMLService {
    * Update an existing AML rule
    * @param ruleId Rule ID
    * @param input Update data
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Updated rule
    */
-  async updateRule(ruleId: string, input: UpdateRuleInput): Promise<AMLRule> {
-    const rule = await this.ruleRepo.update(ruleId, input, this.currentUserId);
+  async updateRule(ruleId: string, input: UpdateRuleInput, actorId?: string): Promise<AMLRule> {
+    const userId = actorId || this.currentUserId;
+    const rule = await this.ruleRepo.update(ruleId, input, userId);
 
     // Audit log rule update
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_rule_updated',
       resource: `aml_rule/${ruleId}`,
       outcome: 'SUCCESS',
@@ -164,16 +209,18 @@ export class AMLService {
    * Rollback a rule to a specific version
    * @param ruleId Rule ID
    * @param version Target version
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Updated rule
    */
-  async rollbackRule(ruleId: string, version: SemVer): Promise<AMLRule> {
-    const rule = await this.ruleRepo.rollbackToVersion(ruleId, version, this.currentUserId);
+  async rollbackRule(ruleId: string, version: SemVer, actorId?: string): Promise<AMLRule> {
+    const userId = actorId || this.currentUserId;
+    const rule = await this.ruleRepo.rollbackToVersion(ruleId, version, userId);
 
     // Audit log rollback
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_rule_rollback',
       resource: `aml_rule/${ruleId}`,
       outcome: 'SUCCESS',
@@ -222,16 +269,18 @@ export class AMLService {
   /**
    * Create a new AML case
    * @param input Case creation data
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Created case
    */
-  async createCase(input: CreateCaseInput): Promise<AMLCase> {
+  async createCase(input: CreateCaseInput, actorId?: string): Promise<AMLCase> {
+    const userId = actorId || this.currentUserId;
     const amlCase = await this.alertRepo.createCase(input);
 
     // Audit log case creation
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_case_created',
       resource: `aml_case/${ amlCase.id}`,
       outcome: 'SUCCESS',
@@ -257,16 +306,18 @@ export class AMLService {
    * Update an AML case
    * @param caseId Case ID
    * @param input Update data
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Updated case
    */
-  async updateCase(caseId: string, input: UpdateCaseInput): Promise<AMLCase> {
+  async updateCase(caseId: string, input: UpdateCaseInput, actorId?: string): Promise<AMLCase> {
+    const userId = actorId || this.currentUserId;
     const amlCase = await this.alertRepo.updateCase(caseId, input);
 
     // Audit log case update
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_case_updated',
       resource: `aml_case/${caseId}`,
       outcome: 'SUCCESS',
@@ -344,16 +395,18 @@ export class AMLService {
   /**
    * Dismiss an alert as false positive
    * @param alertId Alert ID
+   * @param actorId User ID of the actor performing the action (falls back to currentUserId if not provided)
    * @returns Updated alert
    */
-  async dismissAlert(alertId: string): Promise<AMLAlert> {
+  async dismissAlert(alertId: string, actorId?: string): Promise<AMLAlert> {
+    const userId = actorId || this.currentUserId;
     const alert = await this.alertRepo.updateStatus(alertId, 'dismissed');
 
     // Audit log alert dismissal
     await this.auditRepo.record({
       id: this.generateAuditId(),
       type: 'VALIDATION',
-      userId: this.currentUserId,
+      userId,
       action: 'aml_alert_dismissed',
       resource: `aml_alert/${alertId}`,
       outcome: 'SUCCESS',
@@ -471,12 +524,12 @@ export class AMLService {
 /**
  * Factory function to create AMLService with dependencies
  */
-export function createAMLService(db: Pool, auditRepo: SecurityAuditRepository, userId: string): AMLService {
+export function createAMLService(db: Pool, auditRepo: SecurityAuditRepository, userId: string, tenantSettingsService?: TenantSettingsService): AMLService {
   const investmentRepo = new InvestmentRepository(db);
   const ruleRepo = new AMLRuleRepository(db);
   const alertRepo = new AMLAlertRepository(db);
   const ofacReviewRepo = new OFACReviewRepository(db);
   const evaluator = new RuleEvaluator(investmentRepo);
 
-  return new AMLService(ruleRepo, alertRepo, evaluator, auditRepo, userId, ofacReviewRepo);
+  return new AMLService(ruleRepo, alertRepo, evaluator, auditRepo, userId, ofacReviewRepo, tenantSettingsService);
 }

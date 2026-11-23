@@ -1,8 +1,14 @@
 import { Pool, PoolClient } from "pg";
 
+// Disable SSL when PGSSLMODE=disable or DATABASE_URL contains sslmode=disable
+// so local development with a plain Postgres container works without SSL.
+const sslDisabled =
+  process.env.PGSSLMODE === 'disable' ||
+  (process.env.DATABASE_URL ?? '').includes('sslmode=disable');
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: sslDisabled ? false : { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,

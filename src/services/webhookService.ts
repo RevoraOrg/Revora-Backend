@@ -8,6 +8,7 @@ import {
 } from '../lib/webhookSignature';
 import { Logger } from '../lib/logger';
 import { OutboxRepository } from '../db/repositories/outboxRepository';
+import { safeFetch } from '../lib/ssrfProtection';
 
 export const WebhookEventType = {
   OFFERING_CREATED: 'offering.created',
@@ -126,8 +127,25 @@ export class WebhookService {
 
   /**
    * Emits a webhook event to all subscribed endpoints (fire-and-forget).
+   *
+   * Exact-once variant: when `client` (a transactional PoolClient from inside
+   * `withTransaction`) is supplied, the event is written to the transactional
+   * outbox instead of being dispatched directly. The outbox row commits or
+   * rolls back atomically with the producing transaction and the stable
+   * `event_id` is returned so the caller can correlate later deliveries.
+   *
+   * @param event  Webhook event type.
+   * @param data   Event payload.
+   * @param client Optional transactional client. When provided, requires
+   *               `outboxRepo` to be configured; otherwise this throws so an
+   *               event is never silently emitted outside the transaction.
+   * @returns      The stable event_id when emitted through the outbox, else void.
    */
-  async emit<T>(event: WebhookEventType, data: T): Promise<void> {
+  async emit<T>(event: WebhookEventType, data: T, client?: PoolClient): Promise<string | void> {
+    if (client) {
+      return this.emitToOutbox(client, event, data);
+    }
+
     let endpoints: WebhookEndpointRecord[];
     try {
       endpoints = await this.endpointRepo.listActiveByEvent(event);
@@ -179,7 +197,7 @@ export class WebhookService {
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const response = await fetch(endpoint.url, {
+      const response = await safeFetch(endpoint.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -189,6 +207,7 @@ export class WebhookService {
         },
         body,
         signal: controller.signal,
+        redirect: 'manual',
       });
 
       return {
@@ -244,9 +263,9 @@ export class WebhookService {
         const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
         const timestamp = Date.now().toString();
-        let response: Response;
+        let response;
         try {
-          response = await fetch(endpoint.url, {
+          response = await safeFetch(endpoint.url, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -256,6 +275,7 @@ export class WebhookService {
             },
             body,
             signal: controller.signal,
+            redirect: 'manual',
           });
         } finally {
           clearTimeout(timeoutId);

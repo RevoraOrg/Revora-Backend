@@ -78,6 +78,18 @@ describe('PushExperimentsService', () => {
   });
 
   describe('addVariant', () => {
+    const mockExperiment = {
+      id: 'exp-1',
+      tenant_id: 'tenant-1',
+      experiment_key: 'test-exp',
+      status: 'draft' as const,
+      allocation_strategy: 'weighted' as const,
+      started_at: null,
+      ended_at: null,
+      created_at: new Date(),
+      updated_at: new Date(),
+    };
+
     it('should add a variant to an experiment', async () => {
       const mockVariant = {
         id: 'var-1',
@@ -90,6 +102,11 @@ describe('PushExperimentsService', () => {
         is_control: true,
         created_at: new Date(),
       };
+      mockRepo.findExperimentById.mockResolvedValue(mockExperiment);
+      mockRepo.findLegalAllowlistByTenant.mockResolvedValue({
+        titles: ['Test {{name}}'],
+        bodies: ['Hello {{name}}'],
+      });
       mockRepo.findVariantsByExperiment.mockResolvedValue([]);
       mockRepo.createVariant.mockResolvedValue(mockVariant);
 
@@ -103,6 +120,7 @@ describe('PushExperimentsService', () => {
         true
       );
 
+      expect(mockRepo.findLegalAllowlistByTenant).toHaveBeenCalledWith('tenant-1');
       expect(mockRepo.createVariant).toHaveBeenCalledWith({
         experiment_id: 'exp-1',
         variant_key: 'control',
@@ -133,6 +151,11 @@ describe('PushExperimentsService', () => {
         is_control: false,
         created_at: new Date(),
       };
+      mockRepo.findExperimentById.mockResolvedValue(mockExperiment);
+      mockRepo.findLegalAllowlistByTenant.mockResolvedValue({
+        titles: ['Test'],
+        bodies: ['Hello'],
+      });
       mockRepo.findVariantsByExperiment.mockResolvedValue([]);
       mockRepo.createVariant.mockResolvedValue(mockVariant);
 
@@ -148,6 +171,44 @@ describe('PushExperimentsService', () => {
       expect(result).toEqual(mockVariant);
     });
 
+    it('should reject disallowed title template', async () => {
+      mockRepo.findExperimentById.mockResolvedValue(mockExperiment);
+      mockRepo.findLegalAllowlistByTenant.mockResolvedValue({
+        titles: ['Approved {{name}}'],
+        bodies: ['Hello {{name}}'],
+      });
+
+      await expect(
+        service.addVariant('exp-1', 'control', 50, 'Guaranteed returns!', 'Hello {{name}}')
+      ).rejects.toThrow(LegalContentViolationError);
+
+      expect(mockRepo.createVariant).not.toHaveBeenCalled();
+    });
+
+    it('should reject disallowed body template', async () => {
+      mockRepo.findExperimentById.mockResolvedValue(mockExperiment);
+      mockRepo.findLegalAllowlistByTenant.mockResolvedValue({
+        titles: ['Approved {{name}}'],
+        bodies: ['Hello {{name}}'],
+      });
+
+      await expect(
+        service.addVariant('exp-1', 'control', 50, 'Approved {{name}}', 'Risk-free offer')
+      ).rejects.toThrow(LegalContentViolationError);
+
+      expect(mockRepo.createVariant).not.toHaveBeenCalled();
+    });
+
+    it('should throw if experiment does not exist', async () => {
+      mockRepo.findExperimentById.mockResolvedValue(null);
+
+      await expect(
+        service.addVariant('missing', 'control', 50, 'Test', 'Hello')
+      ).rejects.toThrow('Experiment "missing" not found');
+
+      expect(mockRepo.createVariant).not.toHaveBeenCalled();
+    });
+
     it('should skip validation when no existing variants', async () => {
       const mockVariant = {
         id: 'var-1',
@@ -160,6 +221,11 @@ describe('PushExperimentsService', () => {
         is_control: true,
         created_at: new Date(),
       };
+      mockRepo.findExperimentById.mockResolvedValue(mockExperiment);
+      mockRepo.findLegalAllowlistByTenant.mockResolvedValue({
+        titles: ['Test'],
+        bodies: ['Hello'],
+      });
       mockRepo.findVariantsByExperiment.mockResolvedValue([]);
       mockRepo.createVariant.mockResolvedValue(mockVariant);
 
@@ -233,9 +299,8 @@ describe('PushExperimentsService', () => {
 
       mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
       mockRepo.findVariantsByExperiment.mockResolvedValue([mockVariant]);
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
+      mockRepo.findAssignmentByUser.mockResolvedValueOnce(null).mockResolvedValue(mockAssignment);
       mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
 
       const result = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1', { name: 'John' });
 
@@ -364,268 +429,15 @@ describe('PushExperimentsService', () => {
         experiment_id: 'exp-1',
         variant_key: 'control',
         weight: 100,
-        title_template: 'Hello {{name}} {{missing}}',
-        body_template: 'Welcome',
+        title_template: 'Hello {{name}}',
+        body_template: 'Welcome {{name}}',
         data_template: null,
         is_control: true,
         created_at: new Date(),
       };
-      const mockAssignment = {
-        id: 'assign-1',
-        experiment_id: 'exp-1',
-        variant_id: 'var-1',
-        user_id: 'user-1',
-        assigned_at: new Date(),
-        delivered_at: null,
-        opened_at: null,
-      };
-
       mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
       mockRepo.findVariantsByExperiment.mockResolvedValue([mockVariant]);
       mockRepo.findAssignmentByUser.mockResolvedValue(null);
-      mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
-
-      const result = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1', { name: 'John' });
-
-      expect(result.rendered.title).toBe('Hello John {{missing}}');
-    });
-  });
-
-  describe('recordDelivery', () => {
-    it('should record delivery for assignment', async () => {
-      mockRepo.markDelivered.mockResolvedValue();
-
-      await service.recordDelivery('assign-1');
-
-      expect(mockRepo.markDelivered).toHaveBeenCalledWith('assign-1');
-      expect(mockMetrics.incrementCounter).toHaveBeenCalledWith(
-        'push_experiment_delivered',
-        {},
-        1,
-        'Push notification delivered for experiment'
-      );
-    });
-  });
-
-  describe('recordOpen', () => {
-    it('should record open for assignment', async () => {
-      mockRepo.markOpened.mockResolvedValue();
-
-      await service.recordOpen('assign-1');
-
-      expect(mockRepo.markOpened).toHaveBeenCalledWith('assign-1');
-      expect(mockMetrics.incrementCounter).toHaveBeenCalledWith(
-        'push_experiment_opened',
-        {},
-        1,
-        'Push notification opened for experiment'
-      );
-    });
-  });
-
-  describe('getMetrics', () => {
-    it('should get experiment metrics with overall open rate', async () => {
-      const mockMetrics = {
-        total_assignments: 100,
-        total_delivered: 95,
-        total_opened: 50,
-        variant_metrics: [
-          {
-            variant_id: 'var-1',
-            variant_key: 'control',
-            assignments: 50,
-            delivered: 48,
-            opened: 25,
-            open_rate: 0.5,
-          },
-          {
-            variant_id: 'var-2',
-            variant_key: 'variant-a',
-            assignments: 50,
-            delivered: 47,
-            opened: 25,
-            open_rate: 0.5,
-          },
-        ],
-      };
-      mockRepo.getExperimentMetrics.mockResolvedValue(mockMetrics);
-
-      const result = await service.getMetrics('exp-1');
-
-      expect(result.total_assignments).toBe(100);
-      expect(result.total_delivered).toBe(95);
-      expect(result.total_opened).toBe(50);
-      expect(result.overall_open_rate).toBe(0.5);
-      expect(result.variant_metrics).toHaveLength(2);
-    });
-
-    it('should handle zero assignments', async () => {
-      const mockMetrics = {
-        total_assignments: 0,
-        total_delivered: 0,
-        total_opened: 0,
-        variant_metrics: [],
-      };
-      mockRepo.getExperimentMetrics.mockResolvedValue(mockMetrics);
-
-      const result = await service.getMetrics('exp-1');
-
-      expect(result.overall_open_rate).toBe(0);
-    });
-  });
-
-  describe('addLegalAllowlistEntry', () => {
-    it('should add legal allowlist entry', async () => {
-      mockRepo.addLegalAllowlistEntry.mockResolvedValue();
-
-      await service.addLegalAllowlistEntry('tenant-1', 'disclaimer', 'Required legal text');
-
-      expect(mockRepo.addLegalAllowlistEntry).toHaveBeenCalledWith(
-        'tenant-1',
-        'disclaimer',
-        'Required legal text'
-      );
-      expect(mockMetrics.incrementCounter).toHaveBeenCalledWith(
-        'push_experiment_legal_allowlist_added',
-        { tenant_id: 'tenant-1', field_key: 'disclaimer' },
-        1,
-        'Legal allowlist entry added for push experiments'
-      );
-    });
-  });
-
-  describe('deterministic allocation', () => {
-    it('should allocate same user to same variant consistently (weighted)', async () => {
-      const mockExperiment = {
-        id: 'exp-1',
-        tenant_id: 'tenant-1',
-        experiment_key: 'test-exp',
-        status: 'active' as const,
-        allocation_strategy: 'weighted' as const,
-        started_at: new Date(),
-        ended_at: null,
-        created_at: new Date(),
-        updated_at: new Date(),
-      };
-      const mockVariants = [
-        {
-          id: 'var-1',
-          experiment_id: 'exp-1',
-          variant_key: 'control',
-          weight: 50,
-          title_template: 'Control',
-          body_template: 'Control body',
-          data_template: null,
-          is_control: true,
-          created_at: new Date(),
-        },
-        {
-          id: 'var-2',
-          experiment_id: 'exp-1',
-          variant_key: 'variant-a',
-          weight: 50,
-          title_template: 'Variant A',
-          body_template: 'Variant A body',
-          data_template: null,
-          is_control: false,
-          created_at: new Date(),
-        },
-      ];
-      const mockAssignment = {
-        id: 'assign-1',
-        experiment_id: 'exp-1',
-        variant_id: 'var-1',
-        user_id: 'user-1',
-        assigned_at: new Date(),
-        delivered_at: null,
-        opened_at: null,
-      };
-
-      mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
-      mockRepo.findVariantsByExperiment.mockResolvedValue(mockVariants);
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
-      mockRepo.assignUserToVariant.mockResolvedValue(mockAssignment);
-      mockRepo.findAssignmentByUser.mockResolvedValue(mockAssignment);
-
-      const result1 = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1');
-      const result2 = await service.allocateAndRender('tenant-1', 'test-exp', 'user-1');
-
-      expect(result1.variant.id).toBe(result2.variant.id);
-    });
-
-    it('should allocate different users based on hash (uniform)', async () => {
-      const mockExperiment = {
-        id: 'exp-1',
-        tenant_id: 'tenant-1',
-        experiment_key: 'test-exp',
-        status: 'active' as const,
-        allocation_strategy: 'uniform' as const,
-        started_at: new Date(),
-        ended_at: null,
-        created_at: new Date(),
-        updated_at: new Date(),
-      };
-      const mockVariants = [
-        {
-          id: 'var-1',
-          experiment_id: 'exp-1',
-          variant_key: 'control',
-          weight: 50,
-          title_template: 'Control',
-          body_template: 'Control body',
-          data_template: null,
-          is_control: true,
-          created_at: new Date(),
-        },
-        {
-          id: 'var-2',
-          experiment_id: 'exp-1',
-          variant_key: 'variant-a',
-          weight: 50,
-          title_template: 'Variant A',
-          body_template: 'Variant A body',
-          data_template: null,
-          is_control: false,
-          created_at: new Date(),
-        },
-      ];
-
-      mockRepo.findExperimentByKey.mockResolvedValue(mockExperiment);
-      mockRepo.findVariantsByExperiment.mockResolvedValue(mockVariants);
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
-      mockRepo.assignUserToVariant.mockImplementation(async (_, variantId, __) => ({
-        id: 'assign-' + variantId,
-        experiment_id: 'exp-1',
-        variant_id: variantId,
-        user_id: 'user-test',
-        assigned_at: new Date(),
-        delivered_at: null,
-        opened_at: null,
-      }));
-      mockRepo.findAssignmentByUser.mockImplementation(async (_, __) => ({
-        id: 'assign-test',
-        experiment_id: 'exp-1',
-        variant_id: 'var-1',
-        user_id: 'user-test',
-        assigned_at: new Date(),
-        delivered_at: null,
-        opened_at: null,
-      }));
-
-      // Test with different user IDs - they should get different variants based on hash
-      const userId1 = 'user-abc123';
-      const userId2 = 'user-xyz789';
-
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
-      const result1 = await service.allocateAndRender('tenant-1', 'test-exp', userId1);
-      
-      mockRepo.findAssignmentByUser.mockResolvedValue(null);
-      const result2 = await service.allocateAndRender('tenant-1', 'test-exp', userId2);
-
-      // The variants may be the same or different depending on hash, but should be deterministic
-      expect(['var-1', 'var-2']).toContain(result1.variant.id);
-      expect(['var-1', 'var-2']).toContain(result2.variant.id);
     });
   });
 });

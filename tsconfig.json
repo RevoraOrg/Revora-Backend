@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "ES2020.BigInt"],
     "module": "CommonJS",
     "rootDir": "src",
     "outDir": "dist",
@@ -13,6 +13,6 @@
   "include": ["src/**/*.ts"],
   "exclude": [
   "node_modules",
-  "dist"
+  "dist", "src/**/*.test.ts", "src/**/__tests__/**"
 ]
 }

@@ -70,6 +70,45 @@ export interface CreatePayoutInput {
 }
 
 /**
+ * @title SearchPayoutsParams
+ * @dev Parameters accepted by `searchPayoutsByInvestor`.
+ * All filters, sort options, and pagination are pushed into SQL so that the
+ * database—not Node—performs the heavy lifting.
+ *
+ * Security contract:
+ * - `sortBy` MUST be one of the values in ALLOWED_PAYOUT_SORT_COLUMNS.
+ *   The method throws immediately when an unknown column is supplied.
+ * - `sortOrder` MUST be 'asc' or 'desc'.
+ * - Every other value is treated as a parameterised bind variable; no raw
+ *   string interpolation is performed for user-supplied data.
+ * - Amount comparisons use SQL NUMERIC so "10.5" sorts after "9.99".
+ */
+export interface SearchPayoutsParams {
+  investorId: string;
+  status?: 'pending' | 'processed' | 'failed';
+  minAmount?: number;
+  maxAmount?: number;
+  from?: Date;
+  to?: Date;
+  sortBy?: 'created_at' | 'amount' | 'status';
+  sortOrder?: 'asc' | 'desc';
+  limit: number;
+  offset: number;
+}
+
+/**
+ * @title SearchPayoutsResult
+ * @dev Returned by `searchPayoutsByInvestor`.
+ * `total` is the COUNT(*) OVER() window result — the number of rows matching
+ * all filters regardless of LIMIT/OFFSET, allowing callers to derive hasMore
+ * without issuing a separate COUNT query.
+ */
+export interface SearchPayoutsResult {
+  payouts: Payout[];
+  total: number;
+}
+
+/**
  * Distribution Repository
  * Handles database operations for distributions and payouts
  */
@@ -168,13 +207,54 @@ export class DistributionRepository {
   }
 
   /**
-   * Find a distribution run by unique parameters for idempotency
+   * Find a distribution run by offering and period (ignoring amount).
+   * Used for idempotency check and conflict detection.
+   *
+   * @param offeringId Offering ID
+   * @param periodId Period ID
+   * @param client Optional queryable (Pool or PoolClient)
+   * @returns Latest matching distribution run or null
+   */
+  async findRunByOfferingAndPeriod(
+    offeringId: string,
+    periodId: string,
+    client?: Queryable
+  ): Promise<DistributionRun | null> {
+    const query = `
+      SELECT *
+      FROM distributions
+      WHERE offering_id = $1 AND period_id = $2
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+    const queryable = client || this.db;
+    const result: QueryResult<DistributionRun> = await queryable.query(query, [
+      offeringId,
+      periodId,
+    ]);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.mapDistributionRun(result.rows[0]);
+  }
+
+  /**
+   * Find a distribution run by unique parameters for idempotency.
+   * If totalAmount is omitted, looks up by offering_id and period_id.
    */
   async findRunByParams(
     offeringId: string,
     periodId: string,
-    totalAmount: string
+    totalAmount?: string,
+    client?: Queryable
   ): Promise<DistributionRun | null> {
+    if (totalAmount === undefined) {
+      return this.findRunByOfferingAndPeriod(offeringId, periodId, client);
+    }
+
     const query = `
       SELECT *
       FROM distributions
@@ -182,7 +262,8 @@ export class DistributionRepository {
       LIMIT 1
     `;
 
-    const result: QueryResult<DistributionRun> = await this.db.query(query, [
+    const queryable = client || this.db;
+    const result: QueryResult<DistributionRun> = await queryable.query(query, [
       offeringId,
       periodId,
       totalAmount,
@@ -198,18 +279,48 @@ export class DistributionRepository {
   /**
    * Get all payouts for a specific distribution run
    */
-  async getPayoutsForRun(distributionId: string): Promise<Payout[]> {
+  async getPayoutsForRun(distributionId: string, client?: Queryable): Promise<Payout[]> {
     const query = `
       SELECT *
       FROM distribution_payouts
       WHERE distribution_id = $1
     `;
 
-    const result: QueryResult<Payout> = await this.db.query(query, [
+    const result: QueryResult<Payout> = await (client || this.db).query(query, [
       distributionId,
     ]);
 
     return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  async getDistributionTotal(distributionId: string, client?: Queryable): Promise<string | null> {
+    const query = `
+      SELECT total_amount
+      FROM distributions
+      WHERE id = $1
+    `;
+    const result = await (client || this.db).query(query, [distributionId]);
+    return result.rows.length === 0 ? null : String(result.rows[0].total_amount);
+  }
+
+  /**
+   * Count payouts for a specific distribution run filtered by status
+   * @param distributionId Distribution run ID
+   * @param status Payout status ('pending' | 'processed' | 'failed')
+   * @returns Number of payouts with the specified status
+   */
+  async countPayoutsByStatus(
+    distributionId: string,
+    status: 'pending' | 'processed' | 'failed'
+  ): Promise<number> {
+    const query = `
+      SELECT COUNT(*)::int AS count
+      FROM distribution_payouts
+      WHERE distribution_id = $1 AND status = $2
+    `;
+
+    const result = await this.db.query(query, [distributionId, status]);
+    return parseInt(String(result.rows[0]?.count ?? 0), 10);
   }
 
   /**
@@ -231,6 +342,77 @@ export class DistributionRepository {
 
     const queryable = client || this.db;
     await queryable.query(query, [status, id]);
+  }
+
+  /**
+   * List distribution runs for a business period.
+   * Used by the investor-statement generator to derive period fees
+   * (total_amount minus distributed payouts) and cross-offering summaries.
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of distribution runs ordered by run_at for deterministic output
+   */
+  async listByPeriod(periodId: string): Promise<DistributionRun[]> {
+    const query = `
+      SELECT *
+      FROM distributions
+      WHERE period_id = $1
+      ORDER BY run_at ASC, created_at ASC, id ASC
+    `;
+
+    const result: QueryResult<DistributionRun> = await this.db.query(query, [
+      periodId,
+    ]);
+
+    return result.rows.map((row) => this.mapDistributionRun(row));
+  }
+
+  /**
+   * List payouts for an investor belonging to distributions of a business period.
+   * Joins `distribution_payouts` to `distributions` on `period_id` so statements
+   * only surface distributions that actually belong to the reported period.
+   * @param investorId Investor ID
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of payouts ordered by created_at for deterministic output
+   */
+  async listPayoutsByInvestorForPeriod(
+    investorId: string,
+    periodId: string
+  ): Promise<Payout[]> {
+    const query = `
+      SELECT p.*
+      FROM distribution_payouts p
+      INNER JOIN distributions d ON d.id = p.distribution_id
+      WHERE p.investor_id = $1
+        AND d.period_id = $2
+      ORDER BY p.created_at ASC, p.id ASC
+    `;
+
+    const result: QueryResult<Payout> = await this.db.query(query, [
+      investorId,
+      periodId,
+    ]);
+
+    return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  /**
+   * List all payouts for a business period (any investor).
+   * Used to compute period-level fees (retained revenue) on investor statements.
+   * @param periodId Business period identifier (e.g. `2026-07`)
+   * @returns Array of payouts ordered by created_at for deterministic output
+   */
+  async listPayoutsByPeriod(periodId: string): Promise<Payout[]> {
+    const query = `
+      SELECT p.*
+      FROM distribution_payouts p
+      INNER JOIN distributions d ON d.id = p.distribution_id
+      WHERE d.period_id = $1
+      ORDER BY p.created_at ASC, p.id ASC
+    `;
+
+    const result: QueryResult<Payout> = await this.db.query(query, [periodId]);
+
+    return result.rows.map((row) => this.mapPayout(row));
   }
 
   /**
@@ -271,6 +453,180 @@ export class DistributionRepository {
     ]);
 
     return result.rows.map((row) => this.mapPayout(row));
+  }
+
+  /**
+   * @dev Whitelisted column names for ORDER BY in `searchPayoutsByInvestor`.
+   * This set is the single authoritative source of truth: if a value is not
+   * here it is never interpolated into SQL, regardless of where the call
+   * originates. The route layer maintains a parallel allowlist for early
+   * HTTP 400 rejection so callers never reach this method with an invalid
+   * column — but this guard is the defence-in-depth backstop.
+   */
+  static readonly ALLOWED_PAYOUT_SORT_COLUMNS: ReadonlySet<string> = new Set([
+    'created_at',
+    'amount',
+    'status',
+  ]);
+
+  /**
+   * @title searchPayoutsByInvestor
+   * @dev Filtered, sorted, paginated payout query that pushes all work to the
+   * database.  Replaces the in-memory filter/sort/slice pattern that existed
+   * in the route layer.
+   *
+   * Security contract:
+   * - `sortBy` is validated against `ALLOWED_PAYOUT_SORT_COLUMNS` before any
+   *   interpolation.  An unknown column throws immediately so that no partial
+   *   query reaches the database.
+   * - `sortOrder` is asserted to be 'asc' | 'desc'.
+   * - All filter values are bound as parameters ($N) — never interpolated.
+   * - Amount comparisons use the NUMERIC cast so "10.5" sorts after "9.99".
+   * - `COUNT(*) OVER()` is a window aggregate over the filtered rows; it
+   *   returns the total matching count on every row so callers never need a
+   *   separate COUNT query.
+   *
+   * @param params  Filter + sort + pagination parameters.
+   * @returns `{ payouts, total }` where `total` is the full filtered count.
+   * @throws Error when `sortBy` is not in `ALLOWED_PAYOUT_SORT_COLUMNS`.
+   */
+  async searchPayoutsByInvestor(params: SearchPayoutsParams): Promise<SearchPayoutsResult> {
+    const {
+      investorId,
+      status,
+      minAmount,
+      maxAmount,
+      from,
+      to,
+      sortBy = 'created_at',
+      sortOrder = 'desc',
+      limit,
+      offset,
+    } = params;
+
+    // ── Column allowlist guard (defence-in-depth) ──────────────────────────
+    if (!DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS.has(sortBy)) {
+      throw new Error(
+        `Invalid sortBy column: "${sortBy}". ` +
+        `Allowed: ${[...DistributionRepository.ALLOWED_PAYOUT_SORT_COLUMNS].join(', ')}`,
+      );
+    }
+
+    // sortOrder is already constrained to 'asc' | 'desc' by the TypeScript
+    // type, but we assert at runtime in case callers bypass types.
+    const safeOrder = sortOrder === 'asc' ? 'ASC' : 'DESC';
+
+    // ── Build parameterised WHERE clauses ──────────────────────────────────
+    const conditions: string[] = ['investor_id = $1'];
+    const values: unknown[] = [investorId];
+
+    function addParam(value: unknown): string {
+      values.push(value);
+      return `$${values.length}`;
+    }
+
+    if (status !== undefined) {
+      conditions.push(`status = ${addParam(status)}`);
+    }
+    if (minAmount !== undefined) {
+      conditions.push(`amount::NUMERIC >= ${addParam(minAmount)}`);
+    }
+    if (maxAmount !== undefined) {
+      conditions.push(`amount::NUMERIC <= ${addParam(maxAmount)}`);
+    }
+    if (from !== undefined) {
+      conditions.push(`created_at >= ${addParam(from)}`);
+    }
+    if (to !== undefined) {
+      conditions.push(`created_at <= ${addParam(to)}`);
+    }
+
+    // ── ORDER BY column is whitelisted — safe to interpolate ──────────────
+    // For 'amount' we cast to NUMERIC so "10.5" sorts after "9.99".
+    const orderExpr = sortBy === 'amount'
+      ? `amount::NUMERIC ${safeOrder}`
+      : `${sortBy} ${safeOrder}`;
+
+    const limitParam  = addParam(limit);
+    const offsetParam = addParam(offset);
+
+    const query = `
+      SELECT
+        *,
+        COUNT(*) OVER() AS _total_count
+      FROM distribution_payouts
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY ${orderExpr}, id ASC
+      LIMIT ${limitParam} OFFSET ${offsetParam}
+    `;
+
+    const result = await this.db.query<Payout & { _total_count: string }>(query, values);
+
+    const total = result.rows.length > 0 ? parseInt(result.rows[0]._total_count, 10) : 0;
+    const payouts = result.rows.map((row) => this.mapPayout(row));
+
+    return { payouts, total };
+  }
+
+  /**
+   * Fetch distributions and their payouts for a double-entry accounting export.
+   *
+   * Scope is intentionally additive: this query only READS existing
+   * `distributions` and `distribution_payouts` rows and never mutates state,
+   * so it is safe to call concurrently with distribution execution and
+   * preserves existing API/storage compatibility.
+   *
+   * @param offeringId Offering identifier to scope the export.
+   * @param periodId   Optional period filter; when omitted all periods for the
+   *                   offering are returned.
+   * @returns A stable, deterministic list of runs (each with its payouts)
+   *          ordered by `run_at` then `id`.
+   */
+  async listForAccountingExport(
+    offeringId: string,
+    periodId?: string,
+  ): Promise<Array<DistributionRun & { payouts: Payout[] }>> {
+    const runParams: unknown[] = [offeringId];
+    let runQuery = `
+      SELECT *
+      FROM distributions
+      WHERE offering_id = $1
+    `;
+    if (periodId) {
+      runParams.push(periodId);
+      runQuery += ` AND period_id = $${runParams.length}`;
+    }
+    runQuery += ` ORDER BY run_at ASC, id ASC`;
+
+    const runsResult = await this.db.query<DistributionRun>(runQuery, runParams);
+
+    const accounts: string[] = [];
+    const payoutParams: unknown[] = [];
+    for (const run of runsResult.rows) {
+      payoutParams.push(run.id);
+      accounts.push(`$${payoutParams.length}`);
+    }
+
+    const payoutsByRun = new Map<string, Payout[]>();
+    if (accounts.length > 0) {
+      const payoutQuery = `
+        SELECT *
+        FROM distribution_payouts
+        WHERE distribution_id IN (${accounts.join(', ')})
+        ORDER BY id ASC
+      `;
+      const payoutsResult = await this.db.query<Payout>(payoutQuery, payoutParams);
+      for (const payout of payoutsResult.rows) {
+        const list = payoutsByRun.get(payout.distribution_id) ?? [];
+        list.push(payout);
+        payoutsByRun.set(payout.distribution_id, list);
+      }
+    }
+
+    return runsResult.rows.map((run) => ({
+      ...run,
+      payouts: payoutsByRun.get(run.id) ?? [],
+    }));
   }
 
   /**

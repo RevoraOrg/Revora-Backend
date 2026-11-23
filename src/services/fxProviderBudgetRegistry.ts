@@ -106,7 +106,8 @@ export class InMemorySpendStore implements SpendStore {
     const existing = this.records.get(k);
     if (existing) {
       existing.spendUsd += amountUsd;
-    } else {
+    } else if (amountUsd > 0) {
+      // Skip a zero-amount insert so free calls never create a spend record.
       this.records.set(k, { tenantId, providerId, monthKey, spendUsd: amountUsd });
     }
   }
