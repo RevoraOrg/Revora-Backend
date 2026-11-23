@@ -50,14 +50,71 @@ export interface RateLimitStore {
   clear?(): void;
 }
 
+export interface InMemoryRateLimitStoreOptions {
+  /**
+   * Maximum number of keys retained in memory.
+   * When inserting a new key at capacity, expired entries are swept first;
+   * if still at capacity, the oldest entry is evicted.
+   * Default: 100_000.
+   */
+  maxKeys?: number;
+  /**
+   * Number of `increment()` calls between opportunistic expired-entry sweeps.
+   * Default: 1_000.
+   */
+  sweepInterval?: number;
+}
+
+const DEFAULT_MAX_KEYS = 100_000;
+const DEFAULT_SWEEP_INTERVAL = 1_000;
+
 export class InMemoryRateLimitStore implements RateLimitStore {
   private readonly windows = new Map<string, WindowEntry>();
+  private readonly maxKeys: number;
+  private readonly sweepInterval: number;
+  private incrementCount = 0;
+
+  constructor(options: InMemoryRateLimitStoreOptions = {}) {
+    const maxKeys = options.maxKeys ?? DEFAULT_MAX_KEYS;
+    const sweepInterval = options.sweepInterval ?? DEFAULT_SWEEP_INTERVAL;
+
+    if (!Number.isInteger(maxKeys) || maxKeys < 1) {
+      throw new RangeError('InMemoryRateLimitStore maxKeys must be a positive integer');
+    }
+    if (!Number.isInteger(sweepInterval) || sweepInterval < 1) {
+      throw new RangeError('InMemoryRateLimitStore sweepInterval must be a positive integer');
+    }
+
+    this.maxKeys = maxKeys;
+    this.sweepInterval = sweepInterval;
+  }
 
   increment(key: string, windowMs: number): { count: number; resetAt: number } {
     const now = Date.now();
+    this.incrementCount += 1;
+
+    let swept = false;
+    if (this.incrementCount >= this.sweepInterval) {
+      this.sweepExpired(now);
+      this.incrementCount = 0;
+      swept = true;
+    }
+
     const existing = this.windows.get(key);
 
     if (!existing || now >= existing.resetAt) {
+      if (!existing && this.windows.size >= this.maxKeys) {
+        if (!swept) {
+          this.sweepExpired(now);
+          this.incrementCount = 0;
+        }
+        while (this.windows.size >= this.maxKeys) {
+          const oldestKey = this.windows.keys().next().value;
+          if (oldestKey === undefined) break;
+          this.windows.delete(oldestKey);
+        }
+      }
+
       // Start a new window
       const entry: WindowEntry = { count: 1, resetAt: now + windowMs };
       this.windows.set(key, entry);
@@ -68,12 +125,30 @@ export class InMemoryRateLimitStore implements RateLimitStore {
     return { count: existing.count, resetAt: existing.resetAt };
   }
 
+  /** Remove all expired window entries as of `now` and return the count removed. */
+  sweepExpired(now: number = Date.now()): number {
+    let removed = 0;
+    for (const [k, entry] of this.windows) {
+      if (now >= entry.resetAt) {
+        this.windows.delete(k);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  /** Current number of tracked keys in memory. */
+  size(): number {
+    return this.windows.size;
+  }
+
   reset(key: string): void {
     this.windows.delete(key);
   }
 
   clear(): void {
     this.windows.clear();
+    this.incrementCount = 0;
   }
 }
 
