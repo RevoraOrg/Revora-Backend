@@ -102,6 +102,8 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
+import { FxProviderBudgetRegistry } from './services/fxProviderBudgetRegistry';
+import { createFxProviderSpendStore } from './services/pgSpendStore';
 // \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 import { createLoginRouter } from './auth/login/loginRoute';
 import { createRefreshRouter } from './auth/refresh/refreshRoute';
@@ -128,6 +130,14 @@ import { Logger as AppLogger } from './lib/logger';
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
+
+/**
+ * Shared FX budget registry; PostgreSQL is the production default so spend
+ * totals survive restarts and are consistent across application replicas.
+ */
+export const fxProviderBudgetRegistry = new FxProviderBudgetRegistry(
+  createFxProviderSpendStore(env.FX_PROVIDER_SPEND_STORE, pool),
+);
 
 const OFFERING_ROLES = ["startup", "admin", "compliance", "investor"] as const;
 const OFFERING_ACTIONS = [

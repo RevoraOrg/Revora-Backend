@@ -86,6 +86,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | PORT                        | No       | 4000                    | Port for the Express server to listen on         |
  * | API_VERSION_PREFIX          | No       | /api/v1                 | Prefix for API routes                            |
  * | DATABASE_URL                | Yes/Prod | (empty)                 | Connection string for the PostgreSQL database    |
+ * | FX_PROVIDER_SPEND_STORE     | No       | postgres                | FX spend store: postgres (durable) or memory (local/test only) |
  * | JWT_SECRET                  | Yes/Prod | (empty)                 | Secret key for signing JSON Web Tokens           |
  * | JWT_SECRET_PREVIOUS         | No       | (empty)                 | Previous secret key for graceful token rotation  |
  * | JWT_KEY_ID                  | No       | (empty)                 | Key ID for current JWT secret (kid header)      |
@@ -136,6 +137,7 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   API_VERSION_PREFIX: z.string().default("/api/v1"),
   DATABASE_URL: z.string().optional(),
+  FX_PROVIDER_SPEND_STORE: z.enum(["postgres", "memory"]).default("postgres"),
   WEBHOOK_QUEUE_MAX_DEPTH: z.coerce.number().int().positive().default(100),
   JWT_SECRET: z.string().min(16).optional(),
   JWT_SECRET_PREVIOUS: z.string().optional(),
@@ -185,6 +187,10 @@ const envSchema = z.object({
   if (data.NODE_ENV === "production" && !data.DATABASE_URL) return false;
   return true;
 }, { message: "DATABASE_URL is required in production", path: ["DATABASE_URL"] })
+.refine(data => {
+  if (data.NODE_ENV === "production" && data.FX_PROVIDER_SPEND_STORE !== "postgres") return false;
+  return true;
+}, { message: "FX_PROVIDER_SPEND_STORE=postgres is required in production", path: ["FX_PROVIDER_SPEND_STORE"] })
 .refine(data => {
   if (data.NODE_ENV === "production" && !data.JWT_SECRET) return false;
   return true;

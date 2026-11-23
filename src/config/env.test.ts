@@ -73,6 +73,37 @@ describe('env config', () => {
     expect(cfg.STELLAR_SERVER_SECRET).toBeUndefined();
   });
 
+  it('defaults the FX provider spend store to PostgreSQL and accepts memory for local use', () => {
+    process.env.NODE_ENV = 'test';
+    delete process.env.FX_PROVIDER_SPEND_STORE;
+    expect(buildConfig().FX_PROVIDER_SPEND_STORE).toBe('postgres');
+
+    process.env.FX_PROVIDER_SPEND_STORE = 'memory';
+    expect(buildConfig().FX_PROVIDER_SPEND_STORE).toBe('memory');
+  });
+
+  it('rejects the in-memory FX spend store in production', () => {
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code?: number) => {
+      throw new Error(`Process.exit called with ${code}`);
+    });
+    const mockConsoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    process.env.NODE_ENV = 'production';
+    process.env.DATABASE_URL = 'postgres://user:pass@localhost:5432/revora';
+    process.env.JWT_SECRET = 'test-secret-key-that-is-at-least-32-characters-long!';
+    process.env.STELLAR_SERVER_SECRET = 'valid';
+    process.env.AUDIT_EXPORT_SIGNING_KEY = 'test-key';
+    process.env.FX_PROVIDER_SPEND_STORE = 'memory';
+
+    expect(() => buildConfig()).toThrow('Process.exit called with 1');
+    expect(mockConsoleError).toHaveBeenCalledWith(
+      expect.stringContaining('FX_PROVIDER_SPEND_STORE'),
+    );
+
+    mockExit.mockRestore();
+    mockConsoleError.mockRestore();
+  });
+
   it('should parse ALLOWED_ORIGINS correctly', () => {
     process.env.NODE_ENV = 'development';
     process.env.STELLAR_SERVER_SECRET = 'valid';
