@@ -1,8 +1,8 @@
 import { Request, Response } from 'express';
-import { OfferingRepository } from '../db/offeringRepository';
-import { ConcurrencyError } from '../lib/errors';
-import { Logger } from '../lib/logger';
-import { MetricsCollector } from '../lib/metrics';
+import { OfferingRepository } from './offeringRepository';
+import { ConcurrencyError } from '../../lib/errors';
+import { Logger } from '../../lib/logger';
+import { MetricsCollector } from '../../lib/metrics';
 
 /**
  * Handler for updating offerings with ETag and Optimistic Concurrency support.
@@ -20,9 +20,9 @@ export const createUpdateOfferingHandler = (
     const ifMatch = req.headers['if-match'];
     const bodyVersion = req.body.version;
     
-    // Parse version from "W/5" or "5" formats if header is used
+    // Parse version from `W/"5"`, `"5"` or `5` ETag formats when a header is used
     const version = ifMatch 
-      ? parseInt((ifMatch as string).replace(/^(W\/|")|(")$/g, ''), 10)
+      ? parseInt((ifMatch as string).replace(/^W\//, '').replace(/"/g, ''), 10)
       : bodyVersion;
 
     if (issuerId === undefined) {

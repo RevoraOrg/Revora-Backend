@@ -21,6 +21,7 @@ import {
 } from '../../lib/ssrfProtection';
 
 const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_HTTP_TIMEOUT_MS = 5000;    // 5 seconds
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
 const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
 
@@ -41,6 +42,15 @@ interface OidcDiscoveryMetrics {
 export interface OidcAdapterServiceOptions {
   /** Override discovery document cache TTL (ms). Defaults to OIDC_DISCOVERY_TTL_MS or 1h. */
   discoveryTtlMs?: number;
+  /**
+   * Hard timeout (ms) applied to outbound OIDC HTTP requests — the discovery
+   * document fetch and the token endpoint fetch. Defaults to 5000ms.
+   * A non-positive or non-finite override falls back to the default.
+   *
+   * Without a timeout, a slow or hanging identity provider holds the login
+   * request open indefinitely and can exhaust the connection pool.
+   */
+  httpTimeoutMs?: number;
   metrics?: OidcDiscoveryMetrics;
   now?: () => number;
   /** Explicit test/dev override to allow private/local network issuers and endpoints. */
@@ -75,6 +85,23 @@ function resolveDiscoveryTtlMs(override?: number): number {
   return DEFAULT_DISCOVERY_TTL_MS;
 }
 
+function resolveHttpTimeoutMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return override;
+  }
+  return DEFAULT_HTTP_TIMEOUT_MS;
+}
+
+/**
+ * True when an error was produced by an aborted fetch: a timeout from
+ * `AbortSignal.timeout` (DOMException name "TimeoutError") or an explicit abort.
+ */
+function isAbortError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const name = (err as { name?: unknown }).name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 export class OidcAdapterService {
   private readonly discoveryCache = new Map<string, DiscoveryCacheEntry>();
   /** SHA-256 hex digest of the last accepted discovery document, keyed by issuer URL. */
@@ -83,6 +110,7 @@ export class OidcAdapterService {
   /** Set of already-consumed logout token JTIs with their exp timestamps for replay protection. */
   private readonly consumedJtis = new Map<string, number>();
   private readonly discoveryTtlMs: number;
+  private readonly httpTimeoutMs: number;
   private readonly metrics: OidcDiscoveryMetrics;
   private readonly now: () => number;
   private readonly allowPrivateIssuers: boolean;
@@ -93,6 +121,7 @@ export class OidcAdapterService {
     options: OidcAdapterServiceOptions = {},
   ) {
     this.discoveryTtlMs = resolveDiscoveryTtlMs(options.discoveryTtlMs);
+    this.httpTimeoutMs = resolveHttpTimeoutMs(options.httpTimeoutMs);
     this.metrics = options.metrics ?? globalMetrics;
     this.now = options.now ?? (() => Date.now());
     this.allowPrivateIssuers = resolveAllowPrivateIssuers(options.allowPrivateIssuers);
@@ -105,6 +134,31 @@ export class OidcAdapterService {
   }
 
   // ── Discovery ─────────────────────────────────────────────────────────
+
+  /**
+   * Perform an outbound OIDC HTTP request with a hard timeout.
+   *
+   * A hanging identity provider would otherwise hold the login request open
+   * indefinitely and exhaust the connection pool, so we abort via
+   * `AbortSignal.timeout` and surface a clear error message.
+   */
+  private async fetchWithTimeout(
+    input: string,
+    init: RequestInit,
+    requestDescription: string,
+  ): Promise<Response> {
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: AbortSignal.timeout(this.httpTimeoutMs),
+      });
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        throw new Error(`${requestDescription} timed out after ${this.httpTimeoutMs}ms`);
+      }
+      throw err;
+    }
+  }
 
   async getDiscovery(issuerUrl: string): Promise<OidcDiscoveryDocument> {
     const cached = this.discoveryCache.get(issuerUrl);
@@ -130,10 +184,11 @@ export class OidcAdapterService {
         1,
         'OIDC discovery document digest changed for issuer; admin should validate endpoint updates',
       );
-      console.warn(
-        `[OidcAdapter] oidc.discovery.changed issuer=${issuerUrl} ` +
-          `previous=${previous.slice(0, 12)}… current=${digest.slice(0, 12)}…`,
-      );
+      globalLogger.warn('oidc.discovery.changed', {
+        issuer: issuerUrl,
+        previousDigest: previous,
+        currentDigest: digest,
+      });
     }
 
     this.discoveryDigests.set(issuerUrl, digest);

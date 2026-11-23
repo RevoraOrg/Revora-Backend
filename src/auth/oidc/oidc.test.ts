@@ -2,6 +2,7 @@ import { createSign, generateKeyPairSync } from 'crypto';
 import express from 'express';
 import nock from 'nock';
 import request from 'supertest';
+import { globalLogger } from '../../lib/logger';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
 import { createOidcRouter } from './oidcRoute';
@@ -162,7 +163,7 @@ describe('OidcAdapterService', () => {
     it('stores a per-issuer digest and alerts on fixture rotation', async () => {
       const metrics = { incrementCounter: jest.fn() };
       let now = 1_000_000;
-      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const warn = jest.spyOn(globalLogger, 'warn').mockImplementation(() => undefined);
       service = new OidcAdapterService(jwksCache, {
         metrics,
         discoveryTtlMs: 60_000,
@@ -194,7 +195,11 @@ describe('OidcAdapterService', () => {
         1,
         expect.any(String),
       );
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('oidc.discovery.changed'));
+      expect(warn).toHaveBeenCalledWith('oidc.discovery.changed', {
+        issuer: 'https://idp.example.com',
+        previousDigest: firstDigest,
+        currentDigest: service.getDiscoveryDigest('https://idp.example.com'),
+      });
       warn.mockRestore();
     });
 
@@ -231,6 +236,51 @@ describe('OidcAdapterService', () => {
 
       expect(service.getDiscoveryDigest('https://idp.example.com')).toBe(digest);
       expect(metrics.incrementCounter).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── HTTP timeouts ──────────────────────────────────────────────────────
+
+  describe('outbound HTTP timeout', () => {
+    // A hanging identity provider: the request never resolves unless the
+    // caller's AbortSignal fires (mirrors how real fetch honours the signal).
+    const hangingFetch = () =>
+      jest.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          if (!signal) return;
+          signal.addEventListener('abort', () => reject(signal.reason));
+        }),
+      ) as any;
+
+    it('aborts a hanging discovery fetch within the timeout', async () => {
+      const timedService = new OidcAdapterService(jwksCache, { httpTimeoutMs: 25 });
+      global.fetch = hangingFetch();
+
+      await expect(timedService.getDiscovery('https://idp.example.com')).rejects.toThrow(
+        'OIDC discovery request to https://idp.example.com timed out after 25ms',
+      );
+    });
+
+    it('aborts a hanging token endpoint fetch within the timeout', async () => {
+      const timedService = new OidcAdapterService(jwksCache, { httpTimeoutMs: 25 });
+      global.fetch = hangingFetch();
+
+      const provider = makeProvider();
+      const discovery = makeDiscovery() as any;
+      const flowState = {
+        tenantId: 'acme',
+        codeVerifier: 'verifier',
+        nonce: 'nonce',
+        redirectUri: 'https://app.example.com/callback',
+        expiresAt: Date.now() + 60_000,
+      };
+
+      await expect(
+        (timedService as any).exchangeCode('code-1', flowState, provider, discovery),
+      ).rejects.toThrow(
+        'Token exchange request to https://idp.example.com/token timed out after 25ms',
+      );
     });
   });
 

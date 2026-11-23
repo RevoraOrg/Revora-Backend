@@ -164,6 +164,42 @@ export class BadRequestError extends AppError {
   }
 }
 
+/**
+ * Thrown when an optimistic-concurrency update detects that the row was
+ * modified by another writer since it was read (i.e. the supplied version no
+ * longer matches the stored one).
+ *
+ * Security assumptions:
+ * - The message is deliberately generic and never echoes raw database rows or
+ *   stack traces, so it is safe to return to untrusted clients.
+ * - Callers map this to HTTP 409 via {@link ConcurrencyError.statusCode}.
+ */
+export class ConcurrencyError extends Error {
+  public readonly statusCode: number = 409;
+  public readonly errorCode: string = 'CONCURRENCY_CONFLICT';
+
+  constructor(
+    message: string = 'The resource has been modified by another process. Please refresh and try again.',
+  ) {
+    super(message);
+    this.name = 'ConcurrencyError';
+    Object.setPrototypeOf(this, new.target.prototype);
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  /**
+   * Formats the error for client-facing JSON responses.
+   * Ensures no raw stack traces or DB strings are leaked.
+   */
+  public toJSON(): { error: string; message: string; code: string } {
+    return {
+      error: 'Conflict',
+      message: this.message,
+      code: this.errorCode,
+    };
+  }
+}
+
 export class UniqueConstraintError extends Error {
   public readonly field: string;
 

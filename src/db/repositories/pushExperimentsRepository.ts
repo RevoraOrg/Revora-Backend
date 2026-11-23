@@ -77,6 +77,17 @@ export class PushExperimentsRepository {
     return this.mapExperiment(result.rows[0] as Record<string, unknown>);
   }
 
+  async findExperimentById(experimentId: string): Promise<PushExperiment | null> {
+    const query = `
+      SELECT * FROM push_experiments
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const result: QueryResult = await this.db.query(query, [experimentId]);
+    if (result.rows.length === 0) return null;
+    return this.mapExperiment(result.rows[0] as Record<string, unknown>);
+  }
+
   async findExperimentByKey(
     tenantId: string,
     experimentKey: string

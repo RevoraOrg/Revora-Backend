@@ -50,7 +50,7 @@ Main service for experiment management:
 
 **Key Methods:**
 - `createExperiment()`: Creates a new experiment
-- `addVariant()`: Adds a variant with legal content validation
+- `addVariant()`: Adds a variant with legal content validation. Fetches the experiment to resolve its `tenant_id`, loads the tenant legal allowlist via the repository, and rejects title/body templates that violate it with a descriptive `LegalContentViolationError`.
 - `activateExperiment()`: Starts the allocation phase
 - `allocateAndRender()`: Allocates user to variant and renders template
 - `recordDelivery()`: Records push delivery
