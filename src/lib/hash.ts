@@ -1,6 +1,12 @@
 import { scryptSync, randomBytes, timingSafeEqual } from 'crypto';
 
 /**
+ * @deprecated Use async `hashPassword` and `comparePassword` from `src/utils/password.ts` instead.
+ * This module uses synchronous `scryptSync`, which blocks the Node.js event loop.
+ */
+
+/**
+ * @deprecated Use async `hashPassword` from `src/utils/password.ts` instead.
  * Hash a password using scrypt
  * @param password The password to hash
  * @returns The hashed password in the format salt:hash
@@ -12,6 +18,7 @@ export function hashPassword(password: string): string {
 }
 
 /**
+ * @deprecated Use async `comparePassword` from `src/utils/password.ts` instead.
  * Verify a password against a hash
  * @param password The password to verify
  * @param hash The stored hash in the format salt:hash

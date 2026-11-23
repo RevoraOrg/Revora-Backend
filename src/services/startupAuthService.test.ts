@@ -21,6 +21,8 @@
 import { StartupAuthService, RegistrationResult } from './startupAuthService';
 import { UserRepository } from '../db/repositories/userRepository';
 import { UniqueConstraintError } from '../lib/errors';
+import * as passwordUtils from '../utils/password';
+import { verifyPassword as legacyVerifyPassword } from '../lib/hash';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -117,6 +119,45 @@ describe('StartupAuthService', () => {
 
             const callArg = mockUserRepository.createUser.mock.calls[0][0];
             expect(callArg.role).toBe('startup');
+        });
+    });
+
+    // ── Password hashing ─────────────────────────────────────────────────────
+
+    describe('register — password hashing', () => {
+        it('hashes password asynchronously via utils/password in salt:hash format', async () => {
+            const hashSpy = jest.spyOn(passwordUtils, 'hashPassword');
+            mockUserRepository.findByEmail.mockResolvedValue(null);
+            mockUserRepository.createUser.mockResolvedValue(makeUser());
+
+            const result = await service.register({
+                email: 'startup@example.com',
+                password: STRONG_PASSWORD,
+            });
+
+            expect(result.success).toBe(true);
+            expect(hashSpy).toHaveBeenCalledTimes(1);
+            expect(hashSpy).toHaveBeenCalledWith(STRONG_PASSWORD);
+
+            const persistedHash = mockUserRepository.createUser.mock.calls[0][0].password_hash;
+            expect(persistedHash).toMatch(/^[a-f0-9]{32}:[a-f0-9]{128}$/);
+            expect(await passwordUtils.comparePassword(STRONG_PASSWORD, persistedHash)).toBe(true);
+            expect(legacyVerifyPassword(STRONG_PASSWORD, persistedHash)).toBe(true);
+        });
+
+        it('returns opaque 500 when async password hashing rejects', async () => {
+            jest.spyOn(passwordUtils, 'hashPassword').mockRejectedValue(new Error('scrypt OOM failure'));
+            mockUserRepository.findByEmail.mockResolvedValue(null);
+
+            const result = await service.register({
+                email: 'startup@example.com',
+                password: STRONG_PASSWORD,
+            });
+
+            expect(result.success).toBe(false);
+            expect(result.statusCode).toBe(500);
+            expect(result.error).not.toContain('scrypt OOM failure');
+            expect(mockUserRepository.createUser).not.toHaveBeenCalled();
         });
     });
 
