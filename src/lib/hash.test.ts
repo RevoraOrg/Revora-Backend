@@ -63,23 +63,41 @@ describe("hash :: verifyPassword", () => {
     expect(verifyPassword("password123", hash)).toBe(false);
   });
 
-  it("throws on a hash without the salt:key separator", () => {
-    const hash = hashPassword("some-password");
-    const malformed = hash.split(":")[1]; // key hex with no salt prefix
-    expect(() => verifyPassword("some-password", malformed)).toThrow();
+  it("returns false for an empty stored hash", () => {
+    expect(verifyPassword("some-password", "")).toBe(false);
   });
 
-  it("throws on a key segment that is not valid hex", () => {
+  it("returns false on a hash without the salt:key separator", () => {
+    const hash = hashPassword("some-password");
+    const malformed = hash.split(":")[1]; // key hex with no salt prefix
+    expect(verifyPassword("some-password", malformed)).toBe(false);
+  });
+
+  it("returns false when salt or key segment is missing", () => {
+    const hash = hashPassword("some-password");
+    const [salt, key] = hash.split(":");
+    expect(verifyPassword("some-password", `:${key}`)).toBe(false);
+    expect(verifyPassword("some-password", `${salt}:`)).toBe(false);
+  });
+
+  it("returns false on an odd-length hex key segment", () => {
+    const hash = hashPassword("some-password");
+    const salt = hash.split(":")[0];
+    const oddHex = "a".repeat(127);
+    expect(verifyPassword("some-password", `${salt}:${oddHex}`)).toBe(false);
+  });
+
+  it("returns false on a key segment that is not valid hex", () => {
     const hash = hashPassword("some-password");
     const salt = hash.split(":")[0];
     const malformed = `${salt}:not-a-hex-key!`;
-    expect(() => verifyPassword("some-password", malformed)).toThrow();
+    expect(verifyPassword("some-password", malformed)).toBe(false);
   });
 
-  it("throws on a key length that differs from the derived key", () => {
+  it("returns false on a key length that differs from the derived key", () => {
     const hash = hashPassword("some-password");
     const salt = hash.split(":")[0];
     const shortKey = "a".repeat(16);
-    expect(() => verifyPassword("some-password", `${salt}:${shortKey}`)).toThrow();
+    expect(verifyPassword("some-password", `${salt}:${shortKey}`)).toBe(false);
   });
 });
