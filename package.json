@@ -38,7 +38,6 @@
     "pg": "^8.19.0",
     "pg-cursor": "^2.21.0",
     "require-directory": "^2.1.1",
-    "stellar-sdk": "^13.3.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
