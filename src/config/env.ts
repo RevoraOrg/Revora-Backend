@@ -103,6 +103,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  * | AUDIT_EXPORT_SIGNING_KEY    | Yes/Prod | (empty)                 | Base64-encoded Ed25519 private key (32-byte seed) for signing audit CSV exports |
  * | AUDIT_EXPORT_PUBLIC_KEY     | No       | (empty)                 | Base64-encoded Ed25519 public key, documented so auditors can verify exports offline |
+ * | WITNESS_REKOR_URL           | No       | (empty)                 | HTTPS Rekor transparency log URL for publishing audit roots; mock witness is used when unset |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
@@ -155,6 +156,10 @@ export const envSchema = z.object({
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   AUDIT_EXPORT_SIGNING_KEY: z.string().min(1).optional(),
   AUDIT_EXPORT_PUBLIC_KEY: z.string().min(1).optional(),
+  WITNESS_REKOR_URL: z.string().url().refine(
+    (url) => new URL(url).protocol === 'https:',
+    'must use HTTPS',
+  ).optional(),
   SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
