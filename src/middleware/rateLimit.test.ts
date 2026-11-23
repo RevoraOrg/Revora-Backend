@@ -130,6 +130,76 @@ describe('InMemoryRateLimitStore', () => {
     const store = new InMemoryRateLimitStore();
     expect(() => store.reset('nonexistent')).not.toThrow();
   });
+
+  describe('bounded memory and expired window eviction', () => {
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('sweeps expired windows opportunistically so size() shrinks', () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+
+      const store = new InMemoryRateLimitStore({ sweepInterval: 5 });
+      store.increment('ip:1.1.1.1', 1_000);
+      store.increment('ip:1.1.1.2', 1_000);
+      store.increment('ip:1.1.1.3', 1_000);
+      store.increment('ip:1.1.1.4', 10_000); // longer window, still active
+      expect(store.size()).toBe(4);
+
+      // Advance past the 1_000ms windows, but before the 10_000ms window
+      jest.advanceTimersByTime(1_500);
+
+      // 5th increment triggers opportunistic sweep
+      store.increment('ip:1.1.1.5', 10_000);
+
+      // The 3 expired keys should be evicted; only ip:1.1.1.4 and ip:1.1.1.5 remain
+      expect(store.size()).toBe(2);
+      expect(store.increment('ip:1.1.1.4', 10_000).count).toBe(2);
+    });
+
+    it('evicts expired entries before evicting active entries when maxKeys is reached', () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+
+      const store = new InMemoryRateLimitStore({ maxKeys: 3, sweepInterval: 100 });
+      store.increment('ip:old-1', 1_000);
+      store.increment('ip:old-2', 1_000);
+      store.increment('ip:active', 60_000);
+      expect(store.size()).toBe(3);
+
+      jest.advanceTimersByTime(2_000);
+
+      // Adding a new key at capacity should sweep the 2 expired keys first
+      store.increment('ip:new', 60_000);
+      expect(store.size()).toBe(2);
+      // Active key was preserved
+      expect(store.increment('ip:active', 60_000).count).toBe(2);
+    });
+
+    it('enforces maxKeys by evicting the oldest entry when all keys are active', () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+
+      const store = new InMemoryRateLimitStore({ maxKeys: 3, sweepInterval: 100 });
+      store.increment('k1', 60_000);
+      store.increment('k2', 60_000);
+      store.increment('k3', 60_000);
+      expect(store.size()).toBe(3);
+
+      store.increment('k4', 60_000);
+      expect(store.size()).toBe(3);
+
+      // k1 was evicted, so incrementing k1 starts a fresh window with count = 1
+      expect(store.increment('k1', 60_000).count).toBe(1);
+    });
+
+    it('throws RangeError for invalid maxKeys or sweepInterval', () => {
+      expect(() => new InMemoryRateLimitStore({ maxKeys: 0 })).toThrow(RangeError);
+      expect(() => new InMemoryRateLimitStore({ maxKeys: -5 })).toThrow(RangeError);
+      expect(() => new InMemoryRateLimitStore({ sweepInterval: 0 })).toThrow(RangeError);
+    });
+  });
 });
 
 describe('createRateLimitMiddleware — per IP', () => {
