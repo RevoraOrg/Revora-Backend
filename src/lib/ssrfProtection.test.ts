@@ -1,15 +1,14 @@
 import {
   validateWebhookUrl,
   validateWebhookUrlSync,
-  SsrfValidationError,
   isPrivateIPv4,
   isPrivateIPv6,
   isPrivateIP,
   normalizeEncodedIP,
   safeFetch,
 } from './ssrfProtection';
-import * as dnsPromises from 'dns/promises';
-import * as https from 'https';
+import dns from 'dns';
+import https from 'https';
 import nock from 'nock';
 
 // ─── IPv4 Private Range Tests ───────────────────────────────────────────────
@@ -373,7 +372,7 @@ describe('SSRF-safe fetch', () => {
   });
 
   it('rejects any private address in a DNS answer before making a request', async () => {
-    const lookup = jest.spyOn(dnsPromises, 'lookup').mockResolvedValueOnce([
+    const lookup = jest.spyOn(dns.promises, 'lookup').mockResolvedValueOnce([
       { address: '93.184.216.34', family: 4 },
       { address: '127.0.0.1', family: 4 },
     ] as never);
@@ -386,13 +385,13 @@ describe('SSRF-safe fetch', () => {
 
   it('pins the socket lookup to the address validated before connecting', async () => {
     const validatedAddress = '93.184.216.34';
-    const dnsLookup = jest.spyOn(dnsPromises, 'lookup').mockResolvedValueOnce([
+    const dnsLookup = jest.spyOn(dns.promises, 'lookup').mockResolvedValueOnce([
       { address: validatedAddress, family: 4 },
     ] as never).mockResolvedValueOnce([
       { address: '127.0.0.1', family: 4 },
     ] as never);
     let socketAddress: string | undefined;
-    const fakeResponse = { statusCode: 200, resume: jest.fn() } as unknown as https.IncomingMessage;
+    const fakeResponse = { statusCode: 200, resume: jest.fn(), on: jest.fn((event, cb) => { if (event === 'end') cb(); return fakeResponse; }), headers: {} } as unknown as https.IncomingMessage;
     const fakeRequest = {
       once: jest.fn(),
       write: jest.fn(),
@@ -415,6 +414,77 @@ describe('SSRF-safe fetch', () => {
     expect(socketAddress).toBe(validatedAddress);
     expect(dnsLookup).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows safe redirect to another public HTTPS address and re-validates target', async () => {
+    nock('https://8.8.8.8')
+      .get('/initial')
+      .reply(302, '', { Location: 'https://1.1.1.1/target' });
+    nock('https://1.1.1.1')
+      .get('/target')
+      .reply(200, JSON.stringify({ success: true }), { 'Content-Type': 'application/json' });
+
+    const res = await safeFetch('https://8.8.8.8/initial');
+    expect(res.status).toBe(200);
+    expect(res.ok).toBe(true);
+    const data = await res.json<{ success: boolean }>();
+    expect(data.success).toBe(true);
+  });
+
+  it('rejects redirect leading to private IPv4 address', async () => {
+    nock('https://8.8.8.8')
+      .get('/redirect-to-private')
+      .reply(302, '', { Location: 'https://127.0.0.1/admin' });
+
+    await expect(safeFetch('https://8.8.8.8/redirect-to-private'))
+      .rejects.toMatchObject({ code: 'PRIVATE_ADDRESS' });
+  });
+
+  it('rejects redirect leading to AWS metadata service IP', async () => {
+    nock('https://8.8.8.8')
+      .get('/metadata')
+      .reply(302, '', { Location: 'https://169.254.169.254/latest/meta-data' });
+
+    await expect(safeFetch('https://8.8.8.8/metadata'))
+      .rejects.toMatchObject({ code: 'PRIVATE_ADDRESS' });
+  });
+
+  it('rejects redirect leading to non-HTTPS scheme', async () => {
+    nock('https://8.8.8.8')
+      .get('/insecure')
+      .reply(302, '', { Location: 'http://8.8.8.8/insecure' });
+
+    await expect(safeFetch('https://8.8.8.8/insecure'))
+      .rejects.toMatchObject({ code: 'INVALID_SCHEME' });
+  });
+
+  it('rejects redirect loops exceeding maxRedirects', async () => {
+    nock('https://8.8.8.8')
+      .get('/loop1')
+      .reply(302, '', { Location: 'https://1.1.1.1/loop2' })
+      .persist();
+    nock('https://1.1.1.1')
+      .get('/loop2')
+      .reply(302, '', { Location: 'https://8.8.8.8/loop1' })
+      .persist();
+
+    await expect(safeFetch('https://8.8.8.8/loop1', { maxRedirects: 2 }))
+      .rejects.toMatchObject({ code: 'TOO_MANY_REDIRECTS' });
+  });
+
+  it('allows private IPs and HTTP when explicit test/dev override is set', async () => {
+    nock('http://127.0.0.1')
+      .get('/local-jwks')
+      .reply(200, JSON.stringify({ keys: [] }), { 'Content-Type': 'application/json' });
+
+    const res = await safeFetch('http://127.0.0.1/local-jwks', {
+      allowPrivateRanges: true,
+      allowHttp: true,
+    });
+    expect(res.status).toBe(200);
+    expect(res.ok).toBe(true);
+    const body = await res.json<{ keys: unknown[] }>();
+    expect(body.keys).toEqual([]);
   });
 });
 

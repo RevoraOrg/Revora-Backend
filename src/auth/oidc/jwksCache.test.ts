@@ -24,6 +24,7 @@
 
 import { generateKeyPairSync } from 'crypto';
 import type { KeyObject } from 'crypto';
+import nock from 'nock';
 import { globalMetrics } from '../../lib/metrics';
 import { JwksCacheService } from './jwksCache';
 
@@ -405,6 +406,103 @@ describe('JwksCacheService — failure handling', () => {
       await cache.getKey(URI, 'k1');
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // SSRF Protection for JWKS fetch
+  // -------------------------------------------------------------------------
+  describe('SSRF protection for JWKS URI fetch', () => {
+    afterEach(() => {
+      nock.cleanAll();
+    });
+
+    it('rejects JWKS fetch for private IPv4 addresses', async () => {
+      const origFetch = global.fetch;
+      (global as { fetch?: unknown }).fetch = undefined;
+      try {
+        const cache = new JwksCacheService();
+        await expect(cache.getKey('https://127.0.0.1/jwks.json', 'k1'))
+          .rejects.toThrow();
+        await expect(cache.getKey('https://169.254.169.254/jwks.json', 'k1'))
+          .rejects.toThrow();
+        await expect(cache.getKey('https://10.0.0.1/jwks.json', 'k1'))
+          .rejects.toThrow();
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('rejects JWKS fetch for private IPv6 addresses', async () => {
+      const origFetch = global.fetch;
+      (global as { fetch?: unknown }).fetch = undefined;
+      try {
+        const cache = new JwksCacheService();
+        await expect(cache.getKey('https://[::1]/jwks.json', 'k1'))
+          .rejects.toThrow();
+        await expect(cache.getKey('https://[fc00::1]/jwks.json', 'k1'))
+          .rejects.toThrow();
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('rejects plain HTTP JWKS URI when dev override is disabled', async () => {
+      const origFetch = global.fetch;
+      (global as { fetch?: unknown }).fetch = undefined;
+      try {
+        const cache = new JwksCacheService();
+        await expect(cache.getKey('http://idp.example.com/jwks.json', 'k1'))
+          .rejects.toThrow();
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('rejects JWKS URI with embedded credentials', async () => {
+      const origFetch = global.fetch;
+      (global as { fetch?: unknown }).fetch = undefined;
+      try {
+        const cache = new JwksCacheService();
+        await expect(cache.getKey('https://user:pass@idp.example.com/jwks.json', 'k1'))
+          .rejects.toThrow();
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('rejects JWKS fetch when redirect targets AWS metadata service', async () => {
+      const origFetch = global.fetch;
+      (global as { fetch?: unknown }).fetch = undefined;
+      try {
+        nock('https://8.8.8.8')
+          .get('/jwks.json')
+          .reply(302, '', { Location: 'https://169.254.169.254/latest/meta-data' });
+
+        const cache = new JwksCacheService();
+        await expect(cache.getKey('https://8.8.8.8/jwks.json', 'k1'))
+          .rejects.toThrow();
+      } finally {
+        global.fetch = origFetch;
+      }
+    });
+
+    it('allows private JWKS URI when allowPrivateIssuers is enabled', async () => {
+      const devCache = new JwksCacheService({ allowPrivateIssuers: true });
+      fetchMock.mockResolvedValueOnce(makeJwks('k1'));
+      const key = await devCache.getKey('http://127.0.0.1:8080/jwks.json', 'k1');
+      expect(key).toBeDefined();
+    });
+
+    it('blocks private JWKS in production even if allowPrivateIssuers was requested', () => {
+      const origNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        expect(() => new JwksCacheService({ allowPrivateIssuers: true }))
+          .toThrow('Private OIDC issuers are not permitted in production');
+      } finally {
+        process.env.NODE_ENV = origNodeEnv;
+      }
     });
   });
 });

@@ -12,7 +12,13 @@ import {
 import { JwksCacheService } from './jwksCache';
 import { digestDiscoveryDocument } from './discoveryDigest';
 import { globalMetrics } from '../../lib/metrics';
-import { globalLogger } from '../../lib/logger';
+import {
+  safeFetch,
+  SafeFetchInit,
+  SafeFetchResponse,
+  isPrivateIP,
+  normalizeEncodedIP,
+} from '../../lib/ssrfProtection';
 
 const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_HTTP_TIMEOUT_MS = 5000;    // 5 seconds
@@ -47,6 +53,27 @@ export interface OidcAdapterServiceOptions {
   httpTimeoutMs?: number;
   metrics?: OidcDiscoveryMetrics;
   now?: () => number;
+  /** Explicit test/dev override to allow private/local network issuers and endpoints. */
+  allowPrivateIssuers?: boolean;
+  /** Optional custom fetch implementation (defaults to safeFetch). */
+  fetchFn?: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
+}
+
+export function resolveAllowPrivateIssuers(override?: boolean): boolean {
+  if (typeof override === 'boolean') {
+    if (override && process.env.NODE_ENV === 'production') {
+      throw new Error('Private OIDC issuers are not permitted in production');
+    }
+    return override;
+  }
+  const envVal = process.env.OIDC_ALLOW_PRIVATE_ISSUERS ?? process.env.OIDC_DEV_OVERRIDE;
+  if (!envVal) return false;
+  const normalized = envVal.trim().toLowerCase();
+  const enabled = normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+  if (enabled && process.env.NODE_ENV === 'production') {
+    throw new Error('Private OIDC issuers are not permitted in production');
+  }
+  return enabled;
 }
 
 function resolveDiscoveryTtlMs(override?: number): number {
@@ -86,6 +113,8 @@ export class OidcAdapterService {
   private readonly httpTimeoutMs: number;
   private readonly metrics: OidcDiscoveryMetrics;
   private readonly now: () => number;
+  private readonly allowPrivateIssuers: boolean;
+  private readonly fetchFn: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
 
   constructor(
     private readonly jwksCache: JwksCacheService,
@@ -95,6 +124,8 @@ export class OidcAdapterService {
     this.httpTimeoutMs = resolveHttpTimeoutMs(options.httpTimeoutMs);
     this.metrics = options.metrics ?? globalMetrics;
     this.now = options.now ?? (() => Date.now());
+    this.allowPrivateIssuers = resolveAllowPrivateIssuers(options.allowPrivateIssuers);
+    this.fetchFn = options.fetchFn ?? safeFetch;
   }
 
   /** Last observed discovery digest for an issuer, if any. */
@@ -134,11 +165,11 @@ export class OidcAdapterService {
     if (cached && this.now() < cached.cachedUntil) return cached.doc;
 
     const url = `${issuerUrl.replace(/\/$/, '')}/.well-known/openid-configuration`;
-    const res = await this.fetchWithTimeout(
-      url,
-      {},
-      `OIDC discovery request to ${issuerUrl}`,
-    );
+    const res = await this.fetchFn(url, {
+      method: 'GET',
+      allowPrivateRanges: this.allowPrivateIssuers,
+      allowHttp: this.allowPrivateIssuers,
+    });
     if (!res.ok) throw new Error(`OIDC discovery failed for ${issuerUrl}: ${res.status}`);
 
     const doc = (await res.json()) as OidcDiscoveryDocument;
@@ -166,6 +197,45 @@ export class OidcAdapterService {
     return doc;
   }
 
+  private validateEndpointPolicy(endpointUrl: string, endpointName: string): void {
+    let parsed: URL;
+    try {
+      parsed = new URL(endpointUrl);
+    } catch {
+      throw new Error(`OIDC discovery document has invalid ${endpointName} URL: "${endpointUrl}"`);
+    }
+
+    if (parsed.username || parsed.password) {
+      throw new Error(`OIDC discovery document ${endpointName} must not contain embedded credentials`);
+    }
+
+    if (!this.allowPrivateIssuers) {
+      if (parsed.protocol !== 'https:') {
+        throw new Error(
+          `OIDC discovery document ${endpointName} must use HTTPS scheme to share issuer host policy, got "${parsed.protocol}"`
+        );
+      }
+
+      let hostname = parsed.hostname;
+      if (hostname.startsWith('[') && hostname.endsWith(']')) {
+        hostname = hostname.slice(1, -1);
+      }
+      const normalizedHost = normalizeEncodedIP(hostname);
+
+      if (normalizedHost.toLowerCase() === 'localhost' || isPrivateIP(normalizedHost)) {
+        throw new Error(
+          `OIDC discovery document ${endpointName} violates issuer host policy: private or reserved address "${hostname}" is not allowed`
+        );
+      }
+    } else {
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new Error(
+          `OIDC discovery document ${endpointName} must use HTTP or HTTPS scheme, got "${parsed.protocol}"`
+        );
+      }
+    }
+  }
+
   private validateDiscovery(doc: OidcDiscoveryDocument, expectedIssuer: string): void {
     if (!doc.issuer || !doc.authorization_endpoint || !doc.token_endpoint || !doc.jwks_uri) {
       throw new Error('OIDC discovery document missing required fields');
@@ -173,6 +243,24 @@ export class OidcAdapterService {
     const normalised = expectedIssuer.replace(/\/$/, '');
     if (doc.issuer !== normalised && doc.issuer !== expectedIssuer) {
       throw new Error(`OIDC issuer mismatch: expected "${expectedIssuer}", got "${doc.issuer}"`);
+    }
+
+    // Validate that discovery-returned endpoints share the issuer host policy
+    this.validateEndpointPolicy(doc.authorization_endpoint, 'authorization_endpoint');
+    this.validateEndpointPolicy(doc.token_endpoint, 'token_endpoint');
+    this.validateEndpointPolicy(doc.jwks_uri, 'jwks_uri');
+
+    // Optional endpoints if present must also adhere to the issuer host policy
+    const optionalEndpoints: Record<string, unknown> = doc as unknown as Record<string, unknown>;
+    for (const key of [
+      'userinfo_endpoint',
+      'end_session_endpoint',
+      'revocation_endpoint',
+      'introspection_endpoint',
+    ]) {
+      if (typeof optionalEndpoints[key] === 'string') {
+        this.validateEndpointPolicy(optionalEndpoints[key] as string, key);
+      }
     }
   }
 
@@ -255,15 +343,13 @@ export class OidcAdapterService {
       ...(provider.client_secret ? { client_secret: provider.client_secret } : {}),
     });
 
-    const res = await this.fetchWithTimeout(
-      discovery.token_endpoint,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString(),
-      },
-      `Token exchange request to ${discovery.token_endpoint}`,
-    );
+    const res = await this.fetchFn(discovery.token_endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      allowPrivateRanges: this.allowPrivateIssuers,
+      allowHttp: this.allowPrivateIssuers,
+    });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
