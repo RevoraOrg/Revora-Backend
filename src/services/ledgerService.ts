@@ -113,8 +113,22 @@ export class LedgerService {
       );
     }
 
+    if (!/^(?:[0-9a-fA-F]{2}){32,}$/.test(keyHex)) {
+      throw new Error(
+        'LEDGER_CLOSE_SIGNING_KEY must be a hexadecimal string of at least 32 bytes.'
+      );
+    }
+
+    const versionValue = process.env.LEDGER_CLOSE_SIGNING_KEY_VERSION || '1';
+    const version = Number(versionValue);
+    if (!/^[0-9]+$/.test(versionValue) || !Number.isSafeInteger(version) || version <= 0) {
+      throw new Error(
+        'LEDGER_CLOSE_SIGNING_KEY_VERSION must be a positive integer.'
+      );
+    }
+
     return {
-      version: parseInt(process.env.LEDGER_CLOSE_SIGNING_KEY_VERSION || '1', 10),
+      version,
       key: keyHex,
       algorithm: 'hmac-sha256-v1',
     };
