@@ -7,8 +7,9 @@
   "scripts": {
     "test": "jest --coverage",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "migrate": "node src/db/migrate.js",
-    "build": "tsc",
+    "migrate": "node -e \"const fs=require('fs'); const target=fs.existsSync('src/db/migrate.js')?'./src/db/migrate.js':'./dist/db/migrate.js'; require(target).runMigrations();\"",
+    "copy-assets": "node -e \"const fs=require('fs'),path=require('path'); fs.mkdirSync('dist/db/migrations',{recursive:true}); fs.mkdirSync('dist/docs',{recursive:true}); fs.copyFileSync('src/db/migrate.js','dist/db/migrate.js'); for(const f of fs.readdirSync('src/db/migrations')) if(f.endsWith('.sql')) fs.copyFileSync(path.join('src/db/migrations',f),path.join('dist/db/migrations',f)); fs.copyFileSync('src/docs/openapi.yaml','dist/docs/openapi.yaml');\"",
+    "build": "npm run copy-assets && tsc",
     "start": "node dist/index.js",
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "test:coverage": "jest --coverage --runInBand",
