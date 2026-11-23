@@ -1,6 +1,5 @@
 /**
- * Unit tests for parseMoneyString, parseIsoDate, and parseOfferingValidationPayload
- * boundary handling exposed via the __test export in src/index.ts.
+ * Unit tests for the offering-validation parsing boundary.
  *
  * Security assumptions validated here:
  *  - Money amounts are decimal strings; coercion-abuse inputs (scientific notation,
@@ -9,10 +8,11 @@
  *  - Offering validation payloads are structurally validated before any business logic runs.
  */
 
-import { __test } from "../index";
-
-const { parseMoneyString, parseIsoDate, parseOfferingValidationPayload } =
-  __test;
+import {
+  parseIsoDate,
+  parseMoneyString,
+  parseOfferingValidationPayload,
+} from "./offeringValidation";
 
 // ---------------------------------------------------------------------------
 // parseMoneyString
