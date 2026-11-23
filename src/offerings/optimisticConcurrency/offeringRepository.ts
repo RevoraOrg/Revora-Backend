@@ -1,7 +1,7 @@
 import { Pool, PoolClient } from 'pg';
-import { Offering, UpdateOfferingInput } from '../types/offering';
-import { ConcurrencyError } from '../lib/errors';
-import { withTransaction } from './transaction';
+import { Offering, UpdateOfferingInput } from './offering';
+import { ConcurrencyError } from '../../lib/errors';
+import { withTransaction } from '../../db/transaction';
 
 /**
  * Repository for Offering operations implementing optimistic concurrency.
