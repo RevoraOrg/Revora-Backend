@@ -1,7 +1,7 @@
-import { OfferingRepository } from '../db/offeringRepository';
+import { OfferingRepository } from './offeringRepository';
 import { createUpdateOfferingHandler } from './offeringHandler';
-import { ConcurrencyError } from '../lib/errors';
-import { Request, Response } from 'express';
+import { ConcurrencyError } from '../../lib/errors';
+import { Response } from 'express';
 
 describe('Offering Handler - Optimistic Concurrency', () => {
   let mockRepo: jest.Mocked<OfferingRepository>;
