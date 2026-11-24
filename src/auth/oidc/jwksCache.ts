@@ -1,5 +1,11 @@
 import { createPublicKey, KeyObject } from 'crypto';
 import { globalMetrics } from '../../lib/metrics';
+import {
+  safeFetch,
+  SafeFetchInit,
+  SafeFetchResponse,
+} from '../../lib/ssrfProtection';
+import { resolveAllowPrivateIssuers } from './oidcAdapterService';
 
 interface JwksCacheEntry {
   keys: Map<string, KeyObject>;
@@ -11,8 +17,12 @@ interface JwksCacheMetrics {
   setGauge(name: string, value: number, labels?: Record<string, string>, help?: string): void;
 }
 
-interface JwksCacheServiceOptions {
+export interface JwksCacheServiceOptions {
   metrics?: JwksCacheMetrics;
+  /** Explicit test/dev override to allow private/local network JWKS URIs. */
+  allowPrivateIssuers?: boolean;
+  /** Optional custom fetch implementation (defaults to safeFetch). */
+  fetchFn?: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
 }
 
 const JWKS_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -27,9 +37,13 @@ export class JwksCacheService {
   private readonly issuerLastRefresh = new Map<string, number>();
   private readonly inFlightRefreshes = new Map<string, Promise<JwksCacheEntry>>();
   private readonly metrics: JwksCacheMetrics;
+  private readonly allowPrivateIssuers: boolean;
+  private readonly fetchFn: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
 
   constructor(options: JwksCacheServiceOptions = {}) {
     this.metrics = options.metrics ?? globalMetrics;
+    this.allowPrivateIssuers = resolveAllowPrivateIssuers(options.allowPrivateIssuers);
+    this.fetchFn = options.fetchFn ?? safeFetch;
   }
 
   async getKey(jwksUri: string, kid: string, issuer?: string): Promise<KeyObject> {
@@ -86,7 +100,11 @@ export class JwksCacheService {
   }
 
   private async fetchAndCache(jwksUri: string, issuer?: string): Promise<JwksCacheEntry> {
-    const res = await fetch(jwksUri);
+    const res = await this.fetchFn(jwksUri, {
+      method: 'GET',
+      allowPrivateRanges: this.allowPrivateIssuers,
+      allowHttp: this.allowPrivateIssuers,
+    });
     if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status} ${res.statusText}`);
 
     const { keys: rawKeys } = (await res.json()) as { keys: Record<string, unknown>[] };

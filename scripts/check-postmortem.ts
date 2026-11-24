@@ -5,7 +5,7 @@
  */
 import { checkPostmortemGate } from '../src/lib/postmortemGate';
 
-function parseJsonStringArray(envVarName: string): string[] {
+export function parseJsonStringArray(envVarName: string): string[] {
   const raw = process.env[envVarName];
   if (!raw) return [];
   let parsed: unknown;

@@ -46,6 +46,7 @@ export interface StatementRenderOptions {
   auditLogRepository?: AuditLogRepository;
   signerKeyId?: string;
   requestingPrincipal?: string;
+  dataProvider?: StatementDataProvider;
 }
 
 export interface StatementPdfRenderResult {
@@ -342,34 +343,180 @@ export function renderStatementPdfDetails(
   options?: StatementRenderOptions
 ): { bytes: Buffer; watermarkSuppressed: boolean; ledgerRevisionHash: string } {
   const { watermarkSuppressed, ledgerRevisionHash } = evaluateWatermarkState(job, options);
+  const builder = new PdfDocumentBuilder({
+    title: `Investor Statement ${job.period_id} - ${job.investor_id}`,
+    periodId: job.period_id,
+    investorId: job.investor_id,
+    batchId: job.batch_id,
+    watermarkSuppressed,
+    ledgerRevisionHash,
+  });
 
-  const lines = [
-    '%PDF-1.4',
-    `% Revora investor statement`,
-    `% period=${job.period_id}`,
-    `% investor=${job.investor_id}`,
-    `% batch=${job.batch_id}`,
-  ];
+  builder.addMarkedSection('Title', 'H1', ['STATEMENT']);
+  builder.addMarkedSection('InvestorInfo', 'InvestorInfo', [`Investor: ${job.investor_id}`]);
+  builder.addMarkedSection('Period', 'Period', [`Period: ${job.period_id}`]);
 
-  if (!watermarkSuppressed) {
-    lines.push(
-      `% WATERMARK: ${WATERMARK_DRAFT_TEXT}`,
-      `/Watermark << /Type /Pagination /Subtype /Watermark /Text (${WATERMARK_DRAFT_TEXT}) /Rotation 45 /Diagonal true >>`
-    );
-  } else {
-    lines.push(`% WATERMARK: SUPPRESSED (FINAL SIGNED STATEMENT)`);
+  const bytes = builder.build();
+  return { bytes, watermarkSuppressed, ledgerRevisionHash };
+}
+
+// ── PDF/UA Document Builder (Issue #1421) ─────────────────────────────────
+
+export interface PdfSection {
+  tag: string;
+  role: string;
+  mcid: number;
+  lines: string[];
+}
+
+export interface PdfDocumentBuilderOptions {
+  title: string;
+  periodId: string;
+  investorId: string;
+  batchId: string;
+  watermarkSuppressed: boolean;
+  ledgerRevisionHash: string;
+}
+
+/**
+ * Deterministic PDF/UA-1 tagged document builder.
+ *
+ * Emits:
+ * - Catalog with `/MarkInfo << /Marked true >>`, `/StructTreeRoot`, `/Metadata` (XMP), `/Lang`
+ * - `StructTreeRoot` with `RoleMap`, `ParentTree`, and `StructElem` nodes
+ * - Content stream with `BDC` / `EMC` marked-content operators
+ * - XMP metadata declaring `pdfuaid:part` = `1`
+ * - Draft watermark / suppression marker and ledger revision footer stamp
+ */
+export class PdfDocumentBuilder {
+  private readonly options: PdfDocumentBuilderOptions;
+  private readonly sections: PdfSection[] = [];
+
+  constructor(options: PdfDocumentBuilderOptions) {
+    this.options = options;
   }
 
-  lines.push(
-    `% FOOTER_VERSION_STAMP: ledger_revision=${ledgerRevisionHash}`,
-    `/Footer << /Text (Ledger Revision: ${ledgerRevisionHash}) >>`,
-    `1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj`,
-    `trailer<< /Root 1 0 R >>`,
-    `%%EOF`
-  );
+  /** Add a tagged marked-content section to the document. */
+  addMarkedSection(tag: string, role: string, lines: string[]): this {
+    const mcid = this.sections.length;
+    this.sections.push({ tag, role, mcid, lines });
+    return this;
+  }
 
-  const bytes = Buffer.from(lines.join('\n'), 'utf8');
-  return { bytes, watermarkSuppressed, ledgerRevisionHash };
+  /** Build deterministic XMP metadata declaring PDF/UA-1 conformance. */
+  buildXmpMetadata(): string {
+    const safeTitle = this.options.title
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return [
+      '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>',
+      '<x:xmpmeta xmlns:x="adobe:ns:meta/">',
+      '  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">',
+      '    <rdf:Description rdf:about=""',
+      '      xmlns:dc="http://purl.org/dc/elements/1.1/"',
+      '      xmlns:pdf="http://ns.adobe.com/pdf/1.3/"',
+      '      xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/">',
+      '      <pdfuaid:part>1</pdfuaid:part>',
+      `      <dc:title><rdf:Alt><rdf:li xml:lang="x-default">${safeTitle}</rdf:li></rdf:Alt></dc:title>`,
+      '      <pdf:Producer>Revora StatementPdfService</pdf:Producer>',
+      '    </rdf:Description>',
+      '  </rdf:RDF>',
+      '</x:xmpmeta>',
+      '<?xpacket end="w"?>',
+    ].join('\n');
+  }
+
+  /** Build the PDF content stream with BDC/EMC marked-content operators. */
+  buildContentStream(): string {
+    const streamLines: string[] = ['%%CONTENT_BEGIN'];
+    for (const section of this.sections) {
+      streamLines.push(`/${section.tag} << /MCID ${section.mcid} >> BDC`);
+      streamLines.push('BT /F1 10 Tf');
+      for (const line of section.lines) {
+        streamLines.push(`(${line}) Tj T*`);
+      }
+      streamLines.push('ET');
+      streamLines.push('EMC');
+    }
+    streamLines.push('%%CONTENT_END');
+    return streamLines.join('\n');
+  }
+
+  /** Serialize the complete PDF/UA-tagged document to deterministic UTF-8 bytes. */
+  build(): Buffer {
+    const {
+      periodId,
+      investorId,
+      batchId,
+      watermarkSuppressed,
+      ledgerRevisionHash,
+    } = this.options;
+
+    const headerLines: string[] = [
+      '%PDF-1.4',
+      '% Revora investor statement',
+      `% period=${periodId}`,
+      `% investor=${investorId}`,
+      `% batch=${batchId}`,
+    ];
+
+    if (!watermarkSuppressed) {
+      headerLines.push(
+        `% WATERMARK: ${WATERMARK_DRAFT_TEXT}`,
+        `/Watermark << /Type /Pagination /Subtype /Watermark /Text (${pdfSafe(WATERMARK_DRAFT_TEXT)}) /Rotation 45 /Diagonal true >>`
+      );
+    } else {
+      headerLines.push('% WATERMARK: SUPPRESSED (FINAL SIGNED STATEMENT)');
+    }
+
+    headerLines.push(
+      `% FOOTER_VERSION_STAMP: ledger_revision=${ledgerRevisionHash}`,
+      `/Footer << /Text (Ledger Revision: ${pdfSafe(ledgerRevisionHash)}) >>`
+    );
+
+    const xmp = this.buildXmpMetadata();
+    const contentStream = this.buildContentStream();
+
+    // StructElem objects start at object number 8
+    const firstStructElemObj = 8;
+    const structElemRefs = this.sections
+      .map((_, idx) => `${firstStructElemObj + idx} 0 R`)
+      .join(' ');
+
+    const objects: string[] = [
+      // 1: Catalog
+      `1 0 obj<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> /StructTreeRoot 4 0 R /Metadata 5 0 R /Lang (en-US) /ViewerPreferences << /DisplayDocTitle true >> >>endobj`,
+      // 2: Pages
+      `2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj`,
+      // 3: Page
+      `3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /StructParents 0 /Resources << /Font << /F1 7 0 R >> >> >>endobj`,
+      // 4: StructTreeRoot with RoleMap & ParentTree
+      `4 0 obj<< /Type /StructTreeRoot /K [${structElemRefs}] /RoleMap << /Title /H1 /Period /P /InvestorInfo /Sect /Holdings /Table /Transactions /Table /Distributions /Table /Revenue /Sect /TaxClassifications /Table /Watermark /Artifact /Footer /Artifact >> /ParentTree << /Nums [0 [${structElemRefs}]] >> >>endobj`,
+      // 5: XMP Metadata stream
+      `5 0 obj<< /Type /Metadata /Subtype /XML /Length ${Buffer.byteLength(xmp, 'utf8')} >>\nstream\n${xmp}\nendstream\nendobj`,
+      // 6: Content stream with BDC/EMC
+      `6 0 obj<< /Length ${Buffer.byteLength(contentStream, 'utf8')} >>\nstream\n${contentStream}\nendstream\nendobj`,
+      // 7: Font
+      `7 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj`,
+    ];
+
+    this.sections.forEach((section, idx) => {
+      const objNum = firstStructElemObj + idx;
+      objects.push(
+        `${objNum} 0 obj<< /Type /StructElem /S /${section.role} /P 4 0 R /Pg 3 0 R /K ${section.mcid} >>endobj`
+      );
+    });
+
+    const allLines = [
+      ...headerLines,
+      ...objects,
+      'trailer<< /Root 1 0 R >>',
+      '%%EOF',
+    ];
+
+    return Buffer.from(allLines.join('\n'), 'utf8');
+  }
 }
 
 // ── Deterministic content renderer (Issue #874) ───────────────────────────
@@ -394,7 +541,8 @@ function numericCompare(a: string, b: string): number {
 }
 
 /**
- * Build the deterministic PDF text lines for a statement.
+ * Build a deterministic, PDF/UA-tagged statement document for the given
+ * job and content.
  *
  * Frozen layout guarantees: the output depends ONLY on (job metadata,
  * statement content, watermark state, ledger revision hash). No wall-clock
@@ -402,68 +550,62 @@ function numericCompare(a: string, b: string): number {
  * Sections are defensively re-sorted so byte-identical output holds even if
  * a data provider returns rows in a different order.
  */
-function buildContentPdfLines(
+function buildContentPdfDocument(
   job: PdfRenderJobRow,
   content: StatementContent,
   watermarkSuppressed: boolean,
   ledgerRevisionHash: string
-): string[] {
-  const lines = [
-    '%PDF-1.4',
-    '% Revora investor statement',
-    `% period=${job.period_id}`,
-    `% investor=${job.investor_id}`,
-    `% batch=${job.batch_id}`,
-  ];
+): Buffer {
+  const builder = new PdfDocumentBuilder({
+    title: `Investor Statement ${content.periodId} - ${content.investorId}`,
+    periodId: job.period_id,
+    investorId: job.investor_id,
+    batchId: job.batch_id,
+    watermarkSuppressed,
+    ledgerRevisionHash,
+  });
 
-  if (!watermarkSuppressed) {
-    lines.push(
-      `% WATERMARK: ${WATERMARK_DRAFT_TEXT}`,
-      `/Watermark << /Type /Pagination /Subtype /Watermark /Text (${pdfSafe(WATERMARK_DRAFT_TEXT)}) /Rotation 45 /Diagonal true >>`
-    );
-  } else {
-    lines.push(`% WATERMARK: SUPPRESSED (FINAL SIGNED STATEMENT)`);
-  }
-
-  lines.push(
-    `% FOOTER_VERSION_STAMP: ledger_revision=${ledgerRevisionHash}`,
-    `/Footer << /Text (Ledger Revision: ${pdfSafe(ledgerRevisionHash)}) >>`
-  );
-
-  // ── Statement sections ─────────────────────────────────────────────────
-  lines.push('%%CONTENT_BEGIN');
-  lines.push('STATEMENT');
-  lines.push(`Investor: ${content.investorId}`);
-  lines.push(`Investor name: ${pdfSafe(content.investorName)}`);
-  lines.push(`Period: ${content.periodId} (${content.periodLabel})`);
+  builder.addMarkedSection('Title', 'Title', ['STATEMENT']);
+  builder.addMarkedSection('InvestorInfo', 'InvestorInfo', [
+    `Investor: ${content.investorId}`,
+    `Investor name: ${pdfSafe(content.investorName)}`,
+  ]);
+  builder.addMarkedSection('Period', 'Period', [
+    `Period: ${content.periodId} (${content.periodLabel})`,
+  ]);
 
   // Positions / holdings
-  lines.push('', 'POSITIONS', 'OFFERING | SYMBOL | BALANCE');
   const holdings = [...content.holdings].sort(
     (a, b) =>
       a.offeringName.localeCompare(b.offeringName) ||
       a.offeringSymbol.localeCompare(b.offeringSymbol) ||
       numericCompare(a.balance, b.balance)
   );
-  for (const holding of holdings) {
-    lines.push(
-      `${pdfSafe(holding.offeringName)} | ${pdfSafe(holding.offeringSymbol)} | ${holding.balance}`
-    );
-  }
+  builder.addMarkedSection('Holdings', 'Holdings', [
+    'POSITIONS',
+    'OFFERING | SYMBOL | BALANCE',
+    ...holdings.map(
+      (holding) =>
+        `${pdfSafe(holding.offeringName)} | ${pdfSafe(holding.offeringSymbol)} | ${holding.balance}`
+    ),
+  ]);
 
   // Distributions + fees
-  lines.push('', 'DISTRIBUTIONS', 'DATE | AMOUNT | STATUS');
   const distributions = [...content.distributionSummary.distributions].sort(
     (a, b) => a.date.getTime() - b.date.getTime() || numericCompare(a.amount, b.amount)
   );
-  for (const distribution of distributions) {
-    lines.push(`${formatIso(distribution.date)} | ${distribution.amount} | ${distribution.status}`);
-  }
-  lines.push(`Total distributed: ${content.distributionSummary.totalDistributed}`);
-  lines.push(`Fees (retained revenue): ${content.distributionSummary.fees}`);
+  builder.addMarkedSection('Distributions', 'Distributions', [
+    'DISTRIBUTIONS',
+    'DATE | AMOUNT | STATUS',
+    ...distributions.map(
+      (distribution) =>
+        `${formatIso(distribution.date)} | ${distribution.amount} | ${distribution.status}`
+    ),
+    `Total distributed: ${content.distributionSummary.totalDistributed}`,
+    `Fees (retained revenue): ${content.distributionSummary.fees}`,
+  ]);
 
   // Transactions
-  lines.push('', 'TRANSACTIONS', 'DATE | TYPE | DESCRIPTION | AMOUNT | STATUS');
   const transactions = [...content.transactions].sort(
     (a, b) =>
       a.date.getTime() - b.date.getTime() ||
@@ -472,25 +614,28 @@ function buildContentPdfLines(
       a.description.localeCompare(b.description) ||
       a.status.localeCompare(b.status)
   );
-  for (const transaction of transactions) {
-    lines.push(
-      `${formatIso(transaction.date)} | ${transaction.type} | ${pdfSafe(transaction.description)} | ${transaction.amount} | ${transaction.status}`
-    );
-  }
+  builder.addMarkedSection('Transactions', 'Transactions', [
+    'TRANSACTIONS',
+    'DATE | TYPE | DESCRIPTION | AMOUNT | STATUS',
+    ...transactions.map(
+      (transaction) =>
+        `${formatIso(transaction.date)} | ${transaction.type} | ${pdfSafe(transaction.description)} | ${transaction.amount} | ${transaction.status}`
+    ),
+  ]);
 
   // Revenue
   if (content.revenueSummary) {
-    lines.push('', 'REVENUE', `Total revenue: ${content.revenueSummary.totalAmount}`);
+    const revLines = ['REVENUE', `Total revenue: ${content.revenueSummary.totalAmount}`];
     if (content.revenueSummary.periodStart) {
-      lines.push(`Period start: ${formatIso(content.revenueSummary.periodStart)}`);
+      revLines.push(`Period start: ${formatIso(content.revenueSummary.periodStart)}`);
     }
     if (content.revenueSummary.periodEnd) {
-      lines.push(`Period end: ${formatIso(content.revenueSummary.periodEnd)}`);
+      revLines.push(`Period end: ${formatIso(content.revenueSummary.periodEnd)}`);
     }
+    builder.addMarkedSection('Revenue', 'Revenue', revLines);
   }
 
   // Tax classifications
-  lines.push('', 'TAX CLASSIFICATIONS', 'OFFERING | JURISDICTION | QUANTITY | COST BASIS/UNIT | ACQUIRED');
   const taxClassifications = [...content.taxClassifications].sort(
     (a, b) =>
       a.offeringId.localeCompare(b.offeringId) ||
@@ -498,21 +643,20 @@ function buildContentPdfLines(
       a.acquiredAt.getTime() - b.acquiredAt.getTime() ||
       numericCompare(a.costBasisPerUnit, b.costBasisPerUnit)
   );
-  for (const classification of taxClassifications) {
-    lines.push(
-      `${pdfSafe(classification.offeringName)} | ${pdfSafe(classification.jurisdiction)} | ${classification.quantity} | ${classification.costBasisPerUnit} | ${formatIso(classification.acquiredAt)}`
-    );
-  }
+  builder.addMarkedSection('TaxClassifications', 'TaxClassifications', [
+    'TAX CLASSIFICATIONS',
+    'OFFERING | JURISDICTION | QUANTITY | COST BASIS/UNIT | ACQUIRED',
+    ...taxClassifications.map(
+      (classification) =>
+        `${pdfSafe(classification.offeringName)} | ${pdfSafe(classification.jurisdiction)} | ${classification.quantity} | ${classification.costBasisPerUnit} | ${formatIso(classification.acquiredAt)}`
+    ),
+  ]);
 
-  lines.push('%%CONTENT_END');
-  lines.push('1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj');
-  lines.push('trailer<< /Root 1 0 R >>');
-  lines.push('%%EOF');
-  return lines;
+  return builder.build();
 }
 
 /**
- * Render a deterministic, content-aware statement PDF.
+ * Render a deterministic, content-aware statement PDF with PDF/UA structure.
  *
  * The output bytes are a pure function of the job metadata, the statement
  * content, and the watermark/revision state — regenerating the same input
@@ -525,19 +669,44 @@ export function renderStatementPdfWithContent(
   options?: StatementRenderOptions
 ): { bytes: Buffer; watermarkSuppressed: boolean; ledgerRevisionHash: string } {
   const { watermarkSuppressed, ledgerRevisionHash } = evaluateWatermarkState(job, options);
-  const lines = buildContentPdfLines(job, content, watermarkSuppressed, ledgerRevisionHash);
-  const bytes = Buffer.from(lines.join('\n'), 'utf8');
+  const bytes = buildContentPdfDocument(job, content, watermarkSuppressed, ledgerRevisionHash);
   return { bytes, watermarkSuppressed, ledgerRevisionHash };
 }
 
+function isStatementContent(value: unknown): value is StatementContent {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'holdings' in value &&
+    'transactions' in value &&
+    'distributionSummary' in value
+  );
+}
+
 /**
- * Build PDF payload bytes for an investor statement.
+ * Build PDF/UA-tagged payload bytes for an investor statement.
+ *
+ * Accepts either `(job, content, options?)` for full statement rendering or
+ * `(job, options?)` for minimal job-only rendering.
  */
 export function renderStatementPdfBytes(
   job: PdfRenderJobRow,
+  content: StatementContent,
+  options?: StatementRenderOptions
+): Buffer;
+export function renderStatementPdfBytes(
+  job: PdfRenderJobRow,
+  options?: StatementRenderOptions
+): Buffer;
+export function renderStatementPdfBytes(
+  job: PdfRenderJobRow,
+  contentOrOptions?: StatementContent | StatementRenderOptions,
   options?: StatementRenderOptions
 ): Buffer {
-  return renderStatementPdfDetails(job, options).bytes;
+  if (isStatementContent(contentOrOptions)) {
+    return renderStatementPdfWithContent(job, contentOrOptions, options).bytes;
+  }
+  return renderStatementPdfDetails(job, contentOrOptions).bytes;
 }
 
 export type StatementRenderFn = (
@@ -545,36 +714,76 @@ export type StatementRenderFn = (
   options?: StatementRenderOptions
 ) => Promise<StatementPdfRenderResult>;
 
+function isDataProvider(value: unknown): value is StatementDataProvider {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as StatementDataProvider).getStatementContent === 'function'
+  );
+}
+
+async function renderAndStoreStatement(
+  storage: StatementPdfStorage,
+  job: PdfRenderJobRow,
+  mergedOptions: StatementRenderOptions,
+  dataProvider?: StatementDataProvider
+): Promise<StatementPdfRenderResult> {
+  const storageKey =
+    job.storage_key ?? buildStatementStorageKey(job.period_id, job.investor_id);
+
+  const details = dataProvider
+    ? renderStatementPdfWithContent(
+        job,
+        await dataProvider.getStatementContent(job.investor_id, job.period_id),
+        mergedOptions
+      )
+    : renderStatementPdfDetails(job, mergedOptions);
+
+  const bytes = details.bytes;
+  const checksum = checksumPayload(bytes);
+  await storage.putObject(storageKey, bytes);
+
+  const verify = createHash('sha256').update(bytes).digest('hex');
+  if (verify !== checksum) {
+    throw new Error('statement PDF checksum mismatch');
+  }
+  return {
+    storageKey,
+    checksum,
+    bytes,
+    watermarkSuppressed: details.watermarkSuppressed,
+    ledgerRevisionHash: details.ledgerRevisionHash,
+  };
+}
+
 /**
- * Render + store pipeline with watermark suppression & version stamp.
+ * Render + store pipeline with watermark suppression, version stamp, and
+ * optional `StatementDataProvider` for full PDF/UA content rendering.
  */
 export function makeStatementRenderFn(
   storage: StatementPdfStorage,
   defaultOptions?: StatementRenderOptions
+): StatementRenderFn;
+export function makeStatementRenderFn(
+  storage: StatementPdfStorage,
+  dataProvider: StatementDataProvider,
+  defaultOptions?: StatementRenderOptions
+): StatementRenderFn;
+export function makeStatementRenderFn(
+  storage: StatementPdfStorage,
+  optionsOrProvider?: StatementRenderOptions | StatementDataProvider,
+  defaultOptions?: StatementRenderOptions
 ): StatementRenderFn {
+  const provider = isDataProvider(optionsOrProvider) ? optionsOrProvider : undefined;
+  const baseOptions = provider ? defaultOptions : optionsOrProvider;
+
   return async (
     job: PdfRenderJobRow,
     options?: StatementRenderOptions
   ): Promise<StatementPdfRenderResult> => {
-    const mergedOptions = { ...defaultOptions, ...options };
-    const storageKey =
-      job.storage_key ?? buildStatementStorageKey(job.period_id, job.investor_id);
-    const details = renderStatementPdfDetails(job, mergedOptions);
-    const bytes = details.bytes;
-    const checksum = checksumPayload(bytes);
-    await storage.putObject(storageKey, bytes);
-
-    const verify = createHash('sha256').update(bytes).digest('hex');
-    if (verify !== checksum) {
-      throw new Error('statement PDF checksum mismatch');
-    }
-    return {
-      storageKey,
-      checksum,
-      bytes,
-      watermarkSuppressed: details.watermarkSuppressed,
-      ledgerRevisionHash: details.ledgerRevisionHash,
-    };
+    const mergedOptions = { ...baseOptions, ...options };
+    const effectiveProvider = mergedOptions.dataProvider ?? provider;
+    return renderAndStoreStatement(storage, job, mergedOptions, effectiveProvider);
   };
 }
 
@@ -595,27 +804,6 @@ export function makeContentStatementRenderFn(
     options?: StatementRenderOptions
   ): Promise<StatementPdfRenderResult> => {
     const mergedOptions = { ...defaultOptions, ...options };
-    const content = await dataProvider.getStatementContent(
-      job.investor_id,
-      job.period_id
-    );
-    const storageKey =
-      job.storage_key ?? buildStatementStorageKey(job.period_id, job.investor_id);
-    const details = renderStatementPdfWithContent(job, content, mergedOptions);
-    const bytes = details.bytes;
-    const checksum = checksumPayload(bytes);
-    await storage.putObject(storageKey, bytes);
-
-    const verify = createHash('sha256').update(bytes).digest('hex');
-    if (verify !== checksum) {
-      throw new Error('statement PDF checksum mismatch');
-    }
-    return {
-      storageKey,
-      checksum,
-      bytes,
-      watermarkSuppressed: details.watermarkSuppressed,
-      ledgerRevisionHash: details.ledgerRevisionHash,
-    };
+    return renderAndStoreStatement(storage, job, mergedOptions, dataProvider);
   };
 }

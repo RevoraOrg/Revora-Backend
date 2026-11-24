@@ -6,6 +6,8 @@ The backend now exposes a deterministic offering validation capability at `POST 
 
 It evaluates whether a caller is allowed to perform a specific offering action and which business-rule checks passed or failed. The response is intentionally reviewable and safe to return to clients: it contains stable rule codes, omits raw infrastructure errors, and never relies on implicit coercion for money or dates.
 
+The payload parser, decision matrix, authentication middleware, and route factory live in `src/routes/offeringValidation.ts`; `src/index.ts` mounts that router under the versioned API.
+
 ## Supported actions
 
 - `create`
@@ -91,6 +93,7 @@ Response shape:
 
 The backend test suite now covers:
 
+- direct decision-matrix evaluation with deterministic time input
 - health dependency sanitization
 - deterministic Stellar failure classification
 - auth boundary enforcement for the matrix endpoint

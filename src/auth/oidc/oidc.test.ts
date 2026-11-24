@@ -1,6 +1,8 @@
 import { createSign, generateKeyPairSync } from 'crypto';
 import express from 'express';
+import nock from 'nock';
 import request from 'supertest';
+import { globalLogger } from '../../lib/logger';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
 import { createOidcRouter } from './oidcRoute';
@@ -161,7 +163,7 @@ describe('OidcAdapterService', () => {
     it('stores a per-issuer digest and alerts on fixture rotation', async () => {
       const metrics = { incrementCounter: jest.fn() };
       let now = 1_000_000;
-      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const warn = jest.spyOn(globalLogger, 'warn').mockImplementation(() => undefined);
       service = new OidcAdapterService(jwksCache, {
         metrics,
         discoveryTtlMs: 60_000,
@@ -193,7 +195,11 @@ describe('OidcAdapterService', () => {
         1,
         expect.any(String),
       );
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('oidc.discovery.changed'));
+      expect(warn).toHaveBeenCalledWith('oidc.discovery.changed', {
+        issuer: 'https://idp.example.com',
+        previousDigest: firstDigest,
+        currentDigest: service.getDiscoveryDigest('https://idp.example.com'),
+      });
       warn.mockRestore();
     });
 
@@ -230,6 +236,51 @@ describe('OidcAdapterService', () => {
 
       expect(service.getDiscoveryDigest('https://idp.example.com')).toBe(digest);
       expect(metrics.incrementCounter).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── HTTP timeouts ──────────────────────────────────────────────────────
+
+  describe('outbound HTTP timeout', () => {
+    // A hanging identity provider: the request never resolves unless the
+    // caller's AbortSignal fires (mirrors how real fetch honours the signal).
+    const hangingFetch = () =>
+      jest.fn((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          const signal = init?.signal;
+          if (!signal) return;
+          signal.addEventListener('abort', () => reject(signal.reason));
+        }),
+      ) as any;
+
+    it('aborts a hanging discovery fetch within the timeout', async () => {
+      const timedService = new OidcAdapterService(jwksCache, { httpTimeoutMs: 25 });
+      global.fetch = hangingFetch();
+
+      await expect(timedService.getDiscovery('https://idp.example.com')).rejects.toThrow(
+        'OIDC discovery request to https://idp.example.com timed out after 25ms',
+      );
+    });
+
+    it('aborts a hanging token endpoint fetch within the timeout', async () => {
+      const timedService = new OidcAdapterService(jwksCache, { httpTimeoutMs: 25 });
+      global.fetch = hangingFetch();
+
+      const provider = makeProvider();
+      const discovery = makeDiscovery() as any;
+      const flowState = {
+        tenantId: 'acme',
+        codeVerifier: 'verifier',
+        nonce: 'nonce',
+        redirectUri: 'https://app.example.com/callback',
+        expiresAt: Date.now() + 60_000,
+      };
+
+      await expect(
+        (timedService as any).exchangeCode('code-1', flowState, provider, discovery),
+      ).rejects.toThrow(
+        'Token exchange request to https://idp.example.com/token timed out after 25ms',
+      );
     });
   });
 
@@ -812,5 +863,204 @@ describe('createOidcRouter JWKS refresh', () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(429);
     expect(oidcAdapter.refreshJwks).toHaveBeenCalledTimes(1);
+  });
+
+  // ── SSRF Protection for OIDC Discovery and Code Exchange ────────────────
+  describe('SSRF Protection for OIDC outbound requests', () => {
+    let mockJwksCache: jest.Mocked<JwksCacheService>;
+    let unmockedService: OidcAdapterService;
+    let service: OidcAdapterService;
+
+    beforeEach(() => {
+      mockJwksCache = { getKey: jest.fn().mockResolvedValue(publicKey), evict: jest.fn() } as unknown as jest.Mocked<JwksCacheService>;
+      unmockedService = new OidcAdapterService(mockJwksCache);
+      service = new OidcAdapterService(mockJwksCache);
+    });
+
+    afterEach(() => {
+      nock.cleanAll();
+    });
+
+    describe('Discovery SSRF validation', () => {
+      it('rejects loopback and private IPv4 issuers', async () => {
+        await expect(unmockedService.getDiscovery('https://127.0.0.1'))
+          .rejects.toThrow();
+        await expect(unmockedService.getDiscovery('https://10.0.0.1'))
+          .rejects.toThrow();
+        await expect(unmockedService.getDiscovery('https://192.168.1.50'))
+          .rejects.toThrow();
+        await expect(unmockedService.getDiscovery('https://172.16.0.1'))
+          .rejects.toThrow();
+      });
+
+      it('rejects cloud metadata IP issuer (169.254.169.254)', async () => {
+        await expect(unmockedService.getDiscovery('https://169.254.169.254'))
+          .rejects.toThrow();
+      });
+
+      it('rejects IPv6 loopback and private addresses', async () => {
+        await expect(unmockedService.getDiscovery('https://[::1]'))
+          .rejects.toThrow();
+        await expect(unmockedService.getDiscovery('https://[fc00::1]'))
+          .rejects.toThrow();
+        await expect(unmockedService.getDiscovery('https://[fe80::1]'))
+          .rejects.toThrow();
+      });
+
+      it('rejects plain HTTP issuer when dev override is disabled', async () => {
+        await expect(unmockedService.getDiscovery('http://idp.example.com'))
+          .rejects.toThrow();
+      });
+
+      it('rejects issuer with embedded credentials', async () => {
+        await expect(unmockedService.getDiscovery('https://admin:pass@idp.example.com'))
+          .rejects.toThrow();
+      });
+
+      it('rejects discovery document when token_endpoint points to a private IP', async () => {
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            token_endpoint: 'https://127.0.0.1/token',
+          }),
+        } as unknown as Response);
+
+        await expect(service.getDiscovery('https://idp.example.com'))
+          .rejects.toThrow(/token_endpoint violates issuer host policy: private or reserved address/);
+      });
+
+      it('rejects discovery document when token_endpoint points to AWS metadata service', async () => {
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            token_endpoint: 'https://169.254.169.254/token',
+          }),
+        } as unknown as Response);
+
+        await expect(service.getDiscovery('https://idp.example.com'))
+          .rejects.toThrow(/token_endpoint violates issuer host policy: private or reserved address/);
+      });
+
+      it('rejects discovery document when jwks_uri points to a private IP', async () => {
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            jwks_uri: 'https://192.168.1.1/jwks.json',
+          }),
+        } as unknown as Response);
+
+        await expect(service.getDiscovery('https://idp.example.com'))
+          .rejects.toThrow(/jwks_uri violates issuer host policy: private or reserved address/);
+      });
+
+      it('rejects discovery document when endpoint violates HTTPS scheme', async () => {
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            token_endpoint: 'http://idp.example.com/token',
+          }),
+        } as unknown as Response);
+
+        await expect(service.getDiscovery('https://idp.example.com'))
+          .rejects.toThrow(/token_endpoint must use HTTPS scheme to share issuer host policy/);
+      });
+
+      it('rejects discovery document when authorization_endpoint contains credentials', async () => {
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            authorization_endpoint: 'https://user:pass@idp.example.com/auth',
+          }),
+        } as unknown as Response);
+
+        await expect(service.getDiscovery('https://idp.example.com'))
+          .rejects.toThrow(/must not contain embedded credentials/);
+      });
+
+      it('allows private IP and HTTP issuer when allowPrivateIssuers is true', async () => {
+        const devService = new OidcAdapterService(mockJwksCache, { allowPrivateIssuers: true });
+        global.fetch = jest.fn().mockResolvedValueOnce({
+          ok: true,
+          json: async () => makeDiscovery({
+            issuer: 'http://127.0.0.1:8080',
+            authorization_endpoint: 'http://127.0.0.1:8080/auth',
+            token_endpoint: 'http://127.0.0.1:8080/token',
+            jwks_uri: 'http://127.0.0.1:8080/jwks.json',
+          }),
+        } as unknown as Response);
+
+        const doc = await devService.getDiscovery('http://127.0.0.1:8080');
+        expect(doc.issuer).toBe('http://127.0.0.1:8080');
+      });
+
+      it('blocks private issuers in production even if allowPrivateIssuers was requested', () => {
+        const origNodeEnv = process.env.NODE_ENV;
+        process.env.NODE_ENV = 'production';
+        try {
+          expect(() => new OidcAdapterService(mockJwksCache, { allowPrivateIssuers: true }))
+            .toThrow('Private OIDC issuers are not permitted in production');
+        } finally {
+          process.env.NODE_ENV = origNodeEnv;
+        }
+      });
+    });
+
+    describe('Token exchange SSRF validation', () => {
+      it('rejects code exchange if token_endpoint points to a private address', async () => {
+        const provider = makeProvider();
+        const flowState = {
+          tenantId: 'acme',
+          codeVerifier: 'verifier',
+          nonce: 'nonce',
+          redirectUri: 'https://app.example.com/callback',
+          expiresAt: Date.now() + 60000,
+        };
+        const discovery = makeDiscovery({
+          token_endpoint: 'https://127.0.0.1/token',
+        });
+
+        await expect(
+          (service as unknown as { exchangeCode: (...args: unknown[]) => Promise<unknown> }).exchangeCode(
+            'code-123',
+            flowState,
+            provider,
+            discovery,
+          ),
+        ).rejects.toThrow();
+      });
+
+      it('rejects code exchange if token_endpoint redirects to metadata service', async () => {
+        const provider = makeProvider();
+        const flowState = {
+          tenantId: 'acme',
+          codeVerifier: 'verifier',
+          nonce: 'nonce',
+          redirectUri: 'https://app.example.com/callback',
+          expiresAt: Date.now() + 60000,
+        };
+        const discovery = makeDiscovery({
+          token_endpoint: 'https://8.8.8.8/token',
+        });
+
+        nock('https://8.8.8.8')
+          .post('/token')
+          .reply(302, '', { Location: 'https://169.254.169.254/latest/meta-data' });
+
+        const origFetch = global.fetch;
+        (global as { fetch?: unknown }).fetch = undefined;
+        try {
+          await expect(
+            (service as unknown as { exchangeCode: (...args: unknown[]) => Promise<unknown> }).exchangeCode(
+              'code-123',
+              flowState,
+              provider,
+              discovery,
+            ),
+          ).rejects.toThrow();
+        } finally {
+          global.fetch = origFetch;
+        }
+      });
+    });
   });
 });

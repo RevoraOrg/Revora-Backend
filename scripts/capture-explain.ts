@@ -66,9 +66,16 @@ export interface BaselineEntry {
 export function checkRegressionAlarm(
   queryName: string,
   observedCost: number,
-  baseline: BaselineEntry,
+  baseline: BaselineEntry | undefined,
   regressionFactor = 2,
 ): void {
+  if (!baseline) {
+    throw new Error(
+      `Regression Alarm: Missing baseline for "${queryName}". ` +
+      'Cannot verify the observed plan cost.',
+    );
+  }
+
   const alarmThreshold = baseline.total_cost * regressionFactor;
   if (observedCost > alarmThreshold) {
     throw new Error(

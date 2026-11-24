@@ -27,10 +27,11 @@ The idempotency middleware ensures that duplicate requests with the same idempot
 
 ### InMemoryIdempotencyStore
 
-- **Assumption**: Single-instance deployment
-- **Risk**: Idempotency guarantees break across multiple instances or after restart
-- **Mitigation**: Use PostgresIdempotencyStore for production multi-instance deployments
-- **Limitation**: In-memory data is lost on restart
+- **Intended Use**: **Development and testing only** — do not use in production
+- **Assumption**: Single-process dev/test environment
+- **Risk**: Idempotency guarantees break across multiple instances or after restart; unbounded growth without eviction would exhaust process memory
+- **Mitigation**: Use `PostgresIdempotencyStore` for all production deployments; `InMemoryIdempotencyStore` bounds memory via `maxRecords` (default `10,000`, oldest-first eviction) and periodic/size-triggered sweeps of expired records
+- **Limitation**: In-memory data is lost on restart and not shared across processes
 
 ### PostgresIdempotencyStore
 
@@ -125,12 +126,15 @@ CREATE INDEX idx_idempotency_keys_state
 
 ## Usage
 
-### Using InMemoryIdempotencyStore (Single Instance)
+### Using InMemoryIdempotencyStore (Development / Testing Only)
 
 ```typescript
 import { createIdempotencyMiddleware, InMemoryIdempotencyStore } from './middleware/idempotency';
 
-const store = new InMemoryIdempotencyStore({ ttlMs: 3600000 }); // 1 hour TTL
+const store = new InMemoryIdempotencyStore({
+  ttlMs: 3600000, // 1 hour TTL
+  maxRecords: 10000, // Bounded capacity (oldest-first eviction)
+});
 const middleware = createIdempotencyMiddleware({ store });
 
 app.use('/api/payments', middleware);
