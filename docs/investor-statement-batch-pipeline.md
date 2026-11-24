@@ -40,8 +40,29 @@ Checkpoints live **only in Postgres** (job `status`, `storage_key`, `checksum`,
 |-------|------|
 | Migration | `src/db/migrations/017_create_pdf_render_jobs.sql` |
 | Repository | `src/db/repositories/pdfRenderJobRepository.ts` |
+| Data Provider | `src/services/statementDataProvider.ts` |
 | Renderer | `src/services/statementPdfService.ts` |
 | Worker | `src/services/statementPdfBatchWorker.ts` |
+
+### PDF/UA Accessibility & Deterministic Structure
+
+`statementPdfService.ts` uses `PdfDocumentBuilder` to emit deterministic,
+PDF/UA-1-compliant tagged PDFs:
+
+- **Catalog & Metadata:** `/MarkInfo << /Marked true >>`, `/Lang (en-US)`,
+  `/ViewerPreferences << /DisplayDocTitle true >>`, and an XMP metadata stream
+  declaring `<pdfuaid:part>1</pdfuaid:part>`.
+- **Structure Tree:** `/StructTreeRoot` with `/RoleMap` (mapping semantic roles
+  such as `/Title`, `/Period`, `/InvestorInfo`, `/Holdings`, `/Transactions`,
+  `/Distributions`, `/Revenue`, `/TaxClassifications`, `/Watermark`, and
+  `/Footer`), `/ParentTree`, and `/StructElem` nodes.
+- **Marked Content:** Content streams wrap each section in `BDC` / `EMC`
+  operators with matching `/MCID` values.
+- **Data Flow:** `renderStatementPdfBytes(job, content, options?)` and
+  `makeStatementRenderFn(storage, dataProvider, options?)` fetch
+  `StatementContent` via `StatementDataProvider` before rendering, while
+  preserving draft watermark / Ed25519 suppression, ledger revision stamps, and
+  byte-identical determinism.
 
 ### Claim semantics
 

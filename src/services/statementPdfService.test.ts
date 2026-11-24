@@ -6,6 +6,7 @@ import {
   renderStatementPdfWithContent,
   makeStatementRenderFn,
   makeContentStatementRenderFn,
+  PdfDocumentBuilder,
   verifyTreasurySignature,
   parseEd25519PublicKey,
   deriveSignerKeyId,
@@ -945,6 +946,71 @@ describe('statementPdfService - Draft Watermark and Version Stamp (#487)', () =>
       const stored = await storage.getObject(res.storageKey);
       expect(stored?.equals(res.bytes)).toBe(true);
       expect(res.watermarkSuppressed).toBe(false);
+    });
+
+    it('emits PDF/UA structure tree, MarkInfo, RoleMap, ParentTree, BDC/EMC, and XMP metadata', () => {
+      const job = makeFixedJob();
+      const content = makeContent();
+      const bytes = renderStatementPdfBytes(job, content);
+      const text = bytes.toString('utf8');
+
+      // Catalog & MarkInfo
+      expect(text).toContain('/MarkInfo << /Marked true >>');
+      expect(text).toContain('/StructTreeRoot 4 0 R');
+      expect(text).toContain('/Metadata 5 0 R');
+      expect(text).toContain('/Lang (en-US)');
+
+      // StructTreeRoot, RoleMap, ParentTree, StructElem
+      expect(text).toContain('/Type /StructTreeRoot');
+      expect(text).toContain('/RoleMap <<');
+      expect(text).toContain('/ParentTree << /Nums [0 [');
+      expect(text).toContain('/Type /StructElem');
+
+      // Marked-content operators (BDC/EMC) for statement sections
+      expect(text).toContain('/Title << /MCID 0 >> BDC');
+      expect(text).toContain('/InvestorInfo << /MCID 1 >> BDC');
+      expect(text).toContain('/Period << /MCID 2 >> BDC');
+      expect(text).toContain('/Holdings << /MCID 3 >> BDC');
+      expect(text).toContain('/Distributions << /MCID 4 >> BDC');
+      expect(text).toContain('/Transactions << /MCID 5 >> BDC');
+      expect(text).toContain('EMC');
+
+      // XMP PDF/UA declaration
+      expect(text).toContain('xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/"');
+      expect(text).toContain('<pdfuaid:part>1</pdfuaid:part>');
+
+      // Watermark & version stamp preserved
+      expect(text).toContain(WATERMARK_DRAFT_TEXT);
+      expect(text).toContain('FOOTER_VERSION_STAMP: ledger_revision=');
+    });
+
+    it('makeStatementRenderFn fetches StatementContent when given a StatementDataProvider', async () => {
+      const storage = new InMemoryStatementPdfStorage();
+      const content = makeContent();
+      const dataProvider: StatementDataProvider = {
+        getStatementContent: jest.fn().mockResolvedValue(content),
+      };
+      const renderFn = makeStatementRenderFn(storage, dataProvider);
+      const job = makeFixedJob();
+      const res = await renderFn(job);
+
+      expect(dataProvider.getStatementContent).toHaveBeenCalledWith('inv-det', '2026-07');
+      expect(res.bytes.equals(renderStatementPdfBytes(job, content))).toBe(true);
+    });
+
+    it('PdfDocumentBuilder escapes XML special characters in XMP title', () => {
+      const builder = new PdfDocumentBuilder({
+        title: 'Statement <A & B>',
+        periodId: '2026-07',
+        investorId: 'inv-1',
+        batchId: 'batch-1',
+        watermarkSuppressed: true,
+        ledgerRevisionHash: 'rev-1',
+      });
+      builder.addMarkedSection('Title', 'H1', ['STATEMENT']);
+      const text = builder.build().toString('utf8');
+      expect(text).toContain('Statement &lt;A &amp; B&gt;');
+      expect(text).toContain('WATERMARK: SUPPRESSED');
     });
   });
 });

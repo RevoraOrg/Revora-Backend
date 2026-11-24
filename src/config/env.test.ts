@@ -1,4 +1,6 @@
-import { buildConfig, envBoolean, readEnvBoolean } from './env';
+import fs from 'fs';
+import path from 'path';
+import { buildConfig, envBoolean, envSchema, readEnvBoolean } from './env';
 
 describe('env config', () => {
   const originalEnv = process.env;
@@ -35,8 +37,8 @@ describe('env config', () => {
     try {
       buildConfig();
       fail('Expected buildConfig to throw');
-    } catch (e: any) {
-      expect(e.message).toBe('Process.exit called with 1');
+    } catch (e: unknown) {
+      expect((e as Error).message).toBe('Process.exit called with 1');
     }
     expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
     
@@ -56,8 +58,8 @@ describe('env config', () => {
     try {
       buildConfig();
       fail('Expected buildConfig to throw');
-    } catch (e: any) {
-      expect(e.message).toBe('Process.exit called with 1');
+    } catch (e: unknown) {
+      expect((e as Error).message).toBe('Process.exit called with 1');
     }
     expect(mockConsoleError).toHaveBeenCalledWith(expect.stringContaining('[FATAL]'));
     
@@ -274,6 +276,66 @@ describe('env config', () => {
       expect(() => readEnvBoolean('TEST_BOOL_FLAG', false)).toThrow(
         'TEST_BOOL_FLAG must be one of: true, false, 1, 0, yes, no, on, off (case-insensitive)',
       );
+    });
+  });
+
+  describe('.env.example documentation sync', () => {
+    it('documents every environment variable defined in envSchema in .env.example', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      expect(fs.existsSync(envExamplePath)).toBe(true);
+
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+      const declaredVars = new Set<string>();
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        // Matches assignments: VAR_NAME=... or # VAR_NAME=...
+        const match = trimmed.match(/^(?:#\s*)?([A-Z0-9_]+)=/);
+        if (match) {
+          declaredVars.add(match[1]);
+        }
+      }
+
+      const schemaKeys = Object.keys(envSchema.shape);
+      const missingKeys = schemaKeys.filter((key) => !declaredVars.has(key));
+
+      expect(missingKeys).toEqual([]);
+    });
+
+    it('documents key non-schema operational variables in .env.example', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+      const declaredVars = new Set<string>();
+
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        const match = trimmed.match(/^(?:#\s*)?([A-Z0-9_]+)=/);
+        if (match) {
+          declaredVars.add(match[1]);
+        }
+      }
+
+      // Check critical variables called out in issue #1407
+      expect(declaredVars.has('ADMIN_PUBKEYS')).toBe(true);
+      expect(declaredVars.has('LEDGER_CLOSE_SIGNING_KEY')).toBe(true);
+      expect(declaredVars.has('CORS_ALLOW_NO_ORIGIN')).toBe(true);
+      expect(declaredVars.has('RECORD_FIXTURES')).toBe(true);
+    });
+
+    it('contains only placeholder values and no live secrets', () => {
+      const envExamplePath = path.resolve(__dirname, '../../.env.example');
+      const content = fs.readFileSync(envExamplePath, 'utf-8');
+
+      // Ensure no live Stellar seeds (56 characters starting with S)
+      const stellarSecretMatch = content.match(/STELLAR_SERVER_SECRET=S[A-Z0-9]{55}/);
+      if (stellarSecretMatch) {
+        expect(stellarSecretMatch[0]).toContain('X');
+      }
+
+      // Check that secret variables contain placeholder indicators
+      expect(content).toContain('dev-jwt-secret-placeholder');
+      expect(content).toContain('dev-cursor-signing-secret-placeholder');
+      expect(content).toContain('dGVzdC1hdWRpdC1leHBvcnQ');
     });
   });
 });

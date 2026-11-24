@@ -177,3 +177,18 @@ INTEGRATION_DB_URL=postgres://user:pass@localhost:5432/revora_test \
 | `gl_account` contains SQL injection attempt | Passed to a parameterised query; no injection possible |
 | Request with valid compliance token but no `gl_account` | Rejected 400 by the route handler |
 | Rate limit exceeded | 429 from the upstream rate-limiter middleware (runs before auth) |
+
+---
+
+## Bounded memory in `InMemoryRateLimitStore`
+
+`InMemoryRateLimitStore` (`src/middleware/rateLimit.ts`) bounds memory growth from
+one-off or scanning client keys without using background `setInterval` timers that
+could keep the Node.js process alive:
+
+- **Opportunistic expired-window sweep:** Every `sweepInterval` increments (default
+  `1_000`), `sweepExpired()` removes all entries whose `resetAt <= now`.
+- **`maxKeys` safety cap:** When inserting a new key while `size >= maxKeys`
+  (default `100_000`), expired entries are swept first; if the map is still at
+  capacity, the oldest entry (FIFO insertion order) is evicted before inserting
+  the new key.

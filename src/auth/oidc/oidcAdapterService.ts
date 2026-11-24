@@ -12,8 +12,16 @@ import {
 import { JwksCacheService } from './jwksCache';
 import { digestDiscoveryDocument } from './discoveryDigest';
 import { globalMetrics } from '../../lib/metrics';
+import {
+  safeFetch,
+  SafeFetchInit,
+  SafeFetchResponse,
+  isPrivateIP,
+  normalizeEncodedIP,
+} from '../../lib/ssrfProtection';
 
 const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
+const DEFAULT_HTTP_TIMEOUT_MS = 5000;    // 5 seconds
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
 const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
 
@@ -34,8 +42,38 @@ interface OidcDiscoveryMetrics {
 export interface OidcAdapterServiceOptions {
   /** Override discovery document cache TTL (ms). Defaults to OIDC_DISCOVERY_TTL_MS or 1h. */
   discoveryTtlMs?: number;
+  /**
+   * Hard timeout (ms) applied to outbound OIDC HTTP requests — the discovery
+   * document fetch and the token endpoint fetch. Defaults to 5000ms.
+   * A non-positive or non-finite override falls back to the default.
+   *
+   * Without a timeout, a slow or hanging identity provider holds the login
+   * request open indefinitely and can exhaust the connection pool.
+   */
+  httpTimeoutMs?: number;
   metrics?: OidcDiscoveryMetrics;
   now?: () => number;
+  /** Explicit test/dev override to allow private/local network issuers and endpoints. */
+  allowPrivateIssuers?: boolean;
+  /** Optional custom fetch implementation (defaults to safeFetch). */
+  fetchFn?: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
+}
+
+export function resolveAllowPrivateIssuers(override?: boolean): boolean {
+  if (typeof override === 'boolean') {
+    if (override && process.env.NODE_ENV === 'production') {
+      throw new Error('Private OIDC issuers are not permitted in production');
+    }
+    return override;
+  }
+  const envVal = process.env.OIDC_ALLOW_PRIVATE_ISSUERS ?? process.env.OIDC_DEV_OVERRIDE;
+  if (!envVal) return false;
+  const normalized = envVal.trim().toLowerCase();
+  const enabled = normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+  if (enabled && process.env.NODE_ENV === 'production') {
+    throw new Error('Private OIDC issuers are not permitted in production');
+  }
+  return enabled;
 }
 
 function resolveDiscoveryTtlMs(override?: number): number {
@@ -47,6 +85,23 @@ function resolveDiscoveryTtlMs(override?: number): number {
   return DEFAULT_DISCOVERY_TTL_MS;
 }
 
+function resolveHttpTimeoutMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return override;
+  }
+  return DEFAULT_HTTP_TIMEOUT_MS;
+}
+
+/**
+ * True when an error was produced by an aborted fetch: a timeout from
+ * `AbortSignal.timeout` (DOMException name "TimeoutError") or an explicit abort.
+ */
+function isAbortError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const name = (err as { name?: unknown }).name;
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
 export class OidcAdapterService {
   private readonly discoveryCache = new Map<string, DiscoveryCacheEntry>();
   /** SHA-256 hex digest of the last accepted discovery document, keyed by issuer URL. */
@@ -55,16 +110,22 @@ export class OidcAdapterService {
   /** Set of already-consumed logout token JTIs with their exp timestamps for replay protection. */
   private readonly consumedJtis = new Map<string, number>();
   private readonly discoveryTtlMs: number;
+  private readonly httpTimeoutMs: number;
   private readonly metrics: OidcDiscoveryMetrics;
   private readonly now: () => number;
+  private readonly allowPrivateIssuers: boolean;
+  private readonly fetchFn: (url: string | URL, init?: SafeFetchInit) => Promise<SafeFetchResponse>;
 
   constructor(
     private readonly jwksCache: JwksCacheService,
     options: OidcAdapterServiceOptions = {},
   ) {
     this.discoveryTtlMs = resolveDiscoveryTtlMs(options.discoveryTtlMs);
+    this.httpTimeoutMs = resolveHttpTimeoutMs(options.httpTimeoutMs);
     this.metrics = options.metrics ?? globalMetrics;
     this.now = options.now ?? (() => Date.now());
+    this.allowPrivateIssuers = resolveAllowPrivateIssuers(options.allowPrivateIssuers);
+    this.fetchFn = options.fetchFn ?? safeFetch;
   }
 
   /** Last observed discovery digest for an issuer, if any. */
@@ -74,12 +135,41 @@ export class OidcAdapterService {
 
   // ── Discovery ─────────────────────────────────────────────────────────
 
+  /**
+   * Perform an outbound OIDC HTTP request with a hard timeout.
+   *
+   * A hanging identity provider would otherwise hold the login request open
+   * indefinitely and exhaust the connection pool, so we abort via
+   * `AbortSignal.timeout` and surface a clear error message.
+   */
+  private async fetchWithTimeout(
+    input: string,
+    init: RequestInit,
+    requestDescription: string,
+  ): Promise<Response> {
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: AbortSignal.timeout(this.httpTimeoutMs),
+      });
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        throw new Error(`${requestDescription} timed out after ${this.httpTimeoutMs}ms`);
+      }
+      throw err;
+    }
+  }
+
   async getDiscovery(issuerUrl: string): Promise<OidcDiscoveryDocument> {
     const cached = this.discoveryCache.get(issuerUrl);
     if (cached && this.now() < cached.cachedUntil) return cached.doc;
 
     const url = `${issuerUrl.replace(/\/$/, '')}/.well-known/openid-configuration`;
-    const res = await fetch(url);
+    const res = await this.fetchFn(url, {
+      method: 'GET',
+      allowPrivateRanges: this.allowPrivateIssuers,
+      allowHttp: this.allowPrivateIssuers,
+    });
     if (!res.ok) throw new Error(`OIDC discovery failed for ${issuerUrl}: ${res.status}`);
 
     const doc = (await res.json()) as OidcDiscoveryDocument;
@@ -94,16 +184,56 @@ export class OidcAdapterService {
         1,
         'OIDC discovery document digest changed for issuer; admin should validate endpoint updates',
       );
-      console.warn(
-        `[OidcAdapter] oidc.discovery.changed issuer=${issuerUrl} ` +
-          `previous=${previous.slice(0, 12)}… current=${digest.slice(0, 12)}…`,
-      );
+      globalLogger.warn('oidc.discovery.changed', {
+        issuer: issuerUrl,
+        previousDigest: previous,
+        currentDigest: digest,
+      });
     }
 
     this.discoveryDigests.set(issuerUrl, digest);
     doc._cachedUntil = this.now() + this.discoveryTtlMs;
     this.discoveryCache.set(issuerUrl, { doc, cachedUntil: doc._cachedUntil });
     return doc;
+  }
+
+  private validateEndpointPolicy(endpointUrl: string, endpointName: string): void {
+    let parsed: URL;
+    try {
+      parsed = new URL(endpointUrl);
+    } catch {
+      throw new Error(`OIDC discovery document has invalid ${endpointName} URL: "${endpointUrl}"`);
+    }
+
+    if (parsed.username || parsed.password) {
+      throw new Error(`OIDC discovery document ${endpointName} must not contain embedded credentials`);
+    }
+
+    if (!this.allowPrivateIssuers) {
+      if (parsed.protocol !== 'https:') {
+        throw new Error(
+          `OIDC discovery document ${endpointName} must use HTTPS scheme to share issuer host policy, got "${parsed.protocol}"`
+        );
+      }
+
+      let hostname = parsed.hostname;
+      if (hostname.startsWith('[') && hostname.endsWith(']')) {
+        hostname = hostname.slice(1, -1);
+      }
+      const normalizedHost = normalizeEncodedIP(hostname);
+
+      if (normalizedHost.toLowerCase() === 'localhost' || isPrivateIP(normalizedHost)) {
+        throw new Error(
+          `OIDC discovery document ${endpointName} violates issuer host policy: private or reserved address "${hostname}" is not allowed`
+        );
+      }
+    } else {
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new Error(
+          `OIDC discovery document ${endpointName} must use HTTP or HTTPS scheme, got "${parsed.protocol}"`
+        );
+      }
+    }
   }
 
   private validateDiscovery(doc: OidcDiscoveryDocument, expectedIssuer: string): void {
@@ -113,6 +243,24 @@ export class OidcAdapterService {
     const normalised = expectedIssuer.replace(/\/$/, '');
     if (doc.issuer !== normalised && doc.issuer !== expectedIssuer) {
       throw new Error(`OIDC issuer mismatch: expected "${expectedIssuer}", got "${doc.issuer}"`);
+    }
+
+    // Validate that discovery-returned endpoints share the issuer host policy
+    this.validateEndpointPolicy(doc.authorization_endpoint, 'authorization_endpoint');
+    this.validateEndpointPolicy(doc.token_endpoint, 'token_endpoint');
+    this.validateEndpointPolicy(doc.jwks_uri, 'jwks_uri');
+
+    // Optional endpoints if present must also adhere to the issuer host policy
+    const optionalEndpoints: Record<string, unknown> = doc as unknown as Record<string, unknown>;
+    for (const key of [
+      'userinfo_endpoint',
+      'end_session_endpoint',
+      'revocation_endpoint',
+      'introspection_endpoint',
+    ]) {
+      if (typeof optionalEndpoints[key] === 'string') {
+        this.validateEndpointPolicy(optionalEndpoints[key] as string, key);
+      }
     }
   }
 
@@ -195,10 +343,12 @@ export class OidcAdapterService {
       ...(provider.client_secret ? { client_secret: provider.client_secret } : {}),
     });
 
-    const res = await fetch(discovery.token_endpoint, {
+    const res = await this.fetchFn(discovery.token_endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
+      allowPrivateRanges: this.allowPrivateIssuers,
+      allowHttp: this.allowPrivateIssuers,
     });
 
     if (!res.ok) {

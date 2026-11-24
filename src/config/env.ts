@@ -130,7 +130,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | KYC_CIRCUIT_HALF_OPEN_MS    | No       | 30000                   | Wait time in ms before half-open probe            |
  */
 
-const envSchema = z.object({
+export const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   ROLE: z.enum(["api", "batch", "all"]).optional(),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -228,7 +228,7 @@ export function buildConfig(): Config {
     // expected string to have >=16 characters") and custom messages are
     // authored locally without interpolating input. Path + message are
     // therefore safe to log without leaking secrets such as DATABASE_URL.
-    const errorMessages = result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`).join(', ');
+    const errorMessages = result.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ');
     console.error(`[FATAL] Configuration validation failed: Missing or invalid required environment variables: ${errorMessages}`);
     process.exit(1);
   }
