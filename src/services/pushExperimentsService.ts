@@ -1,4 +1,4 @@
-import { PushExperimentsRepository, PushExperiment, PushExperimentVariant, PushExperimentAssignment } from '../db/repositories/pushExperimentsRepository';
+import { PushExperimentsRepository, PushExperiment, PushExperimentVariant, PushExperimentAssignment, PushExperimentLegalAllowlist } from '../db/repositories/pushExperimentsRepository';
 import { MetricsCollector, globalMetrics } from '../lib/metrics';
 import { createHash } from 'crypto';
 
@@ -84,6 +84,10 @@ export class PushExperimentsService {
   /**
    * Adds a variant to an experiment with legal content validation.
    * 
+   * Title and body templates are checked against the tenant's legal allowlist.
+   * For each allowlisted field, the template must either not reference the field
+   * at all, or reference it with the exact required constant value.
+   *
    * @throws {LegalContentViolationError} If variant attempts to vary legal-required content
    */
   async addVariant(
@@ -95,18 +99,13 @@ export class PushExperimentsService {
     dataTemplate?: Record<string, unknown>,
     isControl: boolean = false
   ): Promise<PushExperimentVariant> {
-    // Validate against legal allowlist
-    const variants = await this.repo.findVariantsByExperiment(experimentId);
-    if (variants.length > 0) {
-      // Get the experiment to find tenant_id
-      // We need to fetch the experiment separately since variants don't have tenant_id
-      // For now, we'll skip this validation in this method and require the caller to validate
-      // In production, you'd want to pass tenantId to this method or fetch the experiment
-      const allowlist: any[] = []; // TODO: Fetch tenant_id from experiment and get allowlist
-      
-      // Skip validation for now - would need experiment lookup
-      // In production, implement full legal content validation here
+    const experiment = await this.repo.findExperimentById(experimentId);
+    if (!experiment) {
+      throw new Error(`Experiment "${experimentId}" not found`);
     }
+
+    const allowlist: PushExperimentLegalAllowlist[] = await this.repo.getLegalAllowlist(experiment.tenant_id);
+    this.validateLegalContent(allowlist, titleTemplate, bodyTemplate);
 
     const variant = await this.repo.createVariant({
       experiment_id: experimentId,
@@ -283,6 +282,42 @@ export class PushExperimentsService {
   }
 
   /**
+   * Validates title/body templates against the legal allowlist.
+   * A template violates the allowlist if it references an allowlisted field
+   * with a variable placeholder, or with a constant that differs from the
+   * required value.
+   *
+   * @throws {LegalContentViolationError} On the first disallowed field
+   */
+  private validateLegalContent(
+    allowlist: PushExperimentLegalAllowlist[],
+    titleTemplate: string,
+    bodyTemplate: string
+  ): void {
+    for (const entry of allowlist) {
+      const placeholder = `{{${entry.field_key}}}`;
+      for (const template of [titleTemplate, bodyTemplate]) {
+        if (template.includes(placeholder)) {
+          throw new LegalContentViolationError(entry.field_key);
+        }
+      }
+
+      // Constant (non-templated) values must equal the required value when present.
+      for (const template of [titleTemplate, bodyTemplate]) {
+        if (template.includes(entry.required_value)) {
+          continue;
+        }
+        // If the template declares the field inline (e.g. "disclaimer: ..."),
+        // the declared value must match exactly.
+        const declared = this.extractConstant(template, entry.field_key);
+        if (declared !== null && declared !== entry.required_value) {
+          throw new LegalContentViolationError(entry.field_key);
+        }
+      }
+    }
+  }
+
+  /**
    * Selects a variant for a user based on allocation strategy.
    * 
    * For weighted allocation: uses cumulative weight buckets based on user hash
@@ -343,65 +378,23 @@ export class PushExperimentsService {
   }
 
   /**
-   * Extracts a template value for legal content validation.
-   * Checks if the field appears in the template and returns the constant value.
-   */
-  private extractTemplateValue(titleTemplate: string, bodyTemplate: string, fieldKey: string): string | null {
-    const pattern = new RegExp(`\\{\\{${fieldKey}\\}\\}`, 'g');
-    const titleMatch = titleTemplate.match(pattern);
-    const bodyMatch = bodyTemplate.match(pattern);
-    
-    if (!titleMatch && !bodyMatch) {
-      return null; // Field not used in template
-    }
-
-    // For legal content, we expect the field to be a constant (no {{ }})
-    // This is a simplified check - in production, you'd want more sophisticated parsing
-    const titleValue = this.extractConstant(titleTemplate, fieldKey);
-    const bodyValue = this.extractConstant(bodyTemplate, fieldKey);
-    
-    return titleValue || bodyValue;
-  }
-
-  /**
-   * Extracts a constant value for a field from a template.
-   * Returns null if the field is templated (contains {{ }}).
+   * Extracts a constant value declared for a field in a template, e.g.
+   * "disclaimer: Investment risks apply". Returns null if the field is not
+   * declared inline or is templated.
    */
   private extractConstant(template: string, fieldKey: string): string | null {
-    // If the field is templated, it's not a constant
     if (template.includes(`{{${fieldKey}}}`)) {
       return null;
     }
-    
-    // Try to find a pattern like "fieldKey: value" or similar
-    const patterns = [
-      new RegExp(`${fieldKey}\\s*[:=]\\s*([^\\n]+)`),
-      new RegExp(`([^\\n]+)\\s*${fieldKey}`),
-    ];
-    
-    for (const pattern of patterns) {
-      const match = template.match(pattern);
-      if (match) {
-        return match[1].trim();
-      }
-    }
-    
-    return null;
+    const match = template.match(new RegExp(`${fieldKey}\\s*:\\s*([^\\n]+)`));
+    return match ? match[1].trim() : null;
   }
 
   /**
-   * Hashes a user ID to a number for deterministic allocation.
-   * Uses SHA-256 and takes the first 4 bytes as a number.
+   * Hashes a user id to a 32-bit unsigned integer for deterministic allocation.
    */
   private hashUserId(userId: string): number {
-    const hash = createHash('sha256').update(userId).digest();
-    return hash.readUInt32BE(0);
+    const digest = createHash('sha256').update(userId).digest();
+    return digest.readUInt32BE(0);
   }
-}
-
-export function createPushExperimentsService(
-  repo: PushExperimentsRepository,
-  metrics?: MetricsCollector
-): PushExperimentsService {
-  return new PushExperimentsService(repo, metrics);
 }

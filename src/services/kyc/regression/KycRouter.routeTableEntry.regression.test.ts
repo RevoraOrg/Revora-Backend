@@ -282,7 +282,7 @@ describe('KycRouter RouteTableEntry regression — end-to-end routing contract',
       { jurisdiction: 'EU', providerName: 'provider-a' },
     ]);
     router.loadRouteTable(table);
-    router.loadRouteTable(table); // reload must not corrupt state
+    router.loadRouteTable(table, { allowDowngrade: true }); // reload must not corrupt state
 
     expect(router.route('US')).toBe(providerA);
     expect(router.route('EU')).toBe(providerA);

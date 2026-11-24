@@ -1,26 +1,12 @@
-import 'dotenv/config';
-import express, { NextFunction, Request, RequestHandler, Response } from 'express';
-import morgan from 'morgan';
-import { closePool, dbHealth, query as dbQuery } from './db/client';
-import { createCorsMiddleware } from './middleware/cors';
-import { errorHandler } from './middleware/errorHandler';
-import { requestIdMiddleware } from './middleware/requestId';
-import { Errors } from './lib/errors';
-import { classifyStellarRPCFailure, StellarRPCFailureClass } from './lib/stellarRpcFailure';
-import { createHealthRouter } from './routes/health';
-import vestingRouter from './routes/vesting';
-import { offeringSanitizeMiddleware } from './middleware/offeringSanitize';
-import { createStartupRegisterRateLimit } from './middleware/startupRegisterRateLimit';
-import { env } from './config/env';
-import { validateWebhookUrl, SsrfValidationError } from './lib/ssrfProtection';
-import { WebhookEndpointRepository, WebhookDelivery } from './db/repositories/webhookEndpointRepository';
-import { WebhookService, WebhookPayload, WebhookEventType } from './services/webhookService';
-import { pool } from './db/pool';
-import { createPasswordResetRouter } from './routes/passwordReset';
-import { emailService } from './services/emailService';
-
-const port = env.PORT;
-const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
+import {
+  NextFunction,
+  Request,
+  RequestHandler,
+  Response,
+  Router,
+} from "express";
+import { Errors } from "../lib/errors";
+import { offeringSanitizeMiddleware } from "../middleware/offeringSanitize";
 
 const OFFERING_ROLES = ["startup", "admin", "compliance", "investor"] as const;
 const OFFERING_ACTIONS = [
@@ -48,12 +34,12 @@ const OFFERING_SECURITY_ASSUMPTIONS = [
   "Validation output is safe for clients and never includes raw database, token, or upstream provider error messages.",
 ] as const;
 
-type OfferingActorRole = (typeof OFFERING_ROLES)[number];
-type OfferingValidationAction = (typeof OFFERING_ACTIONS)[number];
-type OfferingStatus = (typeof OFFERING_STATUSES)[number];
+export type OfferingActorRole = (typeof OFFERING_ROLES)[number];
+export type OfferingValidationAction = (typeof OFFERING_ACTIONS)[number];
+export type OfferingStatus = (typeof OFFERING_STATUSES)[number];
 type DecisionSeverity = "error" | "warning";
 
-interface AuthenticatedUser {
+export interface AuthenticatedUser {
   id: string;
   role: OfferingActorRole;
 }
@@ -62,12 +48,7 @@ interface AuthenticatedRequest extends Request {
   user?: AuthenticatedUser;
 }
 
-interface AppDependencies {
-  healthQuery?: typeof dbQuery;
-  healthStatus?: typeof dbHealth;
-}
-
-interface OfferingValidationPayload {
+export interface OfferingValidationPayload {
   action: OfferingValidationAction;
   offering: {
     id?: string;
@@ -81,14 +62,14 @@ interface OfferingValidationPayload {
   };
 }
 
-interface ValidationCheck {
+export interface ValidationCheck {
   code: string;
   passed: boolean;
   severity: DecisionSeverity;
   message: string;
 }
 
-interface OfferingValidationResult {
+export interface OfferingValidationResult {
   allowed: boolean;
   decision: "allow" | "deny";
   action: OfferingValidationAction;
@@ -99,51 +80,6 @@ interface OfferingValidationResult {
   securityAssumptions: readonly string[];
 }
 
-/**
- * @dev Stable JSON serializer used for deterministic fingerprints and tests.
- */
-function stableSerialize(value: unknown): string {
-  const normalize = (input: unknown): unknown => {
-    if (Array.isArray(input)) {
-      return input.map(normalize);
-    }
-
-    if (input && typeof input === "object") {
-      const record = input as Record<string, unknown>;
-      const sorted: Record<string, unknown> = {};
-      for (const key of Object.keys(record).sort()) {
-        sorted[key] = normalize(record[key]);
-      }
-      return sorted;
-    }
-
-    return input;
-  };
-
-  return JSON.stringify(normalize(value));
-}
-
-function isOfferingRole(value: unknown): value is OfferingActorRole {
-  return (
-    typeof value === "string" &&
-    (OFFERING_ROLES as readonly string[]).includes(value)
-  );
-}
-
-function isOfferingAction(value: unknown): value is OfferingValidationAction {
-  return (
-    typeof value === "string" &&
-    (OFFERING_ACTIONS as readonly string[]).includes(value)
-  );
-}
-
-function isOfferingStatus(value: unknown): value is OfferingStatus {
-  return (
-    typeof value === "string" &&
-    (OFFERING_STATUSES as readonly string[]).includes(value)
-  );
-}
-
 function isNonEmptyString(value: unknown, maxLength = 128): value is string {
   return (
     typeof value === "string" &&
@@ -152,59 +88,48 @@ function isNonEmptyString(value: unknown, maxLength = 128): value is string {
   );
 }
 
+export function isOfferingRole(value: unknown): value is OfferingActorRole {
+  return (
+    typeof value === "string" &&
+    (OFFERING_ROLES as readonly string[]).includes(value)
+  );
+}
+
+export function isOfferingAction(
+  value: unknown,
+): value is OfferingValidationAction {
+  return (
+    typeof value === "string" &&
+    (OFFERING_ACTIONS as readonly string[]).includes(value)
+  );
+}
+
+export function isOfferingStatus(value: unknown): value is OfferingStatus {
+  return (
+    typeof value === "string" &&
+    (OFFERING_STATUSES as readonly string[]).includes(value)
+  );
+}
+
 /**
  * @dev Decimal parser with strict input bounds to resist coercion abuse and NaN payloads.
  */
-function parseMoneyString(value: unknown): number | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) {
-    return null;
-  }
-
+export function parseMoneyString(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  if (!/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/.test(value)) return null;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-
+  if (!Number.isFinite(parsed)) return null;
   return parsed;
 }
 
-function parseIsoDate(value: unknown): Date | null {
-  if (!isNonEmptyString(value, 64)) {
-    return null;
-  }
-
+export function parseIsoDate(value: unknown): Date | null {
+  if (!isNonEmptyString(value, 64)) return null;
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return null;
-  }
-
+  if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
 }
 
-function createStartupRegisterHandler(): RequestHandler {
-  return (req: Request, res: Response): void => {
-    const body = req.body as Record<string, unknown> | undefined;
-    const email = body?.email;
-    const password = body?.password;
-
-    if (!isNonEmptyString(email) || !isNonEmptyString(password)) {
-      res.status(400).json({
-        error: "Email and password are required",
-      });
-      return;
-    }
-
-    res.status(201).json({
-      message: "Startup user registered successfully",
-    });
-  };
-}
-
-function requireOfferingAuth(
+export function requireOfferingAuth(
   req: Request,
   _res: Response,
   next: NextFunction,
@@ -221,14 +146,11 @@ function requireOfferingAuth(
     return;
   }
 
-  (req as AuthenticatedRequest).user = {
-    id: userId.trim(),
-    role,
-  };
+  (req as AuthenticatedRequest).user = { id: userId.trim(), role };
   next();
 }
 
-function parseOfferingValidationPayload(
+export function parseOfferingValidationPayload(
   body: unknown,
 ): OfferingValidationPayload {
   if (!body || typeof body !== "object") {
@@ -278,7 +200,7 @@ function parseOfferingValidationPayload(
         },
       );
     }
-    payload.offering.status = offeringRecord.status as OfferingStatus;
+    payload.offering.status = offeringRecord.status;
   }
 
   const stringFields: Array<
@@ -308,11 +230,7 @@ function parseOfferingValidationPayload(
   return payload;
 }
 
-/**
- * @dev Evaluates the permission and invariant matrix for offering actions.
- * The result is deterministic and safe to log or return to clients.
- */
-function evaluateOfferingValidationMatrix(
+export function evaluateOfferingValidationMatrix(
   actor: AuthenticatedUser,
   payload: OfferingValidationPayload,
   now = new Date(),
@@ -517,7 +435,7 @@ function evaluateOfferingValidationMatrix(
   };
 }
 
-function createOfferingValidationHandler(
+export function createOfferingValidationHandler(
   nowProvider: () => Date = () => new Date(),
 ): RequestHandler {
   return (req: Request, res: Response, next: NextFunction): void => {
@@ -543,249 +461,13 @@ function createOfferingValidationHandler(
   };
 }
 
-export function createApp(dependencies: AppDependencies = {}): express.Express {
-  const app = express();
-  const apiRouter = express.Router();
-  const healthQuery = dependencies.healthQuery ?? dbQuery;
-  const healthStatus = dependencies.healthStatus ?? dbHealth;
-
-  app.use(requestIdMiddleware());
-  app.set("trust proxy", 1);
-  app.use(createCorsMiddleware() as RequestHandler);
-  app.use(express.json({ limit: "32kb" }));
-  app.use(morgan(env.NODE_ENV === "test" ? "tiny" : "dev"));
-
-  app.get("/health", async (_req: Request, res: Response) => {
-    const db = await healthStatus();
-    res.status(db.healthy ? 200 : 503).json({
-      status: db.healthy ? "ok" : "degraded",
-      service: "revora-backend",
-      db,
-    });
-  });
-
-  app.use("/health", createHealthRouter(healthQuery as any, healthStatus));
-
-  apiRouter.get("/overview", (_req: Request, res: Response) => {
-    res.json({
-      name: "Stellar RevenueShare (Revora) Backend",
-      description:
-        "Backend API skeleton for tokenized revenue-sharing on Stellar (offerings, investments, revenue distribution).",
-      version: "0.1.0",
-    });
-  });
-
-  apiRouter.post(
-    "/startup/register",
-    createStartupRegisterRateLimit(),
-    createStartupRegisterHandler(),
-  );
-
-  apiRouter.post(
-    "/offerings/validation-matrix",
+export function createOfferingValidationRouter(): Router {
+  const router = Router();
+  router.post(
+    "/validation-matrix",
     requireOfferingAuth,
     offeringSanitizeMiddleware,
     createOfferingValidationHandler(),
   );
-
-  apiRouter.use('/vesting', vestingRouter);
-
-  // Mount password reset router
-  app.use(createPasswordResetRouter({ db: pool, emailService }));
-
-  app.use(API_VERSION_PREFIX, apiRouter);
-  app.use((_req, _res, next) => next(Errors.notFound("Route not found")));
-  app.use(errorHandler);
-
-  return app;
+  return router;
 }
-
-export const __test = {
-  stableSerialize,
-  parseMoneyString,
-  parseIsoDate,
-  parseOfferingValidationPayload,
-  evaluateOfferingValidationMatrix,
-};
-
-export { classifyStellarRPCFailure, StellarRPCFailureClass };
-
-export const app = createApp();
-
-/* istanbul ignore next -- exercised only in real process shutdown */
-async function shutdown(signal: string): Promise<void> {
-  console.log(`\n[server] ${signal} shutting down`);
-  await closePool();
-  /* istanbul ignore next -- process exit is not unit-test friendly */
-  process.exit(0);
-}
-
-let server: ReturnType<typeof app.listen> | undefined;
-
-/* istanbul ignore next -- setter exists for runtime wiring compatibility */
-export const setServer = (value: ReturnType<typeof app.listen>) => {
-  server = value;
-};
-
-/**
- * Webhook delivery queue with exponential backoff and SSRF-aware URL blocking.
- * @notice Uses comprehensive SSRF protection including IPv6, link-local, and DNS rebinding prevention.
- */
-export class WebhookQueue {
-  private static repo: WebhookEndpointRepository;
-  private static service: WebhookService;
-  private static MAX_RETRIES = 5;
-  private static INITIAL_DELAY = 1000;
-
-  static init(repo: WebhookEndpointRepository, service: WebhookService) {
-    this.repo = repo;
-    this.service = service;
-  }
-
-  /**
-   * @notice Validates a webhook URL using comprehensive SSRF protection.
-   * @dev Enforces HTTPS, rejects private/reserved addresses (IPv4 and IPv6),
-   * resolves DNS to prevent rebinding attacks, and rejects embedded credentials.
-   */
-  private static async isSafeUrl(url: string): Promise<boolean> {
-    try {
-      const result = await validateWebhookUrl(url, true);
-      if (!result.valid) {
-        console.error(`[Security] SSRF validation failed for ${url}: ${result.error?.message}`);
-      }
-      return result.valid;
-    } catch (error) {
-      console.error(`[Security] Error validating webhook URL ${url}:`, error);
-      return false;
-    }
-  }
-
-  static getBackoffDelay(retryCount: number): number {
-    if (retryCount >= this.MAX_RETRIES) {
-      return -1;
-    }
-
-    return this.INITIAL_DELAY * Math.pow(2, retryCount);
-  }
-
-  static async processDelivery(
-    url: string,
-    payload: any,
-    deliveryId?: string,
-  ): Promise<boolean> {
-    if (!this.repo || !this.service) {
-      console.error("[WebhookQueue] Not initialized");
-      return false;
-    }
-
-    if (!(await this.isSafeUrl(url))) {
-      console.error(`[Security] Blocked unsafe webhook URL: ${url}`);
-      return false;
-    }
-
-    const endpoint = await this.repo.findByUrl(url);
-    if (!endpoint) {
-      console.error(`[WebhookQueue] No active endpoint found for URL: ${url}`);
-      return false;
-    }
-
-    let delivery: WebhookDelivery | null = null;
-    if (deliveryId) {
-      delivery = await this.repo.findDeliveryById(deliveryId);
-    }
-
-    if (!delivery) {
-      delivery = await this.repo.createDelivery({
-        endpoint_id: endpoint.id,
-        payload,
-        status: 'pending',
-        attempts: 0
-      });
-    }
-
-    const currentAttempt = delivery.attempts + 1;
-    
-    // Construct WebhookPayload for real delivery
-    const webhookPayload: WebhookPayload = {
-      id: delivery.id,
-      event: (payload as any).event || WebhookEventType.OFFERING_UPDATED,
-      payload: (payload as any).payload || payload,
-      timestamp: new Date().toISOString(),
-    };
-
-    const result = await this.service.sendAttempt({
-      id: endpoint.id,
-      url: endpoint.url,
-      secret: endpoint.secret
-    }, webhookPayload);
-
-    if (result.success) {
-      await this.repo.updateDelivery(delivery.id, {
-        status: 'completed',
-        attempts: currentAttempt,
-        last_error: null,
-        next_retry_at: null
-      });
-      return true;
-    }
-
-    const isRetryable = !result.statusCode || (result.statusCode >= 500) || (result.statusCode === 429);
-    const nextDelay = this.getBackoffDelay(currentAttempt);
-
-    if (isRetryable && nextDelay !== -1) {
-      const nextRetryAt = new Date(Date.now() + nextDelay);
-      await this.repo.updateDelivery(delivery.id, {
-        attempts: currentAttempt,
-        last_error: result.error,
-        next_retry_at: nextRetryAt
-      });
-      
-      setTimeout(() => {
-        void this.processDelivery(url, payload, delivery!.id);
-      }, nextDelay);
-      
-      return false;
-    } else {
-      await this.repo.updateDelivery(delivery.id, {
-        status: nextDelay === -1 ? 'dead_letter' : 'failed',
-        attempts: currentAttempt,
-        last_error: result.error,
-        next_retry_at: null
-      });
-      return false;
-    }
-  }
-
-  static async resumePending(): Promise<void> {
-    if (!this.repo) return;
-    const pending = await this.repo.getPendingDeliveries();
-    for (const delivery of pending) {
-      const endpoint = await this.repo.findById(delivery.endpoint_id);
-      if (endpoint) {
-        void this.processDelivery(endpoint.url, delivery.payload, delivery.id);
-      }
-    }
-  }
-}
-
-/* istanbul ignore next -- bootstrapping is integration-environment specific */
-if (require.main === module && env.NODE_ENV !== "test") {
-  process.on("SIGTERM", () => {
-    void shutdown("SIGTERM");
-  });
-  process.on("SIGINT", () => {
-    void shutdown("SIGINT");
-  });
-
-  const repo = new WebhookEndpointRepository(pool);
-  const service = new WebhookService(repo);
-  WebhookQueue.init(repo, service);
-  void WebhookQueue.resumePending();
-
-  server = app.listen(port, () => {
-    console.log(`revora-backend listening on http://localhost:${port}`);
-  });
-}
-
-export default app;
-

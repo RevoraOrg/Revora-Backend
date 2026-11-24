@@ -2,7 +2,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { requireInvestor, AuthenticatedRequest } from '../middleware/auth';
 import { KycRouter } from '../services/kyc/KycRouter';
 import { KycApplicantInfo } from '../services/kyc/KycProvider';
-import { AppError } from '../lib/errors';
+import { AppError, ProviderNotRegisteredError, UnsupportedJurisdictionError } from '../lib/errors';
+import { globalLogger } from '../lib/logger';
 
 export function createKycRoutes(kycRouter: KycRouter): Router {
   const router = Router();
@@ -22,17 +23,41 @@ export function createKycRoutes(kycRouter: KycRouter): Router {
       const investorId = String(authReq.user.id);
       const info = req.body as Partial<KycApplicantInfo>;
 
-      if (!info.address?.country) {
+      const country = info.address?.country;
+
+      if (country === undefined || country === null || country === '') {
         res.status(400).json({ error: 'Country jurisdiction is required in address' });
         return;
       }
 
-      const jurisdiction = info.address.country.toUpperCase();
+      if (typeof country !== 'string' || !/^[A-Za-z]{2}$/.test(country)) {
+        res.status(400).json({ error: 'Invalid country code' });
+        return;
+      }
+
+      const jurisdiction = country.toUpperCase();
       let provider;
       try {
         provider = kycRouter.route(jurisdiction);
-      } catch (err: any) {
-        res.status(403).json({ error: err.message || 'Jurisdiction not supported' });
+      } catch (err: unknown) {
+        if (err instanceof UnsupportedJurisdictionError) {
+          res.status(err.statusCode).json({ error: err.publicMessage });
+          return;
+        }
+
+        if (err instanceof ProviderNotRegisteredError) {
+          // @dev Server misconfiguration: keep provider identity in the logs,
+          //      never in the investor-facing 500 response.
+          globalLogger.error('KYC provider misconfiguration', {
+            error: err,
+            jurisdiction,
+            providerName: err.providerName,
+          });
+          res.status(err.statusCode).json({ error: err.publicMessage });
+          return;
+        }
+
+        next(err);
         return;
       }
 

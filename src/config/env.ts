@@ -104,6 +104,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | AUDIT_RETENTION_DAYS        | No       | 90                      | Number of days to retain audit logs              |
  * | AUDIT_EXPORT_SIGNING_KEY    | Yes/Prod | (empty)                 | Base64-encoded Ed25519 private key (32-byte seed) for signing audit CSV exports |
  * | AUDIT_EXPORT_PUBLIC_KEY     | No       | (empty)                 | Base64-encoded Ed25519 public key, documented so auditors can verify exports offline |
+ * | WITNESS_REKOR_URL           | No       | (empty)                 | HTTPS Rekor transparency log URL for publishing audit roots; mock witness is used when unset |
  * | SESSION_RETENTION_DAYS      | No       | 30                      | Number of days to retain expired/revoked sessions|
  * | EMAIL_PROVIDER              | No       | mock/sendgrid           | Email provider: sendgrid, smtp, or mock          |
  * | FROM_EMAIL                  | No       | noreply@revora.com      | Default sender address for transactional email   |
@@ -116,6 +117,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | REGION                      | No       | us-east-1               | Current region identifier for multi-region setup |
  * | FAILOVER_ACTIVE_REGION      | No       | (REGION value)          | Region currently serving as active failover      |
  * | EMAIL_DELIVERABILITY_ENABLED| No       | true                    | Enable email deliverability tracking; accepts true/false/1/0/yes/no/on/off |
+ * | ADMIN_SIGNATURE_V1_ENABLED  | No       | true                    | Accept deprecated route-unbound admin signatures; accepts true/false/1/0/yes/no/on/off |
  * | SENDGRID_EVENT_WEBHOOK_SECRET| No      | (empty)                 | Secret for SendGrid event webhook verification   |
  * | SES_SNS_TOPIC_ARN           | No       | (empty)                 | ARN of SNS topic for SES bounce notifications    |
  * | SUPPRESSION_AUTO_EXPIRE_DAYS| No       | 365                     | Days before auto-suppression expires             |
@@ -131,7 +133,7 @@ export function readEnvBoolean(name: string, defaultValue: boolean): boolean {
  * | KYC_CIRCUIT_HALF_OPEN_MS    | No       | 30000                   | Wait time in ms before half-open probe            |
  */
 
-const envSchema = z.object({
+export const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   ROLE: z.enum(["api", "batch", "all"]).optional(),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -157,6 +159,10 @@ const envSchema = z.object({
   AUDIT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
   AUDIT_EXPORT_SIGNING_KEY: z.string().min(1).optional(),
   AUDIT_EXPORT_PUBLIC_KEY: z.string().min(1).optional(),
+  WITNESS_REKOR_URL: z.string().url().refine(
+    (url) => new URL(url).protocol === 'https:',
+    'must use HTTPS',
+  ).optional(),
   SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
   EMAIL_PROVIDER: z.enum(["sendgrid", "smtp", "mock"]).optional(),
   FROM_EMAIL: z.string().email().optional(),
@@ -175,6 +181,7 @@ const envSchema = z.object({
   // Boolean("false") === true, so coerce silently turned "disabled" values
   // into enabled features (issue #1305).
   EMAIL_DELIVERABILITY_ENABLED: envBoolean(true),
+  ADMIN_SIGNATURE_V1_ENABLED: envBoolean(true),
   SENDGRID_EVENT_WEBHOOK_SECRET: z.string().optional(),
   SES_SNS_TOPIC_ARN: z.string().optional(),
   KYC_CIRCUIT_TRIP_ERRORS: z.coerce.number().int().positive().default(3),
@@ -234,7 +241,7 @@ export function buildConfig(): Config {
     // expected string to have >=16 characters") and custom messages are
     // authored locally without interpolating input. Path + message are
     // therefore safe to log without leaking secrets such as DATABASE_URL.
-    const errorMessages = result.error.issues.map((e: any) => `${e.path.join('.')}: ${e.message}`).join(', ');
+    const errorMessages = result.error.issues.map((e) => `${e.path.join('.')}: ${e.message}`).join(', ');
     console.error(`[FATAL] Configuration validation failed: Missing or invalid required environment variables: ${errorMessages}`);
     process.exit(1);
   }

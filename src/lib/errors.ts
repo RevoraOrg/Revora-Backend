@@ -89,6 +89,69 @@ export class UnauthorizedError extends AppError {
   }
 }
 
+/**
+ * @notice A KYC applicant's jurisdiction has no configured route.
+ * @dev `message` retains the legacy operator-facing detail (including the
+ *      supplied jurisdiction) so existing diagnostics and tests stay useful.
+ *      `publicMessage` is the only text safe to return to an untrusted client;
+ *      it never reflects arbitrary request input.
+ */
+export class UnsupportedJurisdictionError extends AppError {
+  public readonly jurisdiction: string;
+  public readonly publicMessage: string = 'Jurisdiction not supported';
+
+  constructor(jurisdiction: string) {
+    super(
+      ErrorCode.FORBIDDEN,
+      403,
+      `Jurisdiction ${jurisdiction} not supported. Fails closed.`,
+      { jurisdiction },
+    );
+    this.name = 'UnsupportedJurisdictionError';
+    this.jurisdiction = jurisdiction;
+  }
+
+  public override toResponse(requestId?: string): ErrorResponse {
+    return {
+      code: this.code,
+      message: this.publicMessage,
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+}
+
+/**
+ * @notice The signed route table names a KYC provider that is not registered.
+ * @dev This is a server-side misconfiguration, not a client authorization
+ *      failure. The provider name remains in the internal error message and
+ *      `details` for operators, while `publicMessage` and `expose = false`
+ *      prevent it from leaking to investors.
+ */
+export class ProviderNotRegisteredError extends AppError {
+  public readonly providerName: string;
+  public readonly publicMessage: string = 'Internal server error';
+
+  constructor(providerName: string) {
+    super(
+      ErrorCode.INTERNAL_ERROR,
+      500,
+      `Configured provider ${providerName} not registered.`,
+      { providerName },
+      { expose: false },
+    );
+    this.name = 'ProviderNotRegisteredError';
+    this.providerName = providerName;
+  }
+
+  public override toResponse(requestId?: string): ErrorResponse {
+    return {
+      code: this.code,
+      message: this.publicMessage,
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+}
+
 /** Convenience factories for common error scenarios. */
 export const Errors = {
   validationError: (message: string, details?: unknown): AppError =>
@@ -161,6 +224,42 @@ export class BadRequestError extends AppError {
   constructor(message: string = 'Bad Request') {
     super(ErrorCode.BAD_REQUEST, 400, message);
     this.name = 'BadRequestError';
+  }
+}
+
+/**
+ * Thrown when an optimistic-concurrency update detects that the row was
+ * modified by another writer since it was read (i.e. the supplied version no
+ * longer matches the stored one).
+ *
+ * Security assumptions:
+ * - The message is deliberately generic and never echoes raw database rows or
+ *   stack traces, so it is safe to return to untrusted clients.
+ * - Callers map this to HTTP 409 via {@link ConcurrencyError.statusCode}.
+ */
+export class ConcurrencyError extends Error {
+  public readonly statusCode: number = 409;
+  public readonly errorCode: string = 'CONCURRENCY_CONFLICT';
+
+  constructor(
+    message: string = 'The resource has been modified by another process. Please refresh and try again.',
+  ) {
+    super(message);
+    this.name = 'ConcurrencyError';
+    Object.setPrototypeOf(this, new.target.prototype);
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  /**
+   * Formats the error for client-facing JSON responses.
+   * Ensures no raw stack traces or DB strings are leaked.
+   */
+  public toJSON(): { error: string; message: string; code: string } {
+    return {
+      error: 'Conflict',
+      message: this.message,
+      code: this.errorCode,
+    };
   }
 }
 

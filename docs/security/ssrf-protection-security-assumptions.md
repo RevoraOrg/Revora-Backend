@@ -2,40 +2,53 @@
 
 ## Overview
 
-The webhook delivery system implements comprehensive Server-Side Request Forgery (SSRF) protection to prevent attackers from forcing the server to make requests to internal or restricted resources. This document outlines the security assumptions, threat model, and implementation details.
+The outbound request infrastructure (webhook delivery and OIDC outbound communication) implements comprehensive Server-Side Request Forgery (SSRF) protection to prevent attackers from forcing the server to make requests to internal or restricted resources. This document outlines the security assumptions, threat model, and implementation details for both webhook delivery and tenant-configured OIDC integrations.
 
 ## Threat Model
 
 ### Attack Vectors Prevented
 
-1. **Internal Network Access**
+1. **Internal Network Access & Cloud Metadata Protection**
    - Blocking requests to private IPv4 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
    - Blocking requests to IPv4 loopback (127.0.0.0/8)
-   - Blocking requests to IPv4 link-local (169.254.0.0/16)
+   - Blocking requests to IPv4 link-local and cloud instance metadata (169.254.0.0/16, e.g., 169.254.169.254)
    - Blocking requests to IPv4 unspecified (0.0.0.0/8)
+   - Blocking requests to shared address space (100.64.0.0/10) and benchmarking ranges (198.18.0.0/15)
 
 2. **IPv6 Internal Network Access**
    - Blocking requests to IPv6 loopback (::1)
    - Blocking requests to IPv6 unspecified (::)
    - Blocking requests to IPv6 Unique Local Addresses (fc00::/7)
    - Blocking requests to IPv6 link-local (fe80::/10)
+   - Blocking IPv4-mapped, IPv4-compatible, 6to4, ISATAP, and NAT64 embedded private IPv4 forms
 
 3. **DNS Rebinding Attacks**
-   - DNS resolution is performed before delivery
-   - Resolved IP addresses are validated against private ranges
-   - Hostnames that resolve to private IPs are rejected
+   - Synchronous DNS resolution is performed prior to establishing connections
+   - Resolved IP addresses are validated against private and reserved ranges
+   - Mixed DNS answers (combining public and private records) are rejected
+   - Socket connection lookups are pinned to the verified IP address
 
 4. **Encoding Bypasses**
    - Decimal-encoded IP addresses are normalized and validated (e.g., 2130706433 → 127.0.0.1)
    - Hex-encoded IP addresses are normalized and validated (e.g., 0x7f000001 → 127.0.0.1)
 
 5. **Transport Security**
-   - Only HTTPS URLs are allowed
-   - HTTP and other schemes are rejected
+   - Only HTTPS URLs are allowed by default
+   - Plain HTTP, FTP, and other insecure schemes are rejected
 
 6. **Credential Leakage**
-   - URLs with embedded credentials are rejected
+   - URLs with embedded credentials (e.g., `https://user:pass@host`) are rejected
    - Prevents credential exposure in logs or error messages
+
+7. **Redirect Re-Validation**
+   - Redirects (301, 302, 303, 307, 308) are followed with SSRF validation at every hop
+   - Target redirect URLs to private IPs, cloud metadata, or insecure schemes are blocked immediately
+   - Redirect loop protection enforces a maximum redirect depth (default: 5)
+
+8. **OIDC Discovery Host Policy Sharing**
+   - Tenant-supplied OIDC issuer URLs cannot target internal addresses
+   - Discovery-returned endpoints (`authorization_endpoint`, `token_endpoint`, `jwks_uri`, `userinfo_endpoint`, etc.) are validated to share the issuer host policy
+   - An untrusted discovery document cannot redirect outbound token exchanges or JWKS fetches to internal resources
 
 ## Security Assumptions
 
@@ -78,34 +91,64 @@ The webhook delivery system implements comprehensive Server-Side Request Forgery
 
 ### Module: `src/lib/ssrfProtection.ts`
 
-The SSRF protection module provides the following functions:
+The SSRF protection module provides generalized URL validation and safe HTTP client functions:
 
-#### `validateWebhookUrl(url, resolveDns = true)`
+#### `safeFetch(url, init)`
 
-Asynchronously validates a webhook URL with DNS resolution:
+Executes an outbound HTTP/HTTPS request with full SSRF defenses:
+- Synchronously validates URL and resolves DNS prior to opening a connection
+- Pins the socket lookup agent to the verified IP address, preventing DNS rebinding
+- Manages redirects manually (`init.redirect = 'manual'`) or re-validates each redirect target against SSRF policy before following
+- Provides full response streaming support via `.text()` and `.json()`
+- Accepts optional test/dev overrides (`allowPrivateRanges`, `allowHttp`) for local testing
 
-- Parses and validates URL format
-- Enforces HTTPS scheme
-- Rejects embedded credentials
-- Normalizes encoded IP addresses
-- Performs DNS resolution (if enabled)
-- Validates resolved IP against private ranges
+#### `validateUrl(url, options)`
 
-#### `validateWebhookUrlSync(url)`
+Core validation function supporting configurable security policy options:
+- Parses and normalizes URL format
+- Enforces HTTPS scheme (or HTTP if `options.allowHttp` is set)
+- Rejects embedded userinfo/credentials
+- Normalizes decimal and hex encoded IP addresses
+- Performs DNS resolution and checks resolved IP against private ranges (if `options.resolveDns` is enabled)
+- Validates direct IP addresses against private/reserved ranges (unless `options.allowPrivateRanges` is enabled)
 
-Synchronously validates a webhook URL without DNS resolution:
+#### `validateWebhookUrl(url, resolveDns = true)` / `validateWebhookUrlSync(url)`
 
-- Same validation as async version
-- Skips DNS resolution for performance
-- Does not protect against DNS rebinding attacks
-- Use only when DNS rebinding is not a concern
+Backward-compatible helpers for webhook delivery validation with webhook-default security policies.
 
 #### Helper Functions
 
-- `isPrivateIPv4(ip)`: Checks if an IPv4 address is in a private range
-- `isPrivateIPv6(ip)`: Checks if an IPv6 address is in a private range
-- `isPrivateIP(ip)`: Checks if an IP address (IPv4 or IPv6) is private
+- `isPrivateIPv4(ip)`: Checks if an IPv4 address is in a private range (RFC 1918, 127/8, 169.254/16, 0.0.0.0/8, 100.64/10, 198.18/15)
+- `isPrivateIPv6(ip)`: Checks if an IPv6 address is in a private range (::1, ::, fc00::/7, fe80::/10, IPv4-mapped/compatible/6to4/ISATAP/NAT64)
+- `isPrivateIP(ip)`: Checks if an address (IPv4 or IPv6) is in a private range
 - `normalizeEncodedIP(hostname)`: Normalizes decimal/hex-encoded IPs
+
+### Integration: `src/auth/oidc/`
+
+Tenant-configured OIDC integrations utilize `safeFetch` across all outbound HTTP communication:
+
+1. **Discovery Document Fetch (`OidcAdapterService.getDiscovery`)**:
+   - Outbound requests to `/.well-known/openid-configuration` are routed through `safeFetch`
+   - Rejects tenant-configured issuers targeting private ranges, cloud metadata, or non-HTTPS schemes
+
+2. **Discovery Endpoint Host Policy Validation (`OidcAdapterService.validateDiscovery`)**:
+   - Endpoints returned in the discovery document (`authorization_endpoint`, `token_endpoint`, `jwks_uri`, `userinfo_endpoint`, etc.) are validated before acceptance
+   - Ensures discovery endpoints cannot downgrade to plain HTTP or target private addresses
+
+3. **Token Endpoint Exchange (`OidcAdapterService.exchangeCode`)**:
+   - Authorization code exchange requests to `token_endpoint` use `safeFetch`
+   - Re-validates redirects to prevent redirect-based SSRF into private networks
+
+4. **JWKS Key Bundle Fetching (`JwksCacheService.fetchAndCache`)**:
+   - Public key discovery from `jwks_uri` is fetched using `safeFetch`
+   - Protects key rotation workflows from forged internal targets
+
+### Test/Dev Override Policy
+
+For local development and automated testing with local identity providers (such as Keycloak or Mock OIDC servers running on `localhost` or Docker containers):
+- `allowPrivateIssuers` option on `OidcAdapterServiceOptions` and `JwksCacheServiceOptions`
+- `OIDC_ALLOW_PRIVATE_ISSUERS` / `OIDC_DEV_OVERRIDE` environment variables
+- **Production Guard**: Enabling private issuers is strictly prohibited in production (`NODE_ENV === 'production'`) and throws an immediate fatal error if attempted.
 
 ### Integration: `src/index.ts` - WebhookQueue
 

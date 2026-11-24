@@ -22,6 +22,10 @@ export interface IdempotencyStore {
 
 export interface InMemoryIdempotencyStoreOptions {
   ttlMs?: number;
+  /** Maximum number of completed records to retain (oldest-first eviction). Defaults to 10,000. */
+  maxRecords?: number;
+  /** Minimum interval in milliseconds between full expired-record sweeps. */
+  sweepIntervalMs?: number;
 }
 
 export interface PostgresIdempotencyStoreOptions {
@@ -29,19 +33,48 @@ export interface PostgresIdempotencyStoreOptions {
   ttlMs?: number;
 }
 
+/**
+ * In-memory idempotency store for development and testing only.
+ *
+ * Not suitable for production or multi-instance deployments because state is
+ * process-local and lost on restart; use {@link PostgresIdempotencyStore} in
+ * production. Memory is bounded by `maxRecords` (oldest-first eviction) and
+ * periodic/size-triggered sweeps of expired records.
+ */
 export class InMemoryIdempotencyStore implements IdempotencyStore {
+  static readonly DEFAULT_MAX_RECORDS = 10_000;
+  static readonly DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+
   private readonly records = new Map<
     string,
     { record: IdempotencyRecord; expiresAt?: number }
   >();
   private readonly inFlight = new Set<string>();
   private readonly ttlMs?: number;
+  private readonly maxRecords: number;
+  private readonly sweepIntervalMs: number;
+  private lastSweepAt = Date.now();
 
   constructor(options: InMemoryIdempotencyStoreOptions = {}) {
     this.ttlMs = options.ttlMs;
+    this.maxRecords =
+      options.maxRecords !== undefined
+        ? Math.max(0, Math.floor(options.maxRecords))
+        : InMemoryIdempotencyStore.DEFAULT_MAX_RECORDS;
+    this.sweepIntervalMs =
+      options.sweepIntervalMs !== undefined
+        ? Math.max(1, Math.floor(options.sweepIntervalMs))
+        : this.ttlMs && this.ttlMs > 0
+          ? Math.min(InMemoryIdempotencyStore.DEFAULT_SWEEP_INTERVAL_MS, this.ttlMs)
+          : InMemoryIdempotencyStore.DEFAULT_SWEEP_INTERVAL_MS;
+  }
+
+  get size(): number {
+    return this.records.size;
   }
 
   async checkAndReserve(key: string): Promise<IdempotencyCheckResult> {
+    this.maybeSweepExpired();
     this.pruneExpired(key);
 
     const cached = this.records.get(key);
@@ -59,12 +92,54 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
 
   async save(key: string, record: IdempotencyRecord): Promise<void> {
     this.inFlight.delete(key);
+    this.maybeSweepExpired();
+
+    if (this.maxRecords === 0) {
+      this.records.delete(key);
+      return;
+    }
+
     const expiresAt = this.ttlMs ? Date.now() + this.ttlMs : undefined;
+    // Delete first so re-saving an existing key refreshes its insertion order.
+    this.records.delete(key);
     this.records.set(key, { record, expiresAt });
+
+    if (this.records.size > this.maxRecords) {
+      this.sweepExpired();
+      while (this.records.size > this.maxRecords) {
+        const oldestKey = this.records.keys().next().value;
+        if (oldestKey === undefined) {
+          break;
+        }
+        this.records.delete(oldestKey);
+      }
+    }
   }
 
   async release(key: string): Promise<void> {
     this.inFlight.delete(key);
+  }
+
+  /**
+   * Sweep all expired records from memory and return the number removed.
+   */
+  sweepExpired(now: number = Date.now()): number {
+    let removed = 0;
+    for (const [key, entry] of this.records) {
+      if (entry.expiresAt !== undefined && now >= entry.expiresAt) {
+        this.records.delete(key);
+        removed++;
+      }
+    }
+    this.lastSweepAt = now;
+    return removed;
+  }
+
+  private maybeSweepExpired(): void {
+    const now = Date.now();
+    if (now - this.lastSweepAt >= this.sweepIntervalMs) {
+      this.sweepExpired(now);
+    }
   }
 
   private pruneExpired(key: string): void {

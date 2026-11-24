@@ -801,6 +801,113 @@ describe('InMemoryIdempotencyStore – pruneExpired (lazy eviction)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// InMemoryIdempotencyStore – sweepExpired & maxRecords bounded eviction
+// ---------------------------------------------------------------------------
+
+describe('InMemoryIdempotencyStore – periodic sweep & maxRecords eviction', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('sweeps all expired records periodically without accessing each key individually', async () => {
+    const store = new InMemoryIdempotencyStore({
+      ttlMs: 1000,
+      sweepIntervalMs: 1000,
+    });
+
+    await store.checkAndReserve('sweep-1');
+    await store.save('sweep-1', makeRecord());
+    await store.checkAndReserve('sweep-2');
+    await store.save('sweep-2', makeRecord());
+    await store.checkAndReserve('sweep-3');
+    await store.save('sweep-3', makeRecord());
+    expect(store.size).toBe(3);
+
+    jest.advanceTimersByTime(1500);
+
+    // Accessing an unrelated key triggers the periodic sweep
+    await store.checkAndReserve('sweep-trigger');
+    expect(store.size).toBe(0);
+  });
+
+  it('evicts oldest records first when maxRecords is exceeded', async () => {
+    const store = new InMemoryIdempotencyStore({ maxRecords: 2 });
+
+    await store.checkAndReserve('oldest');
+    await store.save('oldest', makeRecord({ body: '{"n":1}' }));
+    await store.checkAndReserve('middle');
+    await store.save('middle', makeRecord({ body: '{"n":2}' }));
+    await store.checkAndReserve('newest');
+    await store.save('newest', makeRecord({ body: '{"n":3}' }));
+
+    expect(store.size).toBe(2);
+    expect((await store.checkAndReserve('oldest')).state).toBe('new');
+    expect((await store.checkAndReserve('middle')).state).toBe('cached');
+    expect((await store.checkAndReserve('newest')).state).toBe('cached');
+  });
+
+  it('refreshes insertion order when an existing key is re-saved', async () => {
+    const store = new InMemoryIdempotencyStore({ maxRecords: 2 });
+
+    await store.save('k1', makeRecord({ body: '{"v":1}' }));
+    await store.save('k2', makeRecord({ body: '{"v":2}' }));
+    // Re-save k1 so k2 becomes the oldest
+    await store.save('k1', makeRecord({ body: '{"v":11}' }));
+    await store.save('k3', makeRecord({ body: '{"v":3}' }));
+
+    expect(store.size).toBe(2);
+    expect((await store.checkAndReserve('k2')).state).toBe('new');
+    const res1 = await store.checkAndReserve('k1');
+    expect(res1.state).toBe('cached');
+    if (res1.state === 'cached') {
+      expect(res1.record.body).toBe('{"v":11}');
+    }
+    expect((await store.checkAndReserve('k3')).state).toBe('cached');
+  });
+
+  it('sweeps expired records before evicting live records when maxRecords is reached', async () => {
+    const store = new InMemoryIdempotencyStore({
+      ttlMs: 1000,
+      maxRecords: 2,
+      sweepIntervalMs: 60_000, // periodic sweep has not fired yet
+    });
+
+    await store.save('expiring', makeRecord({ body: '{"k":1}' }));
+    jest.advanceTimersByTime(600);
+    await store.save('live', makeRecord({ body: '{"k":2}' }));
+    jest.advanceTimersByTime(500); // 'expiring' is 1100ms old (expired), 'live' is 500ms old
+
+    await store.save('fresh', makeRecord({ body: '{"k":3}' }));
+
+    expect(store.size).toBe(2);
+    expect((await store.checkAndReserve('live')).state).toBe('cached');
+    expect((await store.checkAndReserve('fresh')).state).toBe('cached');
+    expect((await store.checkAndReserve('expiring')).state).toBe('new');
+  });
+
+  it('preserves expiry semantics for active keys within maxRecords', async () => {
+    const store = new InMemoryIdempotencyStore({
+      ttlMs: 2000,
+      maxRecords: 5,
+      sweepIntervalMs: 500,
+    });
+
+    await store.save('active-key', makeRecord());
+    jest.advanceTimersByTime(1500);
+
+    // Periodic sweep runs on checkAndReserve, but active-key is not expired yet
+    expect((await store.checkAndReserve('active-key')).state).toBe('cached');
+
+    jest.advanceTimersByTime(500); // now at 2000ms boundary
+    expect((await store.checkAndReserve('active-key')).state).toBe('new');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Middleware integration – TTL expiry end-to-end
 // ---------------------------------------------------------------------------
 
