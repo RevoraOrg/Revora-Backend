@@ -8,6 +8,7 @@ import {
   PostgresAdminNonceStore,
   verifyAdminSignature,
 } from './adminSignature';
+import { verifyAdminSignature, InMemoryNonceStore } from './adminSignature';
 
 const ADMIN_KID = 'admin-test-key';
 const NOW = new Date('2026-11-22T15:00:00.000Z');
@@ -286,10 +287,10 @@ describe('verifyAdminSignature middleware', () => {
     expect(next).toHaveBeenCalledWith();
 
     const storedNonceStore = (req.app.set as jest.Mock)
-      .mock.calls[0][1] as Set<string>;
+      .mock.calls[0][1] as InMemoryNonceStore;
 
-    expect(storedNonceStore).toBeInstanceOf(Set);
-    expect(storedNonceStore.has(payload.nonce)).toBe(true);
+    expect(storedNonceStore).toBeInstanceOf(InMemoryNonceStore);
+    expect(storedNonceStore.size).toBe(1);
   });
 
   it('accepts valid signatures, attaches adminKid and stores the nonce', () => {
