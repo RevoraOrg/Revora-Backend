@@ -297,6 +297,19 @@ export const POSITIVE_DECIMAL_LIMITS = {
   MAX_DECIMAL_PLACES: 10,
 } as const;
 
+/**
+ * @notice Documented maximum magnitude for taxation quantities and prices.
+ * @dev Expressed as a plain decimal string so it is compared exactly via
+ *      digit counts, never via floating-point. Values above this bound are
+ *      rejected to prevent corruption of gain/loss and lot records.
+ */
+export const MAX_TAX_DECIMAL_STRING = '99999999999999999999.9999999999';
+
+/**
+ * Non-finite and exponent-form inputs (e.g. `1e999`, `Infinity`, `NaN`) are
+ * rejected by the plain-decimal grammar below before any numeric conversion.
+ */
+
 // Plain decimal strings only: no sign ("-5"), no exponent ("1e3", "1e-7"),
 // no hex ("0x10"), no surrounding or embedded whitespace (" 12 "), and no
 // thousands separators. Anchored with only bounded/simple quantifiers, so it

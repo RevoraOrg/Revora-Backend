@@ -25,6 +25,40 @@ import { WashSaleDetectorInput } from '../services/taxation/washSaleDetector';
 
 const VALID_STRATEGIES: DisposalStrategy[] = ['FIFO', 'LIFO', 'HIFO'];
 
+/**
+ * Maximum accepted magnitude for quantities and per-unit monetary values.
+ * Values above this bound are rejected to prevent precision loss and
+ * overflow in gain/loss and lot calculations.
+ */
+export const MAX_NUMERIC_INPUT = 1e12;
+
+/**
+ * Returns true when value is a finite number strictly greater than zero
+ * and no larger than MAX_NUMERIC_INPUT.
+ */
+export function isFinitePositive(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    value <= MAX_NUMERIC_INPUT
+  );
+}
+
+/**
+ * Returns true when value is a finite number greater than or equal to zero
+ * (negative zero is treated as zero) and no larger than MAX_NUMERIC_INPUT.
+ */
+export function isFiniteNonNegative(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    !Object.is(value, -0) &&
+    value >= 0 &&
+    value <= MAX_NUMERIC_INPUT
+  );
+}
+
 function isValidStrategy(value: unknown): value is DisposalStrategy {
   return typeof value === 'string' && (VALID_STRATEGIES as string[]).includes(value);
 }
@@ -43,7 +77,7 @@ export class TaxationHandler {
    *
    * @returns 201 with DisposalResult on success
    */
-  processDisposal = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  processDisposal: (req: AuthenticatedRequest, res: Response, next: NextFunction) => Promise<void> = async (req, res, next) => {
     try {
       const requestId = req.requestId;
       const userId = req.user?.id || req.user?.sub;
@@ -69,11 +103,19 @@ export class TaxationHandler {
       }
 
       // Validate types
-      if (typeof quantity !== 'number' || quantity <= 0) {
-        return next(Errors.validationError('quantity must be a positive number'));
+      if (!isFinitePositive(quantity)) {
+        return next(
+          Errors.validationError(
+            `quantity must be a positive finite number no greater than ${MAX_NUMERIC_INPUT}`
+          )
+        );
       }
-      if (typeof disposal_price_per_unit !== 'number' || disposal_price_per_unit < 0) {
-        return next(Errors.validationError('disposal_price_per_unit must be a non-negative number'));
+      if (!isFiniteNonNegative(disposal_price_per_unit)) {
+        return next(
+          Errors.validationError(
+            `disposal_price_per_unit must be a non-negative finite number no greater than ${MAX_NUMERIC_INPUT}`
+          )
+        );
       }
       if (!isValidStrategy(strategy)) {
         return next(
@@ -129,7 +171,7 @@ export class TaxationHandler {
    *
    * @returns 200 with DisposalResult preview
    */
-  previewDisposal = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  previewDisposal: (req: AuthenticatedRequest, res: Response, next: NextFunction) => Promise<void> = async (req, res, next) => {
     try {
       const requestId = req.requestId;
       const userId = req.user?.id || req.user?.sub;
@@ -153,11 +195,19 @@ export class TaxationHandler {
         return next(Errors.validationError('Missing required field: strategy'));
       }
 
-      if (typeof quantity !== 'number' || quantity <= 0) {
-        return next(Errors.validationError('quantity must be a positive number'));
+      if (!isFinitePositive(quantity)) {
+        return next(
+          Errors.validationError(
+            `quantity must be a positive finite number no greater than ${MAX_NUMERIC_INPUT}`
+          )
+        );
       }
-      if (typeof disposal_price_per_unit !== 'number' || disposal_price_per_unit < 0) {
-        return next(Errors.validationError('disposal_price_per_unit must be a non-negative number'));
+      if (!isFiniteNonNegative(disposal_price_per_unit)) {
+        return next(
+          Errors.validationError(
+            `disposal_price_per_unit must be a non-negative finite number no greater than ${MAX_NUMERIC_INPUT}`
+          )
+        );
       }
       if (!isValidStrategy(strategy)) {
         return next(
