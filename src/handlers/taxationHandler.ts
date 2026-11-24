@@ -361,7 +361,10 @@ export class TaxationHandler {
   /**
    * Handle POST /taxation/lots
    *
-   * Creates a new investment lot.
+   * Creates a new investment lot. `acquired_at` is optional and defaults to now.
+   * When provided it must be a parseable date that is not in the future.
+   *
+   * @returns 201 with the created InvestmentLot
    */
   createLot = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
@@ -372,49 +375,38 @@ export class TaxationHandler {
         return next(Errors.unauthorized('User not authenticated'));
       }
 
-      const {
-        offering_id,
-        investment_id,
-        asset,
-        quantity,
-        cost_basis_per_unit,
-        acquired_at,
-        cost_currency,
-        jurisdiction,
-      } = req.body;
+      const { acquired_at: rawAcquiredAt } = req.body;
 
-      if (!offering_id || !investment_id || !asset) {
-        return next(Errors.validationError('Missing required fields: offering_id, investment_id, asset'));
+      let acquiredAt: Date;
+      if (rawAcquiredAt === undefined || rawAcquiredAt === null) {
+        acquiredAt = new Date();
+      } else {
+        if (typeof rawAcquiredAt !== 'string' && typeof rawAcquiredAt !== 'number') {
+          return next(Errors.validationError('acquired_at must be a valid date'));
+        }
+        acquiredAt = new Date(rawAcquiredAt);
+        if (Number.isNaN(acquiredAt.getTime())) {
+          return next(Errors.validationError('acquired_at must be a valid date'));
+        }
+        if (acquiredAt.getTime() > Date.now()) {
+          return next(Errors.validationError('acquired_at cannot be in the future'));
+        }
       }
 
-      if (typeof quantity !== 'number' || quantity <= 0) {
-        return next(Errors.validationError('quantity must be a positive number'));
-      }
-
-      if (typeof cost_basis_per_unit !== 'number' || cost_basis_per_unit < 0) {
-        return next(Errors.validationError('cost_basis_per_unit must be a non-negative number'));
-      }
+      this.logger.info('Creating investment lot', {
+        requestId,
+        userId,
+        acquired_at: acquiredAt.toISOString(),
+      });
 
       const lot = await this.taxationService.createLot({
         investor_id: userId,
-        offering_id,
-        investment_id,
-        asset,
-        quantity,
-        cost_basis_per_unit,
-        acquired_at: acquired_at ? new Date(acquired_at) : new Date(),
-        cost_currency,
-        jurisdiction,
-      });
-
-      this.logger.info('Investment lot created', {
-        requestId,
-        userId,
-        lotId: lot.id,
+        ...req.body,
+        acquired_at: acquiredAt,
       });
 
       res.status(201).json({
-        message: 'Investment lot created successfully',
+        message: 'Lot created successfully',
         data: lot,
       });
     } catch (error) {
