@@ -172,7 +172,17 @@ export class KycRouter {
       .update(payload)
       .digest('hex');
 
-    if (table.signature !== expectedSignature) {
+    // Constant-time comparison to prevent timing attacks that could leak
+    // prefix matches of the HMAC signature, matching the rest of the codebase
+    // (see src/lib/webhookSignature.ts). A plain `!==` comparison short-circuits
+    // on the first mismatched character, leaking how many leading bytes an
+    // attacker-controlled signature shares with the expected value.
+    if (table.signature.length !== expectedSignature.length) {
+      throw new Error('Invalid route table signature. Fails closed.');
+    }
+    const signatureBuffer = Buffer.from(table.signature, 'utf8');
+    const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+    if (!crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
       throw new Error('Invalid route table signature. Fails closed.');
     }
 
