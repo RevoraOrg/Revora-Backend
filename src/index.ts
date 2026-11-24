@@ -102,6 +102,8 @@ import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
 import { createRequireAuth } from './middleware/auth';
+import { FxProviderBudgetRegistry } from './services/fxProviderBudgetRegistry';
+import { createFxProviderSpendStore } from './services/pgSpendStore';
 // \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 import { createLoginRouter } from './auth/login/loginRoute';
 import { createRefreshRouter } from './auth/refresh/refreshRoute';
@@ -131,6 +133,54 @@ export { parseMoneyString } from "./routes/offeringValidation";
 
 const port = env.PORT;
 const API_VERSION_PREFIX = env.API_VERSION_PREFIX;
+
+/**
+ * Shared FX budget registry; PostgreSQL is the production default so spend
+ * totals survive restarts and are consistent across application replicas.
+ */
+export const fxProviderBudgetRegistry = new FxProviderBudgetRegistry(
+  createFxProviderSpendStore(env.FX_PROVIDER_SPEND_STORE, pool),
+);
+
+const OFFERING_ROLES = ["startup", "admin", "compliance", "investor"] as const;
+const OFFERING_ACTIONS = [
+  "create",
+  "update",
+  "publish",
+  "pause",
+  "close",
+  "cancel",
+  "viewPrivate",
+  "invest",
+] as const;
+const OFFERING_STATUSES = [
+  "draft",
+  "open",
+  "paused",
+  "closed",
+  "cancelled",
+  "completed",
+] as const;
+const OFFERING_SECURITY_ASSUMPTIONS = [
+  "Caller identity is asserted by trusted upstream auth middleware before these rules are used for authorization.",
+  "Money amounts are decimal strings to avoid binary rounding; invalid or unbounded numeric input is rejected.",
+  "Startup actors may only manage offerings they issued unless a privileged admin or compliance actor performs the action.",
+  "Validation output is safe for clients and never includes raw database, token, or upstream provider error messages.",
+] as const;
+
+type OfferingActorRole = (typeof OFFERING_ROLES)[number];
+type OfferingValidationAction = (typeof OFFERING_ACTIONS)[number];
+type OfferingStatus = (typeof OFFERING_STATUSES)[number];
+type DecisionSeverity = "error" | "warning";
+
+interface AuthenticatedUser {
+  id: string;
+  role: OfferingActorRole;
+}
+
+interface AuthenticatedRequest extends Request {
+  user?: AuthenticatedUser;
+}
 
 interface AppDependencies {
   healthQuery?: typeof dbQuery;

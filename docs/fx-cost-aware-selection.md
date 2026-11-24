@@ -30,7 +30,7 @@ CostAwareRateSelector          ← selects the best affordable provider
       │
       └── FxProviderBudgetRegistry
                 │
-                └── SpendStore  (InMemorySpendStore or Postgres-backed)
+                └── SpendStore  (PgSpendStore in production; memory for local/test)
 ```
 
 ### Key files
@@ -38,6 +38,7 @@ CostAwareRateSelector          ← selects the best affordable provider
 | File | Purpose |
 |---|---|
 | `src/services/fxProviderBudgetRegistry.ts` | Per-tenant monthly spend tracking and budget cap enforcement |
+| `src/services/pgSpendStore.ts` | Atomic, durable PostgreSQL spend storage and startup store selection |
 | `src/services/fxCostAwareSelector.ts` | Provider selection logic with degradation and metric emission |
 | `src/services/fxCostAwareSelection.test.ts` | Comprehensive test suite (≥95% coverage) |
 
@@ -76,9 +77,11 @@ CostAwareRateSelector          ← selects the best affordable provider
 ### 1. Configure provider budgets per tenant
 
 ```typescript
-import { FxProviderBudgetRegistry, InMemorySpendStore } from './services/fxProviderBudgetRegistry';
+import { FxProviderBudgetRegistry } from './services/fxProviderBudgetRegistry';
+import { createFxProviderSpendStore } from './services/pgSpendStore';
 
-const store = new InMemorySpendStore(); // replace with Postgres in production
+// FX_PROVIDER_SPEND_STORE selects the backend at application startup.
+const store = createFxProviderSpendStore(env.FX_PROVIDER_SPEND_STORE, pool);
 const registry = new FxProviderBudgetRegistry(store);
 
 // Set a $500/month cap for the bloomberg provider for tenant "acme"
@@ -158,38 +161,28 @@ non-durable and not safe for multi-replica deployments.
 
 ### Production
 
-Implement the `SpendStore` interface against a durable backend:
+`PgSpendStore` uses the shared primary PostgreSQL pool and persists spend rows
+between restarts. At startup, `FX_PROVIDER_SPEND_STORE` selects `postgres` or
+`memory`; it defaults to `postgres`, and configuration validation rejects
+`memory` in production. Set it to `memory` only for local development or tests.
+Apply the migrations before serving FX requests.
 
-```typescript
-export interface SpendStore {
-  increment(tenantId: string, providerId: string, monthKey: string, amountUsd: number): Promise<void>;
-  get(tenantId: string, providerId: string, monthKey: string): Promise<number>;
-  listByTenant(tenantId: string, monthKey: string): Promise<SpendRecord[]>;
-}
-```
+The migration creates `fx_provider_spend` with a unique
+`(tenant_id, provider_id, month_key)` key. Each positive increment is one
+parameterized `INSERT ... ON CONFLICT DO UPDATE`, so PostgreSQL serializes
+concurrent increments on the same budget row without lost updates. Zero-cost
+calls do not create rows. PostgreSQL `NUMERIC` values are converted to numbers
+when read to satisfy the existing `SpendStore` interface.
 
-**Recommended Postgres implementation:**
+Database query errors propagate from the store; the existing registry's
+provider-selection policy fails open on storage failures so conversions are not
+blocked. A database outage can therefore allow paid-provider spend that is not
+recorded; alert on database/store errors if strict spend enforcement is needed.
 
-```sql
--- schema
-CREATE TABLE fx_provider_spend (
-  tenant_id    TEXT        NOT NULL,
-  provider_id  TEXT        NOT NULL,
-  month_key    CHAR(7)     NOT NULL,  -- 'YYYY-MM'
-  spend_usd    NUMERIC(12,6) NOT NULL DEFAULT 0,
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, provider_id, month_key)
-);
-
--- atomic increment
-INSERT INTO fx_provider_spend (tenant_id, provider_id, month_key, spend_usd)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (tenant_id, provider_id, month_key)
-DO UPDATE SET spend_usd = fx_provider_spend.spend_usd + EXCLUDED.spend_usd,
-              updated_at = now();
-```
-
-Use `SELECT FOR UPDATE` or advisory locks if strict serialisation is required.
+`tenantId` is trusted input from the authenticated caller; this store does not
+perform tenant authorization. The database connection must be restricted to
+trusted service code, queries are parameterized, and the schema constrains
+month keys to valid `YYYY-MM` values.
 
 ---
 
@@ -208,13 +201,16 @@ Use `SELECT FOR UPDATE` or advisory locks if strict serialisation is required.
 4. **Metric labels carry no PII.** Only `provider_id` (not `tenant_id`) is
    used as a metric label to keep cardinality low and prevent PII exposure.
 
-5. **Negative spend increments are rejected.** `InMemorySpendStore.increment`
-   and `FxProviderBudgetRegistry.recordSpend` both throw `RangeError` on
-   negative values to prevent underflow manipulation.
+5. **Invalid spend increments are rejected.** In-memory and PostgreSQL stores
+   reject negative or non-finite amounts with `RangeError`; the registry also
+   rejects negative amounts to prevent underflow manipulation.
 
-6. **Budget caps are hard limits, not soft advice.** When `isExhausted` is
-   `true`, the selector never sends traffic to that provider regardless of
-   operator intent.
+6. **Budget caps are selection guidance during storage outages.** With a
+   persisted balance, the selector avoids a provider at its cap; established
+   fail-open behavior can exceed the cap while storage is unavailable.
+
+7. **PostgreSQL is mandatory in production.** Startup validation rejects the
+   non-durable memory backend in production.
 
 ---
 
@@ -226,6 +222,8 @@ Use `SELECT FOR UPDATE` or advisory locks if strict serialisation is required.
 | Spend store unreachable | Fail-open: all providers treated as available |
 | Provider API error / timeout | `rate` is `null`; cost still recorded; caller handles null |
 | Negative spend attempt | `RangeError` thrown immediately |
+| Concurrent increments for one tenant/provider/month | Atomic row upsert; no updates are lost |
+| Database unavailable during a read | Error reaches the registry, whose provider policy fails open |
 | No budget config for provider | Treated as "always available" (open budget) |
 | Degradation threshold > cap | `RangeError` at `configureProvider` time |
 | Missing free provider at startup | `Error` thrown in `CostAwareRateSelector` constructor |
@@ -238,6 +236,9 @@ Use `SELECT FOR UPDATE` or advisory locks if strict serialisation is required.
 ```bash
 # Run only cost-aware selection tests
 npx jest src/services/fxCostAwareSelection.test.ts --coverage
+
+# Run PostgreSQL spend-store unit and gated integration tests
+npx jest src/services/pgSpendStore.test.ts src/services/pgSpendStore.integration.test.ts --coverage=false
 
 # Run the full FX service suite
 npx jest src/services/fxConversionEngine.test.ts src/services/fxCostAwareSelection.test.ts --coverage
@@ -252,4 +253,5 @@ Test coverage target: **≥ 95%** on `fxProviderBudgetRegistry.ts` and
 
 | Date | Change |
 |---|---|
+| 2026-11-23 | Added durable PostgreSQL spend storage and atomic concurrent increments |
 | 2026-07-28 | Initial implementation of cost-aware FX provider selection |
