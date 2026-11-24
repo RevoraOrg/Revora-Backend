@@ -101,7 +101,7 @@ import taxationRouter from './routes/taxation';
 import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository';
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
-import { createRequireAuth, requireCompliance } from './middleware/auth';
+import { createRequireAuth } from './middleware/auth';
 import { FxProviderBudgetRegistry } from './services/fxProviderBudgetRegistry';
 import { createFxProviderSpendStore } from './services/pgSpendStore';
 // \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500

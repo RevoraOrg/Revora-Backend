@@ -1,8 +1,8 @@
 import { Pool, PoolClient } from 'pg';
 import { randomBytes, createHash } from 'node:crypto';
 import { PasswordResetRateLimiter, RateLimitResult } from './passwordResetRateLimiter';
-import { logger } from '../lib/logger';
-import { validatePasswordStrength } from '../lib/passwordStrength';
+import { logger } from '../utils/logger';
+import { validatePasswordStrength } from '../auth/register/validatePasswordStrength';
 
 export type EmailSender = (to: string, subject: string, body: string) => Promise<void>;
 
