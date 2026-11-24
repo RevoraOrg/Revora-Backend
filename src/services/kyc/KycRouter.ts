@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { ProviderNotRegisteredError, UnsupportedJurisdictionError } from '../../lib/errors';
 import { KycProvider } from './KycProvider';
 
 export interface RouteTableEntry {
@@ -250,12 +251,12 @@ export class KycRouter {
   route(jurisdiction: string): KycProvider {
     const providerName = this.routeMap.get(jurisdiction);
     if (!providerName) {
-      throw new Error(`Jurisdiction ${jurisdiction} not supported. Fails closed.`);
+      throw new UnsupportedJurisdictionError(jurisdiction);
     }
 
     const provider = this.providers.get(providerName);
     if (!provider) {
-      throw new Error(`Configured provider ${providerName} not registered.`);
+      throw new ProviderNotRegisteredError(providerName);
     }
 
     return provider;

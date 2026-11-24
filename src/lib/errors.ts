@@ -89,6 +89,69 @@ export class UnauthorizedError extends AppError {
   }
 }
 
+/**
+ * @notice A KYC applicant's jurisdiction has no configured route.
+ * @dev `message` retains the legacy operator-facing detail (including the
+ *      supplied jurisdiction) so existing diagnostics and tests stay useful.
+ *      `publicMessage` is the only text safe to return to an untrusted client;
+ *      it never reflects arbitrary request input.
+ */
+export class UnsupportedJurisdictionError extends AppError {
+  public readonly jurisdiction: string;
+  public readonly publicMessage: string = 'Jurisdiction not supported';
+
+  constructor(jurisdiction: string) {
+    super(
+      ErrorCode.FORBIDDEN,
+      403,
+      `Jurisdiction ${jurisdiction} not supported. Fails closed.`,
+      { jurisdiction },
+    );
+    this.name = 'UnsupportedJurisdictionError';
+    this.jurisdiction = jurisdiction;
+  }
+
+  public override toResponse(requestId?: string): ErrorResponse {
+    return {
+      code: this.code,
+      message: this.publicMessage,
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+}
+
+/**
+ * @notice The signed route table names a KYC provider that is not registered.
+ * @dev This is a server-side misconfiguration, not a client authorization
+ *      failure. The provider name remains in the internal error message and
+ *      `details` for operators, while `publicMessage` and `expose = false`
+ *      prevent it from leaking to investors.
+ */
+export class ProviderNotRegisteredError extends AppError {
+  public readonly providerName: string;
+  public readonly publicMessage: string = 'Internal server error';
+
+  constructor(providerName: string) {
+    super(
+      ErrorCode.INTERNAL_ERROR,
+      500,
+      `Configured provider ${providerName} not registered.`,
+      { providerName },
+      { expose: false },
+    );
+    this.name = 'ProviderNotRegisteredError';
+    this.providerName = providerName;
+  }
+
+  public override toResponse(requestId?: string): ErrorResponse {
+    return {
+      code: this.code,
+      message: this.publicMessage,
+      ...(requestId ? { requestId } : {}),
+    };
+  }
+}
+
 /** Convenience factories for common error scenarios. */
 export const Errors = {
   validationError: (message: string, details?: unknown): AppError =>
