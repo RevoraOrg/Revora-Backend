@@ -109,6 +109,30 @@ describe('KycRouter', () => {
     },
   );
 
+  it.each([
+    ['non-hex characters', (signature: string) => `z${signature.slice(1)}`],
+    ['a short (wrong-length) signature', (signature: string) => signature.slice(0, 32)],
+    ['a long (wrong-length) signature', (signature: string) => `${signature}00`],
+    ['an empty signature', () => ''],
+  ] satisfies Array<[string, (signature: string) => string]>)(
+    'fails closed with the same error for %s',
+    (_description, corrupt) => {
+      const table = signedTable('v1', [
+        { jurisdiction: 'US', providerName: provider.name },
+      ]);
+      table.signature = corrupt(table.signature);
+
+      // A malformed signature must fail closed with the documented error, not
+      // leak a RangeError from timingSafeEqual's length check.
+      expect(() => router.loadRouteTable(table)).toThrow(
+        'Invalid route table signature. Fails closed.',
+      );
+      expect(router.getVersion()).toBe('');
+      expect(() => router.route('US')).toThrow('Jurisdiction US not supported. Fails closed.');
+    },
+  );
+
+
   it('keeps an initially invalid table from installing any routes or version', () => {
     const table = signedTable('v1', [
       { jurisdiction: 'US', providerName: provider.name },

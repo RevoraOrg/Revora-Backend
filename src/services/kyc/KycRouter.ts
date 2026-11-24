@@ -130,6 +130,44 @@ export function compareVersions(v1: string, v2: string): number {
   return 0;
 }
 
+/**
+ * HMAC-SHA256 digests are exactly 32 bytes, encoded as 64 lowercase hex
+ * characters. Rejecting anything else before decoding keeps malformed input
+ * out of `Buffer.from(..., 'hex')`, which silently truncates at the first
+ * invalid character instead of throwing.
+ */
+const ROUTE_TABLE_SIGNATURE_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * Constant-time comparison of a supplied route-table signature against the
+ * expected HMAC.
+ *
+ * A plain `!==` short-circuits on the first mismatched character, leaking
+ * prefix matches through timing. `crypto.timingSafeEqual` requires
+ * equal-length buffers (it throws `RangeError` otherwise), so length is
+ * checked first and any malformed input fails closed with `false`.
+ */
+function isValidRouteTableSignature(
+  suppliedSignature: unknown,
+  expectedSignature: string,
+): boolean {
+  if (
+    typeof suppliedSignature !== 'string' ||
+    !ROUTE_TABLE_SIGNATURE_PATTERN.test(suppliedSignature)
+  ) {
+    return false;
+  }
+
+  const suppliedBuffer = Buffer.from(suppliedSignature, 'hex');
+  const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+
+  if (suppliedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(suppliedBuffer, expectedBuffer);
+}
+
 export class KycRouter {
   private providers: Map<string, KycProvider> = new Map();
   private routeMap: Map<string, string> = new Map();
@@ -172,7 +210,11 @@ export class KycRouter {
       .update(payload)
       .digest('hex');
 
-    if (table.signature !== expectedSignature) {
+    // Constant-time comparison to prevent timing attacks that could leak
+    // prefix matches of the HMAC signature, matching the rest of the codebase
+    // (see src/lib/webhookSignature.ts). Malformed hex and wrong-length input
+    // fail closed with the same error rather than throwing a RangeError.
+    if (!isValidRouteTableSignature(table.signature, expectedSignature)) {
       throw new Error('Invalid route table signature. Fails closed.');
     }
 
