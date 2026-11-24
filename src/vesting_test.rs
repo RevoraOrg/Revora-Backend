@@ -22,8 +22,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let total_amount = 1000i128;
@@ -53,14 +53,40 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Contract already initialized")]
+    fn test_initialize_cannot_be_called_twice() {
+        let env = Env::default();
+        let contract_id = Address::random(&env);
+        env.register_contract(&contract_id, VestingContract);
+        env.mock_all_auths();
+
+        let first_admin = Address::random(&env);
+        VestingContract::initialize(env.clone(), first_admin);
+
+        let second_admin = Address::random(&env);
+        VestingContract::initialize(env, second_admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_initialize_requires_admin_authorization() {
+        let env = Env::default();
+        let contract_id = Address::random(&env);
+        env.register_contract(&contract_id, VestingContract);
+
+        let admin = Address::random(&env);
+        VestingContract::initialize(env, admin);
+    }
+
+    #[test]
     fn test_partial_claim_tracks_cursor_and_ledger() {
         let env = Env::default();
         let contract_id = Address::random(&env);
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         create_basic_vesting(&env, &beneficiary);
@@ -114,8 +140,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let total_amount = 1000i128;
@@ -145,8 +171,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let total_amount = 1000i128;
@@ -176,8 +202,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         create_basic_vesting(&env, &beneficiary);
@@ -209,8 +235,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let schedule = VestingSchedule {
@@ -246,8 +272,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let schedule = VestingSchedule {
@@ -273,8 +299,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         let schedule = VestingSchedule {
@@ -300,6 +326,7 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
+        env.mock_all_auths();
         VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
@@ -314,8 +341,8 @@ mod tests {
         env.register_contract(&contract_id, VestingContract);
 
         let admin = Address::random(&env);
-        VestingContract::initialize(env.clone(), admin);
         env.mock_all_auths();
+        VestingContract::initialize(env.clone(), admin);
 
         let beneficiary = Address::random(&env);
         create_basic_vesting(&env, &beneficiary);

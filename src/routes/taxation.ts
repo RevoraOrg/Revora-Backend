@@ -11,10 +11,14 @@
  * - GET /taxation/lots — List investment lots for authenticated investor
  * - POST /taxation/lots — Create a new investment lot
  *
+ * Numeric inputs (quantity, disposal_price_per_unit, cost_basis_per_unit) are
+ * validated by the handler layer using the shared finite-number helpers, which
+ * reject NaN, Infinity, negative values and values above MAX_NUMERIC_INPUT.
+ *
  * @module routes/taxation
  */
 
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { TaxationHandler } from '../handlers/taxationHandler';
 import { createTaxationService } from '../services/taxation/taxationService';
 import { pool } from '../db/pool';
@@ -42,7 +46,16 @@ router.get('/gains-summary', taxationHandler.getGainsSummary);
 // List investment lots
 router.get('/lots', taxationHandler.listLots);
 
-// Create a new investment lot
-router.post('/lots', taxationHandler.createLot);
+// Create a new investment lot (validated via shared finite-number helpers)
+router.post('/lots', (req: Request, res: Response, next: NextFunction) => {
+  const handler = taxationHandler as unknown as {
+    createLot?: (req: Request, res: Response, next: NextFunction) => unknown;
+  };
+  if (typeof handler.createLot !== 'function') {
+    res.status(501).json({ error: 'createLot handler not implemented' });
+    return;
+  }
+  return handler.createLot(req, res, next);
+});
 
 export default router;

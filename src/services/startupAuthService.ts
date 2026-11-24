@@ -8,7 +8,7 @@
  *    are rejected immediately and never reach the repository.
  *  - Passwords are validated for strength (min-length, character classes) before
  *    hashing; raw password strings are never logged.
- *  - Password hashing is performed by lib/hash (scrypt); the plain-text password
+ *  - Password hashing is performed by utils/password (async scrypt); the plain-text password
  *    is not retained in memory after hashing.
  *  - Duplicate email detection uses two layers: application-level `findByEmail`
  *    check AND DB-level UniqueConstraintError mapping, so concurrent race
@@ -28,7 +28,7 @@
  */
 
 import { UserRepository, CreateUserInput, User } from '../db/repositories/userRepository';
-import { hashPassword } from '../lib/hash';
+import { hashPassword } from '../utils/password';
 import { UniqueConstraintError } from '../lib/errors';
 import { validatePasswordStrength } from '../lib/passwordStrength';
 import { globalLogger } from '../lib/logger';
@@ -147,7 +147,7 @@ export class StartupAuthService {
             }
 
             // ── 5. Hash password ─────────────────────────────────────────────
-            const passwordHash = hashPassword(input.password);
+            const passwordHash = await hashPassword(input.password);
 
             // ── 6. Persist user ──────────────────────────────────────────────
             const createInput: CreateUserInput = {

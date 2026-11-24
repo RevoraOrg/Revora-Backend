@@ -149,3 +149,16 @@ To verify the fix:
 - The VestingService constructor now requires a Pool parameter in production
 - The mock implementation has been removed - all operations now require database
 - Error messages changed from "Schedule not found" to "Schedule not found or access denied" to be more explicit about ownership failures
+
+## Soroban Contract Initializer Hardening (#1408)
+
+`VestingContract::initialize` now checks that `StorageKey::Admin` is unset before
+writing it and requires the proposed admin address to authorize the call. A
+second initialization attempt panics with `Contract already initialized`, so an
+arbitrary caller cannot replace the administrator and take control of
+`create_vesting`. As with any Soroban authorization check, the initial admin
+must authorize the invocation. No pre-existing admin is needed for initial
+setup, but an address cannot be installed as admin without its authorization.
+
+Contract tests cover both rejection paths: attempting initialization a second
+time and calling the initializer without authorization.

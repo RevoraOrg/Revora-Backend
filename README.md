@@ -76,6 +76,14 @@ Jest (`npm test` runs with coverage; `npm run test:coverage` runs in-band). Inte
 
 `.github/workflows/ci.yml` (push/PR to `master`) runs `npm ci` then `npx tsc --noCheck`, a minimal compile gate rather than the full suite. The `Dockerfile` is a multi-stage Node image (currently `node:18-alpine`). Operational docs: [docs/runbooks/](docs/runbooks/), [README-MIGRATIONS.md](README-MIGRATIONS.md), [docs/postmortems/](docs/postmortems/). Nothing here asserts a live deployment.
 
+To run database migrations inside the built container (requires `DATABASE_URL`):
+
+```bash
+docker run --rm -e DATABASE_URL="postgres://..." revora-backend npm run migrate
+# or directly:
+docker run --rm -e DATABASE_URL="postgres://..." revora-backend node dist/db/migrate.js
+```
+
 ## Documentation
 
 See [docs/index.md](docs/index.md) for a categorized index of the ~150 design docs.

@@ -42,6 +42,55 @@ The Milestone Validation Auth Matrix is a production-grade security system that 
 5. **Time**: System clocks are synchronized for audit trail accuracy
 6. **Storage**: Audit logs are append-only and tamper-evident
 
+### Privileged Offering Signature Protocol
+
+Admin offering mutations protected by `verifyAdminSignature` use Ed25519 signatures
+and an `ADMIN_PUBKEYS` JSON map keyed by the `x-admin-kid` header. The request
+timestamp must be within 30 seconds of server time and each nonce may be used only
+once per application process.
+
+The `x-admin-signature-version` header selects the canonical payload. Keys are
+serialized in lexicographic order, with no whitespace:
+
+- Version 1 (legacy; also selected when the version header is absent):
+  `{"action":"approve","nonce":"nonce-123","offeringId":"offering-456","timestamp":1795431600}`
+- Version 2:
+  `{"action":"approve","method":"POST","nonce":"nonce-123","offeringId":"offering-456","path":"/api/startup/offerings/offering-456/approve","timestamp":1795431600}`
+
+For version 2, `method` must exactly equal `req.method`; `path` must exactly equal
+the pathname portion of `req.originalUrl` (the query string is not signed). The
+route prefix and concrete offering identifier are part of the path. Method and
+path are included in the signed JSON, not supplied in headers.
+
+Example Node.js signer for version 2:
+
+```typescript
+import crypto from 'node:crypto';
+
+const payload = {
+  action: 'approve',
+  offeringId: 'offering-456',
+  nonce: 'nonce-123',
+  timestamp: Math.floor(Date.now() / 1000),
+  method: 'POST',
+  path: '/api/startup/offerings/offering-456/approve',
+};
+const canonical = JSON.stringify(payload, Object.keys(payload).sort());
+const signature = crypto.sign(null, Buffer.from(canonical, 'utf8'), privateKey)
+  .toString('base64');
+
+// Send signature in x-admin-signature, along with x-admin-kid and
+// x-admin-signature-version: 2; send the payload as the request JSON body.
+```
+
+Version 1 remains enabled by default to avoid breaking existing clients. Set
+`ADMIN_SIGNATURE_V1_ENABLED=false` to reject it; the environment flag accepts
+`true`, `false`, `1`, `0`, `yes`, `no`, `on`, or `off` (case-insensitive).
+Successful version 1 requests emit a deprecation warning. Version 2 is recommended
+because a captured signature cannot be replayed against a different method or path.
+The nonce cache is process-local, so deployments with multiple workers or replicas
+must use a shared replay store for cluster-wide replay protection.
+
 ## Threat Model
 
 ### Attacker Profiles

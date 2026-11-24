@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { Errors } from '../lib/errors';
 import { globalLogger } from '../lib/logger';
-import { verifyAdminSignature } from '../middleware/adminSignature';
+import { verifyAdminSignature, AdminNonceStore } from '../middleware/adminSignature';
 
 export interface Offering {
   id: string;
@@ -253,15 +253,23 @@ export function createPublicHandlers(offeringRepo: OfferingRepo) {
 export default function createOfferingsRouter(opts: {
   offeringRepo: OfferingRepo;
   verifyJWT: express.RequestHandler;
+  /**
+   * Optional shared nonce store for admin signature replay protection. When
+   * omitted, the middleware falls back to a process-local in-memory cache
+   * (single-instance / development only). Pass a PostgresAdminNonceStore in
+   * multi-instance deployments.
+   */
+  adminNonceStore?: AdminNonceStore;
 }) {
   const router = express.Router();
   const handlers = createOfferingHandlers(opts.offeringRepo);
   const publicHandlers = createPublicHandlers(opts.offeringRepo);
+  const adminSignature = verifyAdminSignature({ store: opts.adminNonceStore });
 
   router.get('/api/startup/offerings', opts.verifyJWT, handlers.listOfferings);
-  router.post('/api/startup/offerings/:id/approve', opts.verifyJWT, verifyAdminSignature(), handlers.approveOffering);
-  router.post('/api/startup/offerings/:id/reject', opts.verifyJWT, verifyAdminSignature(), handlers.rejectOffering);
-  router.post('/api/startup/offerings/:id/archive', opts.verifyJWT, verifyAdminSignature(), handlers.archiveOffering);
+  router.post('/api/startup/offerings/:id/approve', opts.verifyJWT, adminSignature, handlers.approveOffering);
+  router.post('/api/startup/offerings/:id/reject', opts.verifyJWT, adminSignature, handlers.rejectOffering);
+  router.post('/api/startup/offerings/:id/archive', opts.verifyJWT, adminSignature, handlers.archiveOffering);
   router.get('/api/offerings', publicHandlers.listCatalog);
   router.get('/api/offerings/:id', publicHandlers.getOfferingById);
 

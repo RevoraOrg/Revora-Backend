@@ -22,6 +22,58 @@ Verification walks rows in `(created_at ASC, id ASC)` order and detects:
 3. **Genesis anchor** — `SHA-256('REVORA_AUDIT_LOG_GENESIS_v1')` is shared between SQL and TypeScript.
 4. **Periodic verification** — nightly scheduler and CI workflow detect tampering even if triggers were bypassed at the DB admin layer.
 5. **No secrets in hashes** — only row fields already stored in `audit_logs` are hashed.
+6. **External publication** — when `WITNESS_REKOR_URL` is set, the verified chain head is published to a Rekor transparency log so the root has a public, append-only timestamp. When it is unset, the in-process mock witness is used (development/test only).
+
+## External witness publication (Rekor)
+
+`RekorWitnessClient` implements the `WitnessClient` interface used by `AuditWitnessPublisher`. The scheduler selects it automatically when `WITNESS_REKOR_URL` is configured:
+
+```bash
+WITNESS_REKOR_URL=https://rekor.sigstore.dev
+```
+
+### Submission format
+
+The client posts a Rekor v1 `rekord` proposed entry to `/api/v1/log/entries`:
+
+```json
+{
+  "apiVersion": "0.0.1",
+  "kind": "rekord",
+  "spec": {
+    "data": { "content": "<base64 of the UTF-8 SHA-256 root hash>" },
+    "signature": {
+      "format": "x509",
+      "content": "<base64 signature>",
+      "publicKey": { "content": "<base64 SPKI DER public key>" }
+    }
+  }
+}
+```
+
+A fresh P-256 keypair is generated for each submission. The signature exists only to satisfy Rekor's signed-entry schema; the ephemeral public key is not a Revora identity or a long-lived signing credential. The tamper-evidence property comes from the public log recording that exact root hash at a specific time.
+
+### Receipt mapping
+
+A successful Rekor response is a UUID-keyed object. The client maps it to `WitnessReceipt`:
+
+| Receipt field | Source |
+|---------------|--------|
+| `rootHash` | Root hash passed to `publish()` |
+| `witnessType` | Constant `rekor` |
+| `publishedAt` | Rekor `integratedTime` (Unix seconds) |
+| `receiptData.uuid` | Response object key or `ETag` header |
+| `receiptData.logIndex` | Rekor `logIndex` |
+| `receiptData.integratedTime` | Rekor `integratedTime` |
+| `receiptData.logId` | Rekor `logID` (when present) |
+
+### Security and failure handling
+
+- Only HTTPS endpoints without embedded credentials are accepted. Production requests use `safeFetch`, which validates DNS/addresses, pins connections, and re-validates redirects.
+- Root hashes must be 64-character SHA-256 hex strings; arbitrary strings are rejected before any request is made.
+- Each attempt has an abort timeout (default 10s). HTTP 5xx, 429, timeouts, and network errors are retried with exponential backoff (default 3 retries, 250ms base). HTTP 4xx and malformed 2xx responses fail immediately.
+- Exhausted failures throw `RekorWitnessError`; `AuditWitnessPublisher` logs an `audit_witness_publish_failure` alarm and applies its own retry policy without failing local integrity checks.
+- Tests inject a stubbed fetch implementation, so no real network calls are made.
 
 ## Schema migration
 
