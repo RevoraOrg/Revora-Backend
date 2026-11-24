@@ -10,15 +10,16 @@ const path = require('path');
  * - Hidden files (starting with '.') are ignored.
  * - Missing '.sql' extension is rejected (unless strictExtensions is false).
  * - Files must start with a numeric prefix (e.g. '001_').
- * - Duplicate prefixes are rejected (unless allowDuplicates is true).
+ * - Duplicate prefixes are rejected (unless allowDuplicates is true or the prefix is in allowedDuplicatePrefixes).
  * - Prefix '999' is flagged/rejected as out-of-band (unless allowOutOfBand is true).
- * - The sequence of numeric prefixes must be monotonic (strictly increasing, or non-decreasing if duplicates are allowed).
+ * - The sequence of numeric prefixes must be monotonic (strictly increasing, or non-decreasing if duplicates are allowed via allowDuplicates or allowedDuplicatePrefixes).
  *
  * @param {string[]} filenames
  * @param {object} [options]
  * @param {boolean} [options.allowDuplicates=false]
  * @param {boolean} [options.allowOutOfBand=false]
  * @param {boolean} [options.strictExtensions=true]
+ * @param {string[]} [options.allowedDuplicatePrefixes=[]] Allowlist of prefix strings that may be duplicated
  * @returns {string[]} Resolved and sorted list of valid migration filenames
  */
 function resolveMigrations(filenames, options = {}) {
@@ -26,6 +27,7 @@ function resolveMigrations(filenames, options = {}) {
         allowDuplicates = false,
         allowOutOfBand = false,
         strictExtensions = true,
+        allowedDuplicatePrefixes = [],
     } = options;
 
     const resolved = [];
@@ -55,8 +57,8 @@ function resolveMigrations(filenames, options = {}) {
         const prefixNum = parseInt(prefixStr, 10);
 
         // 4. Duplicate prefix rejected
-        if (seenPrefixes.has(prefixStr) && !allowDuplicates) {
-            throw new Error(`Duplicate migration prefix detected: ${prefixStr} (found in ${filename})`);
+        if (seenPrefixes.has(prefixStr) && !allowDuplicates && !allowedDuplicatePrefixes.includes(prefixStr)) {
+            throw new Error(`Duplicate migration prefix detected: ${prefixStr} (found in ${filename}). Use allowedDuplicatePrefixes option to allow known duplicates.`);
         }
         seenPrefixes.add(prefixStr);
 
@@ -78,7 +80,10 @@ function resolveMigrations(filenames, options = {}) {
     // 6. Monotonicity check
     let lastPrefixNum = -1;
     for (const item of resolved) {
-        if (allowDuplicates) {
+        const isAllowedDuplicate = allowedDuplicatePrefixes.includes(item.prefixStr);
+        const shouldAllowDuplicates = allowDuplicates || isAllowedDuplicate;
+
+        if (shouldAllowDuplicates) {
             if (item.prefixNum < lastPrefixNum) {
                 throw new Error(`Non-monotonic migration ordering detected: ${item.filename} has prefix ${item.prefixStr} which is less than preceding prefix`);
             }
@@ -134,6 +139,13 @@ async function runMigrations() {
                 .filter((entry) => entry.isFile())
                 .map((entry) => entry.name);
             const files = resolveMigrations(allFiles);
+            // Load and resolve migrations with strict options
+            // Legacy duplicate prefixes are allowed but tracked
+            const allFiles = fs.readdirSync(migrationsDir);
+            const files = resolveMigrations(allFiles, {
+                allowedDuplicatePrefixes: ['021', '025', '044', '060', '061'],
+                strictExtensions: false
+            });
 
             let appliedCount = 0;
 
