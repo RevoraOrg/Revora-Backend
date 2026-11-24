@@ -806,6 +806,7 @@ export function verifyAdminSignature(
 
       (req as AdminSignedRequest).adminKid = kid;
 
+      req.adminKid = kid;
       next();
 
     } catch (err) {

@@ -126,7 +126,7 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
   async function approveOffering(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      globalLogger.info('Offering approved', { offeringId: id, adminKid: (req as any).adminKid });
+      globalLogger.info('Offering approved', { offeringId: id, adminKid: req.adminKid });
       res.json({ success: true, status: 'approved' });
     } catch (e) {
       next(e);
@@ -136,7 +136,7 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
   async function rejectOffering(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      globalLogger.info('Offering rejected', { offeringId: id, adminKid: (req as any).adminKid });
+      globalLogger.info('Offering rejected', { offeringId: id, adminKid: req.adminKid });
       res.json({ success: true, status: 'rejected' });
     } catch (e) {
       next(e);
@@ -146,7 +146,7 @@ export function createOfferingHandlers(offeringRepo: OfferingRepo) {
   async function archiveOffering(req: Request, res: Response, next: NextFunction) {
     try {
       const { id } = req.params;
-      globalLogger.info('Offering archived', { offeringId: id, adminKid: (req as any).adminKid });
+      globalLogger.info('Offering archived', { offeringId: id, adminKid: req.adminKid });
       res.json({ success: true, status: 'archived' });
     } catch (e) {
       next(e);
