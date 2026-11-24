@@ -61,11 +61,19 @@ pub struct VestingContract;
 
 #[contractimpl]
 impl VestingContract {
-    /// Initializes the vesting contract admin.
+    /// Initializes the vesting contract admin exactly once.
     /// 
     /// # Arguments
     /// * `admin` - The address to be set as the contract administrator.
+    ///
+    /// # Security
+    /// The proposed administrator must authorize initialization. Existing
+    /// initialization cannot be replaced.
     pub fn initialize(env: Env, admin: Address) {
+        let existing_admin: Option<Address> =
+            env.storage().instance().get(&StorageKey::Admin);
+        assert!(existing_admin.is_none(), "Contract already initialized");
+        admin.require_auth();
         env.storage().instance().set(&StorageKey::Admin, &admin);
     }
 
