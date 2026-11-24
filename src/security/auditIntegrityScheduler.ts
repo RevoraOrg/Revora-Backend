@@ -3,6 +3,7 @@
  */
 
 import { Pool } from 'pg';
+import { env } from '../config/env';
 import { globalMetrics } from '../lib/metrics';
 import { globalLogger, Logger } from '../lib/logger';
 import {
@@ -10,7 +11,7 @@ import {
   verifyAuditLogIntegrity,
 } from './auditHashChain';
 import { AuditWitnessPublisher } from './auditWitnessPublisher';
-import { MockWitnessClient } from './witnessClient';
+import { createWitnessClient, WitnessClient } from './witnessClient';
 
 export interface AuditIntegritySchedulerOptions {
   /** Verification interval in milliseconds (default: 24 hours). */
@@ -23,6 +24,8 @@ export interface AuditIntegritySchedulerOptions {
   metrics?: typeof globalMetrics;
   /** Optional witness publisher override. */
   witnessPublisher?: AuditWitnessPublisher;
+  /** Optional witness client override; defaults to Rekor when configured. */
+  witnessClient?: WitnessClient;
 }
 
 const DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -40,10 +43,14 @@ export class AuditIntegrityScheduler {
   ) {
     this.logger = options.logger ?? globalLogger;
     this.metrics = options.metrics ?? globalMetrics;
-    this.witnessPublisher = options.witnessPublisher ?? new AuditWitnessPublisher(pool, new MockWitnessClient(), {
-      logger: this.logger,
-      metrics: this.metrics,
-    });
+    this.witnessPublisher = options.witnessPublisher ?? new AuditWitnessPublisher(
+      pool,
+      options.witnessClient ?? createWitnessClient(env.WITNESS_REKOR_URL),
+      {
+        logger: this.logger,
+        metrics: this.metrics,
+      },
+    );
   }
 
   /** Start periodic verification (nightly by default). */

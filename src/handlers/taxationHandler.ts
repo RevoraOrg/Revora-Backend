@@ -407,4 +407,65 @@ export class TaxationHandler {
       }
     }
   };
+
+  /**
+   * Handle POST /taxation/lots
+   *
+   * Creates a new investment lot. `acquired_at` is optional and defaults to now.
+   * When provided it must be a parseable date that is not in the future.
+   *
+   * @returns 201 with the created InvestmentLot
+   */
+  createLot = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    try {
+      const requestId = req.requestId;
+      const userId = req.user?.id || req.user?.sub;
+
+      if (!userId) {
+        return next(Errors.unauthorized('User not authenticated'));
+      }
+
+      const { acquired_at: rawAcquiredAt } = req.body;
+
+      let acquiredAt: Date;
+      if (rawAcquiredAt === undefined || rawAcquiredAt === null) {
+        acquiredAt = new Date();
+      } else {
+        if (typeof rawAcquiredAt !== 'string' && typeof rawAcquiredAt !== 'number') {
+          return next(Errors.validationError('acquired_at must be a valid date'));
+        }
+        acquiredAt = new Date(rawAcquiredAt);
+        if (Number.isNaN(acquiredAt.getTime())) {
+          return next(Errors.validationError('acquired_at must be a valid date'));
+        }
+        if (acquiredAt.getTime() > Date.now()) {
+          return next(Errors.validationError('acquired_at cannot be in the future'));
+        }
+      }
+
+      this.logger.info('Creating investment lot', {
+        requestId,
+        userId,
+        acquired_at: acquiredAt.toISOString(),
+      });
+
+      const lot = await this.taxationService.createLot({
+        investor_id: userId,
+        ...req.body,
+        acquired_at: acquiredAt,
+      });
+
+      res.status(201).json({
+        message: 'Lot created successfully',
+        data: lot,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        next(error);
+      } else {
+        this.logger.error('Unexpected error creating lot', { error });
+        next(Errors.internal('Internal server error'));
+      }
+    }
+  };
 }

@@ -128,8 +128,11 @@ async function runMigrations() {
                 return;
             }
 
-            // Load and resolve migrations with strict options
-            const allFiles = fs.readdirSync(migrationsDir);
+            // Load and resolve migrations with strict options (skip subdirectories such as compiled safety/)
+            const allFiles = fs
+                .readdirSync(migrationsDir, { withFileTypes: true })
+                .filter((entry) => entry.isFile())
+                .map((entry) => entry.name);
             const files = resolveMigrations(allFiles);
 
             let appliedCount = 0;
