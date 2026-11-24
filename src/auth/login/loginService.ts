@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { comparePassword } from '../../utils/password';
 import {
     JwtIssuer,

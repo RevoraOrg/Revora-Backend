@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { issueToken, verifyToken, TOKEN_EXPIRY, REFRESH_TOKEN_EXPIRY } from '../../lib/jvt';
+import { issueToken, verifyToken, TOKEN_EXPIRY, REFRESH_TOKEN_EXPIRY } from '../../lib/jwt';
 import { RefreshTokenPayload, TokenService } from './types';
 import { UserRole } from '../login/types';
 
