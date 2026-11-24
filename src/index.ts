@@ -125,6 +125,7 @@ import {
 } from './auth/login/types';
 import { issueToken } from './lib/jwt';
 import { Logger as AppLogger } from './lib/logger';
+import { createShutdownHandler } from './lib/gracefulShutdown';
 
 export { parseMoneyString } from "./routes/offeringValidation";
 
@@ -610,58 +611,14 @@ export { classifyStellarRPCFailure, StellarRPCFailureClass };
 
 export const app = createApp();
 
-let isShuttingDown = false;
-
 /* istanbul ignore next -- exercised only in real process shutdown */
-async function shutdown(signal: string): Promise<void> {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-
-  globalSampler.stop();
-  console.log(`\n[server] ${signal} shutting down`);
-
-  if (server) {
-    const drainTimeoutMs = parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '10000', 10);
-    
-    // Stop accepting new connections
-    const serverClosePromise = new Promise<void>((resolve, reject) => {
-      server!.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-
-    console.log('[server] Stopped accepting new connections. Draining in-flight requests...');
-    
-    const drainStart = Date.now();
-    while (inFlightRequests > 0) {
-      if (Date.now() - drainStart > drainTimeoutMs) {
-        console.warn(`[server] Drain timeout exceeded with ${inFlightRequests} in-flight requests. Forcing exit.`);
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    if (inFlightRequests === 0) {
-      console.log('[server] All in-flight requests drained.');
-      // Wait for server to fully close (e.g., closing idle keep-alive sockets)
-      try {
-        const remainingTime = Math.max(0, drainTimeoutMs - (Date.now() - drainStart));
-        await Promise.race([
-          serverClosePromise,
-          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), remainingTime))
-        ]);
-        console.log('[server] Listener closed completely.');
-      } catch (err) {
-        console.warn('[server] Listener close timeout or error. Proceeding to close pool.');
-      }
-    }
-  }
-
-  await closePool();
-  /* istanbul ignore next -- process exit is not unit-test friendly */
-  process.exit(0);
-}
+const shutdown = createShutdownHandler({
+  get server() { return server; },
+  timeoutMs: parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '10000', 10),
+  getInFlightRequests: () => inFlightRequests,
+  sampler: globalSampler,
+  closePool,
+});
 
 let server: ReturnType<typeof app.listen> | undefined;
 

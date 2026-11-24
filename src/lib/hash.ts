@@ -18,8 +18,25 @@ export function hashPassword(password: string): string {
  * @returns True if the password matches the hash
  */
 export function verifyPassword(password: string, hash: string): boolean {
-    const [salt, key] = hash.split(':');
+    if (!hash || typeof hash !== 'string') {
+        return false;
+    }
+
+    const parts = hash.split(':');
+    if (parts.length !== 2) {
+        return false;
+    }
+
+    const [salt, key] = parts;
+    if (!salt || !key || key.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(key)) {
+        return false;
+    }
+
     const keyBuffer = Buffer.from(key, 'hex');
     const derivedKey = scryptSync(password, salt, 64);
+    if (keyBuffer.length !== derivedKey.length) {
+        return false;
+    }
+
     return timingSafeEqual(keyBuffer, derivedKey);
 }

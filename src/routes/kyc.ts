@@ -22,12 +22,19 @@ export function createKycRoutes(kycRouter: KycRouter): Router {
       const investorId = String(authReq.user.id);
       const info = req.body as Partial<KycApplicantInfo>;
 
-      if (!info.address?.country) {
+      const country = info.address?.country;
+
+      if (country === undefined || country === null || country === '') {
         res.status(400).json({ error: 'Country jurisdiction is required in address' });
         return;
       }
 
-      const jurisdiction = info.address.country.toUpperCase();
+      if (typeof country !== 'string' || !/^[A-Za-z]{2}$/.test(country)) {
+        res.status(400).json({ error: 'Invalid country code' });
+        return;
+      }
+
+      const jurisdiction = country.toUpperCase();
       let provider;
       try {
         provider = kycRouter.route(jurisdiction);

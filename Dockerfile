@@ -2,7 +2,7 @@
 # Multi-stage build for optimized production image
 
 # Stage 1: Build
-FROM node:18-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ COPY src ./src
 RUN npm run build
 
 # Stage 2: Production
-FROM node:18-alpine
+FROM node:22-alpine
 
 WORKDIR /app
 
@@ -31,10 +31,14 @@ RUN apk add --no-cache curl
 COPY package*.json ./
 
 # Install production dependencies only
-RUN npm ci --only=production
+RUN npm ci --omit=dev
 
 # Copy built application from builder stage
 COPY --from=builder /app/dist ./dist
+
+# Run the application as the unprivileged node user.
+RUN chown -R node:node /app
+USER node
 
 # Set environment variables
 ENV NODE_ENV=production
