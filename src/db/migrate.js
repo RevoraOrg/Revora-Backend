@@ -133,6 +133,12 @@ async function runMigrations() {
                 return;
             }
 
+            // Load and resolve migrations with strict options (skip subdirectories such as compiled safety/)
+            const allFiles = fs
+                .readdirSync(migrationsDir, { withFileTypes: true })
+                .filter((entry) => entry.isFile())
+                .map((entry) => entry.name);
+            const files = resolveMigrations(allFiles);
             // Load and resolve migrations with strict options
             // Legacy duplicate prefixes are allowed but tracked
             const allFiles = fs.readdirSync(migrationsDir);

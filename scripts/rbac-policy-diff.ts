@@ -20,7 +20,6 @@ import {
   formatPolicyDiff,
   serializePolicy,
   PolicyMatrix,
-  PolicyDiff,
 } from '../src/security/rbacPolicySerializer';
 
 const POLICY_FILE = path.join(process.cwd(), 'src/security/types.ts');
@@ -44,7 +43,7 @@ function writeOutput(key: string, value: string): void {
   }
 }
 
-function main(): void {
+export function main(): void {
   const baseRef = process.env.PR_BASE_REF || process.env.GITHUB_BASE_REF;
   if (!baseRef) {
     console.error('PR_BASE_REF / GITHUB_BASE_REF is required');
@@ -70,4 +69,6 @@ function main(): void {
   writeOutput('has_diff', String(hasDiff));
 }
 
-main();
+if (require.main === module) {
+  main();
+}

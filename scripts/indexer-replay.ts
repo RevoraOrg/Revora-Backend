@@ -2,12 +2,144 @@ import { getClient, pool } from '../src/db/client';
 import { createStellarRpcClient } from '../src/lib/stellarRpcClient';
 import { env } from '../src/config/env';
 
-async function main() {
-  const rpcClient = createStellarRpcClient();
-  const startLedger = parseInt(process.env.START_LEDGER || '1', 10);
+export const INDEXER_REPLAY_USAGE =
+  'Usage: npx ts-node scripts/indexer-replay.ts [--start-ledger <ledger>]';
+
+export interface ReplayArgs {
+  startLedger: number;
+  help: boolean;
+}
+
+export interface ReplayDependencies {
+  createRpcClient?: typeof createStellarRpcClient;
+  getClient?: typeof getClient;
+  pool?: typeof pool;
+  env?: typeof env;
+  exit?: (code: number) => void;
+}
+
+/**
+ * Parse and validate indexer replay arguments.
+ *
+ * Ledger 1 is retained as the default for backward compatibility. Operators
+ * may set START_LEDGER or pass --start-ledger. The legacy positional ledger
+ * form is also accepted.
+ */
+export function parseReplayArgs(
+  argv: string[] = process.argv.slice(2),
+  startLedgerEnv: string | undefined = process.env.START_LEDGER,
+): ReplayArgs {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    return { startLedger: 1, help: true };
+  }
+
+  let ledgerValue: string | undefined;
+  const positional: string[] = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--start-ledger') {
+      if (index + 1 >= argv.length) {
+        throw new Error('Missing value for --start-ledger');
+      }
+      if (ledgerValue !== undefined) {
+        throw new Error('START_LEDGER may only be specified once');
+      }
+      ledgerValue = argv[index + 1];
+      index += 1;
+    } else if (arg.startsWith('--start-ledger=')) {
+      if (ledgerValue !== undefined) {
+        throw new Error('START_LEDGER may only be specified once');
+      }
+      ledgerValue = arg.slice('--start-ledger='.length);
+    } else if (arg.startsWith('-')) {
+      throw new Error(`Unknown argument: ${arg}`);
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  if (positional.length > 1) {
+    throw new Error('Too many arguments');
+  }
+  if (positional.length === 1) {
+    if (ledgerValue !== undefined) {
+      throw new Error('START_LEDGER may only be specified once');
+    }
+    ledgerValue = positional[0];
+  }
+
+  if (ledgerValue === undefined && startLedgerEnv?.trim()) {
+    ledgerValue = startLedgerEnv.trim();
+  }
+
+  if (ledgerValue === undefined) {
+    ledgerValue = '1';
+  }
+
+  if (!/^[1-9]\d*$/.test(ledgerValue)) {
+    throw new Error(`Invalid START_LEDGER "${ledgerValue}". Expected a positive integer.`);
+  }
+
+  const startLedger = Number(ledgerValue);
+  if (!Number.isSafeInteger(startLedger) || startLedger < 1) {
+    throw new Error(`Invalid START_LEDGER "${ledgerValue}". Expected a positive integer.`);
+  }
+
+  return { startLedger, help: false };
+}
+
+// Backward-friendly aliases for callers that prefer explicit names.
+export const parseIndexerReplayArgs = parseReplayArgs;
+export const parseArguments = parseReplayArgs;
+export const parseArgs = parseReplayArgs;
+export const parseCliArgs = parseReplayArgs;
+
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  dependencies: ReplayDependencies = {},
+): Promise<number> {
+  let args: ReplayArgs;
+  try {
+    args = parseReplayArgs(argv);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    console.error(INDEXER_REPLAY_USAGE);
+    (dependencies.exit ?? process.exit)(1);
+    return 1;
+  }
+
+  if (args.help) {
+    console.log(INDEXER_REPLAY_USAGE);
+    return 0;
+  }
+
+  const replayEnv = dependencies.env ?? env;
+  const startLedger = args.startLedger;
   console.log(`Starting indexer replay from ledger ${startLedger}...`);
 
-  const client = await getClient();
+  const getReplayClient = dependencies.getClient ?? getClient;
+  const replayPool = dependencies.pool ?? pool;
+  let rpcClient: ReturnType<typeof createStellarRpcClient>;
+  try {
+    rpcClient = (dependencies.createRpcClient ?? createStellarRpcClient)();
+  } catch (error) {
+    console.error('Replay failed, transaction rolled back.', error);
+    await replayPool.end();
+    (dependencies.exit ?? process.exit)(1);
+    return 1;
+  }
+
+  let client: Awaited<ReturnType<typeof getClient>>;
+  try {
+    client = await getReplayClient();
+  } catch (error) {
+    console.error('Replay failed, transaction rolled back.', error);
+    await replayPool.end();
+    (dependencies.exit ?? process.exit)(1);
+    return 1;
+  }
+
   try {
     await client.query('BEGIN');
     
@@ -36,7 +168,7 @@ async function main() {
         filters: [
           {
             type: 'contract',
-            contractIds: [env.GOVERNANCE_CONTRACT_ID || ''],
+            contractIds: [replayEnv.GOVERNANCE_CONTRACT_ID || ''],
             topics: [['*']],
           },
         ],
@@ -83,17 +215,23 @@ async function main() {
     console.log('Replay completed successfully.');
 
   } catch (error) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('Replay rollback failed.', rollbackError);
+    }
     console.error('Replay failed, transaction rolled back.', error);
-    process.exit(1);
+    (dependencies.exit ?? process.exit)(1);
+    return 1;
   } finally {
     client.release();
-    await pool.end();
+    await replayPool.end();
   }
+  return 0;
 }
 
 if (require.main === module) {
-  main().catch((err) => {
+  void main().catch((err) => {
     console.error(err);
     process.exit(1);
   });
