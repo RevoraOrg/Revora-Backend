@@ -323,6 +323,35 @@ describe('OidcAdapterService', () => {
       expect(stored.tenantId).toBe('acme');
       expect(stored.codeVerifier).toBeTruthy();
     });
+
+    it('sweeps expired states when creating a new flow using the injected clock', async () => {
+      let clock = 1_000_000;
+      service = new OidcAdapterService(jwksCache, { now: () => clock });
+
+      const { state: expiredState } = await service.buildAuthorizeUrl(makeProvider());
+      const expiry = (service as any).flowStates.get(expiredState).expiresAt;
+
+      clock = expiry;
+      const { state: activeState } = await service.buildAuthorizeUrl(makeProvider());
+
+      expect((service as any).flowStates.has(expiredState)).toBe(false);
+      expect((service as any).flowStates.has(activeState)).toBe(true);
+      expect(() => service.consumeFlowState(expiredState)).toThrow(/Invalid or unknown/);
+    });
+
+    it('evicts the oldest state when adding a flow at the capacity limit', async () => {
+      const states = (service as any).flowStates as Map<string, { expiresAt: number }>;
+      for (let i = 0; i < 10_000; i++) {
+        states.set(`state-${i}`, { expiresAt: Date.now() + 60_000 });
+      }
+
+      const { state } = await service.buildAuthorizeUrl(makeProvider());
+
+      expect(states.size).toBe(10_000);
+      expect(states.has('state-0')).toBe(false);
+      expect(states.has('state-1')).toBe(true);
+      expect(states.has(state)).toBe(true);
+    });
   });
 
   // ── ID Token validation ────────────────────────────────────────────────
@@ -417,7 +446,8 @@ describe('OidcAdapterService', () => {
     });
 
     it('throws for expired state', () => {
-      (service as any).flowStates.set('x', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: Date.now() - 1 });
+      service = new OidcAdapterService(jwksCache, { now: () => 10 });
+      (service as any).flowStates.set('x', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: 10 });
       expect(() => service.consumeFlowState('x')).toThrow(/expired/);
     });
 
