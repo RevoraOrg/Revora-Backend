@@ -59,7 +59,7 @@ export interface SpendRecord {
 export interface SpendStore {
   /**
    * Atomically add `amountUsd` to the running total for the given key.
-   * Must reject (throw) if `amountUsd` is negative.
+   * Must reject (throw) unless `amountUsd` is finite and non-negative.
    */
   increment(tenantId: string, providerId: string, monthKey: MonthKey, amountUsd: number): Promise<void>;
 
@@ -97,9 +97,9 @@ export class InMemorySpendStore implements SpendStore {
     monthKey: MonthKey,
     amountUsd: number
   ): Promise<void> {
-    if (amountUsd < 0) {
+    if (!Number.isFinite(amountUsd) || amountUsd < 0) {
       throw new RangeError(
-        `spend increment must be non-negative (got ${amountUsd})`
+        `spend increment must be finite and non-negative (got ${amountUsd})`
       );
     }
     const k = this.key(tenantId, providerId, monthKey);

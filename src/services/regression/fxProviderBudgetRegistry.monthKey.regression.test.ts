@@ -333,10 +333,26 @@ describe('MonthKey regression — recordSpend and store failure/empty-result pat
   it('enforces non-negative amounts at the store layer too (defense in depth)', async () => {
     const store = new InMemorySpendStore();
     await expect(store.increment(TENANT, PROVIDER, MONTH, -1)).rejects.toThrow(
-      'spend increment must be non-negative (got -1)'
+      'spend increment must be finite and non-negative (got -1)'
     );
     await expect(store.increment(TENANT, PROVIDER, MONTH, -0.01)).rejects.toThrow(RangeError);
     expect(await store.get(TENANT, PROVIDER, MONTH)).toBe(0);
+  });
+
+  it.each([NaN, Infinity])('rejects non-finite store increments (%s)', async (amount) => {
+    const store = new InMemorySpendStore();
+
+    await expect(store.increment(TENANT, PROVIDER, MONTH, amount)).rejects.toThrow(RangeError);
+    expect(await store.get(TENANT, PROVIDER, MONTH)).toBe(0);
+    expect(await store.listByTenant(TENANT, MONTH)).toEqual([]);
+  });
+
+  it('accepts negative zero as a no-op store increment', async () => {
+    const store = new InMemorySpendStore();
+
+    await expect(store.increment(TENANT, PROVIDER, MONTH, -0)).resolves.toBeUndefined();
+    expect(await store.get(TENANT, PROVIDER, MONTH)).toBe(0);
+    expect(await store.listByTenant(TENANT, MONTH)).toEqual([]);
   });
 
   it('returns empty results for months and tenants with no spend', async () => {
