@@ -55,17 +55,21 @@ describe('KycRouter', () => {
     );
   });
 
-  it('rejects a route to an unregistered provider until that provider is registered', () => {
+  it('rejects a table that references an unregistered provider without installing it', () => {
     const unconfiguredRouter = new KycRouter(secretKey);
-    unconfiguredRouter.loadRouteTable(signedTable('v1', [
+    const table = signedTable('v1', [
       { jurisdiction: 'US', providerName: provider.name },
-    ]));
+    ]);
 
-    expect(() => unconfiguredRouter.route('US')).toThrow(
-      'Configured provider null_provider not registered.',
+    expect(() => unconfiguredRouter.loadRouteTable(table)).toThrow(
+      `references unregistered provider "${provider.name}"`,
     );
+    expect(unconfiguredRouter.getVersion()).toBe('');
+    expect(() => unconfiguredRouter.route('US')).toThrow('Jurisdiction US not supported. Fails closed.');
 
+    // Once the provider is registered the same table loads and routes.
     unconfiguredRouter.registerProvider(provider);
+    unconfiguredRouter.loadRouteTable(table);
     expect(unconfiguredRouter.route('US')).toBe(provider);
   });
 
@@ -166,5 +170,74 @@ describe('KycRouter', () => {
 
     expect(router.getVersion()).toBe('v2');
     expect(() => router.route('US')).toThrow('Jurisdiction US not supported. Fails closed.');
+  });
+
+  it('rejects duplicate jurisdictions and keeps the previous table active', () => {
+    router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: 'US', providerName: provider.name },
+    ]));
+
+    const duplicate = signedTable('v2', [
+      { jurisdiction: 'US', providerName: provider.name },
+      { jurisdiction: 'US', providerName: provider.name },
+    ]);
+
+    expect(() => router.loadRouteTable(duplicate)).toThrow('duplicate jurisdiction "US"');
+    expect(router.getVersion()).toBe('v1');
+    expect(router.route('US')).toBe(provider);
+  });
+
+  it('treats jurisdictions case-insensitively when detecting duplicates', () => {
+    router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: 'US', providerName: provider.name },
+    ]));
+
+    const duplicate = signedTable('v2', [
+      { jurisdiction: 'us', providerName: provider.name },
+      { jurisdiction: 'US', providerName: provider.name },
+    ]);
+
+    expect(() => router.loadRouteTable(duplicate)).toThrow('duplicate jurisdiction "US"');
+    expect(router.getVersion()).toBe('v1');
+  });
+
+  it('normalises lower-case jurisdictions so they still route', () => {
+    router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: 'us', providerName: provider.name },
+      { jurisdiction: 'ca', providerName: provider.name },
+    ]));
+
+    // `src/routes/kyc.ts` upper-cases the applicant country before routing.
+    expect(router.route('US')).toBe(provider);
+    expect(router.route('CA')).toBe(provider);
+  });
+
+  it('keeps the active table when a reload references an unregistered provider', () => {
+    router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: 'US', providerName: provider.name },
+    ]));
+
+    const bad = signedTable('v2', [
+      { jurisdiction: 'CA', providerName: 'ghost_provider' },
+    ]);
+
+    expect(() => router.loadRouteTable(bad)).toThrow(
+      'references unregistered provider "ghost_provider"',
+    );
+    expect(router.getVersion()).toBe('v1');
+    expect(router.route('US')).toBe(provider);
+    expect(() => router.route('CA')).toThrow('Jurisdiction CA not supported. Fails closed.');
+  });
+
+  it('rejects entries with a missing jurisdiction or providerName', () => {
+    expect(() => router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: '', providerName: provider.name },
+    ]))).toThrow('requires a non-empty jurisdiction');
+    expect(router.getVersion()).toBe('');
+
+    expect(() => router.loadRouteTable(signedTable('v1', [
+      { jurisdiction: 'US', providerName: '' },
+    ]))).toThrow('requires a non-empty providerName');
+    expect(router.getVersion()).toBe('');
   });
 });

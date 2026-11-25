@@ -57,13 +57,18 @@ describe('KycRouter', () => {
     expect(() => router.route('CA')).toThrow('Jurisdiction CA not supported. Fails closed.');
   });
 
-  it('fails if the configured provider is not registered', () => {
+  it('rejects a route table that references an unregistered provider', () => {
     const table = createSignedTable('1.0', [
       { jurisdiction: 'JP', providerName: 'non_existent_provider' },
     ]);
-    router.loadRouteTable(table);
 
-    expect(() => router.route('JP')).toThrow('Configured provider non_existent_provider not registered.');
+    expect(() => router.loadRouteTable(table)).toThrow(
+      'references unregistered provider "non_existent_provider"',
+    );
+
+    // A rejected reload must not install any routes or a version.
+    expect(router.getVersion()).toBe('');
+    expect(() => router.route('JP')).toThrow('Jurisdiction JP not supported. Fails closed.');
   });
 
   it('executes the correct provider methods via routing', async () => {
