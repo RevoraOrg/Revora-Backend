@@ -30,10 +30,10 @@ import {
   InvestmentLot,
   LotAllocation,
   ProcessDisposalInput,
-  DisposalStrategy,
   JurisdictionGainsSummary,
 } from './types';
 import { Errors } from '../../lib/errors';
+import { Decimal } from '../../lib/decimal';
 
 const DEFAULT_CURRENCY = 'USD';
 const DEFAULT_JURISDICTION = 'US';
@@ -61,10 +61,14 @@ export class TaxationService {
    */
   async processDisposal(input: ProcessDisposalInput): Promise<DisposalResult> {
     // 1. Validate inputs
-    if (input.quantity <= 0) {
+    const isStringMode = typeof input.quantity === 'string' || typeof input.disposal_price_per_unit === 'string';
+    const quantityDec = new Decimal(String(input.quantity));
+    const priceDec = new Decimal(String(input.disposal_price_per_unit));
+
+    if (quantityDec.isZero() || quantityDec.isNegative()) {
       throw Errors.validationError('Disposal quantity must be greater than zero');
     }
-    if (input.disposal_price_per_unit < 0) {
+    if (priceDec.isNegative()) {
       throw Errors.validationError('Disposal price per unit cannot be negative');
     }
 
@@ -107,14 +111,19 @@ export class TaxationService {
         );
       }
 
-      // Calculate totals
-      let totalCostBasis = 0;
-      const proceeds = input.quantity * input.disposal_price_per_unit;
+      // Calculate totals using Decimal
+      let totalCostBasisDec = new Decimal('0');
+      const proceedsDec = quantityDec.multiply(priceDec);
 
       // Update each lot and create disposal records
       for (const allocation of allocations) {
-        const newRemainingQuantity =
-          allocation.lot.remaining_quantity - allocation.quantityConsumed;
+        const lotRemDec = new Decimal(String(allocation.lot.remaining_quantity));
+        const consumedDec = new Decimal(String(allocation.quantityConsumed));
+        const newRemainingDec = lotRemDec.subtract(consumedDec);
+
+        const newRemainingQuantity = typeof allocation.lot.remaining_quantity === 'number'
+          ? parseFloat(newRemainingDec.toString())
+          : newRemainingDec.toString();
 
         // Update lot
         await this.lotRepo.updateLotAfterDisposal(
@@ -123,21 +132,23 @@ export class TaxationService {
           newRemainingQuantity,
         );
 
-        totalCostBasis += allocation.totalCostBasis;
+        const allocCostBasisDec = new Decimal(String(allocation.totalCostBasis));
+        totalCostBasisDec = totalCostBasisDec.add(allocCostBasisDec);
+
+        const allocProceedsDec = consumedDec.multiply(priceDec);
+        const allocGainLossDec = allocProceedsDec.subtract(allocCostBasisDec);
 
         // Create disposal record
         await this.disposalRepo.createWithClient(client, {
           investor_id: input.investor_id,
           offering_id: input.offering_id,
           lot_id: allocation.lot.id,
-          quantity_disposed: allocation.quantityConsumed,
-          cost_basis_per_unit: allocation.costBasisPerUnit,
-          total_cost_basis: allocation.totalCostBasis,
-          proceeds: allocation.quantityConsumed * input.disposal_price_per_unit,
-          realized_gain_loss:
-            allocation.quantityConsumed * input.disposal_price_per_unit -
-            allocation.totalCostBasis,
-          disposal_price_per_unit: input.disposal_price_per_unit,
+          quantity_disposed: isStringMode ? consumedDec.toString() : parseFloat(consumedDec.toString()),
+          cost_basis_per_unit: isStringMode ? new Decimal(String(allocation.costBasisPerUnit)).toString() : (typeof allocation.costBasisPerUnit === 'number' ? allocation.costBasisPerUnit : parseFloat(String(allocation.costBasisPerUnit))),
+          total_cost_basis: isStringMode ? allocCostBasisDec.toString() : parseFloat(allocCostBasisDec.toString()),
+          proceeds: isStringMode ? allocProceedsDec.toString() : parseFloat(allocProceedsDec.toString()),
+          realized_gain_loss: isStringMode ? allocGainLossDec.toString() : parseFloat(allocGainLossDec.toString()),
+          disposal_price_per_unit: isStringMode ? priceDec.toString() : (typeof input.disposal_price_per_unit === 'number' ? input.disposal_price_per_unit : parseFloat(priceDec.toString())),
           strategy: strategy.name,
           currency,
           jurisdiction,
@@ -147,16 +158,17 @@ export class TaxationService {
 
       await client.query('COMMIT');
 
-      const realizedGainLoss = proceeds - totalCostBasis;
-      const weightedAverageCostBasis =
-        input.quantity > 0 ? totalCostBasis / input.quantity : 0;
+      const realizedGainLossDec = proceedsDec.subtract(totalCostBasisDec);
+      const weightedAverageCostBasisDec = quantityDec.isPositive()
+        ? totalCostBasisDec.divide(quantityDec)
+        : new Decimal('0');
 
       return {
         allocations,
-        totalQuantityDisposed: input.quantity,
-        weightedAverageCostBasis,
-        totalCostBasis,
-        realizedGainLoss,
+        totalQuantityDisposed: isStringMode ? quantityDec.toString() : (typeof input.quantity === 'number' ? input.quantity : parseFloat(quantityDec.toString())),
+        weightedAverageCostBasis: isStringMode ? weightedAverageCostBasisDec.toString() : parseFloat(weightedAverageCostBasisDec.toString()),
+        totalCostBasis: isStringMode ? totalCostBasisDec.toString() : parseFloat(totalCostBasisDec.toString()),
+        realizedGainLoss: isStringMode ? realizedGainLossDec.toString() : parseFloat(realizedGainLossDec.toString()),
         strategy: strategy.name,
       };
     } catch (error) {
@@ -177,30 +189,45 @@ export class TaxationService {
     offering_id: string;
     investment_id: string;
     asset: string;
-    quantity: number;
-    cost_basis_per_unit: number;
+    quantity: number | string;
+    cost_basis_per_unit: number | string;
     acquired_at: Date;
     cost_currency?: string;
     jurisdiction?: string;
   }): Promise<InvestmentLot> {
-    if (lot.quantity <= 0) {
+    const isStringMode = typeof lot.quantity === 'string' || typeof lot.cost_basis_per_unit === 'string';
+    const quantityDec = new Decimal(String(lot.quantity));
+    const costBasisDec = new Decimal(String(lot.cost_basis_per_unit));
+
+    if (quantityDec.isZero() || quantityDec.isNegative()) {
       throw Errors.validationError('Lot quantity must be greater than zero');
     }
-    if (lot.cost_basis_per_unit < 0) {
+    if (costBasisDec.isNegative()) {
       throw Errors.validationError('Cost basis per unit cannot be negative');
     }
 
-    return this.lotRepo.create({
+    const createdLot = await this.lotRepo.create({
       investor_id: lot.investor_id,
       offering_id: lot.offering_id,
       investment_id: lot.investment_id,
       asset: lot.asset,
-      quantity: lot.quantity,
-      cost_basis_per_unit: lot.cost_basis_per_unit,
+      quantity: isStringMode ? quantityDec.toString() : (typeof lot.quantity === 'number' ? lot.quantity : parseFloat(quantityDec.toString())),
+      cost_basis_per_unit: isStringMode ? costBasisDec.toString() : (typeof lot.cost_basis_per_unit === 'number' ? lot.cost_basis_per_unit : parseFloat(costBasisDec.toString())),
       cost_currency: lot.cost_currency,
       acquired_at: lot.acquired_at,
       jurisdiction: lot.jurisdiction,
     });
+
+    if (isStringMode) {
+      return {
+        ...createdLot,
+        quantity: quantityDec.toString(),
+        cost_basis_per_unit: costBasisDec.toString(),
+        total_cost_basis: quantityDec.multiply(costBasisDec).toString(),
+        remaining_quantity: quantityDec.toString(),
+      };
+    }
+    return createdLot;
   }
 
   /**
@@ -294,10 +321,14 @@ export class TaxationService {
    * Returns the allocations that would be made but does not commit anything.
    */
   async previewDisposal(input: ProcessDisposalInput): Promise<DisposalResult> {
-    if (input.quantity <= 0) {
+    const isStringMode = typeof input.quantity === 'string' || typeof input.disposal_price_per_unit === 'string';
+    const quantityDec = new Decimal(String(input.quantity));
+    const priceDec = new Decimal(String(input.disposal_price_per_unit));
+
+    if (quantityDec.isZero() || quantityDec.isNegative()) {
       throw Errors.validationError('Disposal quantity must be greater than zero');
     }
-    if (input.disposal_price_per_unit < 0) {
+    if (priceDec.isNegative()) {
       throw Errors.validationError('Disposal price per unit cannot be negative');
     }
 
@@ -324,22 +355,23 @@ export class TaxationService {
       );
     }
 
-    let totalCostBasis = 0;
+    let totalCostBasisDec = new Decimal('0');
     for (const allocation of allocations) {
-      totalCostBasis += allocation.totalCostBasis;
+      totalCostBasisDec = totalCostBasisDec.add(new Decimal(String(allocation.totalCostBasis)));
     }
 
-    const proceeds = input.quantity * input.disposal_price_per_unit;
-    const realizedGainLoss = proceeds - totalCostBasis;
-    const weightedAverageCostBasis =
-      input.quantity > 0 ? totalCostBasis / input.quantity : 0;
+    const proceedsDec = quantityDec.multiply(priceDec);
+    const realizedGainLossDec = proceedsDec.subtract(totalCostBasisDec);
+    const weightedAverageCostBasisDec = quantityDec.isPositive()
+      ? totalCostBasisDec.divide(quantityDec)
+      : new Decimal('0');
 
     return {
       allocations,
-      totalQuantityDisposed: input.quantity,
-      weightedAverageCostBasis,
-      totalCostBasis,
-      realizedGainLoss,
+      totalQuantityDisposed: isStringMode ? quantityDec.toString() : (typeof input.quantity === 'number' ? input.quantity : parseFloat(quantityDec.toString())),
+      weightedAverageCostBasis: isStringMode ? weightedAverageCostBasisDec.toString() : parseFloat(weightedAverageCostBasisDec.toString()),
+      totalCostBasis: isStringMode ? totalCostBasisDec.toString() : parseFloat(totalCostBasisDec.toString()),
+      realizedGainLoss: isStringMode ? realizedGainLossDec.toString() : parseFloat(realizedGainLossDec.toString()),
       strategy: strategy.name,
     };
   }

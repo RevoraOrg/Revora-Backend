@@ -24,13 +24,13 @@ export interface InvestmentLot {
   investment_id: string;
   asset: string;
   /** Total quantity acquired in this lot */
-  quantity: number;
+  quantity: number | string;
   /** Cost basis per unit at acquisition (immutable) */
-  cost_basis_per_unit: number;
+  cost_basis_per_unit: number | string;
   /** Total cost basis = quantity * cost_basis_per_unit */
-  total_cost_basis: number;
+  total_cost_basis: number | string;
   /** Remaining quantity available for disposal */
-  remaining_quantity: number;
+  remaining_quantity: number | string;
   /** Currency of cost basis */
   cost_currency: string;
   /** Acquisition date (immutable, used for FIFO/LIFO ordering) */
@@ -49,8 +49,8 @@ export interface CreateInvestmentLotInput {
   offering_id: string;
   investment_id: string;
   asset: string;
-  quantity: number;
-  cost_basis_per_unit: number;
+  quantity: number | string;
+  cost_basis_per_unit: number | string;
   cost_currency?: string;
   acquired_at: Date;
   jurisdiction?: string;
@@ -62,12 +62,12 @@ export interface Disposal {
   investor_id: string;
   offering_id: string;
   lot_id: string;
-  quantity_disposed: number;
-  cost_basis_per_unit: number;
-  total_cost_basis: number;
-  proceeds: number;
-  realized_gain_loss: number;
-  disposal_price_per_unit: number;
+  quantity_disposed: number | string;
+  cost_basis_per_unit: number | string;
+  total_cost_basis: number | string;
+  proceeds: number | string;
+  realized_gain_loss: number | string;
+  disposal_price_per_unit: number | string;
   strategy: DisposalStrategy;
   currency: string;
   jurisdiction: string;
@@ -83,12 +83,12 @@ export interface CreateDisposalInput {
   investor_id: string;
   offering_id: string;
   lot_id: string;
-  quantity_disposed: number;
-  cost_basis_per_unit: number;
-  total_cost_basis: number;
-  proceeds: number;
-  realized_gain_loss: number;
-  disposal_price_per_unit: number;
+  quantity_disposed: number | string;
+  cost_basis_per_unit: number | string;
+  total_cost_basis: number | string;
+  proceeds: number | string;
+  realized_gain_loss: number | string;
+  disposal_price_per_unit: number | string;
   strategy: DisposalStrategy;
   currency?: string;
   jurisdiction?: string;
@@ -100,11 +100,11 @@ export interface LotAllocation {
   /** The lot being consumed */
   lot: InvestmentLot;
   /** Quantity consumed from this lot */
-  quantityConsumed: number;
+  quantityConsumed: number | string;
   /** Cost basis per unit from this lot */
-  costBasisPerUnit: number;
+  costBasisPerUnit: number | string;
   /** Total cost basis for this allocation (quantityConsumed * costBasisPerUnit) */
-  totalCostBasis: number;
+  totalCostBasis: number | string;
 }
 
 /** Result of processing a disposal through a strategy */
@@ -112,13 +112,13 @@ export interface DisposalResult {
   /** The list of lot allocations consumed */
   allocations: LotAllocation[];
   /** Total quantity disposed across all allocations */
-  totalQuantityDisposed: number;
+  totalQuantityDisposed: number | string;
   /** Weighted average cost basis per unit across all allocations */
-  weightedAverageCostBasis: number;
+  weightedAverageCostBasis: number | string;
   /** Total cost basis across all allocations */
-  totalCostBasis: number;
+  totalCostBasis: number | string;
   /** Realized gain/loss (proceeds - totalCostBasis) */
-  realizedGainLoss: number;
+  realizedGainLoss: number | string;
   /** Strategy used */
   strategy: DisposalStrategy;
 }
@@ -126,13 +126,13 @@ export interface DisposalResult {
 /** Per-jurisdiction gains summary */
 export interface JurisdictionGainsSummary {
   jurisdiction: string;
-  totalProceeds: number;
-  totalCostBasis: number;
-  totalRealizedGainLoss: number;
+  totalProceeds: number | string;
+  totalCostBasis: number | string;
+  totalRealizedGainLoss: number | string;
   disposalCount: number;
   strategyBreakdown: Record<DisposalStrategy, {
     count: number;
-    totalGainLoss: number;
+    totalGainLoss: number | string;
   }>;
 }
 
@@ -140,8 +140,8 @@ export interface JurisdictionGainsSummary {
 export interface ProcessDisposalInput {
   investor_id: string;
   offering_id: string;
-  quantity: number;
-  disposal_price_per_unit: number;
+  quantity: number | string;
+  disposal_price_per_unit: number | string;
   strategy: DisposalStrategy;
   currency?: string;
   disposed_at?: Date;
@@ -160,5 +160,5 @@ export interface CostBasisStrategy {
    * @returns Array of lot allocations covering the disposal quantity
    * @throws If insufficient quantity across all available lots
    */
-  selectLots(lots: InvestmentLot[], quantityToDispose: number): LotAllocation[];
+  selectLots(lots: InvestmentLot[], quantityToDispose: number | string): LotAllocation[];
 }

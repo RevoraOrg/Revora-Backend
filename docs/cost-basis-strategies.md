@@ -79,13 +79,13 @@ The tax cost-basis tracking system provides per-lot accounting for investment ac
 ## API Endpoints
 
 ### POST /taxation/dispose
-Process a disposal using the specified strategy.
+Process a disposal using the specified strategy. Accepts decimal strings (preferred, consistent with `src/lib/decimal.ts`) or numbers (deprecated).
 
 ```json
 {
   "offering_id": "off-abc",
-  "quantity": 50.0,
-  "disposal_price_per_unit": 15.0,
+  "quantity": "50.00",
+  "disposal_price_per_unit": "15.00",
   "strategy": "FIFO"
 }
 ```
@@ -96,14 +96,16 @@ Response (201):
   "message": "Disposal processed successfully",
   "data": {
     "allocations": [...],
-    "totalQuantityDisposed": 50.0,
-    "weightedAverageCostBasis": 10.0,
-    "totalCostBasis": 500.0,
-    "realizedGainLoss": 250.0,
+    "totalQuantityDisposed": "50.00",
+    "weightedAverageCostBasis": "10.000000000000000000",
+    "totalCostBasis": "500.0000",
+    "realizedGainLoss": "250.0000",
     "strategy": "FIFO"
   }
 }
 ```
+
+When numeric values are submitted (deprecated compatibility path), results return as numbers for backward compatibility. Decimal strings are propagated end to end with arbitrary precision avoiding floating-point rounding errors.
 
 ### POST /taxation/preview
 Preview a disposal without committing.

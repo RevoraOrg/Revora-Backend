@@ -21,7 +21,8 @@ import { AppError, Errors } from '../lib/errors';
 import { Logger } from '../lib/logger';
 import { LogLevel } from '../lib/logger';
 import { DisposalStrategy } from '../services/taxation/types';
-import { WashSaleDetectorInput } from '../services/taxation/washSaleDetector';
+import { isPositiveDecimalAmount } from '../lib/amountValidation';
+import { Decimal } from '../lib/decimal';
 
 const VALID_STRATEGIES: DisposalStrategy[] = ['FIFO', 'LIFO', 'HIFO'];
 
@@ -57,6 +58,70 @@ export function isFiniteNonNegative(value: unknown): value is number {
     value >= 0 &&
     value <= MAX_NUMERIC_INPUT
   );
+}
+
+/**
+ * Validates a positive money or quantity amount: accepts a decimal string meeting
+ * isPositiveDecimalAmount (up to 10 decimal places, no negative or exponential values)
+ * or a positive finite number (deprecated backward-compatibility path).
+ */
+export function validatePositiveAmount(value: unknown, fieldName: string): number | string {
+  if (typeof value === 'string') {
+    if (!isPositiveDecimalAmount(value)) {
+      throw Errors.validationError(
+        `${fieldName} must be a positive decimal string with up to 10 decimal places`
+      );
+    }
+    const dec = new Decimal(value);
+    if (dec.compareTo(new Decimal(String(MAX_NUMERIC_INPUT))) > 0) {
+      throw Errors.validationError(
+        `${fieldName} exceeds maximum allowed value of ${MAX_NUMERIC_INPUT}`
+      );
+    }
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!isFinitePositive(value)) {
+      throw Errors.validationError(
+        `${fieldName} must be a positive finite number no greater than ${MAX_NUMERIC_INPUT}`
+      );
+    }
+    return value;
+  }
+  throw Errors.validationError(`${fieldName} must be a decimal string or positive number`);
+}
+
+/**
+ * Validates a non-negative money or unit price amount: accepts a decimal string
+ * (positive decimal string or exact zero) or a non-negative finite number (deprecated path).
+ */
+export function validateNonNegativeAmount(value: unknown, fieldName: string): number | string {
+  if (typeof value === 'string') {
+    if (/^0+(\.0{1,10})?$/.test(value)) {
+      return value;
+    }
+    if (!isPositiveDecimalAmount(value)) {
+      throw Errors.validationError(
+        `${fieldName} must be a non-negative decimal string with up to 10 decimal places`
+      );
+    }
+    const dec = new Decimal(value);
+    if (dec.compareTo(new Decimal(String(MAX_NUMERIC_INPUT))) > 0) {
+      throw Errors.validationError(
+        `${fieldName} exceeds maximum allowed value of ${MAX_NUMERIC_INPUT}`
+      );
+    }
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!isFiniteNonNegative(value)) {
+      throw Errors.validationError(
+        `${fieldName} must be a non-negative finite number no greater than ${MAX_NUMERIC_INPUT}`
+      );
+    }
+    return value;
+  }
+  throw Errors.validationError(`${fieldName} must be a decimal string or non-negative number`);
 }
 
 function isValidStrategy(value: unknown): value is DisposalStrategy {
@@ -102,21 +167,16 @@ export class TaxationHandler {
         return next(Errors.validationError('Missing required field: strategy'));
       }
 
-      // Validate types
-      if (!isFinitePositive(quantity)) {
-        return next(
-          Errors.validationError(
-            `quantity must be a positive finite number no greater than ${MAX_NUMERIC_INPUT}`
-          )
-        );
+      // Validate types and bounds (accepts decimal strings or deprecated numbers)
+      let validatedQuantity: number | string;
+      let validatedDisposalPrice: number | string;
+      try {
+        validatedQuantity = validatePositiveAmount(quantity, 'quantity');
+        validatedDisposalPrice = validateNonNegativeAmount(disposal_price_per_unit, 'disposal_price_per_unit');
+      } catch (err) {
+        return next(err);
       }
-      if (!isFiniteNonNegative(disposal_price_per_unit)) {
-        return next(
-          Errors.validationError(
-            `disposal_price_per_unit must be a non-negative finite number no greater than ${MAX_NUMERIC_INPUT}`
-          )
-        );
-      }
+
       if (!isValidStrategy(strategy)) {
         return next(
           Errors.validationError(
@@ -129,15 +189,15 @@ export class TaxationHandler {
         requestId,
         userId,
         offering_id,
-        quantity,
+        quantity: validatedQuantity,
         strategy,
       });
 
       const result = await this.taxationService.processDisposal({
         investor_id: userId,
         offering_id,
-        quantity,
-        disposal_price_per_unit,
+        quantity: validatedQuantity,
+        disposal_price_per_unit: validatedDisposalPrice,
         strategy,
         disposed_at: new Date(),
       });
@@ -195,20 +255,16 @@ export class TaxationHandler {
         return next(Errors.validationError('Missing required field: strategy'));
       }
 
-      if (!isFinitePositive(quantity)) {
-        return next(
-          Errors.validationError(
-            `quantity must be a positive finite number no greater than ${MAX_NUMERIC_INPUT}`
-          )
-        );
+      // Validate types and bounds (accepts decimal strings or deprecated numbers)
+      let validatedQuantity: number | string;
+      let validatedDisposalPrice: number | string;
+      try {
+        validatedQuantity = validatePositiveAmount(quantity, 'quantity');
+        validatedDisposalPrice = validateNonNegativeAmount(disposal_price_per_unit, 'disposal_price_per_unit');
+      } catch (err) {
+        return next(err);
       }
-      if (!isFiniteNonNegative(disposal_price_per_unit)) {
-        return next(
-          Errors.validationError(
-            `disposal_price_per_unit must be a non-negative finite number no greater than ${MAX_NUMERIC_INPUT}`
-          )
-        );
-      }
+
       if (!isValidStrategy(strategy)) {
         return next(
           Errors.validationError(
@@ -221,15 +277,15 @@ export class TaxationHandler {
         requestId,
         userId,
         offering_id,
-        quantity,
+        quantity: validatedQuantity,
         strategy,
       });
 
       const result = await this.taxationService.previewDisposal({
         investor_id: userId,
         offering_id,
-        quantity,
-        disposal_price_per_unit,
+        quantity: validatedQuantity,
+        disposal_price_per_unit: validatedDisposalPrice,
         strategy,
       });
 
@@ -263,6 +319,8 @@ export class TaxationHandler {
         return next(Errors.unauthorized('User not authenticated'));
       }
 
+      this.logger.info('Fetching gains summary', { requestId, userId });
+
       const summary = await this.taxationService.getJurisdictionGainsSummary(userId);
 
       res.status(200).json({
@@ -294,6 +352,8 @@ export class TaxationHandler {
       if (!userId) {
         return next(Errors.unauthorized('User not authenticated'));
       }
+
+      this.logger.info('Listing investment lots', { requestId, userId });
 
       const lots = await this.taxationService.listLots(userId);
 
@@ -425,7 +485,32 @@ export class TaxationHandler {
         return next(Errors.unauthorized('User not authenticated'));
       }
 
-      const { acquired_at: rawAcquiredAt } = req.body;
+      const { offering_id, investment_id, asset, quantity, cost_basis_per_unit, acquired_at: rawAcquiredAt, cost_currency, jurisdiction } = req.body;
+
+      if (!offering_id) {
+        return next(Errors.validationError('Missing required field: offering_id'));
+      }
+      if (!investment_id) {
+        return next(Errors.validationError('Missing required field: investment_id'));
+      }
+      if (!asset) {
+        return next(Errors.validationError('Missing required field: asset'));
+      }
+      if (quantity === undefined || quantity === null) {
+        return next(Errors.validationError('Missing required field: quantity'));
+      }
+      if (cost_basis_per_unit === undefined || cost_basis_per_unit === null) {
+        return next(Errors.validationError('Missing required field: cost_basis_per_unit'));
+      }
+
+      let validatedQuantity: number | string;
+      let validatedCostBasis: number | string;
+      try {
+        validatedQuantity = validatePositiveAmount(quantity, 'quantity');
+        validatedCostBasis = validateNonNegativeAmount(cost_basis_per_unit, 'cost_basis_per_unit');
+      } catch (err) {
+        return next(err);
+      }
 
       let acquiredAt: Date;
       if (rawAcquiredAt === undefined || rawAcquiredAt === null) {
@@ -451,7 +536,13 @@ export class TaxationHandler {
 
       const lot = await this.taxationService.createLot({
         investor_id: userId,
-        ...req.body,
+        offering_id,
+        investment_id,
+        asset,
+        quantity: validatedQuantity,
+        cost_basis_per_unit: validatedCostBasis,
+        cost_currency,
+        jurisdiction,
         acquired_at: acquiredAt,
       });
 
