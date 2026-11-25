@@ -6,7 +6,7 @@ import { globalLogger } from '../../lib/logger';
 import { OidcAdapterService } from './oidcAdapterService';
 import { JwksCacheService } from './jwksCache';
 import { createOidcRouter } from './oidcRoute';
-import { ALLOWED_ID_TOKEN_ALGORITHMS, OidcProviderRow } from './types';
+import { ALLOWED_ID_TOKEN_ALGORITHMS, OidcFlowState, OidcProviderRow } from './types';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -24,6 +24,10 @@ function makeProvider(overrides: Partial<OidcProviderRow> = {}): OidcProviderRow
     created_at: new Date(),
     ...overrides,
   };
+}
+
+function getFlowStates(service: OidcAdapterService): Map<string, OidcFlowState> {
+  return (service as unknown as { flowStates: Map<string, OidcFlowState> }).flowStates;
 }
 
 function makeDiscovery(overrides: Record<string, unknown> = {}) {
@@ -319,7 +323,7 @@ describe('OidcAdapterService', () => {
 
     it('stores flow state server-side', async () => {
       const { state } = await service.buildAuthorizeUrl(makeProvider());
-      const stored = (service as any).flowStates.get(state);
+      const stored = getFlowStates(service).get(state);
       expect(stored.tenantId).toBe('acme');
       expect(stored.codeVerifier).toBeTruthy();
     });
@@ -329,20 +333,27 @@ describe('OidcAdapterService', () => {
       service = new OidcAdapterService(jwksCache, { now: () => clock });
 
       const { state: expiredState } = await service.buildAuthorizeUrl(makeProvider());
-      const expiry = (service as any).flowStates.get(expiredState).expiresAt;
+      const expiry = getFlowStates(service).get(expiredState)?.expiresAt;
+      if (expiry === undefined) throw new Error('Expected the flow state to be stored');
 
       clock = expiry;
       const { state: activeState } = await service.buildAuthorizeUrl(makeProvider());
 
-      expect((service as any).flowStates.has(expiredState)).toBe(false);
-      expect((service as any).flowStates.has(activeState)).toBe(true);
+      expect(getFlowStates(service).has(expiredState)).toBe(false);
+      expect(getFlowStates(service).has(activeState)).toBe(true);
       expect(() => service.consumeFlowState(expiredState)).toThrow(/Invalid or unknown/);
     });
 
     it('evicts the oldest state when adding a flow at the capacity limit', async () => {
-      const states = (service as any).flowStates as Map<string, { expiresAt: number }>;
+      const states = getFlowStates(service);
       for (let i = 0; i < 10_000; i++) {
-        states.set(`state-${i}`, { expiresAt: Date.now() + 60_000 });
+        states.set(`state-${i}`, {
+          tenantId: 'tenant',
+          codeVerifier: 'verifier',
+          nonce: 'nonce',
+          redirectUri: 'https://app.example.com/callback',
+          expiresAt: Date.now() + 60_000,
+        });
       }
 
       const { state } = await service.buildAuthorizeUrl(makeProvider());
@@ -447,14 +458,14 @@ describe('OidcAdapterService', () => {
 
     it('throws for expired state', () => {
       service = new OidcAdapterService(jwksCache, { now: () => 10 });
-      (service as any).flowStates.set('x', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: 10 });
+      getFlowStates(service).set('x', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: 10 });
       expect(() => service.consumeFlowState('x')).toThrow(/expired/);
     });
 
     it('deletes state after consumption (one-time use)', () => {
-      (service as any).flowStates.set('y', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: Date.now() + 60_000 });
+      getFlowStates(service).set('y', { tenantId: 'a', codeVerifier: 'v', nonce: 'n', redirectUri: 'u', expiresAt: Date.now() + 60_000 });
       service.consumeFlowState('y');
-      expect((service as any).flowStates.has('y')).toBe(false);
+      expect(getFlowStates(service).has('y')).toBe(false);
     });
   });
 
