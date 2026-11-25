@@ -252,6 +252,36 @@ describe('startupAuthRateTierPolicy', () => {
       });
       expect(limiter.resolveTier(req)).toBe('trusted');
     });
+
+    it("returns 'standard' when provided secret has same byte length as configured secret but differs in content", () => {
+      process.env.STARTUP_AUTH_TIER_SECRET = 'tier-secret-1234';
+      const limiter = createStartupAuthTierLimiter();
+      const req = makeRequest({
+        [STARTUP_AUTH_RATE_TIER_HEADER]: 'internal',
+        [STARTUP_AUTH_TIER_SECRET_HEADER]: 'tier-secret-9999',
+      });
+      expect(limiter.resolveTier(req)).toBe('standard');
+    });
+
+    it("normalizes uppercase and whitespace-padded tier header values", () => {
+      process.env.STARTUP_AUTH_TIER_SECRET = tierSecret;
+      const limiter = createStartupAuthTierLimiter();
+      const req = makeRequest({
+        [STARTUP_AUTH_RATE_TIER_HEADER]: '  INTERNAL  ',
+        [STARTUP_AUTH_TIER_SECRET_HEADER]: tierSecret,
+      });
+      expect(limiter.resolveTier(req)).toBe('internal');
+    });
+
+    it("returns 'standard' when secret header is whitespace-only", () => {
+      process.env.STARTUP_AUTH_TIER_SECRET = tierSecret;
+      const limiter = createStartupAuthTierLimiter();
+      const req = makeRequest({
+        [STARTUP_AUTH_RATE_TIER_HEADER]: 'trusted',
+        [STARTUP_AUTH_TIER_SECRET_HEADER]: '   ',
+      });
+      expect(limiter.resolveTier(req)).toBe('standard');
+    });
   });
 
   // ─── Task 2.2: middleware integration tests ────────────────────────────────

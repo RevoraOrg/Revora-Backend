@@ -18,7 +18,7 @@ import {
   AuthenticatedRequest as LogoutAuthenticatedRequest,
 } from "../auth/logout/types";
 import { SessionRepository as DbSessionRepository } from "../db/repositories/sessionRepository";
-import { isSessionExpired } from "../auth/session";
+import { hashSessionToken, isSessionExpired } from "../auth/session";
 import { Errors } from "../lib/errors";
 import { globalLogger } from "../lib/logger";
 import { pool } from "../db/pool";
@@ -587,9 +587,22 @@ export function createRequireAuth(
       return;
     }
 
-    let failure: SessionValidationFailure | undefined;
+    if (!payload.sub || !payload.sid) {
+      globalLogger.warn(
+        "Auth failed: Token missing required claims (sub, sid)",
+        { path: req.path },
+      );
+      next(
+        Errors.unauthorized(
+          "Unauthorized: token missing required claims (sub, sid)",
+        ),
+      );
+      return;
+    }
+
+    let session: Awaited<ReturnType<typeof sessionRepository.findById>>;
     try {
-      failure = await validateSession(payload, token, sessionRepository);
+      session = await sessionRepository.findById(payload.sid);
     } catch (error) {
       globalLogger.error("Auth failed: Session lookup failed", {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -598,9 +611,8 @@ export function createRequireAuth(
       next(Errors.internal("Authentication service unavailable"));
       return;
     }
-    if (failure) {
+    if (!session || session.user_id !== payload.sub) {
       globalLogger.warn("Auth failed: Session validation failed", {
-        reason: failure,
         sessionId: payload.sid,
         userId: payload.sub,
         path: req.path,
@@ -632,11 +644,11 @@ export function createRequireAuth(
       return;
     }
 
-    if (session.token_consumed_at) {
+    if ((session as { token_consumed_at?: Date | null }).token_consumed_at) {
       globalLogger.warn("Auth failed: Refresh token already consumed", {
         sessionId: payload.sid,
         userId: payload.sub,
-        consumedAt: session.token_consumed_at,
+        consumedAt: (session as { token_consumed_at?: Date | null }).token_consumed_at,
         path: req.path,
       });
       next(Errors.unauthorized("Unauthorized: refresh token consumed"));

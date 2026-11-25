@@ -1,3 +1,4 @@
+import dnsPromises from "dns/promises";
 import express from "express";
 import request from "supertest";
 import {
@@ -537,6 +538,16 @@ describe("WebhookQueue", () => {
   });
 
   it("classifies safe and unsafe webhook targets correctly", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockImplementation((async (hostname: string) => {
+      if (hostname === "example.com") {
+        return [{ address: "93.184.216.34", family: 4 }];
+      }
+      if (hostname === "localhost") {
+        return [{ address: "127.0.0.1", family: 4 }];
+      }
+      throw new Error(`ENOTFOUND ${hostname}`);
+    }) as unknown as typeof dnsPromises.lookup);
+
     const isSafeUrl = (
       WebhookQueue as unknown as { isSafeUrl: (url: string) => Promise<boolean> }
     ).isSafeUrl;
@@ -1028,7 +1039,17 @@ describe("healthStartupHandler - startup probe", () => {
 });
 
 describe("createHealthRouter - k8s probe endpoints", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
   it("mounts all health endpoints correctly", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200 }) as typeof fetch;
     const mockDbHealth = jest.fn().mockResolvedValue({
       healthy: true,
       latencyMs: 10,
@@ -1666,7 +1687,69 @@ describe("Rate Limiter Tier Policies (BE-011)", () => {
     expect(typeof blocked.body.message).toBe("string");
     expect(blocked.body.message.length).toBeGreaterThan(0);
   });
+
+  it("enforces internal tier quota and blocks the 26th request with 429", async () => {
+    const app = makeApp();
+    const body = { email: "internal@example.com", password: "p" };
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.internal.limit; i++) {
+      const r = await request(app)
+        .post(`${API}/startup/register`)
+        .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+        .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+        .send(body);
+      expect(r.status).toBe(201);
+    }
+
+    const blocked = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "internal")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, tierSecret)
+      .send(body);
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-tier"]).toBe("internal");
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+    expect(blocked.body.message).toBe(STARTUP_AUTH_RATE_TIER_POLICIES.internal.message);
+  });
+
+  it("downgrades same-length wrong secret to standard tier under constant-time comparison", async () => {
+    const app = makeApp();
+    const sameLengthWrongSecret = "X".repeat(tierSecret.length);
+    const res = await request(app)
+      .post(`${API}/startup/register`)
+      .set(STARTUP_AUTH_RATE_TIER_HEADER, "trusted")
+      .set(STARTUP_AUTH_TIER_SECRET_HEADER, sameLengthWrongSecret)
+      .send({ email: "timing@example.com", password: "p" });
+
+    expect(res.status).toBe(201);
+    expect(res.headers["x-ratelimit-tier"]).toBe("standard");
+    expect(res.headers["x-ratelimit-limit"]).toBe(
+      String(STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit),
+    );
+  });
+
+  it("counts invalid-payload requests against the caller's tier quota before handler validation", async () => {
+    const app = makeApp();
+
+    for (let i = 0; i < STARTUP_AUTH_RATE_TIER_POLICIES.standard.limit; i++) {
+      const badReq = await request(app).post(`${API}/startup/register`).send({});
+      expect(badReq.status).toBe(400);
+      expect(badReq.headers["x-ratelimit-tier"]).toBe("standard");
+    }
+
+    const blocked = await request(app)
+      .post(`${API}/startup/register`)
+      .send({ email: "valid@example.com", password: "p" });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["x-ratelimit-remaining"]).toBe("0");
+  });
+
+  it("exposes createStartupAuthTierLimiter on __test for deterministic policy inspection", () => {
+    expect(typeof __test.createStartupAuthTierLimiter).toBe("function");
+    const limiter = __test.createStartupAuthTierLimiter();
+    expect(typeof limiter.middleware).toBe("function");
+    expect(typeof limiter.resolveTier).toBe("function");
+    expect(typeof limiter.reset).toBe("function");
+  });
 });
 
-/ /   R a t e   l i m i t e r   t e s t s  
- 

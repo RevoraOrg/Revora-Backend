@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'crypto';
 import { Request, RequestHandler } from 'express';
 import { createRateLimitMiddleware, InMemoryRateLimitStore } from './rateLimit';
 
@@ -48,8 +49,17 @@ interface StartupAuthTierLimiter {
 }
 
 /**
- * Builds startup-auth tier resolution and enforcement middleware.
- * Security assumption: privileged tiers are honored only with a valid shared secret.
+ * @notice Builds startup-auth tier resolution and rate-limit enforcement middleware.
+ * @dev Security assumptions:
+ *  - Privileged tiers (`trusted`, `internal`) are honored only when both the
+ *    configured environment secret (`STARTUP_AUTH_TIER_SECRET` by default) and
+ *    the `x-revora-tier-secret` request header are non-empty and match under a
+ *    constant-time comparison (`timingSafeEqual`).
+ *  - Any missing, unknown, or unauthenticated tier claim silently downgrades to
+ *    `standard` (fail-safe) and consumes from the `standard` counter bucket.
+ *  - Counter buckets are isolated per tier via `startup-auth:<tier>` key prefixes.
+ * @param options Optional store instance and custom environment variable name.
+ * @returns Middleware, tier resolver, and counter reset helper.
  */
 export function createStartupAuthTierLimiter(
   options: StartupAuthTierLimiterOptions = {},
@@ -71,7 +81,16 @@ export function createStartupAuthTierLimiter(
     const providedSecret = req
       .header(STARTUP_AUTH_TIER_SECRET_HEADER)
       ?.trim();
-    if (!configuredSecret || !providedSecret || configuredSecret !== providedSecret) {
+    if (!configuredSecret || !providedSecret) {
+      return 'standard';
+    }
+
+    const configuredBuf = Buffer.from(configuredSecret, 'utf8');
+    const providedBuf = Buffer.from(providedSecret, 'utf8');
+    if (
+      configuredBuf.length !== providedBuf.length ||
+      !timingSafeEqual(configuredBuf, providedBuf)
+    ) {
       return 'standard';
     }
 

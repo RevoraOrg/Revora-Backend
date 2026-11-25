@@ -1,8 +1,9 @@
 # Rate Limiter Tier Policies
 
 This document describes how Revora's Express API enforces differentiated rate limits
-across caller types, and covers the auth-gating of sensitive export endpoints that
-was hardened alongside the rate-limiter work (Issue #1275).
+across caller types, including the Startup Auth Rate Limiter Tier Policies (BE-011)
+and the auth-gating of sensitive export endpoints hardened alongside the rate-limiter
+work (Issue #1275).
 
 ---
 
@@ -10,22 +11,70 @@ was hardened alongside the rate-limiter work (Issue #1275).
 
 Rate limiting in Revora is tiered: different callers receive different quotas based on
 their identity and the sensitivity of the route they are accessing. The tiers are
-enforced by separate middleware factories mounted in `src/index.ts` and
-`src/middleware/startupAuthRateTierPolicy.ts`.
+enforced by separate middleware factories mounted in `src/index.ts`,
+`src/middleware/rateLimit.ts`, and `src/middleware/startupAuthRateTierPolicy.ts`.
 
 The philosophy is:
 
-- **Fail closed.** If the rate-limit store is unavailable, callers are rejected rather
-  than silently allowed through.
-- **Defence in depth.** Rate limiting never substitutes for authentication. Auth
-  middleware always runs before the route handler, independently of the rate-limiter
-  state.
-- **Explicit tiers.** Every tier is named and documented; there is no default "allow
-  all" tier.
+- **Fail-safe / Fail-closed.** Privileged rate-limit tiers (`trusted`, `internal`) are
+  never granted without cryptographic/shared-secret verification; any missing,
+  malformed, or mismatched secret silently downgrades the caller to the `standard`
+  tier. If a backing store is unavailable, callers are rejected rather than allowed
+  unthrottled.
+- **Defence in depth.** Rate limiting runs before route handlers (and before auth or
+  payload validation on public registration endpoints) so invalid-input floods and
+  brute-force attempts still consume quota.
+- **Explicit tiers & isolated buckets.** Every tier is named, documented, and keyed
+  with an explicit prefix (`startup-auth:<tier>`) so exhausting one tier never affects
+  another tier's counter bucket.
 
 ---
 
-## Tiers
+## Startup Auth Rate Tier Policies (`POST /api/v1/startup/register`)
+
+The startup registration endpoint (`POST /api/v1/startup/register`) enforces three
+distinct rate-limit tiers via `createStartupAuthTierLimiter()` in
+`src/middleware/startupAuthRateTierPolicy.ts`:
+
+| Tier | Key Prefix | Window | Max Requests | 429 Error Message |
+|---|---|---|---|---|
+| `standard` | `startup-auth:standard` | 15 min (`900000` ms) | `5` | `Too many registration attempts, please try again after 15 minutes.` |
+| `trusted` | `startup-auth:trusted` | 15 min (`900000` ms) | `10` | `Too many trusted-tier registration attempts, please try again after 15 minutes.` |
+| `internal` | `startup-auth:internal` | 15 min (`900000` ms) | `25` | `Too many internal registration attempts, please try again after 15 minutes.` |
+
+### Request Headers & Tier Resolution
+
+1. **`x-revora-rate-tier`** (`STARTUP_AUTH_RATE_TIER_HEADER`):
+   - Optional request header indicating the desired tier (`standard`, `trusted`, or `internal`).
+   - Normalized with `.trim().toLowerCase()`.
+   - Omitted, empty, or unknown values (e.g., `vip`) resolve immediately to `standard`.
+2. **`x-revora-tier-secret`** (`STARTUP_AUTH_TIER_SECRET_HEADER`):
+   - Required when requesting `trusted` or `internal`.
+   - Compared against `process.env.STARTUP_AUTH_TIER_SECRET` (or custom `tierSecretEnvName`) after trimming whitespace.
+   - Uses constant-time comparison (`crypto.timingSafeEqual`) after checking UTF-8 byte lengths to prevent timing side-channel leaks of the tier secret.
+   - If `STARTUP_AUTH_TIER_SECRET` is unset/empty, or if `x-revora-tier-secret` is missing, empty, or mismatched, the request silently downgrades to `standard` and consumes from the `startup-auth:standard` bucket.
+
+### Response Headers
+
+Every response from the tier limiter (both `201`/`400` and `429`) emits:
+
+- `X-RateLimit-Tier`: The resolved tier (`standard`, `trusted`, or `internal`).
+- `X-RateLimit-Limit`: Maximum requests allowed in the current window for the resolved tier (`5`, `10`, or `25`).
+- `X-RateLimit-Remaining`: Remaining requests in the current window (clamped to `0` when exhausted).
+- `X-RateLimit-Reset`: UTC epoch seconds when the active window resets.
+- `Retry-After` (on `429 Too Many Requests` only): Positive integer seconds until the window resets.
+
+### Verification & Coverage Command
+
+Run the dedicated BE-011 rate-limiter tier policy test and coverage suite (enforces >= 95% statements, lines, and functions):
+
+```bash
+npm run test:coverage:backend-011
+```
+
+---
+
+## General API Tiers
 
 | Tier | Typical caller | Window | Max requests |
 |---|---|---|---|

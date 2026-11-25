@@ -21,7 +21,13 @@ import {
 } from "./lib/stellarRpcFailure";
 import { createHealthRouter } from "./routes/health";
 import vestingRouter from "./routes/vesting";
-import { createOfferingValidationRouter } from "./routes/offeringValidation";
+import {
+  createOfferingValidationRouter,
+  evaluateOfferingValidationMatrix,
+  parseIsoDate,
+  parseMoneyString,
+  parseOfferingValidationPayload,
+} from "./routes/offeringValidation";
 import { createStartupAuthTierLimiter } from "./middleware/startupAuthRateTierPolicy";
 import { env } from "./config/env";
 import { validateWebhookUrl, SsrfValidationError } from "./lib/ssrfProtection";
@@ -79,6 +85,7 @@ import { MetricsCollector } from "./lib/metrics";
 import {
   createStellarTransactionVerifier,
   StellarTransactionVerifier,
+  StellarTransactionVerifierImpl,
 } from "./lib/stellarTransactionVerifier";
 import { createReconciliationMetricsHandler } from "./routes/reconciliationRoutes";
 import { createReconciliationSchedulerRuntime } from "./services/reconciliationScheduler";
@@ -101,7 +108,7 @@ import taxationRouter from './routes/taxation';
 import { PdfRenderJobRepository } from './db/repositories/pdfRenderJobRepository';
 import { InMemoryStatementPdfStorage } from './services/statementPdfService';
 import createStatementsRouter from './routes/statements';
-import { createRequireAuth } from './middleware/auth';
+import { createRequireAuth, requireCompliance } from './middleware/auth';
 // \u2500\u2500 Auth routers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 import { createLoginRouter } from './auth/login/loginRoute';
 import { createRefreshRouter } from './auth/refresh/refreshRoute';
@@ -595,6 +602,10 @@ export function createApp(dependencies: AppDependencies = {}): express.Express {
 
 export const __test = {
   stableSerialize,
+  parseMoneyString,
+  parseIsoDate,
+  parseOfferingValidationPayload,
+  evaluateOfferingValidationMatrix,
   /**
    * @dev Exposes the tier-limiter factory for integration tests that need to
    *      inspect tier resolution or reset counters without restarting the app.
