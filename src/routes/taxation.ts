@@ -18,7 +18,7 @@
  * @module routes/taxation
  */
 
-import { Router, Request, Response, NextFunction } from 'express';
+import { Router } from 'express';
 import { TaxationHandler } from '../handlers/taxationHandler';
 import { createTaxationService } from '../services/taxation/taxationService';
 import { pool } from '../db/pool';
@@ -46,16 +46,7 @@ router.get('/gains-summary', taxationHandler.getGainsSummary);
 // List investment lots
 router.get('/lots', taxationHandler.listLots);
 
-// Create a new investment lot (validated via shared finite-number helpers)
-router.post('/lots', (req: Request, res: Response, next: NextFunction) => {
-  const handler = taxationHandler as unknown as {
-    createLot?: (req: Request, res: Response, next: NextFunction) => unknown;
-  };
-  if (typeof handler.createLot !== 'function') {
-    res.status(501).json({ error: 'createLot handler not implemented' });
-    return;
-  }
-  return handler.createLot(req, res, next);
-});
+// Create a new investment lot
+router.post('/lots', taxationHandler.createLot);
 
 export default router;

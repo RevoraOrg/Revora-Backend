@@ -17,16 +17,25 @@
  */
 
 import { CostBasisStrategy, InvestmentLot, LotAllocation } from './types';
+import { Decimal } from '../../lib/decimal';
+
+function toDecimal(val: number | string): Decimal {
+  return new Decimal(String(val));
+}
 
 /**
  * Base validation shared by all strategies.
  * Ensures sufficient quantity exists across all available lots.
  */
-function validateSufficientQuantity(lots: InvestmentLot[], quantityToDispose: number): void {
-  const totalAvailable = lots.reduce((sum, lot) => sum + lot.remaining_quantity, 0);
-  if (totalAvailable < quantityToDispose) {
+function validateSufficientQuantity(lots: InvestmentLot[], quantityToDispose: number | string): void {
+  const reqDec = toDecimal(quantityToDispose);
+  const totalAvailableDec = lots.reduce(
+    (sum, lot) => sum.add(toDecimal(lot.remaining_quantity)),
+    new Decimal('0')
+  );
+  if (totalAvailableDec.compareTo(reqDec) < 0) {
     throw new Error(
-      `Insufficient quantity across available lots: requested ${quantityToDispose}, available ${totalAvailable}`
+      `Insufficient quantity across available lots: requested ${typeof quantityToDispose === 'number' ? quantityToDispose : reqDec.toString()}, available ${typeof quantityToDispose === 'number' ? parseFloat(totalAvailableDec.toString()) : totalAvailableDec.toString()}`
     );
   }
 }
@@ -36,24 +45,28 @@ function validateSufficientQuantity(lots: InvestmentLot[], quantityToDispose: nu
  * Consumes from each lot in order until the quantity is satisfied.
  * Skips lots with remaining_quantity <= 0.
  */
-function allocateAcrossLots(lots: InvestmentLot[], quantityToDispose: number): LotAllocation[] {
+function allocateAcrossLots(lots: InvestmentLot[], quantityToDispose: number | string): LotAllocation[] {
+  const isStringMode = typeof quantityToDispose === 'string';
   const allocations: LotAllocation[] = [];
-  let remaining = quantityToDispose;
+  let remainingDec = toDecimal(quantityToDispose);
 
   for (const lot of lots) {
-    if (remaining <= 0) break;
-    if (lot.remaining_quantity <= 0) continue;
+    if (remainingDec.isZero() || remainingDec.isNegative()) break;
+    const lotRemDec = toDecimal(lot.remaining_quantity);
+    if (lotRemDec.isZero() || lotRemDec.isNegative()) continue;
 
-    const consumed = Math.min(lot.remaining_quantity, remaining);
+    const consumedDec = lotRemDec.compareTo(remainingDec) < 0 ? lotRemDec : remainingDec;
+    const costBasisDec = toDecimal(lot.cost_basis_per_unit);
+    const totalCostBasisDec = consumedDec.multiply(costBasisDec);
 
     allocations.push({
       lot,
-      quantityConsumed: consumed,
-      costBasisPerUnit: lot.cost_basis_per_unit,
-      totalCostBasis: consumed * lot.cost_basis_per_unit,
+      quantityConsumed: isStringMode ? consumedDec.toString() : parseFloat(consumedDec.toString()),
+      costBasisPerUnit: isStringMode ? costBasisDec.toString() : (typeof lot.cost_basis_per_unit === 'number' ? lot.cost_basis_per_unit : parseFloat(costBasisDec.toString())),
+      totalCostBasis: isStringMode ? totalCostBasisDec.toString() : parseFloat(totalCostBasisDec.toString()),
     });
 
-    remaining -= consumed;
+    remainingDec = remainingDec.subtract(consumedDec);
   }
 
   return allocations;
@@ -68,7 +81,7 @@ function allocateAcrossLots(lots: InvestmentLot[], quantityToDispose: number): L
 export class FIFOStrategy implements CostBasisStrategy {
   readonly name = 'FIFO' as const;
 
-  selectLots(lots: InvestmentLot[], quantityToDispose: number): LotAllocation[] {
+  selectLots(lots: InvestmentLot[], quantityToDispose: number | string): LotAllocation[] {
     validateSufficientQuantity(lots, quantityToDispose);
 
     // Sort by acquisition date ascending (oldest first)
@@ -90,7 +103,7 @@ export class FIFOStrategy implements CostBasisStrategy {
 export class LIFOStrategy implements CostBasisStrategy {
   readonly name = 'LIFO' as const;
 
-  selectLots(lots: InvestmentLot[], quantityToDispose: number): LotAllocation[] {
+  selectLots(lots: InvestmentLot[], quantityToDispose: number | string): LotAllocation[] {
     validateSufficientQuantity(lots, quantityToDispose);
 
     // Sort by acquisition date descending (newest first)
@@ -112,13 +125,15 @@ export class LIFOStrategy implements CostBasisStrategy {
 export class HIFOStrategy implements CostBasisStrategy {
   readonly name = 'HIFO' as const;
 
-  selectLots(lots: InvestmentLot[], quantityToDispose: number): LotAllocation[] {
+  selectLots(lots: InvestmentLot[], quantityToDispose: number | string): LotAllocation[] {
     validateSufficientQuantity(lots, quantityToDispose);
 
     // Sort by cost basis descending (highest first), tie-break by acquisition date ascending (oldest first)
     const sorted = [...lots].sort((a, b) => {
-      const costDiff = b.cost_basis_per_unit - a.cost_basis_per_unit;
-      if (costDiff !== 0) return costDiff;
+      const aCost = toDecimal(a.cost_basis_per_unit);
+      const bCost = toDecimal(b.cost_basis_per_unit);
+      const costCmp = bCost.compareTo(aCost);
+      if (costCmp !== 0) return costCmp;
       // For equal cost basis, fall back to FIFO (oldest first) for deterministic results
       return a.acquired_at.getTime() - b.acquired_at.getTime();
     });

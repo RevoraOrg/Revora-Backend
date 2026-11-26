@@ -438,6 +438,79 @@ describe('TaxationService', () => {
       expect(result.realizedGainLoss).toBeLessThan(0);
       expect(result.realizedGainLoss).toBe(-250); // 250 - 500
     });
+
+    describe('decimal string handling and precision', () => {
+      it('processes disposal with decimal strings and preserves precision (0.1 + 0.2 case)', async () => {
+        // Lot 1: 0.1 units at price 1.0
+        // Lot 2: 0.2 units at price 1.0
+        const lots = [
+          makeLot({ id: 'lot-1', remaining_quantity: '0.1', cost_basis_per_unit: '1.0' } as any),
+          makeLot({ id: 'lot-2', remaining_quantity: '0.2', cost_basis_per_unit: '1.0' } as any),
+        ];
+        lotRepo.findAvailableLotsForUpdate.mockResolvedValue(lots);
+
+        const result = await service.processDisposal({
+          investor_id: 'inv-1',
+          offering_id: 'off-1',
+          quantity: '0.3',
+          disposal_price_per_unit: '2.5',
+          strategy: 'FIFO',
+        });
+
+        // In JS float: 0.1 + 0.2 = 0.30000000000000004
+        // In Decimal: 0.1 + 0.2 = 0.3 exact
+        expect(result.totalQuantityDisposed).toBe('0.3');
+        expect(result.allocations).toHaveLength(2);
+        expect(result.allocations[0].quantityConsumed).toBe('0.1');
+        expect(result.allocations[1].quantityConsumed).toBe('0.2');
+        // Total cost basis = 0.1 * 1.0 + 0.2 * 1.0 = 0.30
+        expect(result.totalCostBasis).toBe('0.30');
+        // Proceeds = 0.3 * 2.5 = 0.75
+        // Realized gain = 0.75 - 0.30 = 0.45
+        expect(result.realizedGainLoss).toBe('0.45');
+      });
+
+      it('previews disposal with decimal strings accurately', async () => {
+        const lots = [
+          makeLot({ id: 'lot-1', remaining_quantity: '100.50', cost_basis_per_unit: '10.25' } as any),
+        ];
+        lotRepo.findAvailableLots.mockResolvedValue(lots);
+
+        const result = await service.previewDisposal({
+          investor_id: 'inv-1',
+          offering_id: 'off-1',
+          quantity: '50.25',
+          disposal_price_per_unit: '12.50',
+          strategy: 'FIFO',
+        });
+
+        expect(typeof result.realizedGainLoss).toBe('string');
+        // Proceeds = 50.25 * 12.50 = 628.1250
+        // Cost basis = 50.25 * 10.25 = 515.0625
+        // Realized gain = 628.1250 - 515.0625 = 113.0625
+        expect(result.totalCostBasis).toBe('515.0625');
+        expect(result.realizedGainLoss).toBe('113.0625');
+      });
+
+      it('creates lot with decimal string quantity and cost basis', async () => {
+        const lot = makeLot();
+        lotRepo.create.mockResolvedValue(lot);
+
+        const result = await service.createLot({
+          investor_id: 'inv-1',
+          offering_id: 'off-1',
+          investment_id: 'invst-1',
+          asset: 'USDC',
+          quantity: '123.456789',
+          cost_basis_per_unit: '9.87654321',
+          acquired_at: new Date('2024-01-01'),
+        });
+
+        expect(result.quantity).toBe('123.456789');
+        expect(result.cost_basis_per_unit).toBe('9.87654321');
+        expect(typeof result.total_cost_basis).toBe('string');
+      });
+    });
   });
 
   // -----------------------------------------------------------------------

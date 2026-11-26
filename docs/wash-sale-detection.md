@@ -52,7 +52,7 @@ Migration `024_create_wash_sale_adjustments.sql` creates the table with:
 - Audit chain integrity is maintained through the existing `audit_logs` table with `prev_hash → row_hash` linking.
 - The wash-sale window is bounded (1-365 days) to prevent abuse.
 - Cost basis adjustments are additive (disallowed loss added to repurchase lot cost basis), never reducing basis below zero.
-- All monetary values use `NUMERIC(30,10)` precision matching existing taxation column types.
+- All monetary values use `NUMERIC(30,10)` precision matching existing taxation column types and platform decimal string conventions (`src/lib/decimal.ts`).
 
 ## Idempotency
 

@@ -3138,11 +3138,19 @@ components:
         offering_id:
           type: string
         quantity:
-          type: number
-          minimum: 0
+          oneOf:
+            - type: string
+              description: Positive decimal string with up to 10 decimal places (e.g. "50.00")
+            - type: number
+              minimum: 0
+              description: "(Deprecated) Numeric quantity"
         disposal_price_per_unit:
-          type: number
-          minimum: 0
+          oneOf:
+            - type: string
+              description: Non-negative decimal string with up to 10 decimal places (e.g. "15.00")
+            - type: number
+              minimum: 0
+              description: "(Deprecated) Numeric disposal price per unit"
         strategy:
           type: string
           enum: [FIFO, LIFO, HIFO]
@@ -3159,11 +3167,19 @@ components:
         asset:
           type: string
         quantity:
-          type: number
-          minimum: 0
+          oneOf:
+            - type: string
+              description: Positive decimal string with up to 10 decimal places (e.g. "100.00")
+            - type: number
+              minimum: 0
+              description: "(Deprecated) Numeric quantity"
         cost_basis_per_unit:
-          type: number
-          minimum: 0
+          oneOf:
+            - type: string
+              description: Non-negative decimal string with up to 10 decimal places (e.g. "10.00")
+            - type: number
+              minimum: 0
+              description: "(Deprecated) Numeric cost basis per unit"
         acquired_at:
           type: string
           format: date-time

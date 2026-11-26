@@ -10,6 +10,7 @@
 
 import { Pool, PoolClient, QueryResult } from 'pg';
 import { InvestmentLot, CreateInvestmentLotInput, LotStatus } from '../../services/taxation/types';
+import { Decimal } from '../../lib/decimal';
 
 interface InvestmentLotRow {
   id: string;
@@ -200,10 +201,11 @@ export class InvestmentLotRepository {
   async updateLotAfterDisposal(
     client: PoolClient,
     lotId: string,
-    newRemainingQuantity: number,
+    newRemainingQuantity: number | string,
   ): Promise<void> {
+    const remDec = new Decimal(String(newRemainingQuantity));
     const newStatus: LotStatus =
-      newRemainingQuantity <= 0 ? 'exhausted' : 'partially_used';
+      remDec.isZero() || remDec.isNegative() ? 'exhausted' : 'partially_used';
 
     const query = `
       UPDATE investment_lots
