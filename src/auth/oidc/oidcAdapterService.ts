@@ -24,6 +24,7 @@ const DEFAULT_DISCOVERY_TTL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_HTTP_TIMEOUT_MS = 5000;    // 5 seconds
 const CLOCK_SKEW_SECONDS = 300;           // 5 minutes
 const STATE_TTL_MS = 10 * 60 * 1000;     // 10 minutes
+const MAX_FLOW_STATES = 10_000;
 
 interface DiscoveryCacheEntry {
   doc: OidcDiscoveryDocument;
@@ -282,13 +283,21 @@ export class OidcAdapterService {
     const nonce = randomBytes(16).toString('base64url');
     const state = randomBytes(16).toString('base64url');
     const redirectUri = provider.redirect_uris.split(',')[0].trim();
+    const nowMs = this.now();
+
+    this.evictExpiredFlowStates(nowMs);
+    while (this.flowStates.size >= MAX_FLOW_STATES) {
+      const oldestState = this.flowStates.keys().next().value;
+      if (oldestState === undefined) break;
+      this.flowStates.delete(oldestState);
+    }
 
     this.flowStates.set(state, {
       tenantId: provider.tenant_id,
       codeVerifier,
       nonce,
       redirectUri,
-      expiresAt: Date.now() + STATE_TTL_MS,
+      expiresAt: nowMs + STATE_TTL_MS,
     });
 
     const params = new URLSearchParams({
@@ -303,6 +312,14 @@ export class OidcAdapterService {
     });
 
     return { url: `${discovery.authorization_endpoint}?${params}`, state };
+  }
+
+  private evictExpiredFlowStates(nowMs: number): void {
+    for (const [state, flowState] of this.flowStates) {
+      if (nowMs >= flowState.expiresAt) {
+        this.flowStates.delete(state);
+      }
+    }
   }
 
   // ── Callback / token exchange ─────────────────────────────────────────
@@ -324,7 +341,7 @@ export class OidcAdapterService {
     const s = this.flowStates.get(state);
     if (!s) throw new Error('Invalid or unknown OIDC state parameter');
     this.flowStates.delete(state);
-    if (Date.now() > s.expiresAt) throw new Error('OIDC flow state expired');
+    if (this.now() >= s.expiresAt) throw new Error('OIDC flow state expired');
     return s;
   }
 
