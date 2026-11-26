@@ -2,10 +2,10 @@ import crypto from 'crypto';
 import {
   AppError,
   ErrorCode,
-  ProviderNotRegisteredError,
   UnsupportedJurisdictionError,
 } from '../../../lib/errors';
 import { KycRouter, type RouteTable, type RouteTableEntry } from '../KycRouter';
+import type { KycProvider, KycCheckResult } from '../KycProvider';
 
 const SECRET_KEY = 'typed-kyc-errors-test-secret';
 
@@ -18,15 +18,31 @@ function signedTable(version: string, entries: RouteTableEntry[]): RouteTable {
   };
 }
 
-function routerWithRoutes(entries: RouteTableEntry[]): KycRouter {
+function makeProvider(name: string): KycProvider {
+  const result: KycCheckResult = { status: 'pending', provider: name, referenceId: `ref-${name}` };
+  return {
+    name,
+    initiateCheck: jest.fn().mockResolvedValue(result),
+    getStatus: jest.fn().mockResolvedValue(result),
+    handleWebhook: jest.fn().mockResolvedValue(result),
+  };
+}
+
+function routerWithRoutes(entries: RouteTableEntry[], providerNames: string[] = []): KycRouter {
   const router = new KycRouter(SECRET_KEY);
+  for (const name of providerNames) {
+    router.registerProvider(makeProvider(name));
+  }
   router.loadRouteTable(signedTable('1', entries));
   return router;
 }
 
 describe('KycRouter typed route errors', () => {
   it('throws an inspectable UnsupportedJurisdictionError for an unmapped country', () => {
-    const router = routerWithRoutes([{ jurisdiction: 'US', providerName: 'registered-provider' }]);
+    const router = routerWithRoutes(
+      [{ jurisdiction: 'US', providerName: 'registered-provider' }],
+      ['registered-provider'],
+    );
 
     let thrown: unknown;
     try {
@@ -47,41 +63,33 @@ describe('KycRouter typed route errors', () => {
     expect(typed.publicMessage).toBe('Jurisdiction not supported');
   });
 
-  it('throws an inspectable ProviderNotRegisteredError for a missing provider registration', () => {
-    const router = routerWithRoutes([{ jurisdiction: 'DE', providerName: 'internal-vendor-prod' }]);
+  it('rejects a table that references an unregistered provider before installing it', () => {
+    const router = new KycRouter(SECRET_KEY);
+    const table = signedTable('1', [{ jurisdiction: 'DE', providerName: 'internal-vendor-prod' }]);
 
     let thrown: unknown;
     try {
-      router.route('DE');
+      router.loadRouteTable(table);
     } catch (error) {
       thrown = error;
     }
 
-    expect(thrown).toBeInstanceOf(ProviderNotRegisteredError);
-    expect(thrown).toBeInstanceOf(AppError);
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain('internal-vendor-prod');
+    expect((thrown as Error).message).toContain('unregistered provider');
 
-    const typed = thrown as ProviderNotRegisteredError;
-    expect(typed.statusCode).toBe(500);
-    expect(typed.code).toBe(ErrorCode.INTERNAL_ERROR);
-    expect(typed.expose).toBe(false);
-    expect(typed.providerName).toBe('internal-vendor-prod');
-    expect(typed.message).toContain('internal-vendor-prod');
-    expect(typed.publicMessage).toBe('Internal server error');
+    // Nothing was installed, so the jurisdiction still fails closed.
+    expect(router.getVersion()).toBe('');
+    expect(() => router.route('DE')).toThrow(UnsupportedJurisdictionError);
   });
 
-  it('keeps the two failure classes distinct for instanceof callers', () => {
+  it('keeps unsupported-jurisdiction and unregistered-provider failures distinct', () => {
     const unsupportedRouter = routerWithRoutes([]);
-    const missingProviderRouter = routerWithRoutes([
-      { jurisdiction: 'CA', providerName: 'ghost-provider' },
-    ]);
+    const misconfigured = new KycRouter(SECRET_KEY);
+    const badTable = signedTable('1', [{ jurisdiction: 'CA', providerName: 'ghost-provider' }]);
 
     expect(() => unsupportedRouter.route('CA')).toThrow(UnsupportedJurisdictionError);
-    expect(() => missingProviderRouter.route('CA')).toThrow(ProviderNotRegisteredError);
-
-    try {
-      unsupportedRouter.route('CA');
-    } catch (error) {
-      expect(error).not.toBeInstanceOf(ProviderNotRegisteredError);
-    }
+    expect(() => misconfigured.loadRouteTable(badTable)).toThrow(/unregistered provider/);
+    expect(() => misconfigured.route('CA')).toThrow(UnsupportedJurisdictionError);
   });
 });

@@ -6,9 +6,10 @@
  * error instead of silently degrading to a default provider.
  *
  * Evidence branches exercised (src/services/kyc/KycRouter.ts):
- *   - L41: `throw new Error('Invalid route table signature. Fails closed.')`
- *   - L58: `throw new Error(\`Jurisdiction ${jurisdiction} not supported. Fails closed.\`)`
- *   - L63: `throw new Error(\`Configured provider ${providerName} not registered.\`)`
+ *   - `loadRouteTable`: `throw new Error('Invalid route table signature. Fails closed.')`
+ *   - `route`: `throw new Error(\`Jurisdiction ${jurisdiction} not supported. Fails closed.\`)`
+ *   - `loadRouteTable`: rejects entries that reference an unregistered provider
+ *     before mutating the active table (all-or-nothing reload).
  *
  * Each failure branch is paired with its neighbouring success path so the suite
  * pins the *branch*, not merely the throw. All inputs are deterministic (no
@@ -204,52 +205,67 @@ describe('KycRouter RouteTableEntry regression — unknown jurisdiction (fails c
   });
 });
 
-// ─── Branch 3: unregistered provider (L63) ───────────────────────────────────
+// ─── Branch 3: unregistered provider (rejected at load) ──────────────────────
 
-describe('KycRouter RouteTableEntry regression — unregistered provider', () => {
+describe('KycRouter RouteTableEntry regression — unregistered provider rejected at load', () => {
   it('throws the documented error when the mapped provider was never registered', () => {
-    const router = buildRouter([{ jurisdiction: 'DE', providerName: 'ghost-provider' }], ['provider-a']);
+    const router = new KycRouter(SECRET_KEY);
+    router.registerProvider(makeProvider('provider-a'));
 
-    expect(() => router.route('DE')).toThrow('Configured provider ghost-provider not registered.');
+    expect(() =>
+      router.loadRouteTable(signTable(VERSION, [{ jurisdiction: 'DE', providerName: 'ghost-provider' }]))
+    ).toThrow('references unregistered provider "ghost-provider"');
+
+    expect(router.getVersion()).toBe('');
+    expect(() => router.route('DE')).toThrow('Jurisdiction DE not supported. Fails closed.');
   });
 
   it('names the exact missing provider in the error message', () => {
-    const router = buildRouter([{ jurisdiction: 'DE', providerName: 'ghost-provider' }], ['provider-a']);
+    const router = new KycRouter(SECRET_KEY);
+    router.registerProvider(makeProvider('provider-a'));
 
     let thrown: unknown;
     try {
-      router.route('DE');
+      router.loadRouteTable(signTable(VERSION, [{ jurisdiction: 'DE', providerName: 'ghost-provider' }]));
     } catch (e) {
       thrown = e;
     }
-    expect((thrown as Error).message).toBe('Configured provider ghost-provider not registered.');
+    expect((thrown as Error).message).toContain('ghost-provider');
+    expect((thrown as Error).message).toContain('unregistered provider');
   });
 
-  it('surfaces provider misconfiguration even though the jurisdiction is mapped (order of checks)', () => {
-    // Table maps US → provider-a correctly; but the registered provider has a
-    // different name, so the lookup misses. Proves the check is not short-
-    // circuited by a successful jurisdiction lookup.
-    const router = buildRouter(
-      [{ jurisdiction: 'US', providerName: 'provider-a' }],
-      ['provider-b'] // wrong provider registered
-    );
-
-    expect(() => router.route('US')).toThrow('Configured provider provider-a not registered.');
-  });
-
-  it('keeps routing other jurisdictions operational when one mapping is broken (isolation)', () => {
-    const providerB = makeProvider('provider-b');
+  it('rejects the whole table even when only one entry references an unregistered provider', () => {
+    // All-or-nothing: a valid EU mapping must not be installed alongside a
+    // broken DE mapping.
     const router = new KycRouter(SECRET_KEY);
-    router.registerProvider(providerB);
-    router.loadRouteTable(
-      signTable(VERSION, [
-        { jurisdiction: 'DE', providerName: 'ghost-provider' },
-        { jurisdiction: 'EU', providerName: 'provider-b' },
-      ])
-    );
+    router.registerProvider(makeProvider('provider-b'));
 
-    expect(() => router.route('DE')).toThrow('Configured provider ghost-provider not registered.');
-    expect(router.route('EU')).toBe(providerB);
+    expect(() =>
+      router.loadRouteTable(
+        signTable(VERSION, [
+          { jurisdiction: 'DE', providerName: 'ghost-provider' },
+          { jurisdiction: 'EU', providerName: 'provider-b' },
+        ])
+      )
+    ).toThrow(/unregistered provider/);
+
+    expect(router.getVersion()).toBe('');
+    expect(() => router.route('EU')).toThrow('Jurisdiction EU not supported. Fails closed.');
+  });
+
+  it('keeps the previously active table when a reload references an unregistered provider', () => {
+    const providerA = makeProvider('provider-a');
+    const router = new KycRouter(SECRET_KEY);
+    router.registerProvider(providerA);
+    router.loadRouteTable(signTable('1', [{ jurisdiction: 'US', providerName: 'provider-a' }]));
+
+    expect(() =>
+      router.loadRouteTable(signTable('2', [{ jurisdiction: 'DE', providerName: 'ghost-provider' }]))
+    ).toThrow(/unregistered provider/);
+
+    expect(router.getVersion()).toBe('1');
+    expect(router.route('US')).toBe(providerA);
+    expect(() => router.route('DE')).toThrow('Jurisdiction DE not supported. Fails closed.');
   });
 });
 

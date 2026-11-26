@@ -237,10 +237,48 @@ export class KycRouter {
       }
     }
 
-    this.routeMap.clear();
-    for (const entry of table.entries) {
-      this.routeMap.set(entry.jurisdiction, entry.providerName);
+    // Validate every entry and build the replacement map in a local variable.
+    // A reload is all-or-nothing: if any entry is invalid, the previously
+    // active routes and version stay in effect instead of leaving the router
+    // half-populated or pointing at a provider that was never registered.
+    if (!Array.isArray(table.entries)) {
+      throw new Error('Invalid route table: entries must be an array.');
     }
+
+    const nextRouteMap = new Map<string, string>();
+    for (const entry of table.entries) {
+      if (!entry || typeof entry !== 'object') {
+        throw new Error('Invalid route table: each entry must be an object.');
+      }
+      if (typeof entry.jurisdiction !== 'string' || entry.jurisdiction.trim() === '') {
+        throw new Error('Invalid route table: each entry requires a non-empty jurisdiction.');
+      }
+      if (typeof entry.providerName !== 'string' || entry.providerName.trim() === '') {
+        throw new Error('Invalid route table: each entry requires a non-empty providerName.');
+      }
+
+      // The request path upper-cases the applicant's country (`src/routes/kyc.ts`)
+      // before looking it up, so store keys in the same normalised form.
+      // Otherwise a lower-case entry would be unreachable.
+      const jurisdiction = entry.jurisdiction.toUpperCase();
+
+      if (nextRouteMap.has(jurisdiction)) {
+        throw new Error(
+          `Invalid route table: duplicate jurisdiction "${jurisdiction}". Each jurisdiction may map to exactly one provider.`
+        );
+      }
+
+      if (!this.providers.has(entry.providerName)) {
+        throw new Error(
+          `Invalid route table: jurisdiction "${jurisdiction}" references unregistered provider "${entry.providerName}". Register the provider before loading the table.`
+        );
+      }
+
+      nextRouteMap.set(jurisdiction, entry.providerName);
+    }
+
+    // Every entry passed validation: atomically replace the active table.
+    this.routeMap = nextRouteMap;
     this.currentVersion = table.version;
   }
 
